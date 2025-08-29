@@ -203,14 +203,19 @@ class RecipeController(BaseRecipeController):
         translate_language: str | None = Query(None, alias="translateLanguage"),
     ):
         """
-        Create a recipe from an image using OpenAI.
+        Create a recipe from an image using the configured provider chain (AI -> OCR fallback).
         Optionally specify a language for it to translate the recipe to.
         """
 
-        if not (self.settings.OPENAI_ENABLED and self.settings.OPENAI_ENABLE_IMAGE_SERVICES):
+        from mealie.services.image_scanning import ImageScanningService
+        
+        image_scanning_service = ImageScanningService(self.translator)
+        
+        # Check if any provider is configured or OCR fallback is enabled
+        if not (image_scanning_service.is_any_provider_configured() or self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK):
             raise HTTPException(
                 status_code=400,
-                detail=ErrorResponse.respond("OpenAI image services are not enabled"),
+                detail=ErrorResponse.respond("No image scanning providers are configured. Please configure at least one AI provider or enable OCR fallback."),
             )
 
         recipe = await self.service.create_from_images(images, translate_language)

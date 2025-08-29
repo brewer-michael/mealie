@@ -293,7 +293,14 @@ class RecipeService(RecipeServiceBase):
         return recipe
 
     async def create_from_images(self, images: list[UploadFile], translate_language: str | None = None) -> Recipe:
-        openai_recipe_service = OpenAIRecipeService(self.repos, self.user, self.household, self.translator)
+        """Create a recipe from images using the configured provider chain (AI -> OCR fallback)."""
+        from mealie.services.image_scanning import ImageScanningService
+        
+        if not images:
+            raise ValueError("No images provided")
+        
+        image_scanning_service = ImageScanningService(self.translator)
+        
         with get_temporary_path() as temp_path:
             local_images: list[Path] = []
             for image in images:
@@ -301,10 +308,10 @@ class RecipeService(RecipeServiceBase):
                     shutil.copyfileobj(image.file, buffer)
                 local_images.append(temp_path.joinpath(image.filename))
 
-            recipe_data = await openai_recipe_service.build_recipe_from_images(
+            # Use the unified scanning service with fallback chain
+            recipe_data = await image_scanning_service.scan_images_for_recipe(
                 local_images, translate_language=translate_language
             )
-            recipe_data = cleaner.clean(recipe_data, self.translator)
 
             recipe = self.create_one(recipe_data)
             data_service = RecipeDataService(recipe.id)
@@ -314,7 +321,7 @@ class RecipeService(RecipeServiceBase):
             return recipe
 
     def create_from_images_ocr(self, images: list[UploadFile]) -> Recipe:
-        """Create a recipe from images using traditional OCR (Tesseract) instead of OpenAI."""
+        """Create a recipe from images using traditional OCR (Tesseract) - legacy method."""
         try:
             from mealie.services.ocr import OCRService
         except ImportError:

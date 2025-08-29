@@ -30,15 +30,30 @@
           v-if="!item.hide"
           :key="index"
         >
-          <v-list-item @click="setValue(item)">
-            <template
-              v-if="item.icon"
-              #prepend
-            >
-              <v-icon>{{ item.icon }}</v-icon>
+          <v-tooltip :disabled="!item.tooltip" location="top">
+            <template #activator="{ props: tooltipProps }">
+              <v-list-item 
+                @click="setValue(item)" 
+                :disabled="item.disabled"
+                v-bind="tooltipProps"
+              >
+                <template
+                  v-if="item.icon"
+                  #prepend
+                >
+                  <v-icon :class="{ 'text-disabled': item.disabled }">{{ item.icon }}</v-icon>
+                </template>
+                <v-list-item-title :class="{ 'text-disabled': item.disabled }">{{ item.text }}</v-list-item-title>
+                <template
+                  v-if="item.disabled"
+                  #append
+                >
+                  <v-icon size="small" class="text-warning">{{ $globals.icons.alertCircle }}</v-icon>
+                </template>
+              </v-list-item>
             </template>
-            <v-list-item-title>{{ item.text }}</v-list-item-title>
-          </v-list-item>
+            {{ item.tooltip }}
+          </v-tooltip>
           <v-divider
             v-if="item.divider"
             :key="`divider-${index}`"
@@ -122,6 +137,8 @@ export interface MenuItem {
   event?: string;
   divider?: boolean;
   hide?: boolean;
+  disabled?: boolean;
+  tooltip?: string;
 }
 
 export default defineNuxtComponent({
@@ -175,6 +192,10 @@ export default defineNuxtComponent({
     const itemGroup = ref(startIndex);
 
     function setValue(v: MenuItem) {
+      if (v.disabled) {
+        // Don't navigate or emit for disabled items
+        return;
+      }
       context.emit("update:modelValue", v.value);
       activeObj.value = v;
     }

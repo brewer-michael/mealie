@@ -1,0 +1,225 @@
+"""
+Unified image scanning service that implements provider fallback chain.
+Primary -> Secondary -> OCR fallback
+"""
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from mealie.core.config import get_app_settings
+from mealie.lang.providers import Translator
+from mealie.schema.recipe.recipe import CreateRecipe
+from mealie.services.scraper import cleaner
+
+logger = logging.getLogger(__name__)
+
+
+class ImageScanningService:
+    """Unified service for scanning recipe images with provider fallback"""
+    
+    def __init__(self, translator: Translator):
+        self.translator = translator
+        self.settings = get_app_settings()
+    
+    async def scan_images_for_recipe(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe:
+        """
+        Scan recipe images using the configured provider chain:
+        1. Primary AI provider (if configured)
+        2. Secondary AI provider (if configured and primary fails)
+        3. OCR fallback (if enabled and all AI providers fail)
+        
+        Returns a CreateRecipe object with extracted recipe data.
+        """
+        errors = []
+        
+        # Try primary provider
+        primary_provider = self.settings.IMAGE_SCANNING_PRIMARY_PROVIDER.lower()
+        if primary_provider != "none":
+            try:
+                logger.info(f"Attempting recipe extraction with primary provider: {primary_provider}")
+                recipe_data = await self._scan_with_provider(images, primary_provider, translate_language)
+                if recipe_data:
+                    return cleaner.clean(recipe_data, self.translator)
+            except Exception as e:
+                error_msg = f"Primary provider {primary_provider} failed: {str(e)}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+        
+        # Try secondary provider
+        secondary_provider = self.settings.IMAGE_SCANNING_SECONDARY_PROVIDER.lower()
+        if secondary_provider != "none" and secondary_provider != primary_provider:
+            try:
+                logger.info(f"Attempting recipe extraction with secondary provider: {secondary_provider}")
+                recipe_data = await self._scan_with_provider(images, secondary_provider, translate_language)
+                if recipe_data:
+                    return cleaner.clean(recipe_data, self.translator)
+            except Exception as e:
+                error_msg = f"Secondary provider {secondary_provider} failed: {str(e)}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+        
+        # Try OCR fallback
+        if self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK:
+            try:
+                logger.info("Attempting recipe extraction with OCR fallback")
+                recipe_data = await self._scan_with_ocr(images)
+                if recipe_data:
+                    return cleaner.clean(recipe_data, self.translator)
+            except Exception as e:
+                error_msg = f"OCR fallback failed: {str(e)}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+        
+        # If all methods fail, raise an exception with all error details
+        error_summary = f"All image scanning methods failed. Errors: {'; '.join(errors)}"
+        raise Exception(error_summary)
+    
+    async def _scan_with_provider(self, images: list[Path], provider: str, translate_language: str | None = None) -> CreateRecipe | None:
+        """Scan images with a specific AI provider"""
+        if provider == "openai":
+            return await self._scan_with_openai(images, translate_language)
+        elif provider == "anthropic":
+            return await self._scan_with_anthropic(images, translate_language)
+        elif provider == "gemini":
+            return await self._scan_with_gemini(images, translate_language)
+        elif provider == "ollama":
+            return await self._scan_with_ollama(images, translate_language)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+    
+    async def _scan_with_openai(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
+        """Scan images using OpenAI"""
+        if not self.settings.OPENAI_ENABLED:
+            raise Exception("OpenAI is not configured")
+        
+        # Import here to avoid circular dependencies  
+        from mealie.services.recipe.recipe_service import OpenAIRecipeService
+        from mealie.repos.all_repositories import get_repositories
+        from mealie.schema.user.user import PrivateUser
+        from mealie.schema.household.household import HouseholdInDB
+        
+        # Create a minimal OpenAI recipe service instance
+        # Note: This is a bit of a hack - we need repos/user/household to create the service
+        # but we only need the recipe creation logic, not the database operations
+        repos = get_repositories()  # This will need proper initialization
+        
+        # For now, let's use the direct OpenAI service approach
+        from mealie.services.openai import OpenAIService, OpenAILocalImage, OpenAIDataInjection
+        from mealie.schema.openai.recipe import OpenAIRecipe
+        import os
+        
+        openai_service = OpenAIService()
+        prompt = openai_service.get_prompt(
+            "recipes.parse-recipe-image",
+            data_injections=[
+                OpenAIDataInjection(
+                    description=(
+                        "This is the JSON response schema. You must respond in valid JSON that follows this schema. "
+                        "Your payload should be as compact as possible, eliminating unncessesary whitespace. "
+                        "Any fields with default values which you do not populate should not be in the payload."
+                    ),
+                    value=OpenAIRecipe,
+                )
+            ],
+        )
+
+        openai_images = [OpenAILocalImage(filename=os.path.basename(image), path=image) for image in images]
+        message = (
+            f"Please extract the recipe from the {'images' if len(openai_images) > 1 else 'image'} provided."
+            "There should be exactly one recipe."
+        )
+
+        if translate_language:
+            message += f" Please translate the recipe to {translate_language}."
+
+        response = await openai_service.chat_completion_with_images(
+            prompt=prompt,
+            message=message,
+            images=openai_images,
+        )
+        
+        openai_recipe = OpenAIRecipe.model_validate_json(response.choices[0].message.content)
+        
+        # Convert OpenAI recipe to CreateRecipe format
+        from mealie.schema.recipe.recipe import CreateRecipe
+        from mealie.schema.recipe.recipe_ingredient import RecipeIngredient  
+        from mealie.schema.recipe.recipe_step import RecipeStep
+        from mealie.schema.recipe.recipe_notes import RecipeNote
+        
+        return CreateRecipe(
+            name=openai_recipe.name,
+            description=openai_recipe.description,
+            recipe_yield=openai_recipe.recipe_yield,
+            total_time=openai_recipe.total_time,
+            prep_time=openai_recipe.prep_time,
+            perform_time=openai_recipe.perform_time,
+            recipe_ingredient=[
+                RecipeIngredient(title=ingredient.title, note=ingredient.text)
+                for ingredient in openai_recipe.ingredients
+                if ingredient.text
+            ],
+            recipe_instructions=[
+                RecipeStep(title=instruction.title, text=instruction.text)
+                for instruction in openai_recipe.instructions
+                if instruction.text
+            ],
+            notes=[RecipeNote(title=note.title or "", text=note.text) for note in openai_recipe.notes if note.text],
+        )
+    
+    async def _scan_with_anthropic(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
+        """Scan images using Anthropic Claude"""
+        if not self.settings.ANTHROPIC_ENABLED:
+            raise Exception("Anthropic is not configured")
+        
+        # TODO: Implement Anthropic vision API integration
+        raise NotImplementedError("Anthropic integration not yet implemented")
+    
+    async def _scan_with_gemini(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
+        """Scan images using Google Gemini"""
+        if not self.settings.GEMINI_ENABLED:
+            raise Exception("Gemini is not configured")
+        
+        # TODO: Implement Gemini vision API integration
+        raise NotImplementedError("Gemini integration not yet implemented")
+    
+    async def _scan_with_ollama(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
+        """Scan images using Ollama"""
+        if not self.settings.OLLAMA_ENABLED:
+            raise Exception("Ollama is not configured")
+        
+        # TODO: Implement Ollama vision API integration
+        raise NotImplementedError("Ollama integration not yet implemented")
+    
+    async def _scan_with_ocr(self, images: list[Path]) -> CreateRecipe | None:
+        """Scan images using traditional OCR"""
+        try:
+            from mealie.services.ocr import OCRService
+        except ImportError:
+            raise Exception("OCR services are not available. Please install pytesseract and pillow.")
+        
+        if not images:
+            raise Exception("No images provided for OCR scanning")
+        
+        ocr_service = OCRService()
+        # Use the first image for OCR scanning
+        return ocr_service.process_image(images[0])
+    
+    def get_available_providers(self) -> dict[str, bool]:
+        """Get a dict of available providers and their status"""
+        return {
+            "openai": self.settings.OPENAI_ENABLED,
+            "anthropic": self.settings.ANTHROPIC_ENABLED,
+            "gemini": self.settings.GEMINI_ENABLED,
+            "ollama": self.settings.OLLAMA_ENABLED,
+            "ocr": True,  # OCR is always available if tesseract is installed
+        }
+    
+    def is_any_provider_configured(self) -> bool:
+        """Check if any AI provider is configured"""
+        return any([
+            self.settings.OPENAI_ENABLED,
+            self.settings.ANTHROPIC_ENABLED,
+            self.settings.GEMINI_ENABLED,
+            self.settings.OLLAMA_ENABLED,
+        ])

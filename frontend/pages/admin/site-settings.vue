@@ -94,6 +94,18 @@
             <v-list-item-subtitle class="wrap-word">
               {{ check.status ? check.successText : check.errorText }}
             </v-list-item-subtitle>
+            <template v-if="check.configLink" #append>
+              <BaseButton
+                color="primary"
+                small
+                :to="check.configLink"
+              >
+                <template #icon>
+                  {{ $globals.icons.cog }}
+                </template>
+                {{ check.configText }}
+              </BaseButton>
+            </template>
           </v-list-item>
           <v-divider />
         </template>
@@ -348,13 +360,15 @@ export default defineNuxtComponent({
           icon: appConfig.value.oidcReady ? goodIcon : warningIcon,
         },
         {
-          id: "openai-ready",
-          text: i18n.t("settings.openai-ready"),
-          status: appConfig.value.enableOpenai,
-          errorText: i18n.t("settings.openai-ready-error-text"),
-          successText: i18n.t("settings.openai-ready-success-text"),
-          color: appConfig.value.enableOpenai ? goodColor : warningColor,
-          icon: appConfig.value.enableOpenai ? goodIcon : warningIcon,
+          id: "image-scanning-enabled",
+          text: i18n.t("settings.image-scanning-enabled"),
+          status: appConfig.value.enableOpenai || appConfig.value.enableOcrFallback,
+          errorText: i18n.t("settings.image-scanning-disabled-text"),
+          successText: i18n.t("settings.image-scanning-enabled-text"),
+          color: (appConfig.value.enableOpenai || appConfig.value.enableOcrFallback) ? goodColor : warningColor,
+          icon: (appConfig.value.enableOpenai || appConfig.value.enableOcrFallback) ? goodIcon : warningIcon,
+          configLink: "/admin/recipe-scanning",
+          configText: i18n.t("settings.configure-image-scanning"),
         },
       ];
       return data;

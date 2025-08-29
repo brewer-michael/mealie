@@ -79,16 +79,20 @@ export default defineNuxtComponent({
         value: "html",
       },
       {
-        icon: $globals.icons.fileImage,
-        text: i18n.t("recipe.create-from-images"),
+        icon: $globals.icons.robot,
+        text: i18n.t("recipe.create-from-images-ai"),
         value: "image",
-        hide: !enableOpenAIImages.value,
+        hide: false, // Always show, but will show setup prompt if not configured
+        disabled: !enableOpenAIImages.value,
+        tooltip: enableOpenAIImages.value ? null : i18n.t("recipe.ai-scanning-setup-required"),
       },
       {
         icon: $globals.icons.textScan,
         text: i18n.t("recipe.create-from-image-ocr"),
         value: "ocr",
-        hide: false, // Always show OCR option as fallback
+        hide: false,
+        disabled: false,
+        tooltip: i18n.t("recipe.ocr-scanning-privacy-mode"),
       },
       {
         icon: $globals.icons.edit,

@@ -374,6 +374,16 @@ class AppSettings(AppLoggingSettings):
         return self.OIDC_FEATURE.enabled
 
     # ===============================================
+    # Image Scanning Configuration
+    
+    IMAGE_SCANNING_PRIMARY_PROVIDER: str = "openai"
+    """Primary AI provider for image scanning (openai, anthropic, gemini, ollama)"""
+    IMAGE_SCANNING_SECONDARY_PROVIDER: str = "none"
+    """Secondary AI provider for fallback (openai, anthropic, gemini, ollama, none)"""
+    IMAGE_SCANNING_ENABLE_OCR_FALLBACK: bool = True
+    """Enable OCR fallback when AI providers fail"""
+    
+    # ===============================================
     # OpenAI Configuration
 
     OPENAI_BASE_URL: str | None = None
@@ -420,6 +430,45 @@ class AppSettings(AppLoggingSettings):
     def OPENAI_ENABLED(self) -> bool:
         """Validates OpenAI settings are all set"""
         return self.OPENAI_FEATURE.enabled
+
+    # ===============================================
+    # Anthropic Configuration
+    
+    ANTHROPIC_API_KEY: MaskedNoneString = None
+    """Your Anthropic API key for Claude models"""
+    ANTHROPIC_MODEL: str = "claude-3-haiku-20240307"
+    """Which Anthropic model to use for vision tasks"""
+    
+    @property
+    def ANTHROPIC_ENABLED(self) -> bool:
+        """Validates Anthropic settings are all set"""
+        return bool(self.ANTHROPIC_API_KEY and self.ANTHROPIC_MODEL)
+
+    # ===============================================
+    # Google Gemini Configuration
+    
+    GEMINI_API_KEY: MaskedNoneString = None
+    """Your Google Gemini API key"""
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+    """Which Gemini model to use for vision tasks"""
+    
+    @property
+    def GEMINI_ENABLED(self) -> bool:
+        """Validates Gemini settings are all set"""
+        return bool(self.GEMINI_API_KEY and self.GEMINI_MODEL)
+
+    # ===============================================
+    # Ollama Configuration
+    
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    """Base URL for Ollama API"""
+    OLLAMA_MODEL: str = "llava"
+    """Which Ollama model to use for vision tasks"""
+    
+    @property
+    def OLLAMA_ENABLED(self) -> bool:
+        """Validates Ollama settings are available"""
+        return bool(self.OLLAMA_BASE_URL and self.OLLAMA_MODEL)
 
     # ===============================================
     # Web Concurrency
