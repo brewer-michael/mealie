@@ -39,6 +39,7 @@ const routes = {
   recipesCreateUrlBulk: `${prefix}/recipes/create/url/bulk`,
   recipesCreateFromZip: `${prefix}/recipes/create/zip`,
   recipesCreateFromImage: `${prefix}/recipes/create/image`,
+  recipesCreateFromImageOcr: `${prefix}/recipes/create/image/ocr`,
   recipesCreateFromHtmlOrJson: `${prefix}/recipes/create/html-or-json`,
   recipesCategory: `${prefix}/recipes/category`,
   recipesParseIngredient: `${prefix}/parser/ingredient`,
@@ -170,6 +171,16 @@ export class RecipeAPI extends BaseCRUDAPI<CreateRecipe, Recipe, Recipe> {
     }
 
     return await this.requests.post<string>(apiRoute, formData, { timeout: 120000 });
+  }
+
+  async createOneFromImagesOcr(fileObjects: (Blob | File)[]) {
+    const formData = new FormData();
+
+    fileObjects.forEach((file) => {
+      formData.append("images", file);
+    });
+
+    return await this.requests.post<string>(routes.recipesCreateFromImageOcr, formData, { timeout: 120000 });
   }
 
   async parseIngredients(parser: Parser, ingredients: Array<string>) {

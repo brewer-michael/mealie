@@ -313,6 +313,43 @@ class RecipeService(RecipeServiceBase):
                 data_service.write_image(f.read(), "webp")
             return recipe
 
+    def create_from_images_ocr(self, images: list[UploadFile]) -> Recipe:
+        """Create a recipe from images using traditional OCR (Tesseract) instead of OpenAI."""
+        try:
+            from mealie.services.ocr import OCRService
+        except ImportError:
+            raise ValueError("OCR services are not available. Please install pytesseract and pillow.")
+        
+        if not images:
+            raise ValueError("No images provided")
+        
+        ocr_service = OCRService()
+        
+        with get_temporary_path() as temp_path:
+            # Process the first image (main image)
+            first_image = images[0]
+            image_path = temp_path / first_image.filename
+            
+            with image_path.open("wb") as buffer:
+                shutil.copyfileobj(first_image.file, buffer)
+            
+            # Extract recipe using OCR
+            recipe_data = ocr_service.process_image(image_path)
+            
+            # Clean the recipe data using the same cleaner as OpenAI
+            recipe_data = cleaner.clean(recipe_data, self.translator)
+            
+            # Create the recipe
+            recipe = self.create_one(recipe_data)
+            
+            # Set the image for the recipe
+            if recipe and recipe.id:
+                data_service = RecipeDataService(recipe.id)
+                with open(image_path, "rb") as f:
+                    data_service.write_image(f.read(), "webp")
+            
+            return recipe
+
     def duplicate_one(self, old_slug_or_id: str | UUID, dup_data: RecipeDuplicate) -> Recipe:
         """Duplicates a recipe and returns the new recipe."""
 

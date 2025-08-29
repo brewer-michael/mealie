@@ -223,6 +223,35 @@ class RecipeController(BaseRecipeController):
 
         return recipe.slug
 
+    @router.post("/create/image/ocr", status_code=201)
+    async def create_recipe_from_image_ocr(
+        self,
+        images: list[UploadFile] = File(...),
+    ):
+        """
+        Create a recipe from an image using traditional OCR (Tesseract) as an alternative to OpenAI.
+        This provides offline OCR capability for users who prefer not to use external AI services.
+        """
+        try:
+            recipe = self.service.create_from_images_ocr(images)
+            self.publish_event(
+                event_type=EventTypes.recipe_created,
+                document_data=EventRecipeData(operation=EventOperation.create, recipe_slug=recipe.slug),
+                group_id=recipe.group_id,
+                household_id=recipe.household_id,
+            )
+            return recipe.slug
+        except ImportError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=ErrorResponse.respond("OCR services are not available. Please install pytesseract and pillow."),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=ErrorResponse.respond(str(e)),
+            ) from e
+
     # ==================================================================================================================
     # CRUD Operations
 

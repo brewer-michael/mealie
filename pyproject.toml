@@ -59,6 +59,9 @@ ingredient-parser-nlp = "^2.0.0"
 [tool.poetry.group.postgres.dependencies]
 psycopg2-binary = { version = "^2.9.1" }
 
+[tool.poetry.group.ocr.dependencies]
+pytesseract = "^0.3.10"
+
 [tool.poetry.group.dev.dependencies]
 coverage = "^7.0"
 coveragepy-lcov = "^0.1.1"

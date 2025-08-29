@@ -85,6 +85,12 @@ export default defineNuxtComponent({
         hide: !enableOpenAIImages.value,
       },
       {
+        icon: $globals.icons.textScan,
+        text: i18n.t("recipe.create-from-image-ocr"),
+        value: "ocr",
+        hide: false, // Always show OCR option as fallback
+      },
+      {
         icon: $globals.icons.edit,
         text: i18n.t("recipe.create-recipe"),
         value: "new",
