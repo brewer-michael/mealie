@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>mealie-dev</Name>
-  <Repository>ghcr.io/brewer-michael/mealie:dev</Repository>
-  <Registry>https://registry.hub.docker.com/r/ghcr.io/brewer-michael/mealie</Registry>
+  <Repository>brewermichael/mealie-dev:latest</Repository>
+  <Registry>https://hub.docker.com/r/brewermichael/mealie-dev</Registry>
   <Network>proxynet</Network>
   <MyIP/>
   <Shell>sh</Shell>
