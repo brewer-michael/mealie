@@ -40,9 +40,7 @@ from mealie.repos.repository_cookbooks import RepositoryCookbooks
 from mealie.repos.repository_foods import RepositoryFood
 from mealie.repos.repository_household import RepositoryHousehold, RepositoryHouseholdRecipes
 from mealie.repos.repository_meal_plan_rules import RepositoryMealPlanRules
-from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.repos.repository_units import RepositoryUnit
-from mealie.schema.admin.admin_settings import AdminSettingsOut
 from mealie.schema.cookbook.cookbook import ReadCookBook
 from mealie.schema.group.group_exports import GroupDataExport
 from mealie.schema.group.group_preferences import ReadGroupPreferences
@@ -73,6 +71,7 @@ from mealie.schema.user.user import UserRatingOut
 from mealie.schema.user.user_passwords import PrivatePasswordResetToken
 
 from ._utils import NOT_SET, NotSet
+from .repository_admin_settings import RepositoryAdminSettings
 from .repository_generic import GroupRepositoryGeneric, HouseholdRepositoryGeneric
 from .repository_group import RepositoryGroup
 from .repository_meals import RepositoryMeals
@@ -380,7 +379,7 @@ class AllRepositories:
 
     # ================================================================
     # Admin Settings
-
+    
     @cached_property 
     def admin_settings(self) -> RepositoryAdminSettings:
         return RepositoryAdminSettings(self.session)

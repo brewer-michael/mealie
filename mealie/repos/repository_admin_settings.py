@@ -2,7 +2,6 @@
 
 from sqlalchemy.orm.session import Session
 
-from mealie.core.security import get_hasher
 from mealie.db.models.admin.admin_settings import AdminSettings
 from mealie.schema.admin.admin_settings import AdminSettingsIn, AdminSettingsOut
 
@@ -10,7 +9,6 @@ from mealie.schema.admin.admin_settings import AdminSettingsIn, AdminSettingsOut
 class RepositoryAdminSettings:
     def __init__(self, session: Session):
         self.session = session
-        self.hasher = get_hasher()
 
     def get_settings(self) -> AdminSettingsOut:
         """Get the admin settings instance (creates one if doesn't exist)."""
