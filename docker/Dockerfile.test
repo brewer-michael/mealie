@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY docker/entry.sh /app/run.sh
+RUN ls -la /app/
+RUN chmod +x /app/run.sh
+CMD ["/bin/bash"]
