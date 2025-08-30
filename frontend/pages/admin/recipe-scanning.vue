@@ -256,6 +256,7 @@
 <script lang="ts">
 import { onMounted } from 'vue';
 import { useAppInfo } from "~/composables/api";
+import { useRequests } from "~/composables/api/api-client";
 
 // Provider configuration component
 const ProviderConfigForm = defineComponent({
@@ -483,6 +484,7 @@ export default defineNuxtComponent({
   setup() {
     const { $globals } = useNuxtApp();
     const i18n = useI18n();
+    const requests = useRequests();
     
     // State
     const primaryProvider = ref('none');
@@ -552,12 +554,22 @@ export default defineNuxtComponent({
     // Load existing settings on page load
     const loadSettings = async () => {
       try {
-        const response = await $fetch('/api/admin/recipe-scanning/settings');
+        console.log('Loading settings from API...');
+        const { data, error } = await requests.get('/api/admin/recipe-scanning/settings');
+        
+        if (error) {
+          console.error('API error:', error);
+          return;
+        }
+        
+        console.log('Loaded settings:', data);
         
         // Set provider selections
-        primaryProvider.value = response.image_scanning_primary_provider || 'none';
-        secondaryProvider.value = response.image_scanning_secondary_provider || 'none';
-        enableOcrFallback.value = response.image_scanning_enable_ocr_fallback;
+        primaryProvider.value = data.image_scanning_primary_provider || 'none';
+        secondaryProvider.value = data.image_scanning_secondary_provider || 'none';
+        enableOcrFallback.value = data.image_scanning_enable_ocr_fallback;
+        
+        console.log('Set primaryProvider to:', primaryProvider.value);
         
         // Show secondary provider if it's configured
         if (secondaryProvider.value !== 'none') {
@@ -649,10 +661,8 @@ export default defineNuxtComponent({
         };
 
         // Make API call to save settings
-        const response = await $fetch('/api/admin/recipe-scanning/settings', {
-          method: 'PUT',
-          body: settingsData,
-        });
+        const { data } = await requests.put('/api/admin/recipe-scanning/settings', settingsData);
+        const response = data;
 
         // Show success toast
         // TODO: Add proper toast notification system
