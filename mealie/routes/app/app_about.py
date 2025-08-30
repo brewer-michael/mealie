@@ -6,6 +6,7 @@ from mealie.core.settings.static import APP_VERSION
 from mealie.db.db_setup import generate_session
 from mealie.db.models.users.users import User
 from mealie.repos.all_repositories import get_repositories
+# Added for admin settings integration - allows checking AI provider configuration via admin panel
 from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.schema.admin.about import AppInfo, AppStartupInfo, AppTheme
 
@@ -32,11 +33,14 @@ def get_app_info(session: Session = Depends(generate_session)):
         if default_household and default_household.preferences and not default_household.preferences.private_household:
             default_household_slug = default_household.slug
 
-    # Check admin settings for AI provider configuration
+    # ADMIN SETTINGS INTEGRATION: Check admin settings for AI provider configuration
+    # This replaces the legacy OPENAI_ENABLE_IMAGE_SERVICES check to support multiple AI providers
+    # configured via the admin panel instead of environment variables only
     admin_settings_repo = RepositoryAdminSettings(session)
     admin_settings = admin_settings_repo.get_settings()
     
-    # AI image services are enabled if a provider is set and it's not 'none'
+    # AI image services are enabled if any provider is configured in admin settings
+    # This allows the frontend to show/hide image scanning features based on admin configuration
     ai_image_services_enabled = (
         admin_settings and 
         admin_settings.image_scanning_primary_provider and 
@@ -55,7 +59,7 @@ def get_app_info(session: Session = Depends(generate_session)):
         oidc_redirect=settings.OIDC_AUTO_REDIRECT,
         oidc_provider_name=settings.OIDC_PROVIDER_NAME,
         enable_openai=settings.OPENAI_ENABLED,  # Keep legacy setting for backward compatibility
-        enable_openai_image_services=ai_image_services_enabled,  # Now uses admin settings
+        enable_openai_image_services=ai_image_services_enabled,  # CHANGED: Now uses admin settings instead of legacy OPENAI_ENABLE_IMAGE_SERVICES
         allow_password_login=settings.ALLOW_PASSWORD_LOGIN,
     )
 

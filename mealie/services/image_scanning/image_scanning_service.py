@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from mealie.core.config import get_app_settings
 from mealie.lang.providers import Translator
+# ADMIN SETTINGS INTEGRATION: Added to support checking AI provider configuration via admin panel
 from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.schema.recipe.recipe import CreateRecipe
 from mealie.services.scraper import cleaner
@@ -24,6 +25,8 @@ class ImageScanningService:
     def __init__(self, translator: Translator, session: Session | None = None):
         self.translator = translator
         self.settings = get_app_settings()
+        # ADMIN SETTINGS INTEGRATION: Added session parameter and admin settings loading
+        # This allows the service to check admin panel configuration instead of only environment variables
         self.session = session
         self._admin_settings = None
         if session:
@@ -40,6 +43,9 @@ class ImageScanningService:
         Returns a CreateRecipe object with extracted recipe data.
         """
         errors = []
+        
+        # ADMIN SETTINGS INTEGRATION: Use helper methods to get provider settings
+        # This allows checking admin settings first, then falling back to environment variables
         
         # Try primary provider
         primary_provider = self._get_primary_provider().lower()
@@ -232,6 +238,9 @@ class ImageScanningService:
             self._is_provider_enabled("ollama"),
         ])
     
+    # ADMIN SETTINGS INTEGRATION: The following helper methods were added to support
+    # admin panel configuration while maintaining backward compatibility with environment variables
+    
     def _get_primary_provider(self) -> str:
         """Get the primary provider from admin settings or fallback to legacy settings"""
         if self._admin_settings:
@@ -251,7 +260,9 @@ class ImageScanningService:
         return self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK
     
     def _is_provider_enabled(self, provider: str) -> bool:
-        """Check if a specific provider is enabled (has API key configured)"""
+        """Check if a specific provider is enabled (has API key configured)
+        CHANGED: Now checks admin settings first, then falls back to environment variables
+        """
         # First check admin settings if available
         if self._admin_settings:
             if provider == "openai":
@@ -264,7 +275,7 @@ class ImageScanningService:
                 # Ollama doesn't need an API key, just check if base URL is configured
                 return bool(self._admin_settings.ollama_base_url)
         
-        # Fallback to legacy settings
+        # Fallback to legacy settings for backward compatibility
         if provider == "openai":
             return self.settings.OPENAI_ENABLED
         elif provider == "anthropic":

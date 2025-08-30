@@ -299,7 +299,10 @@ class RecipeService(RecipeServiceBase):
         if not images:
             raise ValueError("No images provided")
         
-        image_scanning_service = ImageScanningService(self.translator)
+        # ADMIN SETTINGS INTEGRATION: Pass database session to ImageScanningService
+        # This was added to support admin panel AI provider configuration
+        # Previously: ImageScanningService(self.translator)
+        image_scanning_service = ImageScanningService(self.translator, self.repos.session)
         
         with get_temporary_path() as temp_path:
             local_images: list[Path] = []
