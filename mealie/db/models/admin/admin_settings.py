@@ -7,7 +7,6 @@ from mealie.db.models._model_base import SqlAlchemyBase
 from mealie.db.models._model_utils.auto_init import auto_init
 
 
-@auto_init()
 class AdminSettings(SqlAlchemyBase):
     __tablename__ = "admin_settings"
 
@@ -31,16 +30,20 @@ class AdminSettings(SqlAlchemyBase):
     gemini_model: Mapped[str | None] = mapped_column(String, default="gemini-1.5-flash")
     ollama_model: Mapped[str | None] = mapped_column(String, default="llava")
 
+    @auto_init()
+    def __init__(self, **kwargs) -> None:
+        pass
+
     # Singleton pattern - there should only ever be one row
     @classmethod
-    def get_instance(cls, db):
+    def get_instance(cls, session):
         """Get or create the single admin settings instance."""
-        instance = db.query(cls).first()
+        instance = session.query(cls).first()
         if not instance:
             instance = cls()
-            db.add(instance)
-            db.commit()
-            db.refresh(instance)
+            session.add(instance)
+            session.commit()
+            session.refresh(instance)
         return instance
 
     def update_from_dict(self, data: dict) -> None:

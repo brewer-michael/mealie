@@ -7,12 +7,12 @@
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://forums.unraid.net/topic/138058-support-catduck-templates/</Support>
+  <Support>https://github.com/mealie-recipes/mealie</Support>
   <Project>https://github.com/brewer-michael/mealie</Project>
   <Overview>Mealie Development Build with Enhanced Image Scanning and OCR Support
 
 This is a DEVELOPMENT version of Mealie with enhanced image scanning capabilities including:
-- OCR support for handwritten recipe cards (Tesseract)
+- OCR support for handwritten recipe cards (Tesseract)  
 - Multi-provider AI image scanning (OpenAI, Gemini, Anthropic, Ollama)
 - Intelligent fallback chain: Primary AI → Secondary AI → OCR
 - Support for HEIC/MPO image formats from iPhone
@@ -76,6 +76,4 @@ Default admin credentials: admin@example.com / MyPassword</Overview>
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID for file permissions" Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="WEB_CONCURRENCY" Target="WEB_CONCURRENCY" Default="1" Mode="" Description="Number of worker processes" Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="MAX_WORKERS" Target="MAX_WORKERS" Default="1" Mode="" Description="Maximum number of workers" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  
-  <TailscaleStateDir/>
 </Container>

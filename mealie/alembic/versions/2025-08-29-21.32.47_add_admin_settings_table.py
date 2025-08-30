@@ -21,6 +21,8 @@ def upgrade():
     op.create_table(
         "admin_settings",
         sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=True),
+        sa.Column("update_at", sa.DateTime(), nullable=True),
         sa.Column("image_scanning_primary_provider", sa.String(), nullable=True),
         sa.Column("image_scanning_secondary_provider", sa.String(), nullable=True),
         sa.Column("image_scanning_enable_ocr_fallback", sa.Boolean(), nullable=False),

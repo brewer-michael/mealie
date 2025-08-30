@@ -87,7 +87,7 @@
 
           <!-- Primary Provider Config Form -->
           <v-expand-transition>
-            <div v-if="primaryProvider && primaryProvider !== 'disabled'">
+            <div v-if="primaryProvider && primaryProvider !== 'none'">
               <ProviderConfigForm
                 :provider="primaryProvider"
                 :config="primaryConfig"
@@ -166,7 +166,7 @@
 
               <!-- Secondary Provider Config Form -->
               <v-expand-transition>
-                <div v-if="secondaryProvider && secondaryProvider !== 'disabled'">
+                <div v-if="secondaryProvider && secondaryProvider !== 'none'">
                   <ProviderConfigForm
                     :provider="secondaryProvider"
                     :config="secondaryConfig"
@@ -271,7 +271,7 @@ const ProviderConfigForm = defineComponent({
     const { $globals } = useNuxtApp();
     
     const providerConfigs = computed(() => ({
-      'google-gemini': {
+      'gemini': {
         name: 'Google Gemini',
         fields: [
           {
@@ -294,7 +294,7 @@ const ProviderConfigForm = defineComponent({
           }
         ]
       },
-      'openai-gpt4v': {
+      'openai': {
         name: 'OpenAI GPT-4V',
         fields: [
           {
@@ -318,23 +318,51 @@ const ProviderConfigForm = defineComponent({
           }
         ]
       },
-      'azure-computer-vision': {
-        name: 'Azure Computer Vision',
+      'anthropic': {
+        name: 'Anthropic Claude',
         fields: [
           {
             key: 'apiKey',
             label: 'API Key',
             type: 'password',
-            placeholder: 'Your Azure API key',
-            helpText: 'Get from Azure Portal',
-            helpLink: 'https://portal.azure.com'
+            placeholder: 'sk-ant-...',
+            helpText: 'Get your API key from Anthropic Console',
+            helpLink: 'https://console.anthropic.com/'
           },
           {
-            key: 'endpoint',
-            label: 'Endpoint',
+            key: 'model',
+            label: 'Model',
+            type: 'select',
+            options: [
+              { value: 'claude-3-haiku-20240307', text: 'Claude 3 Haiku (Recommended - Lower cost)' },
+              { value: 'claude-3-sonnet-20240229', text: 'Claude 3 Sonnet (Higher quality)' },
+              { value: 'claude-3-opus-20240229', text: 'Claude 3 Opus (Highest quality)' }
+            ],
+            default: 'claude-3-haiku-20240307'
+          }
+        ]
+      },
+      'ollama': {
+        name: 'Ollama (Local)',
+        fields: [
+          {
+            key: 'baseUrl',
+            label: 'Base URL',
             type: 'text',
-            placeholder: 'https://yourresource.cognitiveservices.azure.com/',
-            helpText: 'Your Azure Computer Vision endpoint'
+            placeholder: 'http://localhost:11434',
+            helpText: 'URL of your Ollama server',
+            default: 'http://localhost:11434'
+          },
+          {
+            key: 'model',
+            label: 'Model',
+            type: 'select',
+            options: [
+              { value: 'llava', text: 'LLaVA (Recommended - General purpose)' },
+              { value: 'llava:13b', text: 'LLaVA 13B (Higher quality)' },
+              { value: 'bakllava', text: 'BakLLaVA (Alternative)' }
+            ],
+            default: 'llava'
           }
         ]
       }
@@ -457,8 +485,8 @@ export default defineNuxtComponent({
     const i18n = useI18n();
     
     // State
-    const primaryProvider = ref('disabled');
-    const secondaryProvider = ref('disabled');
+    const primaryProvider = ref('none');
+    const secondaryProvider = ref('none');
     const primaryConfig = ref({});
     const secondaryConfig = ref({});
     const enableOcrFallback = ref(true);
@@ -470,7 +498,7 @@ export default defineNuxtComponent({
     // Provider options
     const allProviders = [
       {
-        key: 'disabled',
+        key: 'none',
         name: 'Disabled',
         description: 'No AI provider configured',
         icon: $globals.icons.close,
@@ -478,7 +506,7 @@ export default defineNuxtComponent({
         cost: null
       },
       {
-        key: 'google-gemini',
+        key: 'gemini',
         name: 'Google Gemini',
         description: 'Free tier available - Best for getting started',
         icon: $globals.icons.google,
@@ -487,7 +515,7 @@ export default defineNuxtComponent({
         freeCredits: true
       },
       {
-        key: 'openai-gpt4v',
+        key: 'openai',
         name: 'OpenAI GPT-4V',
         description: 'High accuracy - Requires $5 minimum payment',
         icon: $globals.icons.openai,
@@ -496,12 +524,21 @@ export default defineNuxtComponent({
         freeCredits: false
       },
       {
-        key: 'azure-computer-vision',
-        name: 'Azure Computer Vision',
-        description: 'Enterprise option with free tier',
-        icon: $globals.icons.azure,
-        color: 'blue',
-        cost: 'Free tier',
+        key: 'anthropic',
+        name: 'Anthropic Claude',
+        description: 'High quality vision analysis',
+        icon: $globals.icons.robot,
+        color: 'orange',
+        cost: '$0.01/scan',
+        freeCredits: false
+      },
+      {
+        key: 'ollama',
+        name: 'Ollama (Local)',
+        description: 'Run models locally - No API key required',
+        icon: $globals.icons.server,
+        color: 'purple',
+        cost: 'Free',
         freeCredits: true
       }
     ];
@@ -518,12 +555,12 @@ export default defineNuxtComponent({
         const response = await $fetch('/api/admin/recipe-scanning/settings');
         
         // Set provider selections
-        primaryProvider.value = response.image_scanning_primary_provider === 'none' ? 'disabled' : response.image_scanning_primary_provider || 'disabled';
-        secondaryProvider.value = response.image_scanning_secondary_provider === 'none' ? 'disabled' : response.image_scanning_secondary_provider || 'disabled';
+        primaryProvider.value = response.image_scanning_primary_provider || 'none';
+        secondaryProvider.value = response.image_scanning_secondary_provider || 'none';
         enableOcrFallback.value = response.image_scanning_enable_ocr_fallback;
         
         // Show secondary provider if it's configured
-        if (secondaryProvider.value !== 'disabled') {
+        if (secondaryProvider.value !== 'none') {
           showSecondary.value = true;
         }
         
@@ -542,7 +579,7 @@ export default defineNuxtComponent({
       primaryConfig.value = {};
       testResults.value.primary = null;
       if (value === secondaryProvider.value) {
-        secondaryProvider.value = 'disabled';
+        secondaryProvider.value = 'none';
         secondaryConfig.value = {};
         testResults.value.secondary = null;
       }
@@ -555,7 +592,7 @@ export default defineNuxtComponent({
     
     const removeSecondaryProvider = () => {
       showSecondary.value = false;
-      secondaryProvider.value = 'disabled';
+      secondaryProvider.value = 'none';
       secondaryConfig.value = {};
       testResults.value.secondary = null;
     };
@@ -588,24 +625,25 @@ export default defineNuxtComponent({
       try {
         // Prepare the settings data
         const settingsData = {
-          image_scanning_primary_provider: primaryProvider.value === 'disabled' ? 'none' : primaryProvider.value,
-          image_scanning_secondary_provider: secondaryProvider.value === 'disabled' ? 'none' : secondaryProvider.value,
+          image_scanning_primary_provider: primaryProvider.value,
+          image_scanning_secondary_provider: secondaryProvider.value,
           image_scanning_enable_ocr_fallback: enableOcrFallback.value,
-          // API keys
-          openai_api_key: primaryConfig.value.apiKey || secondaryConfig.value.apiKey,
-          gemini_api_key: primaryProvider.value === 'google-gemini' ? primaryConfig.value.apiKey : 
-                          (secondaryProvider.value === 'google-gemini' ? secondaryConfig.value.apiKey : null),
-          anthropic_api_key: primaryProvider.value === 'anthropic-claude' ? primaryConfig.value.apiKey : 
-                             (secondaryProvider.value === 'anthropic-claude' ? secondaryConfig.value.apiKey : null),
+          // API keys - map to correct provider
+          openai_api_key: primaryProvider.value === 'openai' ? primaryConfig.value.apiKey : 
+                          (secondaryProvider.value === 'openai' ? secondaryConfig.value.apiKey : null),
+          gemini_api_key: primaryProvider.value === 'gemini' ? primaryConfig.value.apiKey : 
+                          (secondaryProvider.value === 'gemini' ? secondaryConfig.value.apiKey : null),
+          anthropic_api_key: primaryProvider.value === 'anthropic' ? primaryConfig.value.apiKey : 
+                             (secondaryProvider.value === 'anthropic' ? secondaryConfig.value.apiKey : null),
           ollama_base_url: primaryProvider.value === 'ollama' ? primaryConfig.value.baseUrl : 
                            (secondaryProvider.value === 'ollama' ? secondaryConfig.value.baseUrl : null),
-          // Models
-          openai_model: primaryProvider.value === 'openai-gpt4v' ? primaryConfig.value.model : 
-                        (secondaryProvider.value === 'openai-gpt4v' ? secondaryConfig.value.model : null),
-          gemini_model: primaryProvider.value === 'google-gemini' ? primaryConfig.value.model : 
-                        (secondaryProvider.value === 'google-gemini' ? secondaryConfig.value.model : null),
-          anthropic_model: primaryProvider.value === 'anthropic-claude' ? primaryConfig.value.model : 
-                           (secondaryProvider.value === 'anthropic-claude' ? secondaryConfig.value.model : null),
+          // Models - map to correct provider
+          openai_model: primaryProvider.value === 'openai' ? primaryConfig.value.model : 
+                        (secondaryProvider.value === 'openai' ? secondaryConfig.value.model : null),
+          gemini_model: primaryProvider.value === 'gemini' ? primaryConfig.value.model : 
+                        (secondaryProvider.value === 'gemini' ? secondaryConfig.value.model : null),
+          anthropic_model: primaryProvider.value === 'anthropic' ? primaryConfig.value.model : 
+                           (secondaryProvider.value === 'anthropic' ? secondaryConfig.value.model : null),
           ollama_model: primaryProvider.value === 'ollama' ? primaryConfig.value.model : 
                         (secondaryProvider.value === 'ollama' ? secondaryConfig.value.model : null),
         };
