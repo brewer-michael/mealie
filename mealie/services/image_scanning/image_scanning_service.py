@@ -7,8 +7,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from mealie.core.config import get_app_settings
 from mealie.lang.providers import Translator
+from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.schema.recipe.recipe import CreateRecipe
 from mealie.services.scraper import cleaner
 
@@ -18,9 +21,14 @@ logger = logging.getLogger(__name__)
 class ImageScanningService:
     """Unified service for scanning recipe images with provider fallback"""
     
-    def __init__(self, translator: Translator):
+    def __init__(self, translator: Translator, session: Session | None = None):
         self.translator = translator
         self.settings = get_app_settings()
+        self.session = session
+        self._admin_settings = None
+        if session:
+            admin_settings_repo = RepositoryAdminSettings(session)
+            self._admin_settings = admin_settings_repo.get_settings()
     
     async def scan_images_for_recipe(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe:
         """
@@ -34,7 +42,7 @@ class ImageScanningService:
         errors = []
         
         # Try primary provider
-        primary_provider = self.settings.IMAGE_SCANNING_PRIMARY_PROVIDER.lower()
+        primary_provider = self._get_primary_provider().lower()
         if primary_provider != "none":
             try:
                 logger.info(f"Attempting recipe extraction with primary provider: {primary_provider}")
@@ -47,7 +55,7 @@ class ImageScanningService:
                 errors.append(error_msg)
         
         # Try secondary provider
-        secondary_provider = self.settings.IMAGE_SCANNING_SECONDARY_PROVIDER.lower()
+        secondary_provider = self._get_secondary_provider().lower()
         if secondary_provider != "none" and secondary_provider != primary_provider:
             try:
                 logger.info(f"Attempting recipe extraction with secondary provider: {secondary_provider}")
@@ -60,7 +68,7 @@ class ImageScanningService:
                 errors.append(error_msg)
         
         # Try OCR fallback
-        if self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK:
+        if self._get_ocr_fallback_enabled():
             try:
                 logger.info("Attempting recipe extraction with OCR fallback")
                 recipe_data = await self._scan_with_ocr(images)
@@ -90,7 +98,7 @@ class ImageScanningService:
     
     async def _scan_with_openai(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
         """Scan images using OpenAI"""
-        if not self.settings.OPENAI_ENABLED:
+        if not self._is_provider_enabled("openai"):
             raise Exception("OpenAI is not configured")
         
         # Import here to avoid circular dependencies  
@@ -169,7 +177,7 @@ class ImageScanningService:
     
     async def _scan_with_anthropic(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
         """Scan images using Anthropic Claude"""
-        if not self.settings.ANTHROPIC_ENABLED:
+        if not self._is_provider_enabled("anthropic"):
             raise Exception("Anthropic is not configured")
         
         # TODO: Implement Anthropic vision API integration
@@ -177,7 +185,7 @@ class ImageScanningService:
     
     async def _scan_with_gemini(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
         """Scan images using Google Gemini"""
-        if not self.settings.GEMINI_ENABLED:
+        if not self._is_provider_enabled("gemini"):
             raise Exception("Gemini is not configured")
         
         # TODO: Implement Gemini vision API integration
@@ -185,7 +193,7 @@ class ImageScanningService:
     
     async def _scan_with_ollama(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
         """Scan images using Ollama"""
-        if not self.settings.OLLAMA_ENABLED:
+        if not self._is_provider_enabled("ollama"):
             raise Exception("Ollama is not configured")
         
         # TODO: Implement Ollama vision API integration
@@ -208,18 +216,62 @@ class ImageScanningService:
     def get_available_providers(self) -> dict[str, bool]:
         """Get a dict of available providers and their status"""
         return {
-            "openai": self.settings.OPENAI_ENABLED,
-            "anthropic": self.settings.ANTHROPIC_ENABLED,
-            "gemini": self.settings.GEMINI_ENABLED,
-            "ollama": self.settings.OLLAMA_ENABLED,
+            "openai": self._is_provider_enabled("openai"),
+            "anthropic": self._is_provider_enabled("anthropic"),
+            "gemini": self._is_provider_enabled("gemini"),
+            "ollama": self._is_provider_enabled("ollama"),
             "ocr": True,  # OCR is always available if tesseract is installed
         }
     
     def is_any_provider_configured(self) -> bool:
         """Check if any AI provider is configured"""
         return any([
-            self.settings.OPENAI_ENABLED,
-            self.settings.ANTHROPIC_ENABLED,
-            self.settings.GEMINI_ENABLED,
-            self.settings.OLLAMA_ENABLED,
+            self._is_provider_enabled("openai"),
+            self._is_provider_enabled("anthropic"),
+            self._is_provider_enabled("gemini"),
+            self._is_provider_enabled("ollama"),
         ])
+    
+    def _get_primary_provider(self) -> str:
+        """Get the primary provider from admin settings or fallback to legacy settings"""
+        if self._admin_settings:
+            return self._admin_settings.image_scanning_primary_provider or "none"
+        return self.settings.IMAGE_SCANNING_PRIMARY_PROVIDER
+    
+    def _get_secondary_provider(self) -> str:
+        """Get the secondary provider from admin settings or fallback to legacy settings"""
+        if self._admin_settings:
+            return self._admin_settings.image_scanning_secondary_provider or "none"
+        return self.settings.IMAGE_SCANNING_SECONDARY_PROVIDER
+    
+    def _get_ocr_fallback_enabled(self) -> bool:
+        """Get OCR fallback setting from admin settings or fallback to legacy settings"""
+        if self._admin_settings:
+            return self._admin_settings.image_scanning_enable_ocr_fallback
+        return self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK
+    
+    def _is_provider_enabled(self, provider: str) -> bool:
+        """Check if a specific provider is enabled (has API key configured)"""
+        # First check admin settings if available
+        if self._admin_settings:
+            if provider == "openai":
+                return bool(self._admin_settings.openai_api_key_set)
+            elif provider == "anthropic":
+                return bool(self._admin_settings.anthropic_api_key_set)
+            elif provider == "gemini":
+                return bool(self._admin_settings.gemini_api_key_set)
+            elif provider == "ollama":
+                # Ollama doesn't need an API key, just check if base URL is configured
+                return bool(self._admin_settings.ollama_base_url)
+        
+        # Fallback to legacy settings
+        if provider == "openai":
+            return self.settings.OPENAI_ENABLED
+        elif provider == "anthropic":
+            return self.settings.ANTHROPIC_ENABLED
+        elif provider == "gemini":
+            return self.settings.GEMINI_ENABLED
+        elif provider == "ollama":
+            return self.settings.OLLAMA_ENABLED
+        
+        return False
