@@ -6,6 +6,7 @@ from mealie.core.settings.static import APP_VERSION
 from mealie.db.db_setup import generate_session
 from mealie.db.models.users.users import User
 from mealie.repos.all_repositories import get_repositories
+from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.schema.admin.about import AppInfo, AppStartupInfo, AppTheme
 
 router = APIRouter(prefix="/about")
@@ -31,6 +32,18 @@ def get_app_info(session: Session = Depends(generate_session)):
         if default_household and default_household.preferences and not default_household.preferences.private_household:
             default_household_slug = default_household.slug
 
+    # Check admin settings for AI provider configuration
+    admin_settings_repo = RepositoryAdminSettings(session)
+    admin_settings = admin_settings_repo.get_settings()
+    
+    # AI image services are enabled if a provider is set and it's not 'none'
+    ai_image_services_enabled = (
+        admin_settings and 
+        admin_settings.image_scanning_primary_provider and 
+        admin_settings.image_scanning_primary_provider != 'none' and
+        admin_settings.image_scanning_primary_provider in ['openai', 'gemini', 'anthropic', 'ollama']
+    )
+
     return AppInfo(
         version=APP_VERSION,
         demo_status=settings.IS_DEMO,
@@ -41,8 +54,8 @@ def get_app_info(session: Session = Depends(generate_session)):
         enable_oidc=settings.OIDC_READY,
         oidc_redirect=settings.OIDC_AUTO_REDIRECT,
         oidc_provider_name=settings.OIDC_PROVIDER_NAME,
-        enable_openai=settings.OPENAI_ENABLED,
-        enable_openai_image_services=settings.OPENAI_ENABLED and settings.OPENAI_ENABLE_IMAGE_SERVICES,
+        enable_openai=settings.OPENAI_ENABLED,  # Keep legacy setting for backward compatibility
+        enable_openai_image_services=ai_image_services_enabled,  # Now uses admin settings
         allow_password_login=settings.ALLOW_PASSWORD_LOGIN,
     )
 
