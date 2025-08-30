@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm.session import Session
 
-from mealie.core.dependencies import get_current_admin_user
+from mealie.core.dependencies import get_admin_user
 from mealie.db.db_setup import generate_session
 from mealie.repos.all_repositories import get_repositories
 from mealie.schema.admin.admin_settings import AdminSettingsIn, AdminSettingsOut
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/recipe-scanning", tags=["Admin: Recipe Scanning"])
 @router.get("/settings", response_model=AdminSettingsOut)
 def get_recipe_scanning_settings(
     session: Session = Depends(generate_session),
-    _: PrivateUser = Depends(get_current_admin_user),
+    _: PrivateUser = Depends(get_admin_user),
 ):
     """Get the current recipe scanning settings."""
     repos = get_repositories(session)
@@ -27,7 +27,7 @@ def get_recipe_scanning_settings(
 def update_recipe_scanning_settings(
     settings_data: AdminSettingsIn,
     session: Session = Depends(generate_session),
-    _: PrivateUser = Depends(get_current_admin_user),
+    _: PrivateUser = Depends(get_admin_user),
 ):
     """Update the recipe scanning settings."""
     repos = get_repositories(session)
@@ -46,7 +46,7 @@ def update_recipe_scanning_settings(
 def test_provider_connection(
     provider: str,
     session: Session = Depends(generate_session),
-    _: PrivateUser = Depends(get_current_admin_user),
+    _: PrivateUser = Depends(get_admin_user),
 ):
     """Test connection to a specific provider."""
     # TODO: Implement actual connection testing for each provider
