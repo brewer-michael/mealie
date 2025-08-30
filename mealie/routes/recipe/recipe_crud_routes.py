@@ -212,7 +212,7 @@ class RecipeController(BaseRecipeController):
         image_scanning_service = ImageScanningService(self.translator, self.session)
         
         # Check if any provider is configured or OCR fallback is enabled
-        if not (image_scanning_service.is_any_provider_configured() or image_scanning_service._get_ocr_fallback_enabled()):
+        if not (image_scanning_service.is_any_provider_configured() or image_scanning_service.get_ocr_fallback_enabled()):
             raise HTTPException(
                 status_code=400,
                 detail=ErrorResponse.respond("No image scanning providers are configured. Please configure at least one AI provider or enable OCR fallback."),

@@ -74,7 +74,7 @@ class ImageScanningService:
                 errors.append(error_msg)
         
         # Try OCR fallback
-        if self._get_ocr_fallback_enabled():
+        if self.get_ocr_fallback_enabled():
             try:
                 logger.info("Attempting recipe extraction with OCR fallback")
                 recipe_data = await self._scan_with_ocr(images)
@@ -253,8 +253,10 @@ class ImageScanningService:
             return self._admin_settings.image_scanning_secondary_provider or "none"
         return self.settings.IMAGE_SCANNING_SECONDARY_PROVIDER
     
-    def _get_ocr_fallback_enabled(self) -> bool:
-        """Get OCR fallback setting from admin settings or fallback to legacy settings"""
+    def get_ocr_fallback_enabled(self) -> bool:
+        """Get OCR fallback setting from admin settings or fallback to legacy settings
+        PUBLIC METHOD: Used by recipe routes to check OCR availability
+        """
         if self._admin_settings:
             return self._admin_settings.image_scanning_enable_ocr_fallback
         return self.settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK
