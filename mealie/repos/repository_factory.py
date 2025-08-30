@@ -40,7 +40,9 @@ from mealie.repos.repository_cookbooks import RepositoryCookbooks
 from mealie.repos.repository_foods import RepositoryFood
 from mealie.repos.repository_household import RepositoryHousehold, RepositoryHouseholdRecipes
 from mealie.repos.repository_meal_plan_rules import RepositoryMealPlanRules
+from mealie.repos.repository_admin_settings import RepositoryAdminSettings
 from mealie.repos.repository_units import RepositoryUnit
+from mealie.schema.admin.admin_settings import AdminSettingsOut
 from mealie.schema.cookbook.cookbook import ReadCookBook
 from mealie.schema.group.group_exports import GroupDataExport
 from mealie.schema.group.group_preferences import ReadGroupPreferences
@@ -375,3 +377,10 @@ class AllRepositories:
         return HouseholdRepositoryGeneric(
             self.session, PK_ID, GroupWebhooksModel, ReadWebhook, group_id=self.group_id, household_id=self.household_id
         )
+
+    # ================================================================
+    # Admin Settings
+
+    @cached_property 
+    def admin_settings(self) -> RepositoryAdminSettings:
+        return RepositoryAdminSettings(self.session)

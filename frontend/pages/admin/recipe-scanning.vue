@@ -254,6 +254,7 @@
 </template>
 
 <script lang="ts">
+import { onMounted } from 'vue';
 import { useAppInfo } from "~/composables/api";
 
 // Provider configuration component
@@ -511,6 +512,31 @@ export default defineNuxtComponent({
       allProviders.filter(p => p.key !== primaryProvider.value)
     );
     
+    // Load existing settings on page load
+    const loadSettings = async () => {
+      try {
+        const response = await $fetch('/api/admin/recipe-scanning/settings');
+        
+        // Set provider selections
+        primaryProvider.value = response.image_scanning_primary_provider === 'none' ? 'disabled' : response.image_scanning_primary_provider || 'disabled';
+        secondaryProvider.value = response.image_scanning_secondary_provider === 'none' ? 'disabled' : response.image_scanning_secondary_provider || 'disabled';
+        enableOcrFallback.value = response.image_scanning_enable_ocr_fallback;
+        
+        // Show secondary provider if it's configured
+        if (secondaryProvider.value !== 'disabled') {
+          showSecondary.value = true;
+        }
+        
+      } catch (error) {
+        console.error('Failed to load settings:', error);
+      }
+    };
+
+    // Load settings on component mount
+    onMounted(() => {
+      loadSettings();
+    });
+
     // Methods
     const onPrimaryProviderChange = (value: string) => {
       primaryConfig.value = {};
@@ -560,15 +586,43 @@ export default defineNuxtComponent({
     const saveConfiguration = async () => {
       saving.value = true;
       try {
-        // TODO: Implement actual save logic
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Show success message
-        // TODO: Add toast notification
+        // Prepare the settings data
+        const settingsData = {
+          image_scanning_primary_provider: primaryProvider.value === 'disabled' ? 'none' : primaryProvider.value,
+          image_scanning_secondary_provider: secondaryProvider.value === 'disabled' ? 'none' : secondaryProvider.value,
+          image_scanning_enable_ocr_fallback: enableOcrFallback.value,
+          // API keys
+          openai_api_key: primaryConfig.value.apiKey || secondaryConfig.value.apiKey,
+          gemini_api_key: primaryProvider.value === 'google-gemini' ? primaryConfig.value.apiKey : 
+                          (secondaryProvider.value === 'google-gemini' ? secondaryConfig.value.apiKey : null),
+          anthropic_api_key: primaryProvider.value === 'anthropic-claude' ? primaryConfig.value.apiKey : 
+                             (secondaryProvider.value === 'anthropic-claude' ? secondaryConfig.value.apiKey : null),
+          ollama_base_url: primaryProvider.value === 'ollama' ? primaryConfig.value.baseUrl : 
+                           (secondaryProvider.value === 'ollama' ? secondaryConfig.value.baseUrl : null),
+          // Models
+          openai_model: primaryProvider.value === 'openai-gpt4v' ? primaryConfig.value.model : 
+                        (secondaryProvider.value === 'openai-gpt4v' ? secondaryConfig.value.model : null),
+          gemini_model: primaryProvider.value === 'google-gemini' ? primaryConfig.value.model : 
+                        (secondaryProvider.value === 'google-gemini' ? secondaryConfig.value.model : null),
+          anthropic_model: primaryProvider.value === 'anthropic-claude' ? primaryConfig.value.model : 
+                           (secondaryProvider.value === 'anthropic-claude' ? secondaryConfig.value.model : null),
+          ollama_model: primaryProvider.value === 'ollama' ? primaryConfig.value.model : 
+                        (secondaryProvider.value === 'ollama' ? secondaryConfig.value.model : null),
+        };
+
+        // Make API call to save settings
+        const response = await $fetch('/api/admin/recipe-scanning/settings', {
+          method: 'PUT',
+          body: settingsData,
+        });
+
+        // Show success toast
+        // TODO: Add proper toast notification system
+        console.log('Settings saved successfully:', response);
         
       } catch (error) {
         console.error('Failed to save configuration:', error);
-        // TODO: Show error message
+        // TODO: Show error toast
       } finally {
         saving.value = false;
       }
