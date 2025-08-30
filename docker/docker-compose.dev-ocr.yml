@@ -1,0 +1,88 @@
+services:
+  mealie-dev:
+    container_name: mealie-dev
+    image: mealie:dev-ocr
+    build:
+      context: ../
+      target: production
+      dockerfile: ./docker/Dockerfile.dev
+    restart: always
+    volumes:
+      - mealie-dev-data:/app/data/
+    ports:
+      - 9092:9000
+    environment:
+      ALLOW_SIGNUP: "false"
+      LOG_LEVEL: "DEBUG"
+      
+      # Database Configuration
+      DB_ENGINE: sqlite # Optional: 'sqlite', 'postgres'
+      
+      # Image Scanning Configuration
+      IMAGE_SCANNING_PRIMARY_PROVIDER: "openai"
+      IMAGE_SCANNING_SECONDARY_PROVIDER: "none"
+      IMAGE_SCANNING_ENABLE_OCR_FALLBACK: "true"
+      
+      # API Keys (set these in your environment or .env file)
+      # OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      # GEMINI_API_KEY: "${GEMINI_API_KEY}" 
+      # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # OLLAMA_BASE_URL: "http://ollama:11434"
+      
+      # =====================================
+      # Postgres Config (if using postgres)
+      # POSTGRES_USER: mealie
+      # POSTGRES_PASSWORD: mealie
+      # POSTGRES_SERVER: postgres
+      # POSTGRES_PORT: 5432
+      # POSTGRES_DB: mealie
+      # =====================================
+      
+      # Email Configuration (optional)
+      # SMTP_HOST: "smtp.gmail.com"
+      # SMTP_PORT: 587
+      # SMTP_FROM_NAME: "Mealie Dev"
+      # SMTP_AUTH_STRATEGY: "TLS" # Options: 'TLS', 'SSL', 'NONE'
+      # SMTP_FROM_EMAIL: "your-email@gmail.com"
+      # SMTP_USER: "your-email@gmail.com"
+      # SMTP_PASSWORD: "your-app-password"
+
+  # Optional: Ollama for local AI image processing
+  # ollama:
+  #   container_name: ollama-mealie
+  #   image: ollama/ollama:latest
+  #   restart: always
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   ports:
+  #     - 11434:11434
+  #   # Uncomment if you have NVIDIA GPU
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: 1
+  #   #           capabilities: [gpu]
+
+  # Optional: PostgreSQL database
+  # postgres:
+  #   container_name: postgres-mealie
+  #   image: postgres:15
+  #   restart: always
+  #   environment:
+  #     POSTGRES_PASSWORD: mealie
+  #     POSTGRES_USER: mealie
+  #     POSTGRES_DB: mealie
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - 5432:5432
+
+volumes:
+  mealie-dev-data:
+    driver: local
+  # ollama-data:
+  #   driver: local
+  # postgres-data:
+  #   driver: local
