@@ -60,7 +60,7 @@ export default defineNuxtComponent({
     });
 
     const appInfo = useAppInfo();
-    const enableOpenAIImages = computed(() => appInfo.value?.enableOpenaiImageServices);
+    const enableAIImages = computed(() => appInfo.value?.enableAiImageServices);
 
     const subpages = computed<MenuItem[]>(() => [
       {
@@ -83,8 +83,8 @@ export default defineNuxtComponent({
         text: i18n.t("recipe.create-from-images-ai"),
         value: "image",
         hide: false, // Always show, but will show setup prompt if not configured
-        disabled: !enableOpenAIImages.value,
-        tooltip: enableOpenAIImages.value ? null : i18n.t("recipe.ai-scanning-setup-required"),
+        disabled: !enableAIImages.value,
+        tooltip: enableAIImages.value ? null : i18n.t("recipe.ai-scanning-setup-required"),
       },
       {
         icon: $globals.icons.textScan,

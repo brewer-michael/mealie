@@ -39,14 +39,20 @@ def get_app_info(session: Session = Depends(generate_session)):
     admin_settings_repo = RepositoryAdminSettings(session)
     admin_settings = admin_settings_repo.get_settings()
     
-    # AI image services are enabled if any provider is configured in admin settings
+    # AI image services are enabled if a provider is configured with a valid API key
     # This allows the frontend to show/hide image scanning features based on admin configuration
-    ai_image_services_enabled = (
-        admin_settings and 
-        admin_settings.image_scanning_primary_provider and 
-        admin_settings.image_scanning_primary_provider != 'none' and
-        admin_settings.image_scanning_primary_provider in ['openai', 'gemini', 'anthropic', 'ollama']
-    )
+    ai_image_services_enabled = False
+    if admin_settings and admin_settings.image_scanning_primary_provider and admin_settings.image_scanning_primary_provider != 'none':
+        provider = admin_settings.image_scanning_primary_provider
+        # Check if the selected provider has an API key/URL configured
+        if provider == 'openai' and admin_settings.openai_api_key:
+            ai_image_services_enabled = True
+        elif provider == 'gemini' and admin_settings.gemini_api_key:
+            ai_image_services_enabled = True
+        elif provider == 'anthropic' and admin_settings.anthropic_api_key:
+            ai_image_services_enabled = True
+        elif provider == 'ollama' and admin_settings.ollama_base_url:
+            ai_image_services_enabled = True
 
     return AppInfo(
         version=APP_VERSION,
@@ -59,7 +65,7 @@ def get_app_info(session: Session = Depends(generate_session)):
         oidc_redirect=settings.OIDC_AUTO_REDIRECT,
         oidc_provider_name=settings.OIDC_PROVIDER_NAME,
         enable_openai=settings.OPENAI_ENABLED,  # Keep legacy setting for backward compatibility
-        enable_openai_image_services=ai_image_services_enabled,  # CHANGED: Now uses admin settings instead of legacy OPENAI_ENABLE_IMAGE_SERVICES
+        enable_ai_image_services=ai_image_services_enabled,  # CHANGED: Now uses admin settings instead of legacy OPENAI_ENABLE_IMAGE_SERVICES
         allow_password_login=settings.ALLOW_PASSWORD_LOGIN,
     )
 
