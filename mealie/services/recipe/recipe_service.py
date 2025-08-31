@@ -126,6 +126,9 @@ class RecipeService(RecipeServiceBase):
         Recipe Schema class with the appropriate defaults set. Recipes should not be created
         elsewhere to avoid conflicts.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         additional_attrs = additional_attrs or {}
         additional_attrs["name"] = name
         additional_attrs["user_id"] = self.user.id
@@ -136,10 +139,18 @@ class RecipeService(RecipeServiceBase):
             for i in range(len(additional_attrs.get("tags", []))):
                 additional_attrs["tags"][i]["group_id"] = self.user.group_id
 
+        # DEBUG: Check what ingredients we have before the default logic
+        ingredients = additional_attrs.get("recipe_ingredient")
+        logger.info(f"DEBUG FACTORY: recipe_ingredient = {ingredients}")
+        logger.info(f"DEBUG FACTORY: type = {type(ingredients)}, len = {len(ingredients) if ingredients else 'None'}")
+
         if not additional_attrs.get("recipe_ingredient"):
+            logger.info(f"DEBUG FACTORY: Adding default ingredient because recipe_ingredient is empty/None")
             additional_attrs["recipe_ingredient"] = [
                 RecipeIngredient(note=self.t("recipe.recipe-defaults.ingredient-note"))
             ]
+        else:
+            logger.info(f"DEBUG FACTORY: Using provided {len(additional_attrs['recipe_ingredient'])} ingredients")
 
         if not additional_attrs.get("recipe_instructions"):
             additional_attrs["recipe_instructions"] = [RecipeStep(text=self.t("recipe.recipe-defaults.step-text"))]

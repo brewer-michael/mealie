@@ -103,10 +103,6 @@ class CreateRecipeByUrlBulk(BaseModel):
     imports: list[CreateRecipeBulk]
 
 
-class CreateRecipe(MealieModel):
-    name: str
-
-
 class RecipeSummary(MealieModel):
     id: UUID4 | None = None
     _normalize_search: ClassVar[bool] = True
@@ -377,7 +373,16 @@ class RecipeLastMade(BaseModel):
     timestamp: datetime.datetime
 
 
+class CreateRecipe(RecipeSummary):
+    recipe_ingredient: list[RecipeIngredient] = []
+    recipe_instructions: list[RecipeStep] = []
+    notes: list[RecipeNote] = []
+
+
 from mealie.schema.recipe.recipe_ingredient import RecipeIngredient  # noqa: E402
+from mealie.schema.recipe.recipe_step import RecipeStep  # noqa: E402
+from mealie.schema.recipe.recipe_notes import RecipeNote  # noqa: E402
 
 RecipeSummary.model_rebuild()
 Recipe.model_rebuild()
+CreateRecipe.model_rebuild()

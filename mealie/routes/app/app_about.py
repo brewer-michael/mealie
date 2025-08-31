@@ -36,23 +36,45 @@ def get_app_info(session: Session = Depends(generate_session)):
     # ADMIN SETTINGS INTEGRATION: Check admin settings for AI provider configuration
     # This replaces the legacy OPENAI_ENABLE_IMAGE_SERVICES check to support multiple AI providers
     # configured via the admin panel instead of environment variables only
-    admin_settings_repo = RepositoryAdminSettings(session)
-    admin_settings = admin_settings_repo.get_settings()
-    
-    # AI image services are enabled if a provider is configured with a valid API key
-    # This allows the frontend to show/hide image scanning features based on admin configuration
     ai_image_services_enabled = False
-    if admin_settings and admin_settings.image_scanning_primary_provider and admin_settings.image_scanning_primary_provider != 'none':
-        provider = admin_settings.image_scanning_primary_provider
-        # Check if the selected provider has an API key/URL configured
-        if provider == 'openai' and admin_settings.openai_api_key:
-            ai_image_services_enabled = True
-        elif provider == 'gemini' and admin_settings.gemini_api_key:
-            ai_image_services_enabled = True
-        elif provider == 'anthropic' and admin_settings.anthropic_api_key:
-            ai_image_services_enabled = True
-        elif provider == 'ollama' and admin_settings.ollama_base_url:
-            ai_image_services_enabled = True
+    try:
+        admin_settings_repo = RepositoryAdminSettings(session)
+        admin_settings = admin_settings_repo.get_settings()
+        
+        # DEBUG: Check what we actually have in admin settings
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"DEBUG: admin_settings exists: {admin_settings is not None}")
+        if admin_settings:
+            logger.info(f"DEBUG: image_scanning_primary_provider: {admin_settings.image_scanning_primary_provider}")
+            logger.info(f"DEBUG: openai_api_key_set: {admin_settings.openai_api_key_set}")
+            logger.info(f"DEBUG: gemini_api_key_set: {admin_settings.gemini_api_key_set}")
+            logger.info(f"DEBUG: anthropic_api_key_set: {admin_settings.anthropic_api_key_set}")
+            logger.info(f"DEBUG: ollama_base_url: {admin_settings.ollama_base_url}")
+        
+        # AI image services are enabled if a provider is configured with a valid API key
+        # This allows the frontend to show/hide image scanning features based on admin configuration
+        if admin_settings and admin_settings.image_scanning_primary_provider and admin_settings.image_scanning_primary_provider != 'none':
+            provider = admin_settings.image_scanning_primary_provider
+            # Check if the selected provider has an API key/URL configured
+            if provider == 'openai' and admin_settings.openai_api_key_set:
+                ai_image_services_enabled = True
+            elif provider == 'gemini' and admin_settings.gemini_api_key_set:
+                ai_image_services_enabled = True
+            elif provider == 'anthropic' and admin_settings.anthropic_api_key_set:
+                ai_image_services_enabled = True
+            elif provider == 'ollama' and admin_settings.ollama_base_url and admin_settings.ollama_base_url != "http://localhost:11434":
+                # Only enable if Ollama URL is customized (not the default)
+                ai_image_services_enabled = True
+        
+        logger.info(f"DEBUG: ai_image_services_enabled final value: {ai_image_services_enabled}")
+        
+    except Exception as e:
+        # Fallback to legacy settings if admin settings fail to load
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"DEBUG: Exception loading admin settings: {str(e)}")
+        ai_image_services_enabled = settings.OPENAI_ENABLED and settings.OPENAI_ENABLE_IMAGE_SERVICES
 
     return AppInfo(
         version=APP_VERSION,
@@ -65,7 +87,7 @@ def get_app_info(session: Session = Depends(generate_session)):
         oidc_redirect=settings.OIDC_AUTO_REDIRECT,
         oidc_provider_name=settings.OIDC_PROVIDER_NAME,
         enable_openai=settings.OPENAI_ENABLED,  # Keep legacy setting for backward compatibility
-        enable_ai_image_services=ai_image_services_enabled,  # CHANGED: Now uses admin settings instead of legacy OPENAI_ENABLE_IMAGE_SERVICES
+        ai_image_services_enabled=ai_image_services_enabled,  # CHANGED: Now uses admin settings for any AI provider instead of legacy OPENAI_ENABLE_IMAGE_SERVICES
         allow_password_login=settings.ALLOW_PASSWORD_LOGIN,
     )
 

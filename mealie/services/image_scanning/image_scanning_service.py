@@ -29,9 +29,13 @@ class ImageScanningService:
         # This allows the service to check admin panel configuration instead of only environment variables
         self.session = session
         self._admin_settings = None
+        self._admin_settings_raw = None
         if session:
             admin_settings_repo = RepositoryAdminSettings(session)
-            self._admin_settings = admin_settings_repo.get_settings()
+            self._admin_settings = admin_settings_repo.get_settings()  # AdminSettingsOut (for checking if keys are set)
+            # Also get the raw database model for accessing actual API keys
+            from mealie.db.models.admin.admin_settings import AdminSettings
+            self._admin_settings_raw = AdminSettings.get_instance(session)
     
     async def scan_images_for_recipe(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe:
         """
@@ -54,7 +58,9 @@ class ImageScanningService:
                 logger.info(f"Attempting recipe extraction with primary provider: {primary_provider}")
                 recipe_data = await self._scan_with_provider(images, primary_provider, translate_language)
                 if recipe_data:
-                    return cleaner.clean(recipe_data, self.translator)
+                    # AI providers return CreateRecipe objects which don't need cleaning
+                    # The cleaner is for web-scraped recipes that may have messy HTML/formatting
+                    return recipe_data
             except Exception as e:
                 error_msg = f"Primary provider {primary_provider} failed: {str(e)}"
                 logger.warning(error_msg)
@@ -67,7 +73,8 @@ class ImageScanningService:
                 logger.info(f"Attempting recipe extraction with secondary provider: {secondary_provider}")
                 recipe_data = await self._scan_with_provider(images, secondary_provider, translate_language)
                 if recipe_data:
-                    return cleaner.clean(recipe_data, self.translator)
+                    # AI providers return CreateRecipe objects which don't need cleaning
+                    return recipe_data
             except Exception as e:
                 error_msg = f"Secondary provider {secondary_provider} failed: {str(e)}"
                 logger.warning(error_msg)
@@ -79,7 +86,11 @@ class ImageScanningService:
                 logger.info("Attempting recipe extraction with OCR fallback")
                 recipe_data = await self._scan_with_ocr(images)
                 if recipe_data:
-                    return cleaner.clean(recipe_data, self.translator)
+                    # OCR may need cleaning but AI providers don't
+                    if isinstance(recipe_data, CreateRecipe):
+                        return recipe_data
+                    else:
+                        return cleaner.clean(recipe_data, self.translator)
             except Exception as e:
                 error_msg = f"OCR fallback failed: {str(e)}"
                 logger.warning(error_msg)
@@ -194,8 +205,131 @@ class ImageScanningService:
         if not self._is_provider_enabled("gemini"):
             raise Exception("Gemini is not configured")
         
-        # TODO: Implement Gemini vision API integration
-        raise NotImplementedError("Gemini integration not yet implemented")
+        try:
+            import google.generativeai as genai
+            import base64
+            from PIL import Image
+            import json
+        except ImportError as e:
+            raise Exception(f"Gemini dependencies not available: {e}")
+        
+        # Get API key from admin settings
+        api_key = self._get_gemini_api_key()
+        if not api_key:
+            raise Exception("Gemini API key not configured")
+        
+        # Configure Gemini
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(self._get_gemini_model())
+        
+        # Prepare images
+        pil_images = []
+        for image_path in images:
+            try:
+                pil_image = Image.open(image_path)
+                pil_images.append(pil_image)
+            except Exception as e:
+                logger.warning(f"Failed to load image {image_path}: {e}")
+                continue
+        
+        if not pil_images:
+            raise Exception("No valid images could be loaded")
+        
+        # Create prompt for recipe extraction
+        prompt = """
+        Please carefully analyze the recipe image(s) and extract ALL visible recipe information. Read every ingredient and instruction completely, including any text at the bottom or edges of the image.
+        
+        IMPORTANT: 
+        - List ALL ingredients exactly as written, including specific quantities and types (e.g., "almond flour" not just "flour")
+        - Include ALL instructions in the correct order
+        - Pay special attention to text that might be smaller or at the edges of the image
+        - If this appears to be a gluten-free, sugar-free, or special diet recipe, make sure to capture the specific ingredient types
+        
+        Extract the information in this exact JSON format:
+        {
+            "name": "Recipe Name",
+            "description": "Brief description of the recipe",
+            "recipe_yield": "Number of servings (as string)",
+            "total_time": "Total cooking time in minutes (as string)",
+            "prep_time": "Preparation time in minutes (as string)", 
+            "perform_time": "Cooking/baking time in minutes (as string)",
+            "ingredients": [
+                {"text": "exact ingredient with measurement as written"}
+            ],
+            "instructions": [
+                {"text": "complete step-by-step instruction as written"}
+            ],
+            "notes": [
+                {"text": "any additional notes or tips"}
+            ]
+        }
+        
+        Respond with ONLY the JSON object, no markdown formatting or additional text.
+        """
+        
+        # Add language translation if requested
+        if translate_language:
+            prompt += f"\n\nPlease translate all text to {translate_language}."
+        
+        # Generate content with images
+        try:
+            response = await model.generate_content_async([prompt] + pil_images)
+            response_text = response.text.strip()
+            
+            logger.info(f"DEBUG GEMINI RAW RESPONSE: {response_text[:500]}...")
+            
+            # Clean response text (remove markdown formatting if present)
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            logger.info(f"DEBUG GEMINI CLEANED RESPONSE: {response_text[:500]}...")
+            
+            # Parse JSON response
+            recipe_data = json.loads(response_text)
+            
+            logger.info(f"DEBUG GEMINI PARSED JSON: ingredients={len(recipe_data.get('ingredients', []))}, name={recipe_data.get('name')}")
+            
+            # Convert to CreateRecipe format
+            from mealie.schema.recipe.recipe import RecipeIngredient, RecipeStep, RecipeNote
+            
+            ingredients_list = [
+                RecipeIngredient(note=ingredient["text"])
+                for ingredient in recipe_data.get("ingredients", [])
+                if ingredient.get("text")
+            ]
+            instructions_list = [
+                RecipeStep(text=instruction["text"])
+                for instruction in recipe_data.get("instructions", [])
+                if instruction.get("text")
+            ]
+            
+            logger.info(f"DEBUG GEMINI CREATERECIPE: {len(ingredients_list)} ingredients, {len(instructions_list)} instructions")
+            for i, ing in enumerate(ingredients_list[:3]):
+                logger.info(f"DEBUG INGREDIENT {i+1}: {ing.note}")
+            
+            return CreateRecipe(
+                name=recipe_data.get("name", "Untitled Recipe"),
+                description=recipe_data.get("description", ""),
+                recipe_yield=recipe_data.get("recipe_yield", "1"),
+                total_time=recipe_data.get("total_time"),
+                prep_time=recipe_data.get("prep_time"),
+                perform_time=recipe_data.get("perform_time"),
+                recipe_ingredient=ingredients_list,
+                recipe_instructions=instructions_list,
+                notes=[
+                    RecipeNote(text=note["text"])
+                    for note in recipe_data.get("notes", [])
+                    if note.get("text")
+                ]
+            )
+            
+        except json.JSONDecodeError as e:
+            raise Exception(f"Failed to parse Gemini response as JSON: {e}")
+        except Exception as e:
+            raise Exception(f"Gemini API request failed: {e}")
     
     async def _scan_with_ollama(self, images: list[Path], translate_language: str | None = None) -> CreateRecipe | None:
         """Scan images using Ollama"""
@@ -268,11 +402,11 @@ class ImageScanningService:
         # First check admin settings if available
         if self._admin_settings:
             if provider == "openai":
-                return bool(self._admin_settings.openai_api_key_set)
+                return self._admin_settings.openai_api_key_set
             elif provider == "anthropic":
-                return bool(self._admin_settings.anthropic_api_key_set)
+                return self._admin_settings.anthropic_api_key_set
             elif provider == "gemini":
-                return bool(self._admin_settings.gemini_api_key_set)
+                return self._admin_settings.gemini_api_key_set
             elif provider == "ollama":
                 # Ollama doesn't need an API key, just check if base URL is configured
                 return bool(self._admin_settings.ollama_base_url)
@@ -288,3 +422,15 @@ class ImageScanningService:
             return self.settings.OLLAMA_ENABLED
         
         return False
+    
+    def _get_gemini_api_key(self) -> str | None:
+        """Get Gemini API key from admin settings or environment"""
+        if self._admin_settings_raw and self._admin_settings_raw.gemini_api_key:
+            return self._admin_settings_raw.gemini_api_key
+        return self.settings.GEMINI_API_KEY
+    
+    def _get_gemini_model(self) -> str:
+        """Get Gemini model from admin settings or environment"""
+        if self._admin_settings_raw and self._admin_settings_raw.gemini_model:
+            return self._admin_settings_raw.gemini_model
+        return self.settings.GEMINI_MODEL or "gemini-1.5-flash"

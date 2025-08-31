@@ -60,7 +60,7 @@ export default defineNuxtComponent({
     });
 
     const appInfo = useAppInfo();
-    const enableAIImages = computed(() => appInfo.value?.enableAiImageServices);
+    const enableAIImages = computed(() => appInfo.value?.aiImageServicesEnabled);
 
     const subpages = computed<MenuItem[]>(() => [
       {

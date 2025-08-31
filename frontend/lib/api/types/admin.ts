@@ -17,7 +17,7 @@ export interface AdminAboutInfo {
   oidcRedirect: boolean;
   oidcProviderName: string;
   enableOpenai: boolean;
-  enableAiImageServices: boolean;
+  aiImageServicesEnabled: boolean;
   versionLatest: string;
   apiPort: number;
   apiDocs: boolean;
@@ -49,7 +49,7 @@ export interface AppInfo {
   oidcRedirect: boolean;
   oidcProviderName: string;
   enableOpenai: boolean;
-  enableAiImageServices: boolean;
+  aiImageServicesEnabled: boolean;
 }
 export interface AppStartupInfo {
   isFirstLogin: boolean;

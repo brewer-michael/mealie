@@ -26,7 +26,7 @@ class AdminSettings(SqlAlchemyBase):
     
     # Model Selections
     openai_model: Mapped[str | None] = mapped_column(String, default="gpt-4o-mini")
-    anthropic_model: Mapped[str | None] = mapped_column(String, default="claude-3-haiku-20240307")
+    anthropic_model: Mapped[str | None] = mapped_column(String, default="claude-3-5-sonnet-20241022")
     gemini_model: Mapped[str | None] = mapped_column(String, default="gemini-1.5-flash")
     ollama_model: Mapped[str | None] = mapped_column(String, default="llava")
 
@@ -37,13 +37,43 @@ class AdminSettings(SqlAlchemyBase):
     # Singleton pattern - there should only ever be one row
     @classmethod
     def get_instance(cls, session):
-        """Get or create the single admin settings instance."""
+        """Get or create the single admin settings instance, always updating from environment variables."""
+        from mealie.core.config import get_app_settings
+        settings = get_app_settings()
+        
         instance = session.query(cls).first()
         if not instance:
+            # Create new instance with environment variables
             instance = cls()
             session.add(instance)
-            session.commit()
-            session.refresh(instance)
+        
+        # Always update from environment variables on container startup
+        # Only update fields that have non-None/non-empty values in environment
+        if settings.IMAGE_SCANNING_PRIMARY_PROVIDER:
+            instance.image_scanning_primary_provider = settings.IMAGE_SCANNING_PRIMARY_PROVIDER
+        if settings.IMAGE_SCANNING_SECONDARY_PROVIDER:
+            instance.image_scanning_secondary_provider = settings.IMAGE_SCANNING_SECONDARY_PROVIDER
+        if settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK is not None:
+            instance.image_scanning_enable_ocr_fallback = settings.IMAGE_SCANNING_ENABLE_OCR_FALLBACK
+        if settings.OPENAI_API_KEY:
+            instance.openai_api_key = settings.OPENAI_API_KEY
+        if settings.ANTHROPIC_API_KEY:
+            instance.anthropic_api_key = settings.ANTHROPIC_API_KEY
+        if settings.GEMINI_API_KEY:
+            instance.gemini_api_key = settings.GEMINI_API_KEY
+        if settings.OLLAMA_BASE_URL:
+            instance.ollama_base_url = settings.OLLAMA_BASE_URL
+        if settings.OPENAI_MODEL:
+            instance.openai_model = settings.OPENAI_MODEL
+        if settings.ANTHROPIC_MODEL:
+            instance.anthropic_model = settings.ANTHROPIC_MODEL
+        if settings.GEMINI_MODEL:
+            instance.gemini_model = settings.GEMINI_MODEL
+        if settings.OLLAMA_MODEL:
+            instance.ollama_model = settings.OLLAMA_MODEL
+            
+        session.commit()
+        session.refresh(instance)
         return instance
 
     def update_from_dict(self, data: dict) -> None:

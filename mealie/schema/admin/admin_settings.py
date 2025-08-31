@@ -13,7 +13,7 @@ class AdminSettingsBase(BaseModel):
     
     # Model Selections
     openai_model: str | None = Field(default="gpt-4o-mini", description="OpenAI model to use")
-    anthropic_model: str | None = Field(default="claude-3-haiku-20240307", description="Anthropic model to use")
+    anthropic_model: str | None = Field(default="claude-3-5-sonnet-20241022", description="Anthropic model to use")
     gemini_model: str | None = Field(default="gemini-1.5-flash", description="Gemini model to use")
     ollama_model: str | None = Field(default="llava", description="Ollama model to use")
     ollama_base_url: str | None = Field(default="http://localhost:11434", description="Ollama base URL")

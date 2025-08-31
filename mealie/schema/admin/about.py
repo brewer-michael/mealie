@@ -22,7 +22,7 @@ class AppInfo(MealieModel):
     oidc_redirect: bool
     oidc_provider_name: str
     enable_openai: bool
-    enable_ai_image_services: bool
+    ai_image_services_enabled: bool
 
 
 class AppTheme(MealieModel):
