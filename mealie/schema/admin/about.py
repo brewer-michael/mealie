@@ -21,8 +21,8 @@ class AppInfo(MealieModel):
     enable_oidc: bool
     oidc_redirect: bool
     oidc_provider_name: str
-    enable_openai: bool
-    ai_image_services_enabled: bool
+    enable_openai: bool  # Legacy OpenAI-specific field for backward compatibility
+    ai_image_services_enabled: bool  # NEW: Unified flag for any AI provider (Gemini, OpenAI, Anthropic, etc)
 
 
 class AppTheme(MealieModel):
@@ -70,6 +70,7 @@ class CheckAppConfig(MealieModel):
     email_ready: bool
     ldap_ready: bool
     oidc_ready: bool
-    enable_openai: bool
+    enable_openai: bool  # Legacy OpenAI field for backward compatibility
+    ai_image_services_enabled: bool  # NEW: Unified AI provider status for site-settings page
     base_url_set: bool
     is_up_to_date: bool

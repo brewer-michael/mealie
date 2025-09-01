@@ -374,6 +374,9 @@ class RecipeLastMade(BaseModel):
 
 
 class CreateRecipe(RecipeSummary):
+    # BUGFIX: Added missing fields to fix AI recipe creation
+    # Previously only had 'name' field, causing ingredient data loss during serialization
+    # Now properly inherits from RecipeSummary and includes required creation fields
     recipe_ingredient: list[RecipeIngredient] = []
     recipe_instructions: list[RecipeStep] = []
     notes: list[RecipeNote] = []

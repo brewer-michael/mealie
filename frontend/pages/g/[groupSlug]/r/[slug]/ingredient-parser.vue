@@ -213,7 +213,7 @@ export default defineNuxtComponent({
         {
           text: i18n.t("recipe.parser.openai-parser"),
           value: "openai",
-          hide: !appInfo.value?.enableOpenai,
+          hide: !appInfo.value?.aiImageServicesEnabled,
         },
       ];
     });

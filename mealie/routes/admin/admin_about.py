@@ -1,8 +1,10 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from recipe_scrapers import __version__ as recipe_scraper_version
+from sqlalchemy.orm import Session
 
 from mealie.core.release_checker import get_latest_version
 from mealie.core.settings.static import APP_VERSION
+from mealie.db.db_setup import generate_session
 from mealie.routes._base import BaseAdminController, controller
 from mealie.schema.admin.about import AdminAboutInfo, AppStatistics, CheckAppConfig
 
@@ -51,8 +53,31 @@ class AdminAboutController(BaseAdminController):
         )
 
     @router.get("/check", response_model=CheckAppConfig)
-    def check_app_config(self):
+    def check_app_config(self, session: Session = Depends(generate_session)):
         settings = self.settings
+
+        # ADMIN SETTINGS INTEGRATION: Check if any AI provider is configured 
+        # This matches the logic from app_about.py to provide consistent status
+        ai_image_services_enabled = False
+        try:
+            from mealie.repos.repository_admin_settings import RepositoryAdminSettings
+            admin_settings_repo = RepositoryAdminSettings(session)
+            admin_settings = admin_settings_repo.get_settings()
+            
+            if admin_settings and admin_settings.image_scanning_primary_provider and admin_settings.image_scanning_primary_provider != 'none':
+                provider = admin_settings.image_scanning_primary_provider
+                # Check if the selected provider has an API key/URL configured
+                if provider == 'openai' and admin_settings.openai_api_key_set:
+                    ai_image_services_enabled = True
+                elif provider == 'gemini' and admin_settings.gemini_api_key_set:
+                    ai_image_services_enabled = True
+                elif provider == 'anthropic' and admin_settings.anthropic_api_key_set:
+                    ai_image_services_enabled = True
+                elif provider == 'ollama' and admin_settings.ollama_base_url and admin_settings.ollama_base_url != "http://localhost:11434":
+                    ai_image_services_enabled = True
+        except Exception:
+            # Fallback to legacy settings if admin settings fail to load
+            ai_image_services_enabled = settings.OPENAI_ENABLED and settings.OPENAI_ENABLE_IMAGE_SERVICES
 
         return CheckAppConfig(
             email_ready=settings.SMTP_ENABLE,
@@ -60,5 +85,6 @@ class AdminAboutController(BaseAdminController):
             base_url_set=settings.BASE_URL != "http://localhost:8080",
             is_up_to_date=APP_VERSION == "develop" or APP_VERSION == "nightly" or get_latest_version() == APP_VERSION,
             oidc_ready=settings.OIDC_READY,
-            enable_openai=settings.OPENAI_ENABLED,
+            enable_openai=settings.OPENAI_ENABLED,  # Legacy field
+            ai_image_services_enabled=ai_image_services_enabled,  # NEW: Unified AI provider status
         )

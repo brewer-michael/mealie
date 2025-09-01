@@ -362,11 +362,13 @@ export default defineNuxtComponent({
         {
           id: "image-scanning-enabled",
           text: i18n.t("settings.image-scanning-enabled"),
-          status: appConfig.value.enableOpenai || appConfig.value.enableOcrFallback,
+          // BUGFIX: Use aiImageServicesEnabled to reflect any AI provider being configured
+          // Previously only checked enableOpenai, now checks unified AI provider status
+          status: appConfig.value.aiImageServicesEnabled || appConfig.value.enableOcrFallback,
           errorText: i18n.t("settings.image-scanning-disabled-text"),
           successText: i18n.t("settings.image-scanning-enabled-text"),
-          color: (appConfig.value.enableOpenai || appConfig.value.enableOcrFallback) ? goodColor : warningColor,
-          icon: (appConfig.value.enableOpenai || appConfig.value.enableOcrFallback) ? goodIcon : warningIcon,
+          color: (appConfig.value.aiImageServicesEnabled || appConfig.value.enableOcrFallback) ? goodColor : warningColor,
+          icon: (appConfig.value.aiImageServicesEnabled || appConfig.value.enableOcrFallback) ? goodIcon : warningIcon,
           configLink: "/admin/recipe-scanning",
           configText: i18n.t("settings.configure-image-scanning"),
         },

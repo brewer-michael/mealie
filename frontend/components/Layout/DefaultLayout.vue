@@ -189,7 +189,9 @@ export default defineNuxtComponent({
     });
 
     const appInfo = useAppInfo();
-    const showImageImport = computed(() => appInfo.value?.enableOpenaiImageServices);
+    // BUGFIX: Changed from enableOpenaiImageServices to aiImageServicesEnabled
+    // to match the unified multi-provider field from backend API
+    const showImageImport = computed(() => appInfo.value?.aiImageServicesEnabled);
 
     const toggleDark = useToggleDarkMode();
 

@@ -60,7 +60,9 @@ export default defineNuxtComponent({
     });
 
     const appInfo = useAppInfo();
-    const enableAIImages = computed(() => appInfo.value?.aiImageServicesEnabled);
+    // BUGFIX: Uses aiImageServicesEnabled field to check if any AI provider is configured
+    // Previously used undefined field names, now matches backend API response
+    const enableAIImages = computed(() => appInfo.value?.aiImageServicesEnabled ?? false);
 
     const subpages = computed<MenuItem[]>(() => [
       {

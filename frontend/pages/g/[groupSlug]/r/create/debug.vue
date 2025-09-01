@@ -25,7 +25,7 @@
             persistent-hint
           />
         </v-card-text>
-        <v-card-text v-if="appInfo && appInfo.enableOpenai">
+        <v-card-text v-if="appInfo && appInfo.aiImageServicesEnabled">
           {{ $t('recipe.recipe-debugger-use-openai-description') }}
           <v-checkbox
             v-model="useOpenAI"
