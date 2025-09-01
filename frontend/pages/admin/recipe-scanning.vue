@@ -96,6 +96,16 @@
                 :testing="testingConnection.primary"
                 :test-result="testResults.primary"
               />
+              
+              <!-- Step 1: Static API Key Field for Primary Provider -->
+              <v-text-field
+                model-value="••••••••••••••••••••••••"
+                label="API Key"
+                type="password"
+                variant="outlined"
+                readonly
+                class="mt-4"
+              />
             </div>
           </v-expand-transition>
         </div>
@@ -174,6 +184,16 @@
                     @test-connection="testConnection('secondary')"
                     :testing="testingConnection.secondary"
                     :test-result="testResults.secondary"
+                  />
+                  
+                  <!-- Step 1: Static API Key Field for Secondary Provider -->
+                  <v-text-field
+                    model-value="••••••••••••••••••••••••"
+                    label="API Key"
+                    type="password"
+                    variant="outlined"
+                    readonly
+                    class="mt-4"
                   />
                 </div>
               </v-expand-transition>
