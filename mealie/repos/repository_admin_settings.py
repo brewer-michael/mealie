@@ -17,7 +17,13 @@ class RepositoryAdminSettings:
 
     def update_settings(self, settings_data: dict) -> AdminSettingsOut:
         """Update admin settings with the provided data."""
-        instance = AdminSettings.get_instance(self.session)
+        # Get instance directly from database to avoid environment variable overrides
+        instance = self.session.query(AdminSettings).first()
+        if not instance:
+            # If no instance exists, create one but don't call get_instance() which applies env overrides
+            instance = AdminSettings()
+            self.session.add(instance)
+            self.session.flush()  # Get the ID without committing
         
         # Handle API key encryption
         encrypted_data = settings_data.copy()
@@ -28,7 +34,7 @@ class RepositoryAdminSettings:
         if 'gemini_api_key' in encrypted_data and encrypted_data['gemini_api_key']:
             encrypted_data['gemini_api_key'] = self._encrypt_api_key(encrypted_data['gemini_api_key'])
             
-        # Update the instance
+        # Update the instance directly without environment variable interference
         instance.update_from_dict(encrypted_data)
         self.session.commit()
         self.session.refresh(instance)

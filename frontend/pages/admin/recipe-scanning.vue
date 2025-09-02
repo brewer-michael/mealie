@@ -97,9 +97,9 @@
                 :test-result="testResults.primary"
               />
               
-              <!-- Step 1: Static API Key Field for Primary Provider -->
+              <!-- Step 2: Dynamic API Key Field for Primary Provider -->
               <v-text-field
-                model-value="••••••••••••••••••••••••"
+                :model-value="getApiKeyDisplay(primaryProvider)"
                 label="API Key"
                 type="password"
                 variant="outlined"
@@ -127,7 +127,7 @@
               variant="outlined"
               color="primary"
               @click="showSecondary = true"
-              prepend-icon="mdi-plus"
+              :prepend-icon="$globals.icons.createAlt"
             >
               {{ $t("settings.add-secondary-provider") }}
             </v-btn>
@@ -186,9 +186,9 @@
                     :test-result="testResults.secondary"
                   />
                   
-                  <!-- Step 1: Static API Key Field for Secondary Provider -->
+                  <!-- Step 2: Dynamic API Key Field for Secondary Provider -->
                   <v-text-field
-                    model-value="••••••••••••••••••••••••"
+                    :model-value="getApiKeyDisplay(secondaryProvider)"
                     label="API Key"
                     type="password"
                     variant="outlined"
@@ -516,6 +516,7 @@ export default defineNuxtComponent({
     const saving = ref(false);
     const testingConnection = ref({ primary: false, secondary: false });
     const testResults = ref({ primary: null, secondary: null });
+    const adminSettings = ref(null); // Store admin settings data for API key status
     
     // Provider options
     const allProviders = [
@@ -571,6 +572,23 @@ export default defineNuxtComponent({
       allProviders.filter(p => p.key !== primaryProvider.value)
     );
     
+    // Function to get API key display value for a provider
+    const getApiKeyDisplay = (providerKey) => {
+      if (!adminSettings.value) return "••••••••••••••••••••••••";
+      
+      const keyMappings = {
+        'openai': 'openai_api_key_set',
+        'gemini': 'gemini_api_key_set', 
+        'anthropic': 'anthropic_api_key_set',
+        'ollama': null // Ollama doesn't use API keys
+      };
+      
+      const settingsKey = keyMappings[providerKey];
+      if (!settingsKey) return "Not applicable";
+      
+      return adminSettings.value[settingsKey] ? "••••••••••••••••••••••••" : "Not configured";
+    };
+    
     // Load existing settings on page load
     const loadSettings = async () => {
       try {
@@ -583,6 +601,9 @@ export default defineNuxtComponent({
         }
         
         console.log('Loaded settings:', data);
+        
+        // Store admin settings data for API key status
+        adminSettings.value = data;
         
         // Set provider selections
         primaryProvider.value = data.image_scanning_primary_provider || 'none';
@@ -660,24 +681,14 @@ export default defineNuxtComponent({
           image_scanning_primary_provider: primaryProvider.value,
           image_scanning_secondary_provider: secondaryProvider.value,
           image_scanning_enable_ocr_fallback: enableOcrFallback.value,
-          // API keys - map to correct provider
-          openai_api_key: primaryProvider.value === 'openai' ? primaryConfig.value.apiKey : 
-                          (secondaryProvider.value === 'openai' ? secondaryConfig.value.apiKey : null),
-          gemini_api_key: primaryProvider.value === 'gemini' ? primaryConfig.value.apiKey : 
-                          (secondaryProvider.value === 'gemini' ? secondaryConfig.value.apiKey : null),
-          anthropic_api_key: primaryProvider.value === 'anthropic' ? primaryConfig.value.apiKey : 
-                             (secondaryProvider.value === 'anthropic' ? secondaryConfig.value.apiKey : null),
-          ollama_base_url: primaryProvider.value === 'ollama' ? primaryConfig.value.baseUrl : 
-                           (secondaryProvider.value === 'ollama' ? secondaryConfig.value.baseUrl : null),
-          // Models - map to correct provider
-          openai_model: primaryProvider.value === 'openai' ? primaryConfig.value.model : 
-                        (secondaryProvider.value === 'openai' ? secondaryConfig.value.model : null),
-          gemini_model: primaryProvider.value === 'gemini' ? primaryConfig.value.model : 
-                        (secondaryProvider.value === 'gemini' ? secondaryConfig.value.model : null),
-          anthropic_model: primaryProvider.value === 'anthropic' ? primaryConfig.value.model : 
-                           (secondaryProvider.value === 'anthropic' ? secondaryConfig.value.model : null),
-          ollama_model: primaryProvider.value === 'ollama' ? primaryConfig.value.model : 
-                        (secondaryProvider.value === 'ollama' ? secondaryConfig.value.model : null),
+          // Preserve existing API keys and URLs - don't send null values that would clear them
+          // Note: In Step 7 we'll add proper API key updating logic
+          ollama_base_url: adminSettings.value?.ollama_base_url,
+          // Models - preserve existing model values from backend
+          openai_model: adminSettings.value?.openai_model,
+          gemini_model: adminSettings.value?.gemini_model,
+          anthropic_model: adminSettings.value?.anthropic_model,
+          ollama_model: adminSettings.value?.ollama_model,
         };
 
         // Make API call to save settings
@@ -713,6 +724,8 @@ export default defineNuxtComponent({
       removeSecondaryProvider,
       testConnection,
       saveConfiguration,
+      getApiKeyDisplay,
+      adminSettings,
       $globals
     };
   }
