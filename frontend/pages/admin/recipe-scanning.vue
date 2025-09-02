@@ -63,6 +63,8 @@
             :label="$t('settings.select-provider')"
             variant="outlined"
             class="mb-3"
+            :error="validationErrors.primary"
+            :error-messages="validationErrors.primary ? 'Provider locked by container environment variables' : undefined"
             @update:model-value="onPrimaryProviderChange"
           >
             <template #item="{ props, item }">
@@ -143,6 +145,8 @@
                 :label="$t('settings.select-secondary-provider')"
                 variant="outlined"
                 class="mb-3"
+                :error="validationErrors.secondary"
+                :error-messages="validationErrors.secondary ? 'Provider locked by container environment variables' : undefined"
                 @update:model-value="onSecondaryProviderChange"
               >
                 <template #item="{ props, item }">
@@ -256,6 +260,19 @@
         </v-alert>
       </v-card-text>
     </v-card>
+
+    <!-- Success Alert -->
+    <v-alert
+      v-if="showSuccess"
+      type="success"
+      variant="tonal"
+      class="mb-4"
+      closable
+      @click:close="showSuccess = false"
+    >
+      <v-alert-title>Settings Saved Successfully</v-alert-title>
+      Your recipe scanning configuration has been updated.
+    </v-alert>
 
     <!-- Save Button -->
     <div class="d-flex justify-end gap-2">
@@ -516,7 +533,9 @@ export default defineNuxtComponent({
     const saving = ref(false);
     const testingConnection = ref({ primary: false, secondary: false });
     const testResults = ref({ primary: null, secondary: null });
-    const adminSettings = ref(null); // Store admin settings data for API key status
+    const adminSettings = ref(null);
+    const validationErrors = ref({ primary: false, secondary: false });
+    const showSuccess = ref(false); // Store admin settings data for API key status
     
     // Provider options
     const allProviders = [
@@ -676,6 +695,48 @@ export default defineNuxtComponent({
     const saveConfiguration = async () => {
       saving.value = true;
       try {
+        // Clear any previous validation errors
+        validationErrors.value.primary = false;
+        validationErrors.value.secondary = false;
+        
+        // Validate that user selections match current backend state
+        // (Backend state reflects environment variable overrides)
+        if (adminSettings.value) {
+          const currentPrimary = adminSettings.value.image_scanning_primary_provider;
+          const currentSecondary = adminSettings.value.image_scanning_secondary_provider;
+          
+          let hasValidationError = false;
+          
+          // Check if user is trying to change providers that are locked by environment variables
+          if (primaryProvider.value !== currentPrimary) {
+            // Highlight the field in red and show error
+            validationErrors.value.primary = true;
+            $toast.error(`Primary provider is locked to "${currentPrimary}" by container environment variables. Cannot change to "${primaryProvider.value}".`, { timeout: 8000 });
+            // Revert UI selection to match backend
+            primaryProvider.value = currentPrimary;
+            hasValidationError = true;
+          }
+          
+          if (secondaryProvider.value !== currentSecondary) {
+            // Highlight the field in red and show error
+            validationErrors.value.secondary = true;
+            $toast.error(`Secondary provider is locked to "${currentSecondary}" by container environment variables. Cannot change to "${secondaryProvider.value}".`, { timeout: 8000 });
+            // Revert UI selection to match backend
+            secondaryProvider.value = currentSecondary;
+            hasValidationError = true;
+          }
+          
+          // If we have validation errors, don't proceed with save
+          if (hasValidationError) {
+            // Clear validation errors after 5 seconds
+            setTimeout(() => {
+              validationErrors.value.primary = false;
+              validationErrors.value.secondary = false;
+            }, 5000);
+            return;
+          }
+        }
+
         // Prepare the settings data
         const settingsData = {
           image_scanning_primary_provider: primaryProvider.value,
@@ -695,13 +756,19 @@ export default defineNuxtComponent({
         const { data } = await requests.put('/api/admin/recipe-scanning/settings', settingsData);
         const response = data;
 
-        // Show success toast
-        // TODO: Add proper toast notification system
+        // Show success feedback
+        showSuccess.value = true;
+        $toast.success('Configuration saved successfully!');
         console.log('Settings saved successfully:', response);
+        
+        // Auto-hide success alert after 5 seconds
+        setTimeout(() => {
+          showSuccess.value = false;
+        }, 5000);
         
       } catch (error) {
         console.error('Failed to save configuration:', error);
-        // TODO: Show error toast
+        $toast.error('Failed to save configuration. Please check your connection and try again.', { timeout: 8000 });
       } finally {
         saving.value = false;
       }
@@ -726,6 +793,8 @@ export default defineNuxtComponent({
       saveConfiguration,
       getApiKeyDisplay,
       adminSettings,
+      validationErrors,
+      showSuccess,
       $globals
     };
   }
