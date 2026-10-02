@@ -1,0 +1,23 @@
+{
+  "source": "banana-mug-cake.jpg",
+  "notes": "Handwritten index card photographed sideways (text runs bottom-to-top). The cook time on the card is left blank on purpose; a correct extraction must not invent one.",
+  "verified_by_owner": false,
+  "expected": {
+    "name": "Banana Mug Cake",
+    "description_contains": ["sugar", "gluten"],
+    "ingredients": [
+      "1 banana",
+      "1 T. coconut oil (melted)",
+      "1/4 t. salt",
+      "1/2 t vanilla",
+      "1/3 C. almond flour",
+      "1 egg",
+      "Cinnamon to taste"
+    ],
+    "instructions": [
+      "Mash banana and mix ingredients thoroughly.",
+      "Microwave in bowl or large mug for minutes or until firm in center."
+    ],
+    "must_not_invent": ["cook time"]
+  }
+}
