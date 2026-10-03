@@ -71,6 +71,15 @@ class AlchemyExporter(BaseService):
         "granted_at",
         "revoked_at",
         "last_used_at",
+        # fork: recipe card ingestion's jobs and batches (docs/ai/PHASE2.md §13)
+        "not_before",
+        "lease_expires_at",
+        "task_started_at",
+        "commit_started_at",
+        "committed_at",
+        "last_upload_at",
+        "sealed_at",
+        "notified_at",
     }
     """Column names restored back into datetimes. Anything stored as a `NaiveDateTime` and missing
     here comes back from a backup as a string; `test_every_datetime_column_survives_a_backup` guards

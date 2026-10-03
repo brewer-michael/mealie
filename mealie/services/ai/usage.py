@@ -7,6 +7,8 @@ from mealie.repos.repository_factory import AllRepositories
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
 
+from .policy import current_policy
+
 logger = get_logger(__name__)
 
 
@@ -35,6 +37,8 @@ def record_ai_usage(
     Logs one provider attempt, which failed if there's an `error` or an `error_type` (for a failure that
     isn't an exception, such as an empty answer). A failure to write the row is logged and otherwise
     ignored: the usage log must never break the AI call it describes.
+
+    The row records the recipe card job the current call policy is for, if any (`mealie.services.ai.policy`).
     """
     if error is not None and error_type is None:
         error_type = type(error).__name__
@@ -53,6 +57,7 @@ def record_ai_usage(
                 latency_ms=latency_ms,
                 success=error_type is None,
                 error_type=error_type,
+                job_id=current_policy().job_id,
             )
         )
     except Exception:

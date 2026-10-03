@@ -53,3 +53,34 @@ def describe_provider_error(error: BaseException) -> str:
     status = getattr(cause, "status_code", None)
     name = type(cause).__name__
     return f"{name} (HTTP {status})" if status else name
+
+
+class AIProviderLocalOnlyError(AIProviderError):
+    """
+    The request has to stay on this server's network (a "local only" recipe card, docs/ai/PHASE2.md §10), and
+    none of the slot's providers is marked as running locally at a private address
+    """
+
+    def __init__(self, message: str = "None of the AI providers for this task runs on your own network.") -> None:
+        super().__init__(message)
+
+
+# ==========================================
+# Recipe card ingestion (docs/ai/PHASE2.md §3.9)
+
+
+class IngestPaused(Exception):
+    """
+    Recipe card ingestion is paused while a backup is restored: the pause marker is set, or the restore holds the
+    ingest write lock. Nothing was written; try again once the restore is done.
+    """
+
+
+class IngestBusyError(Exception):
+    """
+    A backup restore gave up waiting for recipe card ingestion to finish writing, before it changed anything.
+    The restore can be tried again in a moment.
+    """
+
+    def __init__(self, message: str = "Recipe card ingestion is busy writing files. Try the restore again.") -> None:
+        super().__init__(message)

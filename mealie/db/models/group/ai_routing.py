@@ -91,6 +91,9 @@ class AIUsageLog(SqlAlchemyBase, BaseMixins):
     error_type: orm.Mapped[str | None] = orm.mapped_column(sa.String, nullable=True)
     """The exception's class name, if the attempt failed"""
 
+    job_id: orm.Mapped[GUID | None] = orm.mapped_column(GUID, nullable=True, index=True)
+    """The recipe card job the attempt was made for (docs/ai/PHASE2.md §10). No foreign key: jobs are purged."""
+
     @auto_init()
     def __init__(self, **_) -> None:
         pass

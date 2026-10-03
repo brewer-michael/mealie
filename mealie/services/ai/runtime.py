@@ -24,6 +24,7 @@ from mealie.schema.openai._base import OpenAIBase
 
 from .errors import AIProviderUnsupportedError, describe_provider_error, is_rate_limit_error
 from .listing import MAX_LISTED_MODELS, take
+from .policy import apply_policy
 from .routing import AIProviderRouter
 from .usage import AITokenUsage, record_ai_usage
 
@@ -112,16 +113,17 @@ class AIRuntime:
 
     def candidates(self, slot: AIProviderSlot) -> list[AIProviderOut]:
         """
-        The providers to try for `slot`, in order (see `mealie.services.ai.routing`). Raises upstream's
-        `OpenAINotEnabledException` if the slot has none, and `AIProviderLimitReachedError` if all of them are
-        over their monthly token limit.
+        The providers to try for `slot`, in order (see `mealie.services.ai.routing`), as the current call policy
+        allows (`mealie.services.ai.policy`). Raises upstream's `OpenAINotEnabledException` if the slot has none,
+        `AIProviderLimitReachedError` if all of them are over their monthly token limit, and
+        `AIProviderLocalOnlyError` if the policy is "local only" and none of them is local.
         """
         primaries = {
             AIProviderSlot.default: self.service.default_provider,
             AIProviderSlot.image: self.service.image_provider,
             AIProviderSlot.audio: self.service.audio_provider,
         }
-        return AIProviderRouter(self.service.repos, primaries).candidates(slot)
+        return apply_policy(slot, AIProviderRouter(self.service.repos, primaries).candidates(slot))
 
     def record_attempt(
         self,

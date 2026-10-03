@@ -56,6 +56,11 @@ class AIProviderCreate(MealieModel):
     protocol: AIProviderProtocol = AIProviderProtocol.openai
     monthly_token_limit: int | None = Field(None, ge=1, le=2_147_483_647)  # the column is a 32-bit INTEGER
     """Prompt + completion tokens allowed per calendar month (UTC); unset means unlimited"""
+    runs_locally: bool = False
+    """
+    Fork: the provider runs on the group's own network. Local-only recipe cards (docs/ai/PHASE2.md §10) use only
+    providers marked so whose base URL resolves to private addresses.
+    """
 
     request_headers: dict[str, str] = {}
     request_params: dict[str, str] = {}

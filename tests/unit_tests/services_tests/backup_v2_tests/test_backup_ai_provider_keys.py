@@ -62,12 +62,14 @@ def _as_pre_encryption_dump(dump: dict, secret: str) -> dict:
     dump["alembic_version"] = [{"version_num": PRE_ENCRYPTION_REVISION}]
     dump.pop("ai_provider_routes", None)
     dump.pop("ai_usage_log", None)
-    # tables of later revisions (docs/ai/PHASE3.md §5)
-    for table in [name for name in dump if name.startswith("mcp_")]:
+    # tables and columns of later revisions (docs/ai/PHASE3.md §5, PHASE2.md §13)
+    later_tables = ("mcp_", "recipe_ingestion_", "ai_event_notifier_options")
+    for table in [name for name in dump if name.startswith(later_tables)]:
         dump.pop(table)
     for row in dump["ai_providers"]:
         row.pop("protocol", None)
         row.pop("monthly_token_limit", None)
+        row.pop("runs_locally", None)
         try:
             row["api_key"] = decrypt_value(row["api_key"], secret)
         except SecretDecryptionError:

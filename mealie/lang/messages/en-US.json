@@ -151,5 +151,36 @@
             "message_bottom": "Please click the button above to test the email.",
             "button_text": "Open Mealie"
         }
+    },
+    "recipe-ingest": {
+        "upload-summary": "{count} recipe card queued. You'll be notified when it's ready. | {count} recipe cards queued. You'll be notified when they're ready.",
+        "upload-summary-none": "No recipe cards were queued.",
+        "upload-summary-rejected": "{count} photo couldn't be used. | {count} photos couldn't be used.",
+        "notification-title": "Recipe cards ready",
+        "notification-ready": "No cards are ready to review | {count} card is ready to review | {count} cards are ready to review",
+        "notification-needs-attention": "{count} needs a look | {count} need a look",
+        "notification-failed": "{count} failed | {count} failed",
+        "notification-body": "{ready}.",
+        "notification-body-with-details": "{ready} ({details}).",
+        "notification-details-separator": ", ",
+        "notification-test-title": "Recipe cards ready (test)",
+        "notification-test-body": "This is a test notification from Mealie. Recipe cards waiting for review: {count}.",
+        "unreadable": "(unreadable)",
+        "note-from": "From",
+        "asset-card": "Recipe card",
+        "asset-card-back": "Recipe card (back)",
+        "asset-card-page": "Recipe card (page {number})",
+        "errors": {
+            "authorization-required": "Send your API token in the Authorization header to upload recipe cards.",
+            "paused-for-restore": "Recipe card uploads are paused while a backup is restored. Try again in a minute.",
+            "ingest-disabled": "Recipe card scanning is turned off on this server.",
+            "too-many-jobs": "Too many recipe cards are waiting to be read. Try again when some have finished.",
+            "too-large": "The upload is too large. The limit is {max} MB.",
+            "unsupported-media-type": "Send recipe cards as images, a multipart form or JSON.",
+            "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",
+            "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
+            "nothing-accepted": "None of the photos could be used.",
+            "busy-restore": "Recipe card ingestion is busy writing files. Try the restore again in a minute."
+        }
     }
 }

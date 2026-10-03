@@ -62,6 +62,8 @@ class AIUsageLogCreate(MealieModel):
     success: bool
     error_type: str | None = None
     """The exception's class name, if the attempt failed"""
+    job_id: UUID4 | None = None
+    """The recipe card job the attempt was made for, if any (docs/ai/PHASE2.md §10)"""
 
 
 class AIUsageLogOut(AIUsageLogCreate):

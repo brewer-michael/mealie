@@ -26,6 +26,7 @@ export interface AIProviderCreate {
   timeout?: number;
   protocol?: AIProviderProtocol;
   monthlyTokenLimit?: number | null;
+  runsLocally?: boolean;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -56,6 +57,7 @@ export interface AIProviderOut {
   timeout?: number;
   protocol?: AIProviderProtocol;
   monthlyTokenLimit?: number | null;
+  runsLocally?: boolean;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -89,6 +91,7 @@ export interface AIProviderSave {
   timeout?: number;
   protocol?: AIProviderProtocol;
   monthlyTokenLimit?: number | null;
+  runsLocally?: boolean;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -131,6 +134,7 @@ export interface AIProviderUpdate {
   timeout?: number;
   protocol?: AIProviderProtocol;
   monthlyTokenLimit?: number | null;
+  runsLocally?: boolean;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -157,6 +161,7 @@ export interface AIUsageLogCreate {
   latencyMs?: number;
   success: boolean;
   errorType?: string | null;
+  jobId?: string | null;
 }
 export interface AIUsageLogOut {
   groupId: string;
@@ -171,6 +176,7 @@ export interface AIUsageLogOut {
   latencyMs?: number;
   success: boolean;
   errorType?: string | null;
+  jobId?: string | null;
   id: string;
   createdAt?: string | null;
 }

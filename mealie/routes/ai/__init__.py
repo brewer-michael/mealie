@@ -2,9 +2,10 @@
 
 from fastapi import APIRouter
 
-from . import controller_tools, mcp
+from . import controller_tools, ingest, mcp
 
 router = APIRouter()
 
 router.include_router(controller_tools.router)
 router.include_router(mcp.router)  # /api/mcp, and the lifespan that runs the MCP server
+router.include_router(ingest.router)  # /api/ai/ingest, /api/ai/notifiers, /api/ai/about, and the ingest dispatcher

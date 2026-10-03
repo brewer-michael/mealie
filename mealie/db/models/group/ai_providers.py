@@ -82,6 +82,11 @@ class AIProvider(SqlAlchemyBase, BaseMixins):
     timeout: orm.Mapped[int] = orm.mapped_column(sa.Integer, nullable=False, default=300)
     protocol: orm.Mapped[str] = orm.mapped_column(sa.String, nullable=False, default="openai", server_default="openai")
     monthly_token_limit: orm.Mapped[int | None] = orm.mapped_column(sa.Integer, nullable=True)
+    # Fork: a manager's word that the provider runs on their own network (docs/ai/PHASE2.md §10); off by default,
+    # so existing providers fail closed for local-only recipe cards
+    runs_locally: orm.Mapped[bool] = orm.mapped_column(
+        sa.Boolean, nullable=False, default=False, server_default=sa.false()
+    )
 
     request_headers: orm.Mapped[list[AIProviderHeaders]] = orm.relationship(
         "AIProviderHeaders", cascade="all, delete-orphan"

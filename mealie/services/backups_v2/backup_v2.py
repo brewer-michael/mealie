@@ -8,6 +8,7 @@ from zipfile import ZipFile
 from mealie.core.config import get_app_settings
 from mealie.core.settings.static import APP_VERSION
 from mealie.services._base_service import BaseService
+from mealie.services.ai.ingest.storage import pauses_ingest  # fork: docs/ai/PHASE2.md §3.9
 from mealie.services.backups_v2.alchemy_exporter import AlchemyExporter
 from mealie.services.backups_v2.backup_file import BackupFile
 
@@ -130,6 +131,7 @@ class BackupV2(BaseService):
         get_app_settings.cache_clear()
         self.settings = get_app_settings()
 
+    @pauses_ingest  # fork: recipe card ingestion pauses, and in-flight writes finish, before anything is replaced
     def restore(self, backup_path: Path) -> None:
         self.logger.info("initializing backup restore")
 
