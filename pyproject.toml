@@ -47,6 +47,7 @@ dependencies = [
     "pint==0.26.1",
     "httpx-curl-cffi==0.1.5",
     "anthropic==1.8.0",
+    "mcp==1.30.0",
 ]
 
 [project.scripts]
