@@ -121,6 +121,35 @@ def test_a_failing_tesseract_gives_an_empty_result(
     assert ocr.extract_text(image_path) == ocr.OCRResult()
 
 
+@pytest.mark.parametrize(("configured", "expected"), [(None, "1"), ("4", "4")])
+def test_tesseract_runs_single_threaded_unless_configured(
+    fake_tesseract: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured: str | None,
+    expected: str,
+):
+    if configured is None:
+        monkeypatch.delenv("OMP_THREAD_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("OMP_THREAD_LIMIT", configured)
+
+    thread_limits: list[str] = []
+
+    def record(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        thread_limits.append(kwargs["env"]["OMP_THREAD_LIMIT"])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tesseract_module.subprocess, "run", record)
+
+    image_path = tmp_path / "recipe.png"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    ocr.extract_text(image_path)
+
+    assert thread_limits
+    assert set(thread_limits) == {expected}
+
+
 def test_tsv_words_are_joined_into_lines_and_blocks():
     tsv = "\n".join(
         [

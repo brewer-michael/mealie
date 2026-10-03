@@ -7,6 +7,7 @@ empty result, never an exception.
 """
 
 import functools
+import os
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +36,14 @@ MAX_DIMENSION = 3000
 """Larger images are scaled down before they're read for their text; Tesseract gains nothing from huge photos"""
 
 ROTATIONS = (0, 90, 180, 270)
+
+OMP_THREAD_LIMIT = "1"
+"""
+Threads each Tesseract process may use, unless the environment already sets `OMP_THREAD_LIMIT`.
+By default Tesseract starts a thread per core, and processes that overlap (several imports at once,
+or other busy containers on the host) slow each other down to the point of timing out. One thread
+is also faster for a single image this size.
+"""
 _TRANSPOSE = {
     # Pillow's ROTATE_* turn counter-clockwise
     90: Image.Transpose.ROTATE_270,
@@ -145,7 +154,10 @@ def _read_words(image: Image.Image, work_dir: Path, deadline: float) -> list[_Wo
     if timeout <= 0:
         raise subprocess.TimeoutExpired(args, 0)
 
-    result = subprocess.run(args, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout, check=True)
+    env = {**os.environ, "OMP_THREAD_LIMIT": os.environ.get("OMP_THREAD_LIMIT", OMP_THREAD_LIMIT)}
+    result = subprocess.run(
+        args, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout, check=True, env=env
+    )
     return _parse_tsv(result.stdout)
 
 
