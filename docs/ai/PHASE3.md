@@ -1,4 +1,4 @@
-# Phase 3: Mealie MCP server (design)
+# Phase 3: Mealie MCP server (design, as built)
 
 Implements the "Phase 3" row of [`AI_INTEGRATION_PLAN.md`](../AI_INTEGRATION_PLAN.md) §9. Phase 1's tool registry
 ([`PHASE1.md`](PHASE1.md) §5) is exposed as an MCP server at `/api/mcp`, so that:
@@ -56,7 +56,7 @@ These were verified on 2026-10-03 against HA core `dev` (= 2026.10.0b0) and 2026
 ## Architecture
 
 ```
-HA / Claude ──POST /api/mcp──► McpBearerAuth (ASGI) ──► StreamableHTTPSessionManager ──► mcp Server
+HA / Claude ──POST /api/mcp──► McpEndpoint (ASGI)   ──► StreamableHTTPSessionManager ──► mcp Server
                                    │ verify token in worker thread                       │ list_tools / call_tool
                                    │ (MCP OAuth token or Mealie API token)               ▼
                                    ▼                                         Phase 1 tool registry
@@ -95,19 +95,36 @@ the REST API: an MCP connection can only ever reach the tools.
   - Arguments are validated with the tool's pydantic model.
   - The handler runs through the registry with a `ToolContext`. Building it touches no database (PHASE1 §5), and all
     database work runs in worker threads.
-  - Calls are capped at **4 s**, so HA's 5 s per-POST budget holds. On timeout the result is a speakable
-    `isError` ("Mealie took too long to answer. Try again.").
+  - Calls are capped at **4 s** counted from the request's arrival (at least 1 s for the tool itself), so HA's 5 s
+    per-POST budget holds. On timeout the result is a speakable `isError`: "Mealie took too long to answer. Try
+    again." (`timeout`) for reads, and for writes, which usually still land, "Mealie is still saving that, and it may
+    still go through. Check before asking again." (`timeout_pending`, `may_have_applied: true`). The tool keeps
+    running and its outcome is logged; at shutdown the server waits up to 10 s for such tools and their events.
+  - At most **16 tools run at once** per process, counting timed-out ones still running. Past that a call gets
+    "Mealie is busy right now. Try again in a moment." (`busy`) instead of queueing.
   - **Result:** a single `TextContent` with compact JSON of the tool result (`speech` first, then the data). No
     `structuredContent` or `outputSchema` for now.
   - **Errors:** unknown tool, `ToolNotFoundError`, `ToolError`, pydantic validation errors and missing write grants
-    all come back as `isError: true` with the speakable message, never as JSON-RPC or HTTP errors.
-  - Write tools publish the same events as REST, with `integration_id = "mcp:<client name>"`.
-- **Origin:** if an `Origin` header is present and isn't the request's own origin, the endpoint returns **403**, as
-  the spec requires against DNS rebinding.
+    all come back as `isError: true` with the speakable message, never as JSON-RPC or HTTP errors. The text is
+    `{"speech", "error", ["errors"]}` with `error` one of `unknown_tool`, `invalid_arguments` (plus pydantic's error
+    list), `not_found`, `tool_error`, `write_not_allowed`, `timeout`, `timeout_pending`, `busy` or
+    `internal_error`. The write grant is checked before the arguments.
+  - **The `tools/call` handler is registered directly** (`server.request_handlers[CallToolRequest]`), not through the
+    SDK's decorator. The decorator keeps a process-wide tool cache that callers with different grants would share,
+    re-lists tools on every miss, logs the raw tool name, and sends raw exception text to the client.
+  - **Requests over 64 KiB get 413** (the largest real call is about 10 KB). The SDK logs parts of malformed
+    requests, so this also bounds what a caller can put in the log. The SDK's per-request INFO loggers are set to
+    WARNING; Mealie logs one line per call.
+  - Write tools publish the same events as REST, with `integration_id = "mcp:<client name>"` (or
+    `"mcp:API token"`). They're sent in the background after the answer, so webhook and notifier latency doesn't
+    count against the 4 s, and a delivery failure is logged.
+- **Origin:** if an `Origin` header is present and isn't the request's own origin, the endpoint returns **403**.
+  This stops ordinary cross-site requests. It can't stop DNS rebinding on its own (the rebound Host matches the
+  Origin); what does is that only bearer tokens authenticate, never cookies.
 
 ## 2. Bearer authentication
 
-`McpBearerAuth` is an ASGI wrapper in front of the session manager.
+`McpEndpoint` is an ASGI wrapper in front of the session manager.
 
 - **Accepted tokens:**
   1. **MCP OAuth access tokens**: opaque, with prefix `mmcp_at_`, looked up by SHA-256 in `mcp_oauth_tokens`. They
@@ -116,12 +133,18 @@ the REST API: an MCP connection can only ever reach the tools.
      `validate_long_live_token` does.
 - **Rejected:** session JWTs and cookies. A browser session can't drive MCP.
 - **Lookups run in a worker thread** (`run_in_threadpool` + `session_context()`), never on the event loop.
-- **Cache:** results are cached for 60 s, keyed by the token's SHA-256, because HA authenticates 4 POSTs per call. A
-  revocation can therefore take up to 60 s to apply; this is documented.
+- **Cache:** results are cached for 60 s, keyed by the token's SHA-256, because HA authenticates 4 POSTs per call.
+  A cache hit is checked on the event loop (`cached_mcp_principal`, no database); only a miss goes to a worker
+  thread. Revoking, disconnecting, deleting a client, API token or user, or any change to a user drops the affected
+  entries once the change is committed, so in a single-process Mealie (the default) it applies at once. Other worker
+  processes notice within 60 s.
 - **Failure:** `401` with
   `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<origin>/.well-known/oauth-protected-resource/api/mcp", scope="mcp:read mcp:write"`.
+  Without any credentials the `error` parameter is left out (RFC 6750 §3.1); HA reads only `resource_metadata` and
+  `scope`.
   - `<origin>` comes from the request's scheme and Host. Uvicorn already trusts `X-Forwarded-Proto` from configured
-    proxies.
+    proxies. The Docker image trusts only the container's gateway, so a TLS proxy in another container isn't trusted;
+    a plain `http` request for an `https` `BASE_URL`'s host and port is therefore upgraded to `https`.
 - **Request identity:** the authenticated user, client name (or "API token"), scopes and write grant are attached to
   the request scope for the tool layer.
 
@@ -160,7 +183,9 @@ Clients are registered in Mealie, under Group Settings → AI assistants. There 
 | `created_at`, `last_used_at` | |
 
 **Redirect URIs** match exactly. The exception is a loopback `http://127.0.0.1|localhost|[::1]` URI, which matches
-on any port (RFC 8252 §7.3), for Claude Code.
+on any port (RFC 8252 §7.3), for Claude Code. Host names must be ASCII (the `xn--` form for international names),
+and the consent page shows the punycode host, so a lookalike such as a Cyrillic "і" can't pass for the real host.
+Plain `http` is allowed only for loopback and local-network hosts.
 
 **The UI:**
 - offers a **Home Assistant preset**, prefilling both HA redirect URIs and setting confidential, PKCE optional and
@@ -185,6 +210,8 @@ on any port (RFC 8252 §7.3), for Claude Code.
 
    These errors redirect back with `error`, `state` and `iss`.
 3. **Store a short-lived pending request** in `mcp_oauth_requests`, keyed by a random handle and valid for 10 min.
+   The endpoint needs no login, so it's bounded: a query string over 8 KB gets the error page, a `state` over 2048
+   characters is refused (HA's is about 600), and only the newest 50 pending requests per client are kept.
 4. **Redirect to the SPA** at `/oauth/consent?request=<handle>`. The SPA page needs a login, so an anonymous user
    goes through `/login?redirect=…` (OIDC included) and comes back.
 5. **The consent page** calls `GET /api/oauth/requests/{handle}`, which needs auth and returns:
@@ -218,6 +245,8 @@ on any port (RFC 8252 §7.3), for Claude Code.
 - **Response:** `{access_token, token_type: "Bearer", expires_in: 3600, refresh_token, scope}`.
   - Access tokens (`mmcp_at_…`) last 1 h.
   - Refresh tokens (`mmcp_rt_…`) expire after 90 days without use, and each refresh extends that.
+- **Concurrency:** issuing, refreshing and revoking lock the client row first (`SELECT … FOR UPDATE`, a no-op on
+  SQLite), so on PostgreSQL a disconnect or password change racing a refresh can't leave the refreshed tokens live.
 - **Storage:** both token types are stored as SHA-256 in `mcp_oauth_tokens`, with:
   - client, user, scopes and resource (defaulting to this server's MCP URL when the client sent none);
   - `family_id`;
@@ -231,7 +260,8 @@ on any port (RFC 8252 §7.3), for Claude Code.
 refresh token. It always returns 200.
 
 **Tokens are also revoked when:**
-- the user changes their password (upstream's `tokens_valid_after` is honoured at verification);
+- the user changes their password: a listener revokes their tokens and codes in the same transaction, and
+  verification also refuses anything issued before `tokens_valid_after` + 1 s (it's stored in whole seconds);
 - the user, the client or the group is deleted;
 - the user disconnects the app under Profile → Connected apps (`GET` / `DELETE /api/users/self/mcp/connections`).
 
@@ -276,17 +306,27 @@ A daily scheduler task purges expired codes and requests, and tokens that have b
 
 ## 6. UI
 
-- **Group Settings → AI assistants (MCP):**
-  - the MCP URL to copy;
-  - the client list (name, client ID, redirect URIs, writes allowed, last used);
-  - add a client (with the Home Assistant preset); edit; rotate secret (shown once); delete.
-- **`/oauth/consent`:**
-  - "*Home Assistant* wants to use your Mealie: read recipes, meal plans and shopping lists", plus an optional
-    "Allow changes" checkbox;
-  - Approve / Deny;
-  - the redirect host is shown, so users can spot a lookalike.
-- **Profile → Connected apps:** your OAuth connections, with scopes and last use, and Disconnect.
-- **Profile → API Tokens:** an "Allow AI assistants to make changes" switch per token.
+- **Group Settings → AI Assistants (MCP)** (managers only, `GroupMcpSettings`, `GroupMcpClientDialog`):
+  - the MCP Server URL to copy, with a note that API tokens work too (linking to Profile → API Tokens, which needs
+    "Show advanced features");
+  - the client list (name, confidential or public, read-only or "Can ask to make changes", client ID, redirect URIs,
+    last used);
+  - Add Client with a **Home Assistant** preset (from `GET /api/groups/mcp/presets/home-assistant`, with an
+    optional Home Assistant address for the second redirect URI) or **Other MCP client**; Edit; Rotate Secret;
+    Delete. The secret appears once in a panel that stays until **Done**, and Add Client and Rotate Secret wait
+    for it.
+- **`/oauth/consent`** (`pages/oauth/consent.vue`):
+  - "*Home Assistant* wants to use your Mealie", what it can do, an optional "Allow changes (add to shopping list,
+    plan meals)" checkbox (unchecked), who you're signed in as with **Switch account**, "You'll be sent back to
+    *host*" (punycode), Approve and Deny;
+  - signed-out users go through `/login?redirect=…` (password and OIDC) and come back;
+  - inside a frame it offers only a link that opens it in a new tab (clickjacking);
+  - expired, answered, foreign-group and malformed requests get a plain message and a way back to Mealie.
+- **Profile → Connected Apps** (`/user/profile/connected-apps`, `UserMcpConnections`): your OAuth connections, with
+  permissions in words, connected and last-used dates, and Disconnect.
+- **Profile → API Tokens:** an "Allow AI assistants to make changes" switch per token (`UserMcpApiTokenWriteSwitch`).
+- **Development:** Nuxt's dev proxy passes the authorize endpoint's redirect to the browser instead of following
+  it (a commented fork edit in `frontend/server/api/[...].ts`), so the flow also works with `task py` + `task ui`.
 
 ## 7. Testing
 
@@ -319,3 +359,42 @@ A daily scheduler task purges expired codes and requests, and tokens that have b
 - **Off the event loop:** auth and tool database work never run on the event loop; at least 24 concurrent calls
   with a small pool timeout succeed (PHASE1 §5 style).
 - **End to end, outside CI:** run HA's real client code (the research probes) against a running Mealie.
+
+### As built
+
+All of the above is covered, plus what the reviews added:
+- **Concurrency:** concurrent code exchanges and refreshes (exactly one wins), and a disconnect or password change
+  racing a refresh. These ran on SQLite and PostgreSQL 16.
+- **Password changes** revoke without backdated tokens.
+- **Cache:**
+  - a user moved to another household is seen at once;
+  - `cached_mcp_principal` never touches the database.
+- **Authorize limits** and the ASCII redirect-host rule.
+- **The endpoint:**
+  - the over-size 413;
+  - one log line per call, and hostile tool names can't forge log lines;
+  - the time budget counted from arrival;
+  - the busy limit;
+  - write timeouts answering `timeout_pending` and landing exactly once;
+  - event failures logged and events sent after the answer;
+  - shutdown waiting for running tools;
+  - the HA replay going through production's middleware and asserting that the losing discovery responses are JSON
+    404s.
+- **Frontend:** vitest for the composables, the client dialog (preset, refused address, a click during preset
+  loading), the secret panel, the consent page (the write checkbox default, framing, the foreign-group message),
+  Connected Apps and the token switch.
+- **Outside CI**, each run against a real production-mode Mealie with the SPA:
+  - HA's own client code (mcp 1.28.1, probatio) completed discovery, authorize without PKCE, consent, token,
+    refresh, the tool list (all 8 schemas converted), reads, a write and the trailing-slash URL.
+  - The UI was driven in Chromium: client management, the full consent round trip from signed out, deny,
+    expired requests, framing, Connected Apps, the token switch, keyboard use and 375 px.
+
+### Known limitations
+
+- Revocation reaches other worker processes within 60 s; the busy limit is per process.
+- A write that times out usually still lands, and a client that retries it anyway creates a duplicate. The answer
+  says so; there is no deduplication.
+- The consent page's frame guard runs in the browser. Mealie sends no `frame-ancestors` header, because upstream
+  allows embedding the app.
+- Requests just under 64 KiB can still make the SDK log a few KB of escaped validation detail at WARNING.
+- Sub-path installs (Mealie under `/something/`) aren't supported: the MCP URL is always `<origin>/api/mcp`.

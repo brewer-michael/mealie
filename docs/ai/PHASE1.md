@@ -26,13 +26,13 @@ tools, nutrition matching, the meal planner) runs on what this phase adds.
 ## 1. Slots and fallback routes
 
 ```python
-class AIProviderSlot(StrEnum):   # mealie/schema/group/ai_providers.py
-    default = "default"     # text tasks (build recipe, scrape fallback)
-    image = "image"         # anything with image attachments
-    audio = "audio"         # transcription / audio attachments
-    planner = "planner"     # tool-using agent work (Phase 5); falls back to default
-    fast = "fast"           # cheap structured calls: ingredient parsing, organizers, translation; falls back to default
-    embedding = "embedding" # embeddings (Phase 6); no fallback to default
+class AIProviderSlot(StrEnum):  # mealie/schema/group/ai_providers.py
+    default = "default"  # text tasks (build recipe, scrape fallback)
+    image = "image"  # anything with image attachments
+    audio = "audio"  # transcription / audio attachments
+    planner = "planner"  # tool-using agent work (Phase 5); falls back to default
+    fast = "fast"  # cheap structured calls: ingredient parsing, organizers, translation; falls back to default
+    embedding = "embedding"  # embeddings (Phase 6); no fallback to default
 ```
 
 **Table `ai_provider_routes`:** `id` (GUID PK), `settings_id` (FK `ai_provider_settings.id`, indexed), `slot`

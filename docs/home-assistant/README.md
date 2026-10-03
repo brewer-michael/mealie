@@ -1,8 +1,14 @@
 # Home Assistant voice for Mealie
 
-Ask Home Assistant (HA) Assist about your Mealie recipes, meal plan and shopping list. This is **Layer A** of
-[`AI_INTEGRATION_PLAN.md` §4.3](../AI_INTEGRATION_PLAN.md#43-home-assistant-and-voice-g1). It needs no Mealie code:
-everything runs on HA's built-in Mealie integration.
+Ask Home Assistant (HA) Assist about your Mealie recipes, meal plan and shopping list. There are two layers
+([`AI_INTEGRATION_PLAN.md` §4.3](../AI_INTEGRATION_PLAN.md#43-home-assistant-and-voice-g1)), and they work side by side:
+
+- **Layer A** (sections 1–7) needs no Mealie code: everything runs on HA's built-in Mealie integration.
+- **Layer B** ([section 8](#8-layer-b-mealies-mcp-server)) connects HA's MCP integration to this Mealie build's MCP
+  server, which gives the LLM richer tools: search by time and ingredients, scaled ingredients, one cooking step at a
+  time, and optionally adding to the shopping list and planning meals.
+
+**Layer A:**
 
 - Simple questions ("What's for dinner?") are answered **locally**, with no LLM, in well under a second.
 - Open-ended questions ("Find me a chicken recipe") go to an **LLM conversation agent**, which gets three Mealie
@@ -20,7 +26,7 @@ everything runs on HA's built-in Mealie integration.
 - [5. Settings and the Mealie config entry](#5-settings-and-the-mealie-config-entry)
 - [6. How it works](#6-how-it-works)
 - [7. Troubleshooting](#7-troubleshooting)
-- [8. What's next](#8-whats-next)
+- [8. Layer B: Mealie's MCP server](#8-layer-b-mealies-mcp-server)
 
 ---
 
@@ -263,19 +269,124 @@ Template tip if you extend the package: Mealie action responses are plain dicts,
 
 ---
 
-## 8. What's next
+## 8. Layer B: Mealie's MCP server
 
-Layer A shows what the built-in integration can do without changes to Mealie. Its limits: keyword search only, no
-cooking-time or ingredient filters, no ingredient scaling, and no writes beyond the to-do list.
+Layer B connects HA's built-in **Model Context Protocol** integration to this Mealie build's MCP server at `/api/mcp`.
+Your LLM conversation agent then gets Mealie's own tools instead of the three Layer A scripts:
 
-**Layer B** ([plan §4.3](../AI_INTEGRATION_PLAN.md#43-home-assistant-and-voice-g1)) adds a Mealie MCP server at
-`/api/mcp` with voice-friendly tools such as `search_recipes` with time and ingredient filters, `get_cooking_step`,
-`scale_ingredients`, `whats_planned`, `get_shopping_list` and opt-in write tools. HA's own MCP client will connect to it
-through OAuth, and other MCP clients (Claude Desktop, Claude Code) through an API token. Keep this package when that
-lands: the local sentences stay the fastest way to answer the everyday questions.
+| Tool | What it adds over Layer A |
+|---|---|
+| `search_recipes` | Filters: total time ("under 30 minutes"), foods to include or leave out, tags and categories |
+| `get_recipe` | Ingredients scaled to any number of servings |
+| `get_cooking_step` | One step at a time, for cooking along |
+| `suggest_from_ingredients` | "What can I make with chicken and rice?" |
+| `whats_planned` | The plan for a day or a range, optionally one meal |
+| `get_shopping_list` | The open items on a list |
+| `add_to_shopping_list` | Add items, or a recipe's ingredients for N servings (only if you allow changes) |
+| `plan_meal` | Put a recipe or a note on the plan (only if you allow changes) |
+
+Each tool answers with a short `speech` sentence the assistant can read out, plus the data for follow-up questions.
+The full reference, including Claude Code and other clients, is [`docs/ai/MCP.md`](../ai/MCP.md).
+
+Keep Layer A installed: its local sentences still answer "What's for dinner?" instantly and without an LLM. Once
+Layer B works, you can un-expose the three Layer A scripts (**Settings > Voice assistants > Expose**) so the LLM
+doesn't see two ways of doing the same thing.
+
+### Requirements
+
+- **This Mealie build** (`ai-integration`). Stock Mealie has no MCP server.
+- **Home Assistant 2026.9 or newer** with an LLM conversation agent.
+- **One address for Mealie that works both from HA and from your browser.** You approve the connection in your
+  browser, and HA then calls Mealie at the same address. Prefer HTTPS: HA verifies certificates, so a self-signed
+  certificate needs a CA that HA trusts.
+- **A Mealie user for HA**, such as the `Kitchen Voice` user from [section 1](#use-a-dedicated-kitchen-voice-user-for-the-token).
+  The connection acts as the user who approves it, and sees that user's household.
+
+### Step 1: register Home Assistant in Mealie
+
+1. Sign in to Mealie as a group manager and open **Group Settings > AI Assistants (MCP)** (from your profile page,
+   or `/group`).
+2. Copy the **MCP Server URL**, for example `https://mealie.example.com/api/mcp`.
+3. Select **Add Client**. The **Home Assistant** preset is selected and fills in:
+   - **Redirect URIs:** `https://my.home-assistant.io/redirect/oauth` (used when HA's `my` integration is on, which is
+     the default) and `http://homeassistant.local:8123/auth/external/callback`. If you turned `my` off and HA isn't at
+     `homeassistant.local:8123`, enter its address under **Home Assistant Address** first, for example
+     `http://192.168.1.20:8123`.
+   - **Confidential** with **PKCE optional**: HA always sends a client secret and never sends PKCE.
+   - **Allow changes** off. Turn it on if voice may add to the shopping list and plan meals.
+4. Select **Create**, then copy the **Client ID** and **Client Secret** from the panel that appears, and select
+   **Done**. The secret is shown only once. If you lose it, use **Rotate Secret** and enter the new one in HA.
+
+### Step 2: add the credentials to HA
+
+1. In HA, go to **Settings > Devices & services**, open the **⋮** menu at the top right and choose
+   **Application credentials**.
+2. Select **Add application credential**, pick **Model Context Protocol**, name it `Mealie`, and paste the client ID
+   and secret from step 1.
+
+If you skip this step, HA asks for the credentials when you add the integration in step 3.
+
+### Step 3: add the MCP integration
+
+1. Go to **Settings > Devices & services > Add integration** and choose **Model Context Protocol**.
+2. Enter the MCP server URL **exactly as Mealie shows it**: the same `https://` or `http://`, a lowercase host, the port
+   if there is one, and **no trailing slash**. HA compares it with the address Mealie reports, character for
+   character.
+3. HA sends you to Mealie's consent page. Sign in as **Kitchen Voice** (use a private window if you're signed in as
+   yourself). Check that the page names Home Assistant and says you'll be sent back to `my.home-assistant.io` (or
+   your HA address). Tick **Allow changes** only if you want voice to change things, then select **Approve**.
+4. HA adds an entry named **Mealie**.
+
+### Step 4: give the tools to your conversation agent
+
+1. Go to **Settings > Devices & services**, open your LLM integration (OpenAI, Anthropic, Google, Ollama...) and
+   configure its conversation agent.
+2. Under **Control Home Assistant**, select **Mealie**. Keep **Assist** selected too if the agent should still
+   control devices and use the Layer A scripts. With more than one selected, HA names the tools
+   `mealie__search_recipes` and so on.
+3. Optionally add instructions like these:
+
+   ```text
+   Use the Mealie tools for anything about food, recipes, cooking, the meal plan or the shopping list.
+   Read the speech field of a Mealie result aloud as it is. Give one cooking step at a time unless asked for more.
+   ```
+
+### What you can say
+
+| You say | Tools the agent typically calls |
+|---|---|
+| "Find a chicken recipe under 30 minutes" | `search_recipes(query="chicken", max_total_minutes=30)` |
+| "Something vegetarian without mushrooms" | `search_recipes(tags=["vegetarian"], exclude_foods=["mushroom"])` |
+| "What do I need for the lasagna, for eight people?" | `search_recipes`, then `get_recipe(slug, part="ingredients", servings=8)` |
+| "What's the next step?" | `get_cooking_step(slug, step=4)` |
+| "What can I make with chicken and rice?" | `suggest_from_ingredients(foods=["chicken", "rice"])` |
+| "What's planned this week?" | `whats_planned(start, end)` |
+| "Add the lasagna ingredients to the shopping list" | `add_to_shopping_list(recipe_slug, servings)` (changes) |
+| "Put the lasagna on Friday's dinner" | `plan_meal(date, meal="dinner", recipe_slug)` (changes) |
+
+### Allowing changes later
+
+1. In **Group Settings > AI Assistants (MCP)**, edit the Home Assistant client and turn on **Allow changes**.
+2. Sign in to Mealie as Kitchen Voice and disconnect Home Assistant under **Profile > Connected Apps**.
+3. On its next request HA finds its access gone and asks you to re-authenticate the Mealie entry (look under
+   **Settings > Devices & services**). Approve again with **Allow changes** ticked.
+
+### Troubleshooting Layer B
+
+| Symptom | Check |
+|---|---|
+| "OAuth resource metadata is invalid" or "Failed to connect" | The address typed in HA differs from the one Mealie shows: a trailing slash, capitals, `http` instead of `https`, or a missing port. Behind a reverse proxy, set Mealie's `BASE_URL` to its public address ([MCP guide, section 2](../ai/MCP.md#2-the-mcp-server-url)). |
+| Mealie shows "This app can't connect to Mealie" | HA's redirect URI isn't registered on the client. HA uses `https://my.home-assistant.io/redirect/oauth` when its `my` integration is on, otherwise `<HA address>/auth/external/callback`. |
+| HA asks for credentials again and again | The client ID or secret in **Application credentials** is wrong, or the secret was rotated. |
+| The agent doesn't use the Mealie tools | Select **Mealie** under **Control Home Assistant** in the agent's options. HA re-reads the tool list every 30 minutes, or when you reload the Mealie MCP entry. |
+| The agent can't add to the shopping list | The connection is read-only. See [Allowing changes later](#allowing-changes-later). |
+| The agent reads the wrong household's plan | You approved as the wrong user. Disconnect it in Mealie and re-authenticate as Kitchen Voice. |
+| "Mealie took too long to answer. Try again." | HA gives up after 5 seconds, so Mealie stops each tool after 4. Check Mealie's load. |
 
 ### References
 
+- [Model Context Protocol integration](https://www.home-assistant.io/integrations/mcp/),
+  [Application credentials](https://www.home-assistant.io/integrations/application_credentials/)
 - HA Mealie integration: [docs](https://www.home-assistant.io/integrations/mealie/),
   [`services.yaml`](https://github.com/home-assistant/core/blob/dev/homeassistant/components/mealie/services.yaml),
   [`services.py`](https://github.com/home-assistant/core/blob/dev/homeassistant/components/mealie/services.py)
