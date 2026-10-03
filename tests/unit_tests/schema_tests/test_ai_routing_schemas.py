@@ -3,7 +3,14 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut, AIProviderProtocol, AIProviderSlot
+from mealie.schema.group.ai_providers import (
+    AIProviderCreate,
+    AIProviderOut,
+    AIProviderProtocol,
+    AIProviderSlot,
+    AIProviderSummary,
+    AIProviderUpdate,
+)
 from mealie.schema.group.ai_routing import AIProviderModelsQuery, AIProviderRoutesUpdate
 
 
@@ -72,3 +79,49 @@ def test_models_query_needs_no_name_or_model_and_hides_the_key():
     assert query.base_url is None
     assert query.protocol is AIProviderProtocol.openai
     assert "secret" not in query.model_dump_json()
+
+
+def test_monthly_token_limit_fits_a_32_bit_integer_column():
+    limit = 2_147_483_647
+    assert AIProviderCreate(name="t", api_key="k", model="m", monthly_token_limit=limit).monthly_token_limit == limit
+
+    with pytest.raises(ValidationError):
+        AIProviderCreate(name="t", api_key="k", model="m", monthly_token_limit=limit + 1)
+
+
+@pytest.mark.parametrize(
+    "base_url", ["https://internal.test/v1?", "https://internal.test/v1?x=1", "https://internal.test/v1#frag"]
+)
+def test_base_url_rejects_a_query_string_or_fragment(base_url: str):
+    # Paths like /models are appended to the base URL; a "?" would turn them into a query value
+    with pytest.raises(ValidationError, match="query string or fragment"):
+        AIProviderCreate(name="t", api_key="k", model="m", base_url=base_url)
+    with pytest.raises(ValidationError, match="query string or fragment"):
+        AIProviderUpdate(name="t", api_key="k", model="m", base_url=base_url)
+    with pytest.raises(ValidationError, match="query string or fragment"):
+        AIProviderModelsQuery(api_key="k", base_url=base_url)
+
+    # A provider saved before the check still loads
+    assert AIProviderOut(id=uuid4(), name="t", api_key="k", model="m", base_url=base_url).base_url == base_url
+
+
+def test_base_url_accepts_plain_urls():
+    base_url = "http://ollama.local:11434/v1/"
+    assert AIProviderCreate(name="t", api_key="k", model="m", base_url=base_url).base_url == base_url
+    assert AIProviderModelsQuery(api_key="k", base_url=base_url).base_url == base_url
+
+
+def test_api_key_set_never_exposes_the_key():
+    provider = AIProviderOut(id=uuid4(), name="t", api_key="sk-secret", model="m")
+    assert provider.api_key_set is True
+    dumped = provider.model_dump_json(by_alias=True)
+    assert '"apiKeySet":true' in dumped
+    assert "sk-secret" not in dumped
+
+    # An undecryptable key reads as ""
+    assert AIProviderOut(id=uuid4(), name="t", api_key="", model="m").api_key_set is False
+
+
+def test_provider_summary_has_no_key_data():
+    """The summary is in `/groups/self`, which every group member can read"""
+    assert set(AIProviderSummary(id=uuid4(), name="t").model_dump(by_alias=True)) == {"id", "name"}

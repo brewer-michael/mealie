@@ -7,6 +7,7 @@ from mealie.core.root_logger import get_logger
 from mealie.routes._base import controller
 from mealie.routes._base.base_controllers import BaseUserController
 from mealie.routes._base.mixins import HttpRepo
+from mealie.routes.groups.controller_group_ai_routing import require_api_key_for_new_destination
 from mealie.schema.group.ai_providers import (
     AIProviderCreate,
     AIProviderOut,
@@ -63,7 +64,6 @@ class GroupAIProviderController(BaseUserController):
             model=data.model,
             timeout=data.timeout,
             protocol=data.protocol,
-            monthly_token_limit=data.monthly_token_limit,
             request_headers=data.request_headers,
             request_params=data.request_params,
         )
@@ -86,6 +86,8 @@ class GroupAIProviderController(BaseUserController):
 
         provider = self.mixins.get_one(provider_id)
         if overrides:
+            # The saved key isn't reused with a changed protocol, base URL or headers (docs/ai/PHASE1.md)
+            require_api_key_for_new_destination(provider, overrides, overrides.api_key)
             provider = provider.model_copy(
                 update={
                     "name": overrides.name,
@@ -93,7 +95,6 @@ class GroupAIProviderController(BaseUserController):
                     "model": overrides.model,
                     "timeout": overrides.timeout,
                     "protocol": overrides.protocol,
-                    "monthly_token_limit": overrides.monthly_token_limit,
                     "request_headers": overrides.request_headers,
                     "request_params": overrides.request_params,
                     **({"api_key": overrides.api_key} if overrides.api_key else {}),

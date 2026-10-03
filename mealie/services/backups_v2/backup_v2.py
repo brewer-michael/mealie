@@ -92,15 +92,40 @@ class BackupV2(BaseService):
         get_app_settings.cache_clear()
         self.settings = get_app_settings()
 
-    def _restore_secrets(self, data_path: Path) -> None:
+    def _restore_secrets(self, data_path: Path) -> dict[Path, bytes | None]:
         """
         Restores the backup's `.secret` ahead of its database. Values encrypted with it (AI provider
         API keys) must be read with it, and when an older backup's migrations encrypt plaintext keys
         during the import, they must encrypt with the secret this instance will run with afterwards.
+
+        The secret being replaced is kept as `mealie_<date>.bak.secret`, next to the SQLite safety copy
+        (`mealie_<date>.bak.db`) whose keys it decrypts. Returns the replaced files' contents (`None`
+        for a file that didn't exist) for `_undo_restore_secrets`.
         """
+        timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y.%m.%d")
+        replaced: dict[Path, bytes | None] = {}
         for name in self.RESTORE_FILES:
-            if (data_path / name).is_file():
-                shutil.copyfile(data_path / name, self.directories.DATA_DIR / name)
+            if not (data_path / name).is_file():
+                continue
+
+            target = self.directories.DATA_DIR / name
+            replaced[target] = target.read_bytes() if target.is_file() else None
+            if target.is_file():
+                shutil.copy2(target, self.directories.DATA_DIR / f"mealie_{timestamp}.bak{name}")
+
+            shutil.copyfile(data_path / name, target)
+
+        get_app_settings.cache_clear()
+        self.settings = get_app_settings()
+        return replaced
+
+    def _undo_restore_secrets(self, replaced: dict[Path, bytes | None]) -> None:
+        """Puts back the files `_restore_secrets` replaced, after a failed import"""
+        for target, content in replaced.items():
+            if content is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_bytes(content)
 
         get_app_settings.cache_clear()
         self.settings = get_app_settings()
@@ -135,10 +160,15 @@ class BackupV2(BaseService):
             # ================================
             # Restore Database
 
-            self._restore_secrets(contents.data_directory)
+            replaced_secrets = self._restore_secrets(contents.data_directory)
 
             self.logger.info("importing database tables")
-            self.db_exporter.restore(database_json)
+            try:
+                self.db_exporter.restore(database_json)
+            except Exception:
+                self.logger.error("importing database tables failed; putting the original .secret back")
+                self._undo_restore_secrets(replaced_secrets)
+                raise
 
             self.logger.info("database tables imported successfully")
 

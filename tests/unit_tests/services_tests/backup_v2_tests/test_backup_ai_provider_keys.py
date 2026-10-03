@@ -2,13 +2,15 @@
 
 import json
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
-from mealie.core.config import get_app_settings
+from mealie.core.config import get_app_dirs, get_app_settings
 from mealie.db.db_setup import session_context
 from mealie.db.models._model_utils.encrypted import (
     ENCRYPTED_PREFIX,
@@ -18,6 +20,7 @@ from mealie.db.models._model_utils.encrypted import (
 )
 from mealie.db.models._model_utils.guid import GUID
 from mealie.repos.all_repositories import get_repositories
+from mealie.services.backups_v2.alchemy_exporter import AlchemyExporter
 from mealie.services.backups_v2.backup_v2 import BackupV2
 from tests.utils import api_routes
 from tests.utils.factories import random_string
@@ -135,4 +138,55 @@ def test_restoring_pre_encryption_backup_encrypts_keys_with_the_backups_secret(
 
     assert get_app_settings().SECRET == original_secret
     assert _read_api_key(unique_user, provider_id) == "sk-legacy-backup"
+    api_client.delete(api_routes.groups_ai_providers_providers_provider_id(provider_id), headers=unique_user.token)
+
+
+def test_failed_import_puts_the_original_secret_back(
+    api_client: TestClient, unique_user: TestUser, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The backup's `.secret` is restored before its database. If the import then fails, the original
+    secret must come back: it's the one the SQLite safety copy (`mealie_<date>.bak.db`) needs.
+    """
+    provider_id = _create_provider(api_client, unique_user, "sk-before-failed-restore")
+    data_dir = get_app_dirs().DATA_DIR
+    original_secret = get_app_settings().SECRET
+    original_secret_file = (data_dir / ".secret").read_bytes()
+
+    backup_v2 = BackupV2()
+    original_backup = backup_v2.backup()
+    try:
+        other_backup = tmp_path / "other-instance.zip"
+        with zipfile.ZipFile(original_backup) as src, zipfile.ZipFile(other_backup, "w") as dst:
+            for item in src.infolist():
+                if item.filename != "data/.secret":
+                    dst.writestr(item, src.read(item))
+            dst.writestr("data/.secret", "secret-of-another-instance")
+
+        real_import = AlchemyExporter.restore
+
+        def failing_import(self: AlchemyExporter, db_dump: dict) -> None:
+            assert get_app_settings().SECRET == "secret-of-another-instance"
+            # Fails at the very end, so the tables exist for the clean-up below: on PostgreSQL, upstream's
+            # drop_all() can't run twice in a row (it drops the enum types unconditionally)
+            real_import(self, db_dump)
+            raise RuntimeError("import failed")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(AlchemyExporter, "restore", failing_import)
+            with pytest.raises(RuntimeError, match="import failed"):
+                backup_v2.restore(other_backup)
+
+        assert (data_dir / ".secret").read_bytes() == original_secret_file
+        assert get_app_settings().SECRET == original_secret
+
+        # A copy of the replaced secret is kept next to the SQLite safety copy as well
+        today = datetime.now(UTC).strftime("%Y.%m.%d")
+        assert (data_dir / f"mealie_{today}.bak.secret").read_bytes() == original_secret_file
+    finally:
+        # Puts the suite's database back
+        backup_v2.restore(original_backup)
+        backup_v2.db_exporter.engine.dispose()
+
+    assert _read_api_key(unique_user, provider_id) == "sk-before-failed-restore"
     api_client.delete(api_routes.groups_ai_providers_providers_provider_id(provider_id), headers=unique_user.token)

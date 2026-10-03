@@ -36,6 +36,17 @@ class AIProviderProtocol(StrEnum):
     """Anthropic's native Messages API (Claude)"""
 
 
+def check_base_url(val: str | None) -> str | None:
+    """
+    Rejects a base URL with a query string or fragment. Request paths (e.g. `/models`) are appended to it,
+    so a `?` would turn them into a query value; query parameters belong in `request_params`.
+    """
+    if val and ("?" in val or "#" in val):
+        raise ValueError("base_url cannot contain a query string or fragment; use request params instead")
+
+    return val
+
+
 class AIProviderCreate(MealieModel):
     name: str
     base_url: str | None = None
@@ -43,7 +54,7 @@ class AIProviderCreate(MealieModel):
     model: str
     timeout: int = 300
     protocol: AIProviderProtocol = AIProviderProtocol.openai
-    monthly_token_limit: int | None = Field(None, ge=1)
+    monthly_token_limit: int | None = Field(None, ge=1, le=2_147_483_647)  # the column is a 32-bit INTEGER
     """Prompt + completion tokens allowed per calendar month (UTC); unset means unlimited"""
 
     request_headers: dict[str, str] = {}
@@ -59,6 +70,10 @@ class AIProviderCreate(MealieModel):
     @field_validator("base_url", mode="before")
     def validate_as_none(val: Any | None) -> Any | None:
         return val or None
+
+    @field_validator("base_url")
+    def validate_base_url(val: str | None) -> str | None:
+        return check_base_url(val)
 
     @field_validator("monthly_token_limit", mode="before")
     def validate_blank_as_none(val: Any | None) -> Any | None:
@@ -92,6 +107,17 @@ class AIProviderOut(AIProviderCreate):
             raise ValueError(f"{info.field_name} cannot be empty")
 
         return val
+
+    @field_validator("base_url")
+    def validate_base_url(val: str | None) -> str | None:
+        # Overrides AIProviderCreate's check: a provider saved before it existed must still load
+        return val
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def api_key_set(self) -> bool:
+        """Whether a readable key is stored; a key that can't be decrypted (`.secret` changed) reads as unset"""
+        return bool(self.api_key)
 
     @field_validator("request_headers", "request_params", mode="before")
     def wrap_headers_and_params(cls, v):

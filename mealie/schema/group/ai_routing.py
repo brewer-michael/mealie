@@ -7,7 +7,7 @@ from pydantic import UUID4, ConfigDict, Field, field_validator
 
 from mealie.schema._mealie import MealieModel
 
-from .ai_providers import AIProviderProtocol, AIProviderSlot
+from .ai_providers import AIProviderProtocol, AIProviderSlot, check_base_url
 
 # ==========================================
 # Fallback routes
@@ -132,6 +132,10 @@ class AIProviderModelsQuery(MealieModel):
     @field_validator("base_url", mode="before")
     def validate_as_none(val: Any | None) -> Any | None:
         return val or None
+
+    @field_validator("base_url")
+    def validate_base_url(val: str | None) -> str | None:
+        return check_base_url(val)
 
 
 class AIProviderModelInfo(MealieModel):

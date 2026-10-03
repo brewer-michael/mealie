@@ -63,6 +63,7 @@ export interface AIProviderOut {
     [k: string]: string;
   };
   id: string;
+  apiKeySet: boolean;
 }
 export interface AIProviderRouteOut {
   id: string;

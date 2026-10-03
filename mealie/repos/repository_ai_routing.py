@@ -145,12 +145,26 @@ class GroupRepositoryAIUsage(GroupRepositoryGeneric[AIUsageLogOut, AIUsageLog]):
         return list(criteria)
 
     def create(self, data: AIUsageLogCreate | dict) -> AIUsageLogOut:  # type: ignore[override]
-        """Logs one attempt. A group-scoped repository always logs it to its own group."""
-        data = data if isinstance(data, dict) else data.model_dump()
+        """
+        Logs one attempt. A group-scoped repository always logs it to its own group.
+
+        `provider_id` is kept only if it's one of the group's saved providers; usage of an unsaved
+        provider (e.g. a connection test) is logged without one.
+        """
+        data = dict(data) if isinstance(data, dict) else data.model_dump()
         if self.group_id:
             data["group_id"] = self.group_id
         elif not data.get("group_id"):
             raise ValueError("group_id is required to log AI usage outside a group-scoped repository")
+
+        if provider_id := data.get("provider_id"):
+            saved = self.session.execute(
+                sa.select(AIProvider.id)
+                .join(AIProviderSettings, AIProvider.settings_id == AIProviderSettings.id)
+                .where(AIProvider.id == provider_id, AIProviderSettings.group_id == data["group_id"])
+            ).scalar_one_or_none()
+            if saved is None:
+                data["provider_id"] = None
 
         return super().create(data)
 

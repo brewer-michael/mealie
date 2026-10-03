@@ -1,23 +1,30 @@
 """Integration tests for AI provider fallback routes, the usage summary and model lists (docs/ai/PHASE1.md)"""
 
 import json
+import threading
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import httpx2
 import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
 
 from mealie.db.db_setup import session_context
+from mealie.db.models.group.ai_providers import AIProvider
 from mealie.db.models.group.ai_routing import AIProviderRoute, AIUsageLog
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_ai_routing import month_range
 from mealie.repos.repository_factory import AllRepositories
+from mealie.routes.groups.controller_group_ai_routing import safe_models
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut, AIProviderSlot
-from mealie.schema.group.ai_routing import AIUsageLogCreate
+from mealie.schema.group.ai_routing import AIProviderModelInfo, AIUsageLogCreate
+from mealie.services.ai import anthropic_adapter
 from mealie.services.openai import OpenAIService
 from tests.utils import api_routes
 from tests.utils.factories import random_string
@@ -427,14 +434,69 @@ def test_list_models_error_never_returns_the_providers_response_body(
     assert "internal-host" not in response.text
 
 
-def test_list_models_for_anthropic_is_not_available_yet(api_client: TestClient, unique_user: TestUser):
+def _install_fake_anthropic(monkeypatch: pytest.MonkeyPatch, response: httpx2.Response) -> list[httpx2.Request]:
+    requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return response
+
+    get_client = anthropic_adapter.get_client
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "get_client",
+        lambda provider: get_client(provider).with_options(
+            max_retries=0, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        ),
+    )
+    return requests
+
+
+def test_list_models_for_anthropic(api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch):
+    models = [
+        {"type": "model", "id": "claude-b", "display_name": "Claude B", "created_at": "2026-01-01T00:00:00Z"},
+        {
+            "type": "model",
+            "id": "claude-a",
+            "display_name": "Claude A",
+            "created_at": "2026-01-01T00:00:00Z",
+            "capabilities": {"image_input": {"supported": True}},
+        },
+    ]
+    requests = _install_fake_anthropic(
+        monkeypatch, httpx2.Response(200, json={"data": models, "has_more": False, "first_id": None, "last_id": None})
+    )
+
     response = api_client.post(
         api_routes.groups_ai_providers_providers_models,
         json={"apiKey": "sk-ant", "protocol": "anthropic"},
         headers=unique_user.token,
     )
+    assert response.status_code == 200
+    assert response.json() == [
+        {"id": "claude-a", "displayName": "Claude A", "supportsImages": True},
+        {"id": "claude-b", "displayName": "Claude B", "supportsImages": None},
+    ]
+
+    (request,) = requests
+    assert str(request.url) == "https://api.anthropic.com/v1/models"
+    assert request.headers["x-api-key"] == "sk-ant"
+
+
+def test_list_models_for_anthropic_error_never_returns_the_providers_response_body(
+    api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    body = {"type": "error", "error": {"type": "authentication_error", "message": "top secret internal detail"}}
+    _install_fake_anthropic(monkeypatch, httpx2.Response(401, json=body))
+
+    response = api_client.post(
+        api_routes.groups_ai_providers_providers_models,
+        json={"apiKey": "sk-wrong", "protocol": "anthropic"},
+        headers=unique_user.token,
+    )
     assert response.status_code == 400
-    assert "Anthropic" in response.json()["detail"]["message"]
+    assert response.json()["detail"]["message"] == "AuthenticationError (HTTP 401)"
+    assert "secret" not in response.text
 
 
 def test_list_models_for_saved_provider_uses_the_saved_key(
@@ -442,7 +504,7 @@ def test_list_models_for_saved_provider_uses_the_saved_key(
 ):
     api = _FakeModelsAPI()
     api.install(monkeypatch)
-    provider = _create_provider(unique_user, base_url="https://saved.example.test/v1")
+    provider = _create_provider(unique_user, base_url="https://saved.example.test/v1", request_headers={"X-Saved": "1"})
 
     try:
         route = api_routes.groups_ai_providers_providers_provider_id_models(provider.id)
@@ -450,25 +512,172 @@ def test_list_models_for_saved_provider_uses_the_saved_key(
         assert response.status_code == 200
         assert [m["id"] for m in response.json()] == ["model-a", "model-b"]
 
-        # Unsaved edits: a blank key keeps the saved one
-        response = api_client.post(
-            route, json={"apiKey": "", "baseUrl": "https://edited.example.test/v1"}, headers=unique_user.token
-        )
-        assert response.status_code == 200
+        # Unsaved edits: fields left out keep their saved values, and a blank key keeps the saved one
+        for overrides in [{"apiKey": ""}, {"timeout": 5, "requestParams": {"p": "1"}}, {"protocol": "openai"}]:
+            response = api_client.post(route, json=overrides, headers=unique_user.token)
+            assert response.status_code == 200
 
+        # A new key can go anywhere (the saved headers still apply unless overridden)
         response = api_client.post(
             route, json={"apiKey": "sk-new", "baseUrl": "https://edited.example.test/v1"}, headers=unique_user.token
         )
         assert response.status_code == 200
 
-        sent = [(str(r.url), r.headers["Authorization"]) for r in api.requests]
+        sent = [(str(r.url), r.headers["Authorization"], r.headers.get("X-Saved")) for r in api.requests]
         assert sent == [
-            ("https://saved.example.test/v1/models", "Bearer saved-key"),
-            ("https://edited.example.test/v1/models", "Bearer saved-key"),
-            ("https://edited.example.test/v1/models", "Bearer sk-new"),
+            *[("https://saved.example.test/v1/models", "Bearer saved-key", "1")] * 4,
+            ("https://edited.example.test/v1/models", "Bearer sk-new", "1"),
         ]
     finally:
         unique_user.repos.group_ai_providers.delete(provider.id)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"baseUrl": "https://elsewhere.example.test/v1"},
+        {"apiKey": "", "baseUrl": "https://elsewhere.example.test/v1"},
+        {"baseUrl": None},  # the provider's default host
+        {"protocol": "anthropic"},
+        {"requestHeaders": {"X-Saved": "1", "X-Forwarded-Host": "elsewhere.example.test"}},
+    ],
+)
+def test_list_models_for_saved_provider_needs_the_key_again_for_a_new_destination(
+    api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch, overrides: dict
+):
+    """The saved key only goes where it was saved for; sending it elsewhere needs it entered again"""
+    api = _FakeModelsAPI()
+    api.install(monkeypatch)
+    provider = _create_provider(unique_user, base_url="https://saved.example.test/v1", request_headers={"X-Saved": "1"})
+
+    try:
+        route = api_routes.groups_ai_providers_providers_provider_id_models(provider.id)
+        response = api_client.post(route, json=overrides, headers=unique_user.token)
+        assert response.status_code == 400
+        assert "API key again" in response.json()["detail"]["message"]
+        assert api.requests == []
+    finally:
+        unique_user.repos.group_ai_providers.delete(provider.id)
+
+
+def test_list_models_for_saved_provider_with_a_query_in_its_base_url(
+    api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """New base URLs can't have a query string; one saved before that check isn't used to list models"""
+    api = _FakeModelsAPI()
+    api.install(monkeypatch)
+    provider = _create_provider(unique_user)
+    with session_context() as session:
+        session.execute(
+            sa.update(AIProvider)
+            .where(AIProvider.id == provider.id)
+            .values(base_url="https://internal-host.test/admin?q=")
+        )
+        session.commit()
+
+    try:
+        route = api_routes.groups_ai_providers_providers_provider_id_models(provider.id)
+        response = api_client.post(route, headers=unique_user.token)
+        assert response.status_code == 400
+        assert "query string" in response.json()["detail"]["message"]
+        assert api.requests == []
+
+        # It still loads, so it can be fixed
+        response = api_client.get(
+            api_routes.groups_ai_providers_providers_provider_id(provider.id), headers=unique_user.token
+        )
+        assert response.status_code == 200
+    finally:
+        unique_user.repos.group_ai_providers.delete(provider.id)
+
+
+class _ProbedHost(BaseHTTPRequestHandler):
+    """An internal host that answers anything with a JSON list whose ids are secrets, as a probe would find"""
+
+    SECRETS = [
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+        '{"password": "hunter2"}',
+        "postgres://admin:hunter2@db.internal:5432/prod",
+        "x" * 129,
+        "",
+    ]
+    MODELS = ["gpt-4o", "llama3.1:8b", "org/model@v1+q4", *(f"model-{i:04d}" for i in range(600))]
+
+    paths: list[str] = []
+
+    def do_GET(self) -> None:
+        _ProbedHost.paths.append(self.path)
+        ids = [*self.SECRETS, *self.MODELS]
+        body = json.dumps(
+            {"object": "list", "data": [{"id": x, "object": "model", "created": 0, "owned_by": "x"} for x in ids]}
+        ).encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+@pytest.fixture
+def probed_host() -> Generator[str]:
+    _ProbedHost.paths = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProbedHost)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_list_models_only_relays_model_ids(api_client: TestClient, unique_user: TestUser, probed_host: str):
+    """A manager can point base_url at an internal host; only model-like ids (at most 500) come back"""
+    response = api_client.post(
+        api_routes.groups_ai_providers_providers_models,
+        json={"apiKey": "sk-probe", "baseUrl": f"{probed_host}/internal/admin"},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+    assert _ProbedHost.paths == ["/internal/admin/models"]
+
+    ids = [model["id"] for model in response.json()]
+    assert len(ids) == 500
+    assert ids[:4] == ["gpt-4o", "llama3.1:8b", "model-0000", "model-0001"]
+    for secret in ["wJalrXUtnFEMI", "PRIVATE KEY", "hunter2", "x" * 129]:
+        assert secret not in response.text
+
+
+@pytest.mark.parametrize("suffix", ["?q=", "?", "#"])
+def test_list_models_rejects_a_query_in_the_base_url(
+    api_client: TestClient, unique_user: TestUser, probed_host: str, suffix: str
+):
+    # "<host>/internal/admin?q=" + "/models" would turn "/models" into a query value
+    response = api_client.post(
+        api_routes.groups_ai_providers_providers_models,
+        json={"apiKey": "sk-probe", "baseUrl": f"{probed_host}/internal/admin{suffix}"},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 422
+    assert _ProbedHost.paths == []
+
+
+def test_list_models_hides_display_names_that_dont_look_like_names():
+    models = [
+        AIProviderModelInfo(id="claude-a", display_name="Claude A (latest)", supports_images=True),
+        AIProviderModelInfo(id="claude-b", display_name="password=hunter2; token=abc", supports_images=None),
+        AIProviderModelInfo(id="not an id", display_name="Not an id", supports_images=None),
+    ]
+    assert safe_models(models) == [
+        AIProviderModelInfo(id="claude-a", display_name="Claude A (latest)", supports_images=True),
+        AIProviderModelInfo(id="claude-b", display_name=None, supports_images=None),
+    ]
 
 
 def test_list_models_for_saved_provider_not_found(

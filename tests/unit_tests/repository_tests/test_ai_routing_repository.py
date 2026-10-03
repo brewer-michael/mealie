@@ -62,6 +62,28 @@ def test_usage_create_uses_the_repository_group(unique_user: TestUser, g2_user: 
         unique_user.repos.group_ai_providers.delete(provider.id)
 
 
+def test_usage_create_keeps_only_the_groups_saved_providers(session, unique_user: TestUser, g2_user: TestUser):
+    """Usage of an unsaved provider has no provider row to point at (an FK violation on PostgreSQL)"""
+    provider, foreign = _create_provider(unique_user), _create_provider(g2_user)
+    unsaved = AIProviderOut(id=uuid4(), name="unsaved", model="m", api_key="k")
+
+    try:
+        usage = unique_user.repos.group_ai_usage
+        assert usage.create(_usage(provider, 1)).provider_id == provider.id
+        assert usage.create(_usage(unsaved, 1)).provider_id is None
+        assert usage.create(_usage(foreign, 1)).provider_id is None
+
+        # Outside a group-scoped repository, the row's own group decides
+        instance_usage = get_repositories(session, group_id=None, household_id=None).group_ai_usage
+        row = instance_usage.create(_usage(foreign, 1, group_id=g2_user.group_id))
+        assert (str(row.group_id), row.provider_id) == (g2_user.group_id, foreign.id)
+        row = instance_usage.create(_usage(provider, 1, group_id=g2_user.group_id))
+        assert (str(row.group_id), row.provider_id) == (g2_user.group_id, None)
+    finally:
+        unique_user.repos.group_ai_providers.delete(provider.id)
+        g2_user.repos.group_ai_providers.delete(foreign.id)
+
+
 def test_usage_create_needs_a_group(session):
     repos = get_repositories(session, group_id=None, household_id=None)
     entry = AIUsageLogCreate(provider_name="x", model="m", protocol="openai", slot="default", success=True)

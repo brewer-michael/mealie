@@ -1,8 +1,10 @@
 """
-Fork-owned AI provider routes: per-slot fallback routes, the usage summary and model lists
-(docs/ai/PHASE1.md). Kept apart from upstream's `controller_group_ai_providers.py` to avoid sync conflicts.
+Fork-owned AI provider routes: the managers' provider list, per-slot fallback routes, the usage summary
+and model lists (docs/ai/PHASE1.md). Kept apart from upstream's `controller_group_ai_providers.py` to
+avoid sync conflicts.
 """
 
+import re
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -12,7 +14,7 @@ from pydantic import UUID4
 from mealie.repos.repository_ai_routing import as_utc, month_range
 from mealie.routes._base import controller
 from mealie.routes._base.base_controllers import BaseUserController
-from mealie.schema.group.ai_providers import AIProviderOut
+from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut, check_base_url
 from mealie.schema.group.ai_routing import (
     AIProviderModelInfo,
     AIProviderModelsQuery,
@@ -26,9 +28,73 @@ from mealie.services.openai import OpenAIService
 
 router = APIRouter(prefix="/groups/ai-providers", tags=["Groups: AI Provider Routing"])
 
+MODEL_ID_PATTERN = re.compile(r"[\w.:/@+-]{1,128}")
+MODEL_NAME_PATTERN = re.compile(r"[\w .:/@+()-]{1,128}")
+MAX_MODELS = 500
+"""
+Model lists come from whatever host `base_url` names, so only model-like ids and names (and at most
+`MAX_MODELS` of them) are passed on: the endpoint mustn't relay arbitrary data from internal hosts.
+"""
+
+_CONNECTION_FIELDS = ("protocol", "base_url", "timeout", "request_headers", "request_params")
+"""The `AIProviderModelsQuery` fields a saved provider's model list can override"""
+
+
+def require_api_key_for_new_destination(saved: AIProviderOut, edited: AIProviderCreate, api_key: str) -> None:
+    """
+    Unsaved edits to a saved provider may reuse its stored key (a blank `api_key`) only while the key
+    still goes where it was saved for. Raises a 400 asking for the key again if `edited` changes the
+    protocol, base URL or request headers.
+    """
+    if api_key:
+        return
+
+    if (edited.protocol, edited.base_url, edited.request_headers) != (
+        saved.protocol,
+        saved.base_url,
+        saved.request_headers,
+    ):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=ErrorResponse.respond(
+                message="Enter the API key again to use it with a different API type, base URL or request headers."
+            ),
+        )
+
+
+def safe_models(models: list[AIProviderModelInfo]) -> list[AIProviderModelInfo]:
+    """The first `MAX_MODELS` models with a model-like id; display names that don't look like one are dropped"""
+    safe: list[AIProviderModelInfo] = []
+    for model in models:
+        if not MODEL_ID_PATTERN.fullmatch(model.id):
+            continue
+
+        if model.display_name and not MODEL_NAME_PATTERN.fullmatch(model.display_name):
+            model = model.model_copy(update={"display_name": None})
+
+        safe.append(model)
+        if len(safe) >= MAX_MODELS:
+            break
+
+    return safe
+
 
 @controller(router)
 class GroupAIProviderRoutingController(BaseUserController):
+    # ==========================================
+    # Providers
+
+    @router.get("/providers", response_model=list[AIProviderOut])
+    def get_ai_providers(self) -> list[AIProviderOut]:
+        """
+        The group's providers, by name, without their API keys. `apiKeySet` is false for a key that can't
+        be read (e.g. after `.secret` changed). Unlike the provider list in `/groups/self`, this is for
+        group managers only, so it can say so.
+        """
+        self.checks.can_manage()
+
+        return sorted(self.repos.group_ai_providers.get_all(), key=lambda provider: provider.name.casefold())
+
     # ==========================================
     # Fallback routes
 
@@ -81,7 +147,13 @@ class GroupAIProviderRoutingController(BaseUserController):
 
     async def _list_models(self, provider: AIProviderOut) -> list[AIProviderModelInfo]:
         try:
-            return await OpenAIService(self.repos).list_models(provider)
+            # A provider saved before base URLs were checked may still have a query string
+            check_base_url(provider.base_url)
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ErrorResponse.respond(message=str(e))) from None
+
+        try:
+            return safe_models(await OpenAIService(self.repos).list_models(provider))
         except Exception as e:
             # Only the error's type and status reach the caller (see `describe_provider_error`)
             self.logger.exception("Listing AI provider models failed")
@@ -121,7 +193,8 @@ class GroupAIProviderRoutingController(BaseUserController):
         List the models a saved provider offers, with its saved API key.
 
         Like the saved-provider connection test, this accepts unsaved edits to use instead of what's
-        stored; a blank `apiKey` keeps the saved key.
+        stored. Fields left out keep their saved values. A blank `apiKey` keeps the saved key, but only
+        while the protocol, base URL and request headers are unchanged; otherwise it's a 400.
         """
         self.checks.can_manage()
 
@@ -130,14 +203,13 @@ class GroupAIProviderRoutingController(BaseUserController):
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail=ErrorResponse.respond(message="Not found."))
 
         if overrides:
-            provider = provider.model_copy(
-                update={
-                    "protocol": overrides.protocol,
-                    "base_url": overrides.base_url,
-                    "timeout": overrides.timeout,
-                    "request_headers": overrides.request_headers,
-                    "request_params": overrides.request_params,
-                    **({"api_key": overrides.api_key} if overrides.api_key else {}),
-                }
+            changes = {
+                name: getattr(overrides, name) for name in _CONNECTION_FIELDS if name in overrides.model_fields_set
+            }
+            edited = provider.model_copy(
+                update={**changes, **({"api_key": overrides.api_key} if overrides.api_key else {})}
             )
+            require_api_key_for_new_destination(provider, edited, overrides.api_key)
+            provider = edited
+
         return await self._list_models(provider)
