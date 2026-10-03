@@ -28,6 +28,8 @@ from .repository_generic import GroupRepositoryGeneric
 
 TOKEN_RETENTION = timedelta(days=30)
 """How long expired or revoked tokens are kept, so reuse of a recent one is still recognised"""
+MAX_PENDING_REQUESTS = 50
+"""Per client. Anyone who knows a client id can start an authorization, so only the newest requests are kept."""
 
 
 def _rowcount(result: sa.Result) -> int:
@@ -40,8 +42,11 @@ class RepositoryMcpOAuthClients(GroupRepositoryGeneric[McpClientOut, McpOAuthCli
     def __init__(self, session: Session, *, group_id: UUID4 | None) -> None:
         super().__init__(session, "id", McpOAuthClient, McpClientOut, group_id=group_id)
 
-    def get_row(self, client_pk: UUID4) -> McpOAuthClient | None:
+    def get_row(self, client_pk: UUID4, *, for_update: bool = False) -> McpOAuthClient | None:
+        """`for_update` locks the row until the transaction ends (see `RepositoryMcpOAuth.get_client`)"""
         stmt = sa.select(McpOAuthClient).filter_by(**self._filter_builder(id=client_pk))
+        if for_update:
+            stmt = stmt.with_for_update()
         return self.session.execute(stmt).scalars().one_or_none()
 
     def delete(self, value, match_key: str | None = None) -> McpClientOut:
@@ -71,9 +76,16 @@ class RepositoryMcpOAuth:
     # ==========================================
     # Clients
 
-    def get_client(self, client_id: str) -> McpOAuthClient | None:
-        """By the public `client_id`"""
+    def get_client(self, client_id: str, *, for_update: bool = False) -> McpOAuthClient | None:
+        """
+        By the public `client_id`. `for_update` locks the row until the transaction ends (PostgreSQL; SQLite runs
+        one write transaction at a time anyway). Whatever issues or revokes a client's tokens takes the lock first,
+        so a revocation can't miss tokens a concurrent grant is about to commit: under READ COMMITTED, an UPDATE
+        only sees rows committed before it started.
+        """
         stmt = sa.select(McpOAuthClient).where(McpOAuthClient.client_id == client_id)
+        if for_update:
+            stmt = stmt.with_for_update()
         return self.session.execute(stmt).scalars().one_or_none()
 
     def get_user(self, user_id: UUID4) -> User | None:
@@ -83,11 +95,19 @@ class RepositoryMcpOAuth:
     # Pending requests
 
     def add_request(self, request: McpOAuthRequest, now: datetime) -> None:
-        # Unauthenticated requests create these rows, so a client's expired ones go whenever it gets a new one
+        # Unauthenticated requests create these rows, so whenever a client gets a new one, its expired ones go, and
+        # so do all but its newest
+        of_client = McpOAuthRequest.oauth_client_id == request.oauth_client_id
+        newest = (
+            sa.select(McpOAuthRequest.id)
+            .where(of_client, McpOAuthRequest.expires_at > now)
+            .order_by(McpOAuthRequest.created_at.desc())
+            .limit(MAX_PENDING_REQUESTS - 1)
+        )
         self.session.execute(
-            sa.delete(McpOAuthRequest).where(
-                McpOAuthRequest.oauth_client_id == request.oauth_client_id, McpOAuthRequest.expires_at <= now
-            )
+            sa.delete(McpOAuthRequest)
+            .where(of_client, McpOAuthRequest.id.not_in(newest))
+            .execution_options(synchronize_session=False)
         )
         self.session.add(request)
 
@@ -169,6 +189,8 @@ class RepositoryMcpOAuth:
 
     def revoke_user_client(self, user_id: UUID4, client_pk: UUID4, now: datetime) -> int:
         """Revokes every token the user has for that client, and its unused codes. Returns how many were live."""
+        # waits for a grant in progress to commit (see `get_client`)
+        self.session.execute(sa.select(McpOAuthClient.id).where(McpOAuthClient.id == client_pk).with_for_update())
         self.session.execute(
             sa.delete(McpOAuthCode).where(McpOAuthCode.user_id == user_id, McpOAuthCode.oauth_client_id == client_pk)
         )
@@ -186,8 +208,9 @@ class RepositoryMcpOAuth:
         return _rowcount(result)
 
     def touch(self, token_id: UUID4, client_pk: UUID4, now: datetime) -> None:
-        self.session.execute(sa.update(McpOAuthToken).where(McpOAuthToken.id == token_id).values(last_used_at=now))
+        # the client's row first, like everything else that locks both (see `get_client`), so they can't deadlock
         self.session.execute(sa.update(McpOAuthClient).where(McpOAuthClient.id == client_pk).values(last_used_at=now))
+        self.session.execute(sa.update(McpOAuthToken).where(McpOAuthToken.id == token_id).values(last_used_at=now))
 
     def connections(self, user_id: UUID4, now: datetime) -> list[McpConnection]:
         """The user's connections: clients with a live (unrevoked, unexpired) token, oldest first"""

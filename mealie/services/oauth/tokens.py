@@ -6,7 +6,7 @@ import hmac
 import re
 import secrets
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 SCOPE_READ = "mcp:read"
 SCOPE_WRITE = "mcp:write"
@@ -67,6 +67,16 @@ def pkce_matches(verifier: str, challenge: str) -> bool:
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return hmac.compare_digest(computed, challenge)
+
+
+def predates_password_change(issued_at: datetime, tokens_valid_after: datetime | None) -> bool:
+    """
+    Whether a code or token issued at `issued_at` predates the user's last password change (upstream's
+    `tokens_valid_after`). That is floored to whole seconds, so all of its second counts as before it: a token
+    refreshed earlier in the same second must not outlive the change. The change also revokes them in the database
+    (`mealie.db.models.ai_mcp`); this is the backstop.
+    """
+    return tokens_valid_after is not None and issued_at < tokens_valid_after + timedelta(seconds=1)
 
 
 def format_scopes(scopes: Iterable[str]) -> str:

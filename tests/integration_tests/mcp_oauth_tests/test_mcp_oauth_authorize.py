@@ -11,7 +11,8 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from mealie.db.db_setup import session_context
-from mealie.db.models.ai_mcp import McpOAuthRequest
+from mealie.db.models.ai_mcp import McpOAuthClient, McpOAuthRequest
+from mealie.repos.repository_mcp import MAX_PENDING_REQUESTS
 from mealie.services.oauth.tokens import hash_secret
 from tests.utils import api_routes
 from tests.utils.fixture_schemas import TestUser
@@ -206,6 +207,19 @@ def test_repeated_parameters_are_refused(api_client: TestClient, unique_user: Te
     assert "state" not in redirect
 
 
+def test_overlong_requests_are_refused(api_client: TestClient, unique_user: TestUser):
+    """Anyone can make a pending request, so what one stores is bounded"""
+    client = create_client(api_client, unique_user)
+    consent_handle(authorize(api_client, authorize_params(client, state="s" * 2048)))
+
+    redirect = _error_redirect(authorize(api_client, authorize_params(client, state="s" * 2049)))
+    assert redirect["error"] == "invalid_request"
+    assert "state" not in redirect
+
+    # a request this long isn't read at all
+    _assert_error_page(authorize(api_client, authorize_params(client, prompt="p" * 8192)))
+
+
 def test_resource_defaults_to_this_server_and_may_be_given(api_client: TestClient, unique_user: TestUser):
     client = create_client(api_client, unique_user)
     for resource in (None, f"{ORIGIN}/api/mcp", f"{ORIGIN}/api/mcp/"):
@@ -312,6 +326,21 @@ def test_consent_shows_the_request(api_client: TestClient, unique_user: TestUser
     assert body["writesOffered"] is False
 
 
+def test_consent_shows_an_international_host_in_ascii(api_client: TestClient, unique_user: TestUser):
+    """So a lookalike letter from another script stands out. Registration refuses such hosts in the first place."""
+    lookalike = "https://my.home-assіstant.io/redirect/oauth"  # with a Cyrillic "і"
+    client = create_client(api_client, unique_user)
+    with session_context() as session:
+        session.execute(
+            sa.update(McpOAuthClient).where(McpOAuthClient.id == client["id"]).values(redirect_uris=[lookalike])
+        )
+        session.commit()
+
+    handle = consent_handle(authorize(api_client, authorize_params(client, redirect_uri=lookalike)))
+    body = api_client.get(api_routes.oauth_requests_handle(handle), headers=unique_user.token).json()
+    assert body["redirectHost"] == "my.xn--home-assstant-bil.io"
+
+
 @pytest.mark.parametrize(
     "allow_writes, writable, scope",
     [(False, True, "mcp:read"), (True, True, "mcp:read mcp:write"), (True, False, "mcp:read")],
@@ -355,6 +384,23 @@ def test_each_request_is_decided_once(api_client: TestClient, unique_user: TestU
     assert decide(api_client, unique_user, handle).status_code == 404
     assert decide(api_client, unique_user, handle, approve=False).status_code == 404
     assert api_client.get(api_routes.oauth_requests_handle(handle), headers=unique_user.token).status_code == 404
+
+
+def test_only_a_clients_newest_pending_requests_are_kept(api_client: TestClient, unique_user: TestUser):
+    """Anyone who knows a client ID can make pending requests: they can't pile up"""
+    client, other = create_client(api_client, unique_user), create_client(api_client, unique_user)
+    others = consent_handle(authorize(api_client, authorize_params(other)))
+    handles = [consent_handle(authorize(api_client, authorize_params(client))) for _ in range(MAX_PENDING_REQUESTS + 2)]
+
+    with session_context() as session:
+        pending = session.execute(
+            sa.select(sa.func.count()).where(McpOAuthRequest.oauth_client_id == client["id"])
+        ).scalar_one()
+    assert pending == MAX_PENDING_REQUESTS == 50
+    for handle, status_code in ((handles[0], 404), (handles[1], 404), (handles[2], 200), (handles[-1], 200)):
+        response = api_client.get(api_routes.oauth_requests_handle(handle), headers=unique_user.token)
+        assert response.status_code == status_code
+    assert api_client.get(api_routes.oauth_requests_handle(others), headers=unique_user.token).status_code == 200
 
 
 def test_requests_expire(api_client: TestClient, unique_user: TestUser):

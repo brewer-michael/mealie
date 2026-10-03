@@ -9,23 +9,25 @@ Bearer token verification for the MCP endpoint (docs/ai/PHASE3.md §2-3).
 Anything else is refused, session JWTs and cookies included: a browser session can't drive MCP, and an MCP
 server must not accept tokens that weren't issued for it.
 
-It's synchronous and does its own database work, so callers run it in a worker thread, never on the event loop.
-Results are cached for `PRINCIPAL_CACHE_TTL` seconds, keyed by the token's SHA-256, because Home Assistant
-authenticates four requests per tool call. Revoking a token, disconnecting an app, deleting a client, an API token or
-a user, changing a password, or changing a write grant drops the affected entries from this process's cache; other
-worker processes notice within `PRINCIPAL_CACHE_TTL`.
+It's synchronous and does its own database work, so callers run it in a worker thread, never on the event loop;
+`cached_mcp_principal` is the part that may run there. Results are cached for `PRINCIPAL_CACHE_TTL` seconds, keyed by
+the token's SHA-256, because Home Assistant authenticates four requests per tool call. Revoking a token,
+disconnecting an app, deleting a client, an API token or a user, changing a user (their password, household, group
+or permissions), or changing a write grant drops the affected entries from this process's cache once the change is
+committed; other worker processes notice within `PRINCIPAL_CACHE_TTL`.
 """
 
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic
+from typing import Any
 
 import jwt
 from fastapi import HTTPException
 from jwt.exceptions import PyJWTError
 from pydantic import UUID4
-from sqlalchemy import event, select
+from sqlalchemy import event, orm, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from mealie.core.config import get_app_settings
@@ -45,6 +47,7 @@ from mealie.services.oauth.tokens import (
     SCOPE_WRITE,
     SUPPORTED_SCOPES,
     hash_secret,
+    predates_password_change,
 )
 from mealie.services.oauth.urls import canonical_resource, protected_resource_metadata_url
 
@@ -200,17 +203,36 @@ def _deadline(expires_at: datetime) -> float:
 # Verification
 
 
+def _cache_lookup(token: str, resource: str) -> tuple[str, str] | None:
+    """`(cache key, audience)` to verify `token` at `resource` with, or `None` if it can't be valid there"""
+    audience = canonical_resource(resource)
+    if not token or len(token) > MAX_TOKEN_LENGTH or audience is None:
+        return None
+    return hash_secret(token), audience
+
+
+def cached_mcp_principal(token: str, resource: str) -> McpPrincipal | None:
+    """
+    What `verify_mcp_token` would return from this process's cache, without it: the principal if `token` was
+    verified for `resource` in the last `PRINCIPAL_CACHE_TTL` seconds and nothing has invalidated it, else `None`
+    (which says nothing about the token). Never uses the database, so it may run on the event loop, sparing a
+    cached request the hop to a worker thread.
+    """
+    lookup = _cache_lookup(token, resource)
+    return _cache.get(*lookup) if lookup is not None else None
+
+
 def verify_mcp_token(token: str, resource: str) -> McpPrincipal | None:
     """
     The principal `token` authenticates at the MCP endpoint `resource` (this server's `/api/mcp` URL, see
     `mealie.services.oauth.urls.mcp_url`), or `None` if it doesn't. Synchronous and uses the database: run it in a
     worker thread.
     """
-    audience = canonical_resource(resource)
-    if not token or len(token) > MAX_TOKEN_LENGTH or audience is None:
+    lookup = _cache_lookup(token, resource)
+    if lookup is None:
         return None
 
-    key = hash_secret(token)
+    key, audience = lookup
     if (principal := _cache.get(key, audience)) is not None:
         return principal
 
@@ -250,8 +272,9 @@ def _verify_access_token(token_hash: str, audience: str) -> _CacheEntry | None:
             if user is None or user.group_id != client.group_id:
                 return None
 
-            # A password change evicts every token issued before it, as upstream does for its own tokens
-            if user.tokens_valid_after is not None and token.created_at < user.tokens_valid_after:
+            # A password change evicts every token issued before it, as upstream does for its own tokens. It revokes
+            # them too; this covers a token issued while the change was being committed.
+            if predates_password_change(token.created_at, user.tokens_valid_after):
                 return None
 
             scopes = frozenset(token.scopes.split())
@@ -307,9 +330,14 @@ def _verify_api_token(token: str) -> _CacheEntry | None:
             except HTTPException:
                 return None
 
+            # Two API tokens given the same name in the same second are the same JWT (upstream doesn't make
+            # `token` unique). Upstream authenticates with the first row it finds; here the first row's grant applies.
             token_id = session.execute(
-                select(LongLiveToken.id).where(LongLiveToken.token == token, LongLiveToken.user_id == user.id)
-            ).scalar_one_or_none()
+                select(LongLiveToken.id)
+                .where(LongLiveToken.token == token, LongLiveToken.user_id == user.id)
+                .order_by(LongLiveToken.id)
+                .limit(1)
+            ).scalar()
             if token_id is None:
                 return None
 
@@ -350,25 +378,52 @@ def mcp_www_authenticate(origin: str, error: str | None = "invalid_token") -> st
 
 
 # ==========================================
-# Invalidation on changes made anywhere (upstream's routes included), for this process
+# Invalidation on changes made anywhere (upstream's routes included), for this process. The changes are seen at flush
+# and applied once committed: dropping entries any earlier would let a verification that reads the database before
+# the commit cache what it's about to replace.
+
+_PENDING_INVALIDATIONS = "mcp_principal_invalidations"
+"""`Session.info` key of the invalidations waiting for the session's commit"""
+
+
+def _invalidate_on_commit(target: object, **kwargs: Any) -> None:
+    session = orm.object_session(target)
+    if session is None:
+        invalidate_mcp_principals(**kwargs)
+        return
+    session.info.setdefault(_PENDING_INVALIDATIONS, []).append(kwargs)
+
+
+@event.listens_for(orm.Session, "after_commit")
+def _apply_invalidations(session: orm.Session) -> None:
+    for kwargs in session.info.pop(_PENDING_INVALIDATIONS, ()):
+        invalidate_mcp_principals(**kwargs)
+
+
+@event.listens_for(orm.Session, "after_transaction_end")
+def _discard_invalidations(session: orm.Session, transaction: orm.SessionTransaction) -> None:
+    # after a commit, nothing is left; after a rollback (or a close without commit), the changes never happened
+    if transaction.parent is None:
+        session.info.pop(_PENDING_INVALIDATIONS, None)
 
 
 @event.listens_for(User, "after_delete")
 def _user_deleted(_mapper, _connection, target: User) -> None:
-    invalidate_mcp_principals(user_id=target.id)
+    _invalidate_on_commit(target, user_id=target.id)
 
 
-@event.listens_for(User.tokens_valid_after, "set")
-def _password_changed(target: User, value: datetime | None, _old, _initiator) -> None:
-    if value is not None and target.id is not None:
-        invalidate_mcp_principals(user_id=target.id)
+@event.listens_for(User, "after_update")
+def _user_updated(_mapper, _connection, target: User) -> None:
+    # Any change: a new password evicts their tokens, and their household, group and permissions are in the
+    # principal. Users change rarely, so this costs next to nothing.
+    _invalidate_on_commit(target, user_id=target.id)
 
 
 @event.listens_for(LongLiveToken, "after_delete")
 def _api_token_deleted(_mapper, _connection, target: LongLiveToken) -> None:
-    invalidate_mcp_principals(api_token_id=target.id)
+    _invalidate_on_commit(target, api_token_id=target.id)
 
 
 @event.listens_for(McpOAuthClient, "after_delete")
 def _client_deleted(_mapper, _connection, target: McpOAuthClient) -> None:
-    invalidate_mcp_principals(oauth_client_id=target.id)
+    _invalidate_on_commit(target, oauth_client_id=target.id)

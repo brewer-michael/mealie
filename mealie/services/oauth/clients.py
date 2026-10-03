@@ -111,7 +111,8 @@ class McpClientService:
 
     def delete(self, client_pk: UUID4) -> McpClientOut | None:
         """Deletes a client, revoking all its tokens"""
-        if self.clients.get_row(client_pk) is None:
+        # locked first, so the delete waits for a grant in progress (see `RepositoryMcpOAuth.get_client`)
+        if self.clients.get_row(client_pk, for_update=True) is None:
             return None
 
         deleted = self.clients.delete(client_pk)

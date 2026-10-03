@@ -4,15 +4,16 @@ authorization requests, authorization codes, access and refresh tokens, and the 
 
 Kept apart from upstream's model packages so upstream syncs don't conflict. The relationships back to upstream's
 models are declared here as backrefs for the same reason. They are what delete these rows along with a group, a
-user or an API token: SQLite doesn't enforce foreign keys, so the database itself won't.
+user or an API token: SQLite doesn't enforce foreign keys, so the database itself won't. A listener here likewise
+revokes a user's tokens when their password changes.
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
-from sqlalchemy import orm
+from sqlalchemy import event, orm
 from sqlalchemy.types import TypeDecorator
 
 from ._model_base import BaseMixins, SqlAlchemyBase
@@ -187,3 +188,34 @@ class McpApiTokenGrant(SqlAlchemyBase, BaseMixins):
     )
 
     allow_writes: orm.Mapped[bool] = orm.mapped_column(sa.Boolean, nullable=False, default=False)
+
+
+@event.listens_for(User, "after_update")
+def _revoke_on_password_change(_mapper: orm.Mapper, connection: sa.Connection, target: User) -> None:
+    """
+    A password change (upstream stamps `tokens_valid_after`, whichever path makes it: the user's own change, a reset
+    by email, the `change_password` script) revokes the user's MCP tokens and deletes their unused codes, in the same
+    transaction. Comparing issue times alone can't tell a token refreshed in the second of the change from one issued
+    after it, since `tokens_valid_after` is whole seconds, and would leave the dead connection listed as connected.
+    """
+    # (without loading the attribute when it wasn't set)
+    history = orm.attributes.get_history(target, "tokens_valid_after", orm.attributes.PASSIVE_NO_INITIALIZE)
+    if not history.has_changes() or target.tokens_valid_after is None:
+        return
+
+    # First the locks that issuing or revoking a client's tokens takes (`RepositoryMcpOAuth.get_client`): a grant
+    # being committed meanwhile is then seen, rather than keeping what it issued (READ COMMITTED). The user can only
+    # connect their group's clients.
+    group_id = sa.select(User.group_id).where(User.id == target.id).scalar_subquery()
+    connection.execute(
+        sa.select(McpOAuthClient.id)
+        .where(McpOAuthClient.group_id == group_id)
+        .order_by(McpOAuthClient.id)
+        .with_for_update()
+    )
+    connection.execute(
+        sa.update(McpOAuthToken)
+        .where(McpOAuthToken.user_id == target.id, McpOAuthToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(UTC))
+    )
+    connection.execute(sa.delete(McpOAuthCode).where(McpOAuthCode.user_id == target.id))

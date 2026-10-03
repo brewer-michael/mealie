@@ -22,6 +22,8 @@ router = APIRouter(prefix="/oauth", tags=["MCP: OAuth"])
 
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 """RFC 6749 §5.1: token responses must not be cached"""
+MAX_AUTHORIZE_QUERY_LENGTH = 8192
+"""Anyone can send an authorization request: a longer one isn't read at all"""
 
 
 def _error_page(message: str) -> HTMLResponse:
@@ -58,6 +60,9 @@ def authorize(request: Request, session: Session = Depends(generate_session)) ->
     RFC 6749 §4.1.1. Sends the browser to the consent page (`/oauth/consent?request=…`), or back to the client
     with an error. A request naming an unknown client or an unregistered redirect URI gets an error page instead.
     """
+    if len(request.scope.get("query_string", b"")) > MAX_AUTHORIZE_QUERY_LENGTH:
+        return _error_page("The request is too long.")
+
     try:
         location = McpAuthorizationServer(session).authorize(
             request.query_params.multi_items(), request_origin(request.scope)

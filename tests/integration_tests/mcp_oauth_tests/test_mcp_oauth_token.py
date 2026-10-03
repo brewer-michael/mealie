@@ -5,7 +5,10 @@ RFC 7009, OAuth 2.1 refresh token rotation)
 
 import asyncio
 import base64
+import contextlib
 import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -18,7 +21,12 @@ from sqlalchemy import event
 from mealie.app import app
 from mealie.db.db_setup import engine, session_context
 from mealie.db.models.ai_mcp import McpOAuthCode, McpOAuthToken
+from mealie.repos.all_repositories import get_repositories
+from mealie.repos.repository_mcp import RepositoryMcpOAuth
 from mealie.services.ai.mcp.auth import verify_mcp_token
+from mealie.services.oauth.clients import McpConnectionService
+from mealie.services.oauth.errors import OAuthError
+from mealie.services.oauth.server import McpAuthorizationServer
 from mealie.services.oauth.tokens import hash_secret
 from tests.utils import api_routes
 from tests.utils.fixture_schemas import TestUser
@@ -415,6 +423,173 @@ def test_revoke_authenticates_the_client(api_client: TestClient, unique_user: Te
     )
     assert response.status_code == 200
     assert verify_mcp_token(tokens["access_token"], MCP_URL) is None
+
+
+# ==========================================
+# Concurrent requests
+
+
+def _live_tokens(client: dict[str, Any]) -> int:
+    with session_context() as session:
+        return session.execute(
+            sa.select(sa.func.count())
+            .select_from(McpOAuthToken)
+            .where(McpOAuthToken.oauth_client_id == client["id"], McpOAuthToken.revoked_at.is_(None))
+        ).scalar_one()
+
+
+def _record_results(monkeypatch: pytest.MonkeyPatch, name: str) -> list[bool]:
+    """What each call of `RepositoryMcpOAuth.<name>` returns"""
+    results: list[bool] = []
+    method = getattr(RepositoryMcpOAuth, name)
+
+    def recorded(self: RepositoryMcpOAuth, *args: Any) -> bool:
+        results.append(method(self, *args))
+        return results[-1]
+
+    monkeypatch.setattr(RepositoryMcpOAuth, name, recorded)
+    return results
+
+
+def _all_at_once(monkeypatch: pytest.MonkeyPatch, count: int, params: list[tuple[str, str]]) -> tuple[list[str], bool]:
+    """
+    Makes the same token request from `count` threads, each with its own session, held back once they've checked
+    the code or refresh token until all of them have, so that they race to use it. Returns each one's outcome ("ok"
+    or the OAuth error), and whether they raced: on PostgreSQL, the client's row lock lets one in at a time.
+    """
+    barrier = threading.Barrier(count, timeout=1)
+    check_user = McpAuthorizationServer._check_user
+
+    def check_user_then_wait(self: McpAuthorizationServer, *args: Any) -> Any:
+        user = check_user(self, *args)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        return user
+
+    monkeypatch.setattr(McpAuthorizationServer, "_check_user", check_user_then_wait)
+    outcomes = [""] * count
+
+    def request(i: int) -> None:
+        with session_context() as session:
+            try:
+                McpAuthorizationServer(session).token(params, None)
+                outcomes[i] = "ok"
+            except OAuthError as e:
+                outcomes[i] = e.error
+
+    threads = [threading.Thread(target=request, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return outcomes, not barrier.broken
+
+
+def test_concurrent_exchanges_of_a_code(api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch):
+    """Only one gets tokens. The others count as reuse (RFC 6749 §4.1.2), which revokes the winner's tokens too."""
+    client = create_client(api_client, unique_user)
+    code = get_code(api_client, unique_user, client)
+    claims = _record_results(monkeypatch, "claim_code")
+
+    outcomes, raced = _all_at_once(
+        monkeypatch,
+        4,
+        [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", HA_REDIRECT_URI),
+            ("client_id", client["clientId"]),
+            ("client_secret", client["clientSecret"]),
+        ],
+    )
+
+    assert sorted(outcomes) == ["invalid_grant"] * 3 + ["ok"]
+    if raced:
+        # all four found the code unused: three lost the claim
+        assert sorted(claims) == [False, False, False, True]
+    assert _live_tokens(client) == 0
+
+
+def test_concurrent_refreshes(api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch):
+    """Only one rotates the refresh token. The others count as replays (OAuth 2.1 §4.3.1): the family is revoked."""
+    client = create_client(api_client, unique_user)
+    tokens = connect(api_client, unique_user, client)
+    rotations = _record_results(monkeypatch, "rotate")
+
+    outcomes, raced = _all_at_once(
+        monkeypatch,
+        4,
+        [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", tokens["refresh_token"]),
+            ("client_id", client["clientId"]),
+            ("client_secret", client["clientSecret"]),
+        ],
+    )
+
+    assert sorted(outcomes) == ["invalid_grant"] * 3 + ["ok"]
+    if raced:
+        # all four found the refresh token unrevoked: three lost the rotation
+        assert sorted(rotations) == [False, False, False, True]
+    assert _live_tokens(client) == 0
+
+
+@pytest.mark.parametrize("revocation", ["disconnect", "password change"])
+def test_a_revocation_during_a_refresh_revokes_its_tokens(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, revocation: str
+):
+    """
+    A disconnect or password change made while a refresh is being committed waits for it, and revokes the tokens it
+    issued. (On PostgreSQL, an UPDATE doesn't see rows committed after it started: without the client's row lock,
+    they'd live.)
+    """
+    user = unique_user_fn_scoped
+    client = create_client(api_client, user)
+    tokens = connect(api_client, user, client)
+    rotated, revoking = threading.Event(), threading.Event()
+    rotate: Callable[..., bool] = RepositoryMcpOAuth.rotate
+
+    def rotate_then_wait(self: RepositoryMcpOAuth, *args: Any) -> bool:
+        result = rotate(self, *args)
+        rotated.set()
+        revoking.wait(timeout=5)
+        time.sleep(0.3)  # for the revocation to get as far as it can
+        return result
+
+    monkeypatch.setattr(RepositoryMcpOAuth, "rotate", rotate_then_wait)
+    refreshed: dict[str, Any] = {}
+
+    def refresh_in_thread() -> None:
+        params = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", tokens["refresh_token"]),
+            ("client_id", client["clientId"]),
+            ("client_secret", client["clientSecret"]),
+        ]
+        with session_context() as session:
+            refreshed.update(McpAuthorizationServer(session).token(params, None))
+
+    thread = threading.Thread(target=refresh_in_thread)
+    thread.start()
+    try:
+        assert rotated.wait(timeout=5)
+        with session_context() as session:
+            users = get_repositories(session, group_id=None, household_id=None).users
+            revoking.set()
+            if revocation == "disconnect":
+                private_user = users.get_one(user.user_id)
+                assert private_user is not None
+                assert McpConnectionService(session, private_user).disconnect(client["id"])
+            else:
+                users.update_password(user.user_id, "a-new-password-hash")
+    finally:
+        revoking.set()
+        thread.join()
+
+    assert refreshed["access_token"]
+    assert _live_tokens(client) == 0
+    assert verify_mcp_token(refreshed["access_token"], MCP_URL) is None
+    _assert_error(refresh(api_client, client, refreshed["refresh_token"]), "invalid_grant")
 
 
 # ==========================================

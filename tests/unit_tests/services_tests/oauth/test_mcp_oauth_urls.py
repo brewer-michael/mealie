@@ -1,7 +1,10 @@
 """The MCP authorization server's URL rules and secrets (docs/ai/PHASE3.md §4)"""
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
+from mealie.core.config import get_app_settings
 from mealie.services.oauth.tokens import (
     format_scopes,
     hash_secret,
@@ -9,11 +12,13 @@ from mealie.services.oauth.tokens import (
     new_client_id,
     new_secret,
     pkce_matches,
+    predates_password_change,
     secret_matches,
 )
 from mealie.services.oauth.urls import (
     canonical_resource,
     check_redirect_uri,
+    display_host,
     is_local_host,
     mcp_url,
     protected_resource_metadata_url,
@@ -56,6 +61,36 @@ def test_request_origin_falls_back_to_the_server_address(host: str | None):
     assert request_origin(_scope(host)) == "http://10.0.0.2:9000"
     assert request_origin(_scope(host, server=("::1", 9000))) == "http://[::1]:9000"
     assert request_origin(_scope(host, server=None)) == "http://localhost"
+
+
+@pytest.mark.parametrize(
+    "base_url, scheme, host, origin",
+    [
+        # a TLS proxy uvicorn doesn't trust: the scope says http, BASE_URL knows better
+        ("https://mealie.example.com", "http", "mealie.example.com", "https://mealie.example.com"),
+        ("https://Mealie.Example.com/", "http", "MEALIE.example.com", "https://mealie.example.com"),
+        ("https://mealie.example.com", "http", "mealie.example.com:443", "https://mealie.example.com"),
+        ("https://mealie.example.com:8443", "http", "mealie.example.com:8443", "https://mealie.example.com:8443"),
+        ("https://mealie.example.com", "https", "mealie.example.com", "https://mealie.example.com"),
+        # another address, or another port on the same host, keeps the request's own origin
+        ("https://mealie.example.com", "http", "192.168.1.20:9925", "http://192.168.1.20:9925"),
+        ("https://mealie.example.com", "http", "mealie.example.com:9925", "http://mealie.example.com:9925"),
+        ("https://mealie.example.com:8443", "http", "mealie.example.com", "http://mealie.example.com"),
+        ("https://mealie.example.com", "http", "mealie.example.com.evil.test", "http://mealie.example.com.evil.test"),
+        # only ever an upgrade: a request that arrived over TLS keeps https
+        ("http://mealie.example.com", "https", "mealie.example.com", "https://mealie.example.com"),
+        ("http://mealie.example.com:9925", "https", "mealie.example.com:9925", "https://mealie.example.com:9925"),
+        ("http://mealie.example.com", "http", "mealie.example.com", "http://mealie.example.com"),
+        # BASE_URL left at its default changes nothing
+        ("http://localhost:8080", "https", "localhost:8080", "https://localhost:8080"),
+        ("http://localhost:8080", "http", "localhost:8080", "http://localhost:8080"),
+    ],
+)
+def test_request_origin_follows_base_url(
+    monkeypatch: pytest.MonkeyPatch, base_url: str, scheme: str, host: str, origin: str
+):
+    monkeypatch.setattr(get_app_settings(), "BASE_URL", base_url)
+    assert request_origin(_scope(host, scheme)) == origin
 
 
 def test_server_urls():
@@ -104,6 +139,7 @@ def test_canonical_resource(url: str, canonical: str | None):
         "http://localhost:33418/callback",
         "http://[::1]/callback",
         "https://example.com/cb?tenant=1",
+        "https://xn--bcher-kva.example/cb",
     ],
 )
 def test_valid_redirect_uris(uri: str):
@@ -126,11 +162,31 @@ def test_valid_redirect_uris(uri: str):
         ("https://example.com/c b", "spaces"),
         ("", "spaces"),
         ("https://example.com:99999/cb", "absolute"),
+        # a lookalike: the "і" is Cyrillic
+        ("https://my.home-assіstant.io/redirect/oauth", "xn-- form, my.xn--home-assstant-bil.io "),
+        ("https://bücher.example/cb", "xn-- form, xn--bcher-kva.example "),
+        ("http://bücher.local:8123/cb", "xn-- form"),
     ],
 )
 def test_invalid_redirect_uris(uri: str, reason: str):
     with pytest.raises(ValueError, match=reason):
         check_redirect_uri(uri)
+
+
+@pytest.mark.parametrize(
+    "uri, host",
+    [
+        ("https://my.home-assistant.io/redirect/oauth", "my.home-assistant.io"),
+        ("http://homeassistant.local:8123/auth/external/callback", "homeassistant.local:8123"),
+        ("http://[::1]:43123/callback", "[::1]:43123"),
+        # the consent page never shows a host in Unicode, where a lookalike could pass for the real one
+        ("https://my.home-assіstant.io/redirect/oauth", "my.xn--home-assstant-bil.io"),
+        ("https://bücher.example:8443/cb", "xn--bcher-kva.example:8443"),
+        ("https://bücher..example/cb", "b%C3%BCcher..example"),
+    ],
+)
+def test_display_host(uri: str, host: str):
+    assert display_host(uri) == host
 
 
 @pytest.mark.parametrize(
@@ -238,6 +294,16 @@ def test_pkce_s256():
     assert not pkce_matches("a" * 129, challenge)
     assert not is_s256_challenge(challenge + "=")
     assert not is_s256_challenge("plain-challenge")
+
+
+def test_a_password_change_evicts_everything_issued_in_its_second():
+    # upstream floors `tokens_valid_after` to the second
+    changed = datetime(2026, 10, 3, 12, 0, 0, tzinfo=UTC)
+    assert predates_password_change(changed - timedelta(seconds=5), changed)
+    assert predates_password_change(changed + timedelta(milliseconds=300), changed)
+    assert predates_password_change(changed + timedelta(milliseconds=999), changed)
+    assert not predates_password_change(changed + timedelta(seconds=1), changed)
+    assert not predates_password_change(changed, None)
 
 
 def test_scopes_are_written_in_a_fixed_order():

@@ -9,7 +9,7 @@ import base64
 import binascii
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from urllib.parse import unquote_plus, urlsplit
+from urllib.parse import unquote_plus
 from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
@@ -38,14 +38,24 @@ from .tokens import (
     new_secret,
     parse_scopes,
     pkce_matches,
+    predates_password_change,
     secret_matches,
 )
-from .urls import CONSENT_PAGE_PATH, canonical_resource, mcp_url, redirect_uri_matches, with_query_params
+from .urls import (
+    CONSENT_PAGE_PATH,
+    canonical_resource,
+    display_host,
+    mcp_url,
+    redirect_uri_matches,
+    with_query_params,
+)
 
 Params = Sequence[tuple[str, str]]
 
 IGNORED_SCOPES = frozenset({"offline_access"})
 """Asked for by some clients to get a refresh token, which every client gets anyway"""
+MAX_STATE_LENGTH = 2048
+"""Home Assistant's `state` is about 600 characters"""
 
 
 class _ParamError(Exception):
@@ -120,6 +130,10 @@ class McpAuthorizationServer:
             repeated: str | None = None
         except _ParamError as e:
             state, repeated = None, e.name
+        # it would be stored, and anyone can make a pending request: too long a state is refused, and not echoed
+        state_too_long = state is not None and len(state) > MAX_STATE_LENGTH
+        if state_too_long:
+            state = None
 
         def fail(error: str, description: str) -> str:
             return self._redirect(target, origin, state, error=error, error_description=description)
@@ -133,6 +147,8 @@ class McpAuthorizationServer:
             repeated = e.name
         if repeated:
             return fail("invalid_request", f"The {repeated} parameter is repeated")
+        if state_too_long:
+            return fail("invalid_request", f"state is longer than {MAX_STATE_LENGTH} characters")
 
         if response_type is None:
             return fail("invalid_request", "response_type is required")
@@ -216,7 +232,7 @@ class McpAuthorizationServer:
             client_name=request.oauth_client.name,
             scopes=[McpScope(scope) for scope in scopes],
             writes_offered=SCOPE_WRITE in scopes,
-            redirect_host=urlsplit(request.redirect_uri).netloc,
+            redirect_host=display_host(request.redirect_uri),
             expires_at=request.expires_at,
         )
 
@@ -293,7 +309,8 @@ class McpAuthorizationServer:
         else:
             raise OAuthError("invalid_client", "Client authentication is required")
 
-        client = self.repo.get_client(client_id)
+        # The request's first read locks the client until it commits, so granting and revoking its tokens take turns
+        client = self.repo.get_client(client_id, for_update=True)
         if client is None:
             raise OAuthError("invalid_client", "Unknown client", basic_auth_used=basic is not None)
 
@@ -335,8 +352,9 @@ class McpAuthorizationServer:
         user = self.repo.get_user(user_id)
         if user is None or user.group_id != client.group_id:
             raise OAuthError("invalid_grant", "The user is gone")
-        # Changing a password evicts everything issued before it, as it does for upstream's tokens
-        if user.tokens_valid_after is not None and issued_at < user.tokens_valid_after:
+        # Changing a password evicts everything issued before it, as it does for upstream's tokens. It also revokes
+        # them; this covers a grant that was being committed at the time.
+        if predates_password_change(issued_at, user.tokens_valid_after):
             raise OAuthError("invalid_grant", "The user's password changed since this was issued")
         return user
 

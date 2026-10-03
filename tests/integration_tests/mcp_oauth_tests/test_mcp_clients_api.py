@@ -100,6 +100,7 @@ def test_client_crud(api_client: TestClient, unique_user: TestUser):
         {"redirectUris": ["/relative"]},
         {"redirectUris": []},
         {"redirectUris": [f"https://example.com/cb{i}" for i in range(11)]},
+        {"redirectUris": ["https://my.home-assіstant.io/redirect/oauth"]},  # with a Cyrillic "і"
         {"name": "   "},
         {"name": "x" * 101},
         {"isConfidential": False, "pkceOptional": True},
@@ -115,6 +116,16 @@ def test_client_validation(api_client: TestClient, unique_user: TestUser, change
     }
     response = api_client.post(api_routes.groups_mcp_clients, json=data, headers=unique_user.token)
     assert response.status_code == 422
+
+
+def test_international_hosts_are_registered_in_their_ascii_form(api_client: TestClient, unique_user: TestUser):
+    data = {"name": "Client", "redirectUris": ["https://bücher.example/cb"], "isConfidential": True}
+    response = api_client.post(api_routes.groups_mcp_clients, json=data, headers=unique_user.token)
+    assert response.status_code == 422
+    assert "xn-- form, xn--bcher-kva.example" in response.json()["message"]
+
+    client = create_client(api_client, unique_user, redirectUris=["https://xn--bcher-kva.example/cb"])
+    assert client["redirectUris"] == ["https://xn--bcher-kva.example/cb"]
 
 
 def test_rotate_secret(api_client: TestClient, unique_user: TestUser):

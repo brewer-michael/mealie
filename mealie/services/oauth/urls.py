@@ -7,10 +7,12 @@ issuer, the resource and the URLs in `WWW-Authenticate` always agree.
 
 import ipaddress
 import re
-from urllib.parse import SplitResult, urlencode, urlsplit
+from urllib.parse import SplitResult, quote, urlencode, urlsplit
 
 from starlette.datastructures import Headers
 from starlette.types import Scope
+
+from mealie.core.config import get_app_settings
 
 MCP_PATH = "/api/mcp"
 PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
@@ -47,6 +49,8 @@ def request_origin(scope: Scope) -> str:
     `scheme://host[:port]` as the client reached this server: the ASGI scope's scheme (uvicorn has already applied
     `X-Forwarded-Proto` from trusted proxies) and the `Host` header, lowercased and without a default port. A
     `Host` that isn't a plain host name or IP literal falls back to the address the server listens on.
+
+    A plain `http` request for an `https` `BASE_URL`'s host and port gets `https` (see `_base_url_origin`).
     """
     scheme = str(scope.get("scheme") or "http").lower()
     host = Headers(scope=scope).get("host", "").strip().lower()
@@ -60,7 +64,35 @@ def request_origin(scope: Scope) -> str:
         else:
             host = "localhost"
 
-    return f"{scheme}://{_without_default_port(scheme, host)}"
+    return _base_url_origin(scheme, host) or f"{scheme}://{_without_default_port(scheme, host)}"
+
+
+def _base_url_origin(scheme: str, host: str) -> str | None:
+    """
+    An `https` `BASE_URL`'s origin for a plain `http` request that names its host and port (or no port, as a TLS
+    proxy forwarding from 443 sends it). Only ever an upgrade: a request that arrived over TLS keeps `https`.
+
+    Behind a TLS proxy that uvicorn doesn't trust (it trusts `X-Forwarded-Proto` only from `HOST_IP`, which the
+    Docker image sets to the container's gateway, not to a proxy container's address), the scope says `http` while
+    clients use `https://`. OAuth clients compare the resource with the URL they were given as an exact string, so
+    the scheme has to be right.
+    """
+    settings = get_app_settings()
+    if scheme != "http" or settings.is_default_base_url:
+        return None
+
+    base = _split(settings.BASE_URL)
+    if base is None or base.scheme != "https" or not base.hostname or "@" in base.netloc:
+        return None
+    request = _split(f"{scheme}://{host}")
+    if request is None or request.hostname != base.hostname:
+        return None
+
+    base_port = base.port or _DEFAULT_PORTS[base.scheme]
+    if (request.port or _DEFAULT_PORTS[base.scheme]) != base_port:
+        return None
+
+    return f"{base.scheme}://{_without_default_port(base.scheme, base.netloc.lower())}"
 
 
 def mcp_url(origin: str) -> str:
@@ -137,6 +169,7 @@ def check_redirect_uri(uri: str) -> str:
     """
     Returns `uri` if it can be registered as a redirect URI, else raises a `ValueError` saying why:
     - absolute `http` or `https` (RFC 6749 §3.1.2), with no fragment (§3.1.2) and no user info;
+    - an ASCII host: an internationalised name in its `xn--` form;
     - plain `http` only for loopback and local-network hosts: Home Assistant's own callback is often
       `http://homeassistant.local:8123/auth/external/callback`, and native apps use loopback (RFC 8252 §7.3).
     """
@@ -152,6 +185,11 @@ def check_redirect_uri(uri: str) -> str:
         raise ValueError(f"Redirect URIs can't have a fragment ({uri})")
     if "@" in parts.netloc:
         raise ValueError(f"Redirect URIs can't contain a user name or password ({uri})")
+    if not parts.netloc.isascii():
+        # the consent page shows the host, where a lookalike letter from another script could pass for the real one
+        ascii_host = _idna(parts.hostname)
+        hint = f", {ascii_host}" if ascii_host else ""
+        raise ValueError(f"Write the host of a redirect URI in its xn-- form{hint} ({uri})")
     if parts.scheme == "http" and not is_local_host(parts.hostname):
         raise ValueError(f"Use https://, or http:// only for a local network address ({uri})")
 
@@ -175,6 +213,27 @@ def redirect_uri_matches(registered: str, requested: str) -> bool:
         return False
 
     return (ours.hostname, ours.path, ours.query) == (theirs.hostname, theirs.path, theirs.query)
+
+
+def display_host(uri: str) -> str:
+    """
+    The host (and port) of `uri` as the consent page shows it, in ASCII: an internationalised name in its `xn--`
+    form, so a lookalike letter from another script stands out. Registration refuses such hosts too.
+    """
+    netloc = urlsplit(uri).netloc
+    if netloc.isascii():
+        return netloc
+
+    host, colon, port = netloc.partition(":")
+    return (_idna(host) or quote(host, safe="")) + colon + quote(port, safe="")
+
+
+def _idna(host: str) -> str | None:
+    """`host` with each label in its ASCII (`xn--`) form, or `None` if it isn't a valid internationalised name"""
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
 
 
 def with_query_params(uri: str, params: list[tuple[str, str]]) -> str:
