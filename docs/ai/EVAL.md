@@ -87,6 +87,8 @@ name shown there.
 | `--price NAME=IN,OUT` | Provider price in USD per million input and output tokens, to report cost; repeatable. |
 | `--out FILE` | Where to write the full JSON results. Defaults to `recipe-card-eval.json`. |
 
+Each run is pinned to the provider it names. The group's fallback routes and monthly token limits are ignored, so a failing provider is scored as a failure and never as another provider's answer. Eval runs write nothing to the group's AI usage log.
+
 Each provider is scored on its own: if a provider fails to read a card, the run counts as an error, and the error
 recorded is the provider's own (for example an authentication failure). It does not fall back to OCR the way a real
 import would. Likewise the OCR rows are scored on what Tesseract reads, never on a vision provider.
@@ -140,7 +142,7 @@ OCR+Ollama  qwen3:8b             3       1   0.55    0.71       0.80      1.5   
 | **Instr** | Share of the card's instruction text the recipe covers, weighted by length. Rewording lowers it. |
 | **Invented** | Runs that filled in a field the card leaves blank (`must_not_invent`), such as a made-up cook time. Should be 0. |
 | **Latency**, **p50** | Mean and median seconds per card for successful runs: reading the card and building the recipe. |
-| **Tokens**, **Cost/card** | Mean tokens per run as the provider reports them, and the mean cost of the runs that reported any, when every provider involved has a `--price`. |
+| **Tokens**, **Cost/card** | Mean tokens per run as the provider reports them, Claude included (per attempt, summed over any server-side fallback), and the mean cost of the runs that reported any, when every provider involved has a `--price`. |
 | **Errors** | Runs that produced no recipe. Recall, Precision, Misread, Instr and latency only count successful runs. |
 
 ### How ingredient lines are compared
