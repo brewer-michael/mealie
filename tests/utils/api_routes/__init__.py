@@ -77,6 +77,10 @@ groups_households = "/api/groups/households"
 """`/api/groups/households`"""
 groups_labels = "/api/groups/labels"
 """`/api/groups/labels`"""
+groups_mcp_clients = "/api/groups/mcp/clients"
+"""`/api/groups/mcp/clients`"""
+groups_mcp_presets_home_assistant = "/api/groups/mcp/presets/home-assistant"
+"""`/api/groups/mcp/presets/home-assistant`"""
 groups_members = "/api/groups/members"
 """`/api/groups/members`"""
 groups_migrations = "/api/groups/migrations"
@@ -133,6 +137,12 @@ households_webhooks_rerun = "/api/households/webhooks/rerun"
 """`/api/households/webhooks/rerun`"""
 media_docker_validate_txt = "/api/media/docker/validate.txt"
 """`/api/media/docker/validate.txt`"""
+oauth_authorize = "/api/oauth/authorize"
+"""`/api/oauth/authorize`"""
+oauth_revoke = "/api/oauth/revoke"
+"""`/api/oauth/revoke`"""
+oauth_token = "/api/oauth/token"
+"""`/api/oauth/token`"""
 organizers_categories = "/api/organizers/categories"
 """`/api/organizers/categories`"""
 organizers_categories_empty = "/api/organizers/categories/empty"
@@ -209,6 +219,10 @@ users_self = "/api/users/self"
 """`/api/users/self`"""
 users_self_favorites = "/api/users/self/favorites"
 """`/api/users/self/favorites`"""
+users_self_mcp_api_tokens = "/api/users/self/mcp/api-tokens"
+"""`/api/users/self/mcp/api-tokens`"""
+users_self_mcp_connections = "/api/users/self/mcp/connections"
+"""`/api/users/self/mcp/connections`"""
 users_self_ratings = "/api/users/self/ratings"
 """`/api/users/self/ratings`"""
 utils_download = "/api/utils/download"
@@ -370,6 +384,16 @@ def groups_labels_item_id(item_id):
     return f"{prefix}/groups/labels/{item_id}"
 
 
+def groups_mcp_clients_item_id(item_id):
+    """`/api/groups/mcp/clients/{item_id}`"""
+    return f"{prefix}/groups/mcp/clients/{item_id}"
+
+
+def groups_mcp_clients_item_id_rotate_secret(item_id):
+    """`/api/groups/mcp/clients/{item_id}/rotate-secret`"""
+    return f"{prefix}/groups/mcp/clients/{item_id}/rotate-secret"
+
+
 def groups_members_username_or_id(username_or_id):
     """`/api/groups/members/{username_or_id}`"""
     return f"{prefix}/groups/members/{username_or_id}"
@@ -478,6 +502,11 @@ def media_recipes_recipe_id_images_timeline_timeline_event_id_file_name(recipe_i
 def media_users_user_id_file_name(user_id, file_name):
     """`/api/media/users/{user_id}/{file_name}`"""
     return f"{prefix}/media/users/{user_id}/{file_name}"
+
+
+def oauth_requests_handle(handle):
+    """`/api/oauth/requests/{handle}`"""
+    return f"{prefix}/oauth/requests/{handle}"
 
 
 def organizers_categories_item_id(item_id):
@@ -618,6 +647,16 @@ def users_id_ratings_slug(id, slug):
 def users_item_id(item_id):
     """`/api/users/{item_id}`"""
     return f"{prefix}/users/{item_id}"
+
+
+def users_self_mcp_api_tokens_token_id(token_id):
+    """`/api/users/self/mcp/api-tokens/{token_id}`"""
+    return f"{prefix}/users/self/mcp/api-tokens/{token_id}"
+
+
+def users_self_mcp_connections_client_id(client_id):
+    """`/api/users/self/mcp/connections/{client_id}`"""
+    return f"{prefix}/users/self/mcp/connections/{client_id}"
 
 
 def users_self_ratings_recipe_id(recipe_id):

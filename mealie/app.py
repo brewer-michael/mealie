@@ -21,7 +21,7 @@ from mealie.core.config import get_app_settings
 from mealie.core.root_logger import get_logger
 from mealie.core.settings.static import APP_VERSION
 from mealie.middleware.locale_context import LocaleContextMiddleware
-from mealie.routes import router, spa, utility_routes
+from mealie.routes import oauth, router, spa, utility_routes
 from mealie.routes.handlers import register_debug_handler
 from mealie.routes.media import media_router
 from mealie.services.scheduler import SchedulerRegistry, SchedulerService, tasks
@@ -130,6 +130,7 @@ async def start_scheduler():
         tasks.create_mealplan_timeline_events,
         tasks.delete_old_checked_list_items,
         tasks.purge_ai_usage_log,
+        tasks.purge_mcp_oauth,
     )
 
     SchedulerRegistry.register_minutely(
@@ -149,6 +150,7 @@ def api_routers():
     app.include_router(router)
     app.include_router(media_router)
     app.include_router(utility_routes.router)
+    app.include_router(oauth.router)  # fork: /.well-known (must come before the SPA) and the MCP OAuth endpoints
 
     if settings.PRODUCTION and not settings.TESTING:
         spa.mount_spa(app)

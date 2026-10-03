@@ -4,6 +4,7 @@ from .post_webhooks import post_group_webhooks
 from .purge_ai_usage_log import purge_ai_usage_log
 from .purge_expired_share_tokens import purge_expired_tokens
 from .purge_group_exports import purge_group_data_exports
+from .purge_mcp_oauth import purge_mcp_oauth
 from .purge_password_reset import purge_password_reset_tokens
 from .purge_registration import purge_group_registration
 from .reset_locked_users import locked_user_reset
@@ -14,6 +15,7 @@ __all__ = [
     "post_group_webhooks",
     "purge_ai_usage_log",
     "purge_expired_tokens",
+    "purge_mcp_oauth",
     "purge_password_reset_tokens",
     "purge_group_data_exports",
     "purge_group_registration",

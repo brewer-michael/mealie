@@ -67,6 +67,10 @@ class AlchemyExporter(BaseService):
         "last_made",
         "completed_date",
         "tokens_valid_after",
+        # fork: the MCP server's OAuth tables (docs/ai/PHASE3.md §5)
+        "granted_at",
+        "revoked_at",
+        "last_used_at",
     }
     """Column names restored back into datetimes. Anything stored as a `NaiveDateTime` and missing
     here comes back from a backup as a string; `test_every_datetime_column_survives_a_backup` guards
