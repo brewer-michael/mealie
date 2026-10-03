@@ -208,7 +208,7 @@ A `recipe_ingestion_ready` event goes onto Mealie's event bus. Existing Apprise 
 with no new code.
 
 **Eval harness (build this early).** Store 15–30 of *your* cards in `tests/data/cards/` (start with `IMG_2503.jpg`),
-each with hand-checked JSON. `dev/scripts/ai_eval_cards.py` scores field accuracy, latency and cost per provider and
+each with hand-checked JSON. `mealie/scripts/eval_recipe_cards.py` ([how to run it](ai/EVAL.md)) scores field accuracy, latency and cost per provider and
 model. It decides decision D3 and catches prompt regressions.
 
 ### 4.3 Home Assistant and voice (G1)
@@ -475,8 +475,8 @@ Each phase can merge on its own and leaves the app working.
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0. Sync and port** | ✅ Branch rebuilt on upstream `v3.28.0`. Remaining: port per §2.3 (fallback idea, Tesseract fallback, Docker/Unraid files, eval fixture); drop the rest; set up Gemini, OpenAI and Ollama as upstream provider records | `task py:check` and `task ui:check` pass; the test card imports through `/create/ai` with Gemini and with a local model; **HA 2026.10 connects** |
-| **0.5 HA Layer A** | `docs/home-assistant/`: custom sentences, `intent_script`, scripts exposed to Assist | "What's for dinner?" (local) and "find a chicken recipe" (LLM through scripts) work by voice |
+| **0. Sync and port** | ✅ Rebuilt on upstream `v3.28.0`. ✅ Tesseract fallback as an `OCRImageCompiler` in the import workflow. ✅ Docker `INSTALL_OCR` build arg, compose file, Unraid template, [`docs/ai/DEPLOY.md`](ai/DEPLOY.md). ✅ Startup and backup-restore repair for databases from the old `add-ocr-recipe` build. ✅ Eval fixture and `mealie.scripts.eval_recipe_cards` ([`docs/ai/EVAL.md`](ai/EVAL.md)). **Left for you:** add your Gemini / OpenAI / Ollama keys as providers and run the eval. Provider fallback routes move to Phase 1 | `task py:check` and `task ui:check` pass; the test card imports through `/create/ai` with Gemini and with a local model; **HA 2026.10 connects** |
+| **0.5 HA Layer A** | ✅ [`docs/home-assistant/`](home-assistant/README.md): custom sentences, `intent_script`, scripts exposed to Assist. Checked with hassil, `check_config` and end-to-end tests on HA 2026.9.4 and 2026.10.0b0. **Left for you:** install it on your HA and try it by voice | "What's for dinner?" (local) and "find a chicken recipe" (LLM through scripts) work by voice |
 | **1. Platform additions** | Fallback routes, the extra slots, the Anthropic adapter, encrypted keys, the usage log, the tool registry | Every slot fails over in tests; the Claude, Gemini and Ollama providers all pass upstream's connection test |
 | **2. Card ingestion v2** | Jobs, batch upload, review page, ingredient linking, card kept as an asset, inbox folder, events, **eval harness** | 20-card eval set scored per provider; a 10-card batch reviewed and committed from a phone |
 | **3. MCP server** | `/api/mcp` with read tools and bearer auth → OAuth for HA → write tools | Claude Desktop and HA's stock MCP client both list and call tools; voice "find chicken under 30 minutes" goes through MCP |
