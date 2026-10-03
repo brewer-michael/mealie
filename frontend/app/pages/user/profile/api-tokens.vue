@@ -94,6 +94,7 @@
             <v-list-item-subtitle>
               {{ $t('general.created-on-date', [$d(new Date(token.createdAt!))]) }}
             </v-list-item-subtitle>
+            <UserMcpApiTokenWriteSwitch :token-id="token.id" />
             <template #append>
               <BaseButton
                 delete

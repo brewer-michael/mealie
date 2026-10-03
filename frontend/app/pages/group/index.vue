@@ -64,6 +64,14 @@
         </v-card-text>
       </v-card>
     </div>
+
+    <div class="mt-6">
+      <v-card variant="outlined" style="border-color: lightgray;">
+        <v-card-text>
+          <GroupMcpSettings />
+        </v-card-text>
+      </v-card>
+    </div>
   </v-container>
 </template>
 
@@ -71,6 +79,7 @@
 import GroupPreferencesEditor from "~/components/Domain/Group/GroupPreferencesEditor.vue";
 import GroupAIProviderSettingsEditor from "~/components/Domain/Group/GroupAIProviderSettingsEditor.vue";
 import GroupAIProviderUsage from "~/components/Domain/Group/GroupAIProviderUsage.vue";
+import GroupMcpSettings from "~/components/Domain/Group/GroupMcpSettings.vue";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useAIProviders } from "~/composables/use-ai-providers";
 import { useAIProviderKeyStatus, useAIProviderRoutes } from "~/composables/use-ai-provider-routing";
