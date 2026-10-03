@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>mealie-ai</Name>
+  <Repository>brewermichael/mealie-dev:ai</Repository>
+  <Registry>https://hub.docker.com/r/brewermichael/mealie-dev</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/brewer-michael/mealie/blob/claude/busy-planck-3le4l9/docs/ai/DEPLOY.md</Support>
+  <Project>https://github.com/brewer-michael/mealie</Project>
+  <Overview>Mealie self-hosted recipe manager and meal planner: a personal build of upstream Mealie v3.28.0 with this fork's AI additions.
+
+- AI providers are set up in the web UI, per group, under User Settings > Group Settings > AI Provider Settings (not with variables). Any OpenAI-compatible API works: OpenAI, Google Gemini, OpenRouter, or a local Ollama. A default provider is required for AI features; separate image and audio providers are optional.
+- Create > Import with AI turns photos, pasted text, links or videos into recipes.
+- Tesseract OCR is built in as a fallback for recipe photos: when no image provider is set, or it fails, the text is read with OCR and the default provider turns it into a recipe.
+
+Upgrading from the older mealie-dev image: back up your appdata folder FIRST. The database is migrated on first start and the old image-scanning variables and admin page no longer exist. Read the deploy guide (Support link) before switching.
+
+On a fresh install, sign in with Mealie's documented default admin account and change its password immediately.</Overview>
+  <Category>Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:9000]</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/brewer-michael/mealie/claude/busy-planck-3le4l9/docker/unraid/mealie-ai.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/selfhosters/unRAID-CA-templates/master/templates/img/mealiev1.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <!-- Core -->
+  <Config Name="WebUI Port" Target="9000" Default="9925" Mode="tcp" Description="Host port for the web interface (the container listens on 9000)" Type="Port" Display="always" Required="true" Mask="false"/>
+  <Config Name="App Data" Target="/app/data" Default="/mnt/user/appdata/mealie-ai" Mode="rw" Description="Database, images, backups and the secret key. When upgrading, point this at a COPY of the old mealie-dev folder." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="BASE_URL" Target="BASE_URL" Default="" Mode="" Description="The URL you open Mealie at, e.g. http://192.168.1.10:9925 or https://mealie.example.com. Used for links, emails and the OIDC callback." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="TZ" Target="TZ" Default="" Mode="" Description="Time zone name, e.g. America/New_York. This replaces the server time zone Unraid passes in, so it must not be left empty." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="ALLOW_SIGNUP" Target="ALLOW_SIGNUP" Default="false" Mode="" Description="Allow anyone to register without an invite (true/false)" Type="Variable" Display="always" Required="false" Mask="false"/>
+
+  <!-- OCR fallback (AI providers themselves are configured in the web UI) -->
+  <Config Name="OCR_ENABLED" Target="OCR_ENABLED" Default="true" Mode="" Description="Read recipe photos with Tesseract when no image provider is set or it fails. Needs a default AI provider to turn the text into a recipe." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="OCR_LANGUAGES" Target="OCR_LANGUAGES" Default="eng" Mode="" Description="Tesseract language codes joined by +, e.g. eng+deu. This image ships English (eng) only; other languages need a rebuild with OCR_LANGUAGE_PACKS." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="OCR_TIMEOUT" Target="OCR_TIMEOUT" Default="60" Mode="" Description="Seconds before an OCR run is abandoned" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Email -->
+  <Config Name="SMTP_HOST" Target="SMTP_HOST" Default="" Mode="" Description="SMTP server hostname (leave empty to disable email)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="SMTP_PORT" Target="SMTP_PORT" Default="587" Mode="" Description="SMTP server port" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="SMTP_AUTH_STRATEGY" Target="SMTP_AUTH_STRATEGY" Default="TLS" Mode="" Description="TLS, SSL or NONE" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="SMTP_FROM_EMAIL" Target="SMTP_FROM_EMAIL" Default="" Mode="" Description="From email address" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="SMTP_USER" Target="SMTP_USER" Default="" Mode="" Description="SMTP username (set together with SMTP_PASSWORD)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="SMTP_PASSWORD" Target="SMTP_PASSWORD" Default="" Mode="" Description="SMTP password" Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <!-- Database -->
+  <Config Name="DB_ENGINE" Target="DB_ENGINE" Default="sqlite" Mode="" Description="sqlite (stored in App Data) or postgres" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="POSTGRES_SERVER" Target="POSTGRES_SERVER" Default="postgres" Mode="" Description="PostgreSQL hostname (only used with DB_ENGINE=postgres)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="POSTGRES_PORT" Target="POSTGRES_PORT" Default="5432" Mode="" Description="PostgreSQL port" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="POSTGRES_DB" Target="POSTGRES_DB" Default="mealie" Mode="" Description="PostgreSQL database name" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="POSTGRES_USER" Target="POSTGRES_USER" Default="mealie" Mode="" Description="PostgreSQL username" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="POSTGRES_PASSWORD" Target="POSTGRES_PASSWORD" Default="" Mode="" Description="PostgreSQL password" Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <!-- System -->
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns App Data (Unraid: 99 = nobody)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns App Data (Unraid: 100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="UVICORN_WORKERS" Target="UVICORN_WORKERS" Default="1" Mode="" Description="Web server worker processes" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

@@ -136,6 +136,17 @@ RUN apt-get update \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional Tesseract for the OCR fallback (fork addition, off by default)
+ARG INSTALL_OCR=false
+ARG OCR_LANGUAGE_PACKS="eng"
+RUN if [ "$INSTALL_OCR" = "true" ]; then \
+    apt-get update \
+    && apt-get install --no-install-recommends -y \
+    tesseract-ocr \
+    $(for lang in $OCR_LANGUAGE_PACKS; do echo "tesseract-ocr-$lang"; done) \
+    && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # create directory used for Docker Secrets
 RUN mkdir -p /run/secrets
 

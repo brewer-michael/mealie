@@ -1,0 +1,70 @@
+# Mealie (this fork: upstream + AI additions) with Tesseract for the OCR fallback.
+# See docs/ai/DEPLOY.md for building, upgrading and configuring AI providers.
+#
+#   docker compose -f docker/docker-compose.ai.yml up -d --build
+#
+# AI providers (OpenAI, Gemini, Ollama, ...) are NOT configured with environment variables.
+# Add them in the UI under User Settings > Group Settings > AI Provider Settings.
+name: mealie-ai
+
+services:
+  mealie:
+    container_name: mealie-ai
+    image: brewermichael/mealie-dev:ai
+    build:
+      context: ../
+      target: production
+      dockerfile: ./docker/Dockerfile
+      args:
+        INSTALL_OCR: "true"
+        # Space-separated packs, installed as Debian tesseract-ocr-<pack>, e.g. "eng deu fra".
+        # Debian writes '_' in Tesseract codes as '-': OCR_LANGUAGES chi_sim needs pack chi-sim.
+        OCR_LANGUAGE_PACKS: "eng"
+    restart: always
+    volumes:
+      - mealie-ai-data:/app/data/
+    ports:
+      - 9925:9000
+    environment:
+      # Public URL Mealie is reached at; used in links, notifications and the OIDC callback
+      BASE_URL: "http://localhost:9925"
+      ALLOW_SIGNUP: "false"
+      TZ: "Etc/UTC" # e.g. America/New_York
+
+      # OCR fallback, used when no image provider is set or it fails. Needs a default (text) provider.
+      OCR_ENABLED: "true"
+      OCR_LANGUAGES: "eng" # joined by '+', e.g. "eng+deu"; each needs its pack in OCR_LANGUAGE_PACKS
+      # OCR_TIMEOUT: "60" # seconds
+
+      # PUID: 99 # Unraid's nobody:users
+      # PGID: 100
+
+  # Optional: local models through Ollama. In Mealie, add a provider with
+  # Base URL http://ollama:11434/v1 and any non-empty API key.
+  # ollama:
+  #   container_name: ollama
+  #   image: ollama/ollama
+  #   restart: always
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   ports:
+  #     - 11434:11434
+  #   # NVIDIA GPU: needs the NVIDIA Container Toolkit on the host
+  #   # (on Unraid, the Nvidia-Driver plugin).
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: all
+  #   #           capabilities: [gpu]
+  #   # AMD GPU: use image ollama/ollama:rocm instead, plus:
+  #   # devices:
+  #   #   - /dev/kfd
+  #   #   - /dev/dri
+
+volumes:
+  mealie-ai-data:
+    driver: local
+  # ollama-data:
+  #   driver: local
