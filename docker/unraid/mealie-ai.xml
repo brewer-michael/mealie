@@ -7,7 +7,7 @@
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/brewer-michael/mealie/blob/claude/busy-planck-3le4l9/docs/ai/DEPLOY.md</Support>
+  <Support>https://github.com/brewer-michael/mealie/blob/ai-integration/docs/ai/DEPLOY.md</Support>
   <Project>https://github.com/brewer-michael/mealie</Project>
   <Overview>Mealie self-hosted recipe manager and meal planner: a personal build of upstream Mealie v3.28.0 with this fork's AI additions.
 
@@ -20,7 +20,7 @@ Upgrading from the older mealie-dev image: back up your appdata folder FIRST. Th
 On a fresh install, sign in with Mealie's documented default admin account and change its password immediately.</Overview>
   <Category>Productivity:</Category>
   <WebUI>http://[IP]:[PORT:9000]</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/brewer-michael/mealie/claude/busy-planck-3le4l9/docker/unraid/mealie-ai.xml</TemplateURL>
+  <TemplateURL>https://raw.githubusercontent.com/brewer-michael/mealie/ai-integration/docker/unraid/mealie-ai.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/selfhosters/unRAID-CA-templates/master/templates/img/mealiev1.png</Icon>
   <ExtraParams/>
   <PostArgs/>

@@ -1,6 +1,6 @@
 # AI Integration Plan
 
-_Branch `claude/busy-planck-3le4l9`, based on upstream Mealie `v3.28.0`. The earlier scanning work is on
+_Branch `ai-integration`, based on upstream Mealie `v3.28.0`. The earlier scanning work is on
 `add-ocr-recipe`. Drafted 2026-10-02._
 
 This plan picks up the recipe-card scanning work from `add-ocr-recipe` and turns it into a broader AI layer for this

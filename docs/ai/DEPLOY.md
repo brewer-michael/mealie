@@ -23,7 +23,7 @@ nothing else is needed, but the frontend build is slow and memory-hungry.
 ```sh
 git clone https://github.com/brewer-michael/mealie.git
 cd mealie
-git checkout claude/busy-planck-3le4l9
+git checkout ai-integration
 
 docker build -f docker/Dockerfile \
   --build-arg INSTALL_OCR=true \
@@ -74,7 +74,7 @@ Unraid terminal:
 
 ```sh
 wget -O /boot/config/plugins/dockerMan/templates-user/my-mealie-ai.xml \
-  https://raw.githubusercontent.com/brewer-michael/mealie/claude/busy-planck-3le4l9/docker/unraid/mealie-ai.xml
+  https://raw.githubusercontent.com/brewer-michael/mealie/ai-integration/docker/unraid/mealie-ai.xml
 ```
 
 Then go to **Docker > Add Container** and pick **mealie-ai** from the template list. Two fields must be filled in:
