@@ -5,6 +5,8 @@
 /* Do not modify it by hand - just update the pydantic models and then re-run the script
 */
 
+export type AIProviderProtocol = "openai" | "anthropic";
+export type AIProviderSlot = "default" | "image" | "audio" | "planner" | "fast" | "embedding";
 export type SupportedMigrations =
   | "nextcloud"
   | "chowdown"
@@ -22,6 +24,24 @@ export interface AIProviderCreate {
   baseUrl?: string | null;
   model: string;
   timeout?: number;
+  protocol?: AIProviderProtocol;
+  monthlyTokenLimit?: number | null;
+  requestHeaders?: {
+    [k: string]: string;
+  };
+  requestParams?: {
+    [k: string]: string;
+  };
+}
+export interface AIProviderModelInfo {
+  id: string;
+  displayName: string | null;
+  supportsImages: boolean | null;
+}
+export interface AIProviderModelsQuery {
+  protocol?: AIProviderProtocol;
+  baseUrl?: string | null;
+  timeout?: number;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -34,6 +54,8 @@ export interface AIProviderOut {
   baseUrl?: string | null;
   model: string;
   timeout?: number;
+  protocol?: AIProviderProtocol;
+  monthlyTokenLimit?: number | null;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -42,11 +64,30 @@ export interface AIProviderOut {
   };
   id: string;
 }
+export interface AIProviderRouteOut {
+  id: string;
+  settingsId: string;
+  slot: AIProviderSlot;
+  position: number;
+  providerId: string;
+}
+export interface AIProviderRoutesOut {
+  routes: {
+    [k: string]: string[];
+  };
+}
+export interface AIProviderRoutesUpdate {
+  routes?: {
+    [k: string]: string[];
+  };
+}
 export interface AIProviderSave {
   name: string;
   baseUrl?: string | null;
   model: string;
   timeout?: number;
+  protocol?: AIProviderProtocol;
+  monthlyTokenLimit?: number | null;
   requestHeaders?: {
     [k: string]: string;
   };
@@ -87,12 +128,67 @@ export interface AIProviderUpdate {
   baseUrl?: string | null;
   model: string;
   timeout?: number;
+  protocol?: AIProviderProtocol;
+  monthlyTokenLimit?: number | null;
   requestHeaders?: {
     [k: string]: string;
   };
   requestParams?: {
     [k: string]: string;
   };
+}
+export interface AIUsageDaySummary {
+  date: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+}
+export interface AIUsageLogCreate {
+  groupId?: string | null;
+  providerId?: string | null;
+  providerName: string;
+  model: string;
+  protocol: AIProviderProtocol;
+  slot: AIProviderSlot;
+  feature?: string | null;
+  promptTokens?: number;
+  completionTokens?: number;
+  latencyMs?: number;
+  success: boolean;
+  errorType?: string | null;
+}
+export interface AIUsageLogOut {
+  groupId: string;
+  providerId?: string | null;
+  providerName: string;
+  model: string;
+  protocol: AIProviderProtocol;
+  slot: AIProviderSlot;
+  feature?: string | null;
+  promptTokens?: number;
+  completionTokens?: number;
+  latencyMs?: number;
+  success: boolean;
+  errorType?: string | null;
+  id: string;
+  createdAt?: string | null;
+}
+export interface AIUsageProviderSummary {
+  providerId: string | null;
+  providerName: string;
+  model: string;
+  requests: number;
+  failures: number;
+  promptTokens: number;
+  completionTokens: number;
+  monthlyTokenLimit: number | null;
+  lastUsedAt: string | null;
+}
+export interface AIUsageSummary {
+  start: string;
+  end: string;
+  byProvider: AIUsageProviderSummary[];
+  byDay: AIUsageDaySummary[];
 }
 export interface CreateGroupPreferences {
   privateGroup?: boolean;

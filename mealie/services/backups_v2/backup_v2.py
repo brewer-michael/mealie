@@ -92,6 +92,19 @@ class BackupV2(BaseService):
         get_app_settings.cache_clear()
         self.settings = get_app_settings()
 
+    def _restore_secrets(self, data_path: Path) -> None:
+        """
+        Restores the backup's `.secret` ahead of its database. Values encrypted with it (AI provider
+        API keys) must be read with it, and when an older backup's migrations encrypt plaintext keys
+        during the import, they must encrypt with the secret this instance will run with afterwards.
+        """
+        for name in self.RESTORE_FILES:
+            if (data_path / name).is_file():
+                shutil.copyfile(data_path / name, self.directories.DATA_DIR / name)
+
+        get_app_settings.cache_clear()
+        self.settings = get_app_settings()
+
     def restore(self, backup_path: Path) -> None:
         self.logger.info("initializing backup restore")
 
@@ -121,6 +134,8 @@ class BackupV2(BaseService):
 
             # ================================
             # Restore Database
+
+            self._restore_secrets(contents.data_directory)
 
             self.logger.info("importing database tables")
             self.db_exporter.restore(database_json)

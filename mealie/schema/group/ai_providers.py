@@ -1,3 +1,4 @@
+from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import UUID4, ConfigDict, Field, ValidationInfo, computed_field, field_validator, model_validator
@@ -9,12 +10,41 @@ from mealie.schema._mealie import MealieModel
 from mealie.services import ocr
 
 
+class AIProviderSlot(StrEnum):
+    """A kind of AI task. Each slot has an ordered list of providers to try (see docs/ai/PHASE1.md)"""
+
+    default = "default"
+    """Text tasks (build recipe, scrape fallback)"""
+    image = "image"
+    """Anything with image attachments"""
+    audio = "audio"
+    """Transcription and audio attachments"""
+    planner = "planner"
+    """Tool-using agent work; falls back to `default`"""
+    fast = "fast"
+    """Cheap structured calls (ingredient parsing, organizers, translation); falls back to `default`"""
+    embedding = "embedding"
+    """Embeddings; never falls back to `default`"""
+
+
+class AIProviderProtocol(StrEnum):
+    """The wire protocol a provider speaks"""
+
+    openai = "openai"
+    """OpenAI-compatible chat completions (OpenAI, Gemini, Ollama, OpenRouter, ...)"""
+    anthropic = "anthropic"
+    """Anthropic's native Messages API (Claude)"""
+
+
 class AIProviderCreate(MealieModel):
     name: str
     base_url: str | None = None
     api_key: str = Field("", exclude=True)
     model: str
     timeout: int = 300
+    protocol: AIProviderProtocol = AIProviderProtocol.openai
+    monthly_token_limit: int | None = Field(None, ge=1)
+    """Prompt + completion tokens allowed per calendar month (UTC); unset means unlimited"""
 
     request_headers: dict[str, str] = {}
     request_params: dict[str, str] = {}
@@ -29,6 +59,10 @@ class AIProviderCreate(MealieModel):
     @field_validator("base_url", mode="before")
     def validate_as_none(val: Any | None) -> Any | None:
         return val or None
+
+    @field_validator("monthly_token_limit", mode="before")
+    def validate_blank_as_none(val: Any | None) -> Any | None:
+        return None if val == "" else val
 
     @field_validator("timeout")
     def validate_non_negative_number(val: int, info: ValidationInfo) -> int:
@@ -49,6 +83,15 @@ class AIProviderOut(AIProviderCreate):
     id: UUID4
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("name", "api_key", "model")
+    def validate_not_empty(val: str, info: ValidationInfo) -> str:
+        # Overrides AIProviderCreate's check: a stored key that can't be decrypted (e.g. after `.secret`
+        # changed) reads as "", and the provider must still load so its calls fail auth and it can be fixed
+        if not val and info.field_name != "api_key":
+            raise ValueError(f"{info.field_name} cannot be empty")
+
+        return val
 
     @field_validator("request_headers", "request_params", mode="before")
     def wrap_headers_and_params(cls, v):

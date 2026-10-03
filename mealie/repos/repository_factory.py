@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, with_expression
 from mealie.db.models._model_utils.guid import GUID
 from mealie.db.models.group import Group, ReportEntryModel, ReportModel
 from mealie.db.models.group.ai_providers import AIProvider, AIProviderSettings
+from mealie.db.models.group.ai_routing import AIProviderRoute, AIUsageLog
 from mealie.db.models.group.exports import GroupDataExportsModel
 from mealie.db.models.group.preferences import GroupPreferencesModel
 from mealie.db.models.household.cookbook import CookBook
@@ -39,6 +40,7 @@ from mealie.db.models.users import LongLiveToken, User
 from mealie.db.models.users.password_reset import PasswordResetModel
 from mealie.db.models.users.user_to_recipe import UserToRecipe
 from mealie.repos.repository_ai_provider import GroupRepositoryAIProvider
+from mealie.repos.repository_ai_routing import GroupRepositoryAIProviderRoutes, GroupRepositoryAIUsage
 from mealie.repos.repository_cookbooks import RepositoryCookbooks
 from mealie.repos.repository_foods import RepositoryFood
 from mealie.repos.repository_household import RepositoryHousehold, RepositoryHouseholdRecipes
@@ -46,6 +48,7 @@ from mealie.repos.repository_meal_plan_rules import RepositoryMealPlanRules
 from mealie.repos.repository_units import RepositoryUnit
 from mealie.schema.cookbook.cookbook import ReadCookBook
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSettingsOut
+from mealie.schema.group.ai_routing import AIProviderRouteOut, AIUsageLogOut
 from mealie.schema.group.group_exports import GroupDataExport
 from mealie.schema.group.group_preferences import ReadGroupPreferences
 from mealie.schema.household.group_events import GroupEventNotifierOut
@@ -299,6 +302,16 @@ class AllRepositories:
     @cached_property
     def group_ai_providers(self) -> GroupRepositoryAIProvider:
         return GroupRepositoryAIProvider(self.session, PK_ID, AIProvider, AIProviderOut, group_id=self.group_id)
+
+    @cached_property
+    def group_ai_provider_routes(self) -> GroupRepositoryAIProviderRoutes:
+        return GroupRepositoryAIProviderRoutes(
+            self.session, PK_ID, AIProviderRoute, AIProviderRouteOut, group_id=self.group_id
+        )
+
+    @cached_property
+    def group_ai_usage(self) -> GroupRepositoryAIUsage:
+        return GroupRepositoryAIUsage(self.session, PK_ID, AIUsageLog, AIUsageLogOut, group_id=self.group_id)
 
     # ================================================================
     # Household

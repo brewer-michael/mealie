@@ -129,6 +129,7 @@ async def start_scheduler():
         tasks.purge_group_data_exports,
         tasks.create_mealplan_timeline_events,
         tasks.delete_old_checked_list_items,
+        tasks.purge_ai_usage_log,
     )
 
     SchedulerRegistry.register_minutely(

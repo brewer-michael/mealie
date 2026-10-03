@@ -61,10 +61,16 @@ foods_merge = "/api/foods/merge"
 """`/api/foods/merge`"""
 groups_ai_providers_providers = "/api/groups/ai-providers/providers"
 """`/api/groups/ai-providers/providers`"""
+groups_ai_providers_providers_models = "/api/groups/ai-providers/providers/models"
+"""`/api/groups/ai-providers/providers/models`"""
 groups_ai_providers_providers_test = "/api/groups/ai-providers/providers/test"
 """`/api/groups/ai-providers/providers/test`"""
+groups_ai_providers_routes = "/api/groups/ai-providers/routes"
+"""`/api/groups/ai-providers/routes`"""
 groups_ai_providers_settings = "/api/groups/ai-providers/settings"
 """`/api/groups/ai-providers/settings`"""
+groups_ai_providers_usage = "/api/groups/ai-providers/usage"
+"""`/api/groups/ai-providers/usage`"""
 groups_households = "/api/groups/households"
 """`/api/groups/households`"""
 groups_labels = "/api/groups/labels"
@@ -335,6 +341,11 @@ def foods_item_id(item_id):
 def groups_ai_providers_providers_provider_id(provider_id):
     """`/api/groups/ai-providers/providers/{provider_id}`"""
     return f"{prefix}/groups/ai-providers/providers/{provider_id}"
+
+
+def groups_ai_providers_providers_provider_id_models(provider_id):
+    """`/api/groups/ai-providers/providers/{provider_id}/models`"""
+    return f"{prefix}/groups/ai-providers/providers/{provider_id}/models"
 
 
 def groups_ai_providers_providers_provider_id_test(provider_id):

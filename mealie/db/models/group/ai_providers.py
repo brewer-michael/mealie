@@ -6,6 +6,7 @@ from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 
 from .._model_base import BaseMixins, SqlAlchemyBase
 from .._model_utils.auto_init import auto_init
+from .._model_utils.encrypted import EncryptedString
 from .._model_utils.guid import GUID
 
 if TYPE_CHECKING:
@@ -76,9 +77,11 @@ class AIProvider(SqlAlchemyBase, BaseMixins):
 
     name: orm.Mapped[str] = orm.mapped_column(sa.String, index=True, nullable=False)
     base_url: orm.Mapped[str | None] = orm.mapped_column(sa.String, nullable=True)
-    api_key: orm.Mapped[str] = orm.mapped_column(sa.String, nullable=False)
+    api_key: orm.Mapped[str] = orm.mapped_column(EncryptedString, nullable=False)
     model: orm.Mapped[str] = orm.mapped_column(sa.String, nullable=False)
     timeout: orm.Mapped[int] = orm.mapped_column(sa.Integer, nullable=False, default=300)
+    protocol: orm.Mapped[str] = orm.mapped_column(sa.String, nullable=False, default="openai", server_default="openai")
+    monthly_token_limit: orm.Mapped[int | None] = orm.mapped_column(sa.Integer, nullable=True)
 
     request_headers: orm.Mapped[list[AIProviderHeaders]] = orm.relationship(
         "AIProviderHeaders", cascade="all, delete-orphan"

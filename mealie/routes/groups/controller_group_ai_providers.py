@@ -62,6 +62,8 @@ class GroupAIProviderController(BaseUserController):
             api_key=data.api_key,
             model=data.model,
             timeout=data.timeout,
+            protocol=data.protocol,
+            monthly_token_limit=data.monthly_token_limit,
             request_headers=data.request_headers,
             request_params=data.request_params,
         )
@@ -90,6 +92,8 @@ class GroupAIProviderController(BaseUserController):
                     "base_url": overrides.base_url,
                     "model": overrides.model,
                     "timeout": overrides.timeout,
+                    "protocol": overrides.protocol,
+                    "monthly_token_limit": overrides.monthly_token_limit,
                     "request_headers": overrides.request_headers,
                     "request_params": overrides.request_params,
                     **({"api_key": overrides.api_key} if overrides.api_key else {}),

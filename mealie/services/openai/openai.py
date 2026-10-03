@@ -19,9 +19,11 @@ from mealie.core import exceptions, root_logger
 from mealie.core.config import get_app_settings
 from mealie.pkgs import img
 from mealie.repos.repository_factory import AllRepositories
-from mealie.schema.group.ai_providers import AIProviderOut, AIProviderTestResult
+from mealie.schema.group.ai_providers import AIProviderOut, AIProviderProtocol, AIProviderTestResult
+from mealie.schema.group.ai_routing import AIProviderModelInfo
 from mealie.schema.openai._base import OpenAIBase
 from mealie.schema.openai.general import OpenAIText
+from mealie.services.ai.errors import AIProviderUnsupportedError
 
 from .._base_service import BaseService
 
@@ -195,6 +197,25 @@ class OpenAIService(BaseService):
             return AIProviderTestResult(success=False, message="No response received from the provider.")
 
         return AIProviderTestResult(success=True, supports_images=await self._check_image_support(provider))
+
+    async def list_models(self, provider: AIProviderOut) -> list[AIProviderModelInfo]:
+        """
+        The models a provider offers, sorted by id, for the model picker when setting one up.
+
+        Provider errors propagate unchanged; report them to users with
+        `mealie.services.ai.errors.describe_provider_error`, never with the error's own message.
+        """
+        if provider.protocol == AIProviderProtocol.anthropic:
+            # The native Claude adapter (mealie/services/ai/anthropic_adapter.py) provides this
+            raise AIProviderUnsupportedError("Listing models isn't available for Anthropic (Claude) providers yet.")
+
+        client = self.get_client(provider)
+        # OpenAI-compatible model lists don't say which models read images
+        models = [
+            AIProviderModelInfo(id=model.id, display_name=None, supports_images=None)
+            async for model in client.models.list()
+        ]
+        return sorted(models, key=lambda model: model.id)
 
     async def _check_image_support(self, provider: AIProviderOut) -> bool:
         """

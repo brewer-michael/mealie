@@ -3,6 +3,7 @@ from fastapi import HTTPException, status
 from pydantic import UUID4
 
 from mealie.db.models.group.ai_providers import AIProvider, AIProviderSettings
+from mealie.db.models.group.ai_routing import AIProviderRoute, AIUsageLog
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut
 
 from .repository_generic import GroupRepositoryGeneric
@@ -33,11 +34,10 @@ class GroupRepositoryAIProvider(GroupRepositoryGeneric[AIProviderOut, AIProvider
             new_data = new_data.model_dump()
             new_data["api_key"] = api_key
 
-        # Merge existing API key into new data
+        # No key given: leave the stored (encrypted) one untouched. Copying the decrypted value back
+        # would replace a key that can't currently be decrypted (e.g. after `.secret` changed) with "".
         if not new_data.get("api_key"):
-            existing = self.get_one(match_value)
-            if existing:
-                new_data["api_key"] = existing.api_key
+            new_data.pop("api_key", None)
 
         return super().update(match_value, new_data)
 
@@ -58,6 +58,16 @@ class GroupRepositoryAIProvider(GroupRepositoryGeneric[AIProviderOut, AIProvider
             .where(AIProviderSettings.image_provider_id == value)
             .values(image_provider_id=None)
         )
+
+        # Drop the provider's fallback routes, and keep its usage history without the reference
+        routes = sa.delete(AIProviderRoute).where(AIProviderRoute.provider_id == value)
+        usage = sa.update(AIUsageLog).where(AIUsageLog.provider_id == value).values(provider_id=None)
+        if self.group_id:
+            group_settings = sa.select(AIProviderSettings.id).where(AIProviderSettings.group_id == self.group_id)
+            routes = routes.where(AIProviderRoute.settings_id.in_(group_settings))
+            usage = usage.where(AIUsageLog.group_id == self.group_id)
+        self.session.execute(routes)
+        self.session.execute(usage)
 
         # Delete
         return super().delete(value, match_key)
