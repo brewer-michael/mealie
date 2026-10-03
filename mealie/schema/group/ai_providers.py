@@ -6,6 +6,7 @@ from sqlalchemy.orm.interfaces import LoaderOption
 
 from mealie.db.models.group.ai_providers import AIProvider, AIProviderSettings
 from mealie.schema._mealie import MealieModel
+from mealie.services import ocr
 
 
 class AIProviderCreate(MealieModel):
@@ -135,6 +136,11 @@ class AIProviderSettingsOut(AIProviderSettingsUpdate):
     @property
     def image_provider_enabled(self) -> bool:
         return self.ai_enabled and self.image_provider_id is not None
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def ocr_fallback_enabled(self) -> bool:
+        return self.ai_enabled and ocr.is_available()
 
     @classmethod
     def loader_options(cls) -> list[LoaderOption]:

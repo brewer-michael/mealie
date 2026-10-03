@@ -136,6 +136,14 @@ Recipe import can also transcribe a video's audio with AI (e.g. to import a reci
 |-------------------------------------------------------------------------|:-----------:|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | YTDLP_COOKIEFILE | None | Cookiefile for yt-dlp to use when downloading a video, needed for content that requires sign-in |
 
+Recipe import can still read photos when your group has no image provider, or when it fails. Mealie reads the text in each photo with on-device [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR and sends that text to your default provider. Tesseract must be installed on the server (the `tesseract` command must be on the `PATH`). If it isn't, this step is skipped. OCR handles printed text well but often misreads handwriting, so an image provider gives better results when you have one.
+
+| Variables | Default | Description |
+|-------------------------------------------------------------------------|:-----------:|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| OCR_ENABLED | True | Read photos with Tesseract when there's no image provider, or it fails. Has no effect if Tesseract isn't installed |
+| OCR_LANGUAGES | eng | The languages Tesseract reads, joined by `+` (e.g. `eng+deu`). Each language needs its Tesseract language data installed (e.g. the `tesseract-ocr-deu` package) |
+| OCR_TIMEOUT | 60 | Maximum seconds Tesseract may spend reading a single photo |
+
 ### Recipe Scraper
 
 When you import a recipe from a URL, Mealie fetches the page (and its image) before parsing it. Many

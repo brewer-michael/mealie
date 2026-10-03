@@ -66,6 +66,7 @@ export interface AIProviderSettingsOut {
   aiEnabled: boolean;
   audioProviderEnabled: boolean;
   imageProviderEnabled: boolean;
+  ocrFallbackEnabled: boolean;
 }
 export interface AIProviderSummary {
   id: string;

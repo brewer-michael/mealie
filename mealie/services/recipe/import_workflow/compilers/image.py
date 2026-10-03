@@ -13,7 +13,7 @@ class ImageCompiler(SourceCompiler):
     progress_key = "recipe.create-progress.reading-images-with-ai"
 
     def can_compile(self) -> bool:
-        return bool(self.ctx.input.images)
+        return bool(self.ctx.input.images) and self.ctx.ai.image_provider is not None
 
     async def compile(self) -> OpenAICompiledSource | None:
         images = self.ctx.input.images

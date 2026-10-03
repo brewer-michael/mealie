@@ -546,6 +546,7 @@
     "import-with-ai-content-hint": "Optional. Paste a recipe, or the contents of a page Mealie can't reach. Combined with anything else you provide, so you can also use it for notes, like what to name the recipe or a detail to correct.",
     "import-with-ai-provider-required": "To import recipes with AI, configure a default provider in your group's AI settings.",
     "import-with-ai-image-provider-required": "To create recipes from photos, configure an image provider in your group's AI settings.",
+    "import-with-ai-images-ocr-hint": "No image provider is set, so photos will be read with on-device text recognition. Handwriting may need corrections.",
     "import-with-ai-error-details": "AI was unable to create a recipe from what you provided. Check that it contains a recipe, and try again.",
     "create-new-organizers": "Create new organizers",
     "create-new-organizers-hint": "Tags, categories, and tools found on the recipe are always matched against the ones you already have. Turn this on to also create the ones you don't.",

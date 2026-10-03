@@ -1,11 +1,13 @@
 from .base import COMPILE_SOURCE_PROMPT, SourceCompiler, SourceType
 from .image import ImageCompiler
+from .ocr_image import OCRImageCompiler
 from .structured_data import StructuredDataCompiler
 from .transcription import TranscriptionCompiler
 from .web_page import WebPageCompiler
 
 DEFAULT_SOURCE_COMPILERS: list[type[SourceCompiler]] = [
     ImageCompiler,
+    OCRImageCompiler,
     TranscriptionCompiler,
     StructuredDataCompiler,
     WebPageCompiler,
@@ -16,6 +18,7 @@ __all__ = [
     "COMPILE_SOURCE_PROMPT",
     "DEFAULT_SOURCE_COMPILERS",
     "ImageCompiler",
+    "OCRImageCompiler",
     "SourceCompiler",
     "SourceType",
     "StructuredDataCompiler",

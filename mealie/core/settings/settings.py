@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import secrets
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -8,7 +9,7 @@ from typing import Annotated, Literal, NamedTuple
 from urllib.parse import urlparse
 
 from dateutil.tz import tzlocal
-from pydantic import PlainSerializer, field_validator
+from pydantic import PlainSerializer, PositiveInt, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mealie.core.settings.themes import Theme
@@ -57,6 +58,9 @@ DEFAULT_ALLOWED_IFRAME_HOSTS = [
 ]
 """Secure-by-default hostnames permitted as `<iframe>` sources in user content. Limited to
 well-known video providers. Subdomains of these hosts are also allowed (e.g. `www.youtube.com`)."""
+
+OCR_LANGUAGES_PATTERN = re.compile(r"\w+(/\w+)?(\+\w+(/\w+)?)*", re.ASCII)
+"""Tesseract language codes joined by `+`, e.g. `eng`, `eng+deu`, or `script/Latin`"""
 
 
 MaskedNoneString = Annotated[
@@ -451,6 +455,32 @@ class AppSettings(AppLoggingSettings):
     Path to a folder containing custom prompt files;
     files are individually optional, each prompt name will fall back to the default if no custom file exists
     """
+
+    # ===============================================
+    # OCR Configuration
+
+    OCR_ENABLED: bool = True
+    """
+    Read recipe images with on-device Tesseract OCR when a group has no image provider, or it fails,
+    and pass the text to the default provider instead; skipped if ``tesseract`` isn't on the PATH
+    """
+
+    OCR_LANGUAGES: str = "eng"
+    """Tesseract languages to read with, joined by ``+`` (e.g. ``eng+deu``); each needs its language data installed"""
+
+    OCR_TIMEOUT: PositiveInt = 60
+    """Maximum seconds Tesseract may spend reading a single image"""
+
+    @field_validator("OCR_LANGUAGES")
+    @classmethod
+    def validate_ocr_languages(cls, v: str) -> str:
+        """Passed to Tesseract as an argument, so only language codes are accepted"""
+        v = v.strip()
+        if not OCR_LANGUAGES_PATTERN.fullmatch(v):
+            raise ValueError(
+                f"OCR_LANGUAGES must be Tesseract language codes joined by '+', e.g. 'eng+deu' (got '{v}')"
+            )
+        return v
 
     # ===============================================
     # Scraper Configuration

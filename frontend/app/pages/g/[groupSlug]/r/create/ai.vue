@@ -69,6 +69,15 @@
         />
 
         <div v-if="imagesEnabled" class="mt-6">
+          <v-alert
+            v-if="!imageProviderEnabled"
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="mb-4"
+          >
+            {{ $t('recipe.import-with-ai-images-ocr-hint') }}
+          </v-alert>
           <RecipeImportImages v-model="uploadedImages" :disabled="state.loading" />
         </div>
         <v-alert
@@ -194,7 +203,8 @@ const groupSlug = computed(() => route.params.groupSlug as string || auth.user.v
 const urlImporterTarget = computed(() => `/g/${groupSlug.value}/r/create/url`);
 const htmlOrJsonImporterTarget = computed(() => `/g/${groupSlug.value}/r/create/html`);
 const aiEnabled = computed(() => !!group.value?.aiProviderSettings?.aiEnabled);
-const imagesEnabled = computed(() => !!group.value?.aiProviderSettings?.imageProviderEnabled);
+const imageProviderEnabled = computed(() => !!group.value?.aiProviderSettings?.imageProviderEnabled);
+const imagesEnabled = computed(() => imageProviderEnabled.value || !!group.value?.aiProviderSettings?.ocrFallbackEnabled);
 const videosEnabled = computed(() => !!group.value?.aiProviderSettings?.audioProviderEnabled);
 
 const domUrlForm = ref<VForm | null>(null);

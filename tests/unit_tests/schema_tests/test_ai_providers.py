@@ -8,6 +8,7 @@ from mealie.schema.group.ai_providers import (
     AIProviderSettingsOut,
     AIProviderSummary,
 )
+from mealie.services import ocr
 
 
 class AIProviderCreateTests:
@@ -137,6 +138,26 @@ class AIProviderSettingsOutTests:
         )
         assert s.ai_enabled
         assert s.image_provider_enabled
+
+    # --- ocr_fallback_enabled ---
+
+    def test_ocr_fallback_enabled_with_default_provider_and_ocr(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ocr, "is_available", lambda: True)
+        pid = uuid4()
+        s = self._make_settings(default_provider_id=pid, providers=[AIProviderSummary(id=pid, name="p")])
+        assert not s.image_provider_enabled
+        assert s.ocr_fallback_enabled
+
+    def test_ocr_fallback_disabled_without_ocr(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ocr, "is_available", lambda: False)
+        pid = uuid4()
+        s = self._make_settings(default_provider_id=pid, providers=[AIProviderSummary(id=pid, name="p")])
+        assert not s.ocr_fallback_enabled
+
+    def test_ocr_fallback_disabled_when_no_default(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(ocr, "is_available", lambda: True)
+        s = self._make_settings()
+        assert not s.ocr_fallback_enabled
 
     # --- validate_providers model validator ---
 

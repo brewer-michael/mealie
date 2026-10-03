@@ -23,6 +23,7 @@ from mealie.schema.openai.recipe import (
     OpenAIRecipeNutrition,
 )
 from mealie.schema.recipe.recipe_category import TagSave
+from mealie.services import ocr
 from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.recipe.organizer_resolver import OrganizerResolver
 from mealie.services.recipe.recipe_data_service import RecipeDataService
@@ -891,11 +892,8 @@ def test_create_with_ai_disabled(api_client: TestClient, unique_user: TestUser):
     assert r.status_code == 400
 
 
-def test_create_with_images_but_no_image_provider(
-    api_client: TestClient,
-    unique_user: TestUser,
-    test_image_jpg: str,
-):
+@pytest.fixture()
+def no_image_provider(unique_user: TestUser) -> None:
     settings = unique_user.repos.group_ai_provider_settings.get_one(unique_user.repos.group_id)
     assert settings
     unique_user.repos.group_ai_provider_settings.update(
@@ -907,10 +905,43 @@ def test_create_with_images_but_no_image_provider(
         ),
     )
 
+
+def test_create_with_images_but_no_image_provider(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    test_image_jpg: str,
+    no_image_provider: None,
+):
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+
     with open(test_image_jpg, "rb") as f:
         r = post_ai(api_client, unique_user, files=[("images", ("recipe.jpg", f, "image/jpeg"))])
 
     assert r.status_code == 400
+
+
+def test_create_with_images_and_no_image_provider_falls_back_to_ocr(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    openai_recipe: OpenAIRecipe,
+    test_image_jpg: str,
+    no_image_provider: None,
+):
+    ocr_text = random_string()
+    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    monkeypatch.setattr(ocr, "extract_text", lambda _: ocr.OCRResult(text=ocr_text, confidence=80))
+    ai = AIResponses(recipe=openai_recipe).install(monkeypatch)
+
+    with open(test_image_jpg, "rb") as f:
+        r = post_ai(api_client, unique_user, files=[("images", ("recipe.jpg", f, "image/jpeg"))])
+
+    assert r.status_code == 201
+
+    # the default provider reads the text instead of the image, then builds the recipe as usual
+    assert ai.requested_schemas[:2] == ["OpenAICompiledSource", "OpenAIRecipe"]
+    assert ocr_text in ai.messages[0]
 
 
 def test_create_stream_emits_progress(
