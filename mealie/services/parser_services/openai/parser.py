@@ -2,6 +2,7 @@ import json
 
 from rapidfuzz import fuzz
 
+from mealie.schema.group.ai_providers import AIProviderSlot
 from mealie.schema.openai.recipe_ingredient import OpenAIIngredient, OpenAIIngredients
 from mealie.schema.recipe.recipe_ingredient import (
     CreateIngredientFood,
@@ -161,7 +162,10 @@ class OpenAIParser(ABCIngredientParser):
         prompt = self._get_prompt(service)
 
         response = await service.get_response(
-            prompt, json.dumps(ingredients, separators=(",", ":")), response_schema=OpenAIIngredients
+            prompt,
+            json.dumps(ingredients, separators=(",", ":")),
+            response_schema=OpenAIIngredients,
+            slot=AIProviderSlot.fast,
         )
 
         if not response:

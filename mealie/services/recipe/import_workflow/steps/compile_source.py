@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from mealie.core.root_logger import get_logger
 from mealie.pkgs.safehttp import resilient_fetch
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
+from mealie.services.ai.errors import AIProviderLimitReachedError
+from mealie.services.openai import OpenAINotEnabledException
 from mealie.services.openai.content import truncate_source_parts
 
 from ..base import WorkflowStep
@@ -51,6 +53,7 @@ class CompileSourceStep(WorkflowStep):
     async def _compile(
         self, ctx: WorkflowContext, source_type: SourceType, content: str | None = None
     ) -> OpenAICompiledSource | None:
+        provider_error: Exception | None = None
         for CompilerClass in self.compilers:
             if CompilerClass.source_type is not source_type:
                 continue
@@ -64,6 +67,12 @@ class CompileSourceStep(WorkflowStep):
 
             try:
                 compiled = await compiler.compile()
+            except (AIProviderLimitReachedError, OpenAINotEnabledException) as e:
+                # Fork: no provider may take the request (e.g. all at their monthly token limit). Another
+                # compiler may still read the source on other providers; if none does, that's the error to
+                # report, not an unreadable source.
+                provider_error = e
+                continue
             except Exception:
                 # `can_compile` judges the shape of the source, not whether it can actually be read.
                 # yt-dlp recognises every cooking.nytimes.com/recipes/<id> URL, for instance, but
@@ -74,6 +83,9 @@ class CompileSourceStep(WorkflowStep):
 
             if compiled:
                 return compiled
+
+        if provider_error:
+            raise provider_error
 
         return None
 

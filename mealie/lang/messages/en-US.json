@@ -21,6 +21,7 @@
         },
         "and-amount": "and {amount}",
         "import-errors": {
+            "ai-limit-reached": "Every AI provider for this task has reached its monthly token limit",
             "ai-not-enabled": "AI services are not enabled",
             "ai-request-failed": "The AI provider was unable to complete the request. Please try again",
             "image-provider-not-enabled": "AI image services are not enabled",

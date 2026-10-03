@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 from abc import ABC, abstractmethod
+from functools import cached_property
 from pathlib import Path
 from textwrap import dedent
 from typing import TYPE_CHECKING, TypeVar
@@ -19,11 +20,11 @@ from mealie.core import exceptions, root_logger
 from mealie.core.config import get_app_settings
 from mealie.pkgs import img
 from mealie.repos.repository_factory import AllRepositories
-from mealie.schema.group.ai_providers import AIProviderOut, AIProviderProtocol, AIProviderTestResult
+from mealie.schema.group.ai_providers import AIProviderOut, AIProviderProtocol, AIProviderSlot, AIProviderTestResult
 from mealie.schema.group.ai_routing import AIProviderModelInfo
 from mealie.schema.openai._base import OpenAIBase
 from mealie.schema.openai.general import OpenAIText
-from mealie.services.ai.errors import AIProviderUnsupportedError
+from mealie.services.ai.runtime import AIRuntime, capture_openai_usage, get_claude_response
 
 from .._base_service import BaseService
 
@@ -160,6 +161,11 @@ class OpenAIService(BaseService):
             default_query=provider.request_params or None,
         )
 
+    @cached_property
+    def runtime(self) -> AIRuntime:
+        """Fork: provider routing, the native Claude adapter and the usage log (mealie/services/ai/runtime.py)"""
+        return AIRuntime(self)
+
     async def ping(
         self, provider: AIProviderOut, message: str, images: list[OpenAILocalImage] | None = None
     ) -> OpenAIText | None:
@@ -199,23 +205,8 @@ class OpenAIService(BaseService):
         return AIProviderTestResult(success=True, supports_images=await self._check_image_support(provider))
 
     async def list_models(self, provider: AIProviderOut) -> list[AIProviderModelInfo]:
-        """
-        The models a provider offers, sorted by id, for the model picker when setting one up.
-
-        Provider errors propagate unchanged; report them to users with
-        `mealie.services.ai.errors.describe_provider_error`, never with the error's own message.
-        """
-        if provider.protocol == AIProviderProtocol.anthropic:
-            # The native Claude adapter (mealie/services/ai/anthropic_adapter.py) provides this
-            raise AIProviderUnsupportedError("Listing models isn't available for Anthropic (Claude) providers yet.")
-
-        client = self.get_client(provider)
-        # OpenAI-compatible model lists don't say which models read images
-        models = [
-            AIProviderModelInfo(id=model.id, display_name=None, supports_images=None)
-            async for model in client.models.list()
-        ]
-        return sorted(models, key=lambda model: model.id)
+        """Fork: the models a provider offers, for the model picker (mealie/services/ai/runtime.py)"""
+        return await self.runtime.list_models(provider)
 
     async def _check_image_support(self, provider: AIProviderOut) -> bool:
         """
@@ -389,6 +380,7 @@ class OpenAIService(BaseService):
         ) as response:
             completion = ChatCompletion.model_validate(json.loads(await response.text()))
 
+        capture_openai_usage(completion)  # Fork: for the usage log
         for choice in completion.choices:
             if choice.finish_reason == "length":
                 raise openai.LengthFinishReasonError(completion=completion)
@@ -408,12 +400,19 @@ class OpenAIService(BaseService):
         response_schema: type[T],
         attachments: list[OpenAIAttachment] | None = None,
         provider: AIProviderOut | None = None,
+        slot: AIProviderSlot | None = None,
     ) -> T | None:
         """Send data to OpenAI and return the response message content"""
         import openai
 
+        if not provider:
+            # Fork: try each of the slot's providers in turn, logging every attempt
+            return await self.runtime.get_response(prompt, message, response_schema, attachments, slot)
+
         try:
             provider = provider or self._get_provider(attachments)
+            if provider.protocol == AIProviderProtocol.anthropic:  # Fork: Claude's native API
+                return await get_claude_response(prompt, message, response_schema, provider, attachments)
             user_messages: list[dict] = [{"type": "text", "text": message}]
             for attachment in attachments or []:
                 user_messages.append(attachment.build_message())
@@ -430,16 +429,9 @@ class OpenAIService(BaseService):
         if not self.audio_provider:
             raise OpenAINotEnabledException("No audio provider set")
 
-        client = self.get_client(self.audio_provider)
-
-        # Create a transcription from the audio
+        # Create a transcription from the audio (Fork: with each audio provider in turn)
         try:
-            with open(audio_file_path, "rb") as audio_file:
-                transcript = await client.audio.transcriptions.create(
-                    model=self.audio_provider.model,
-                    file=audio_file,
-                )
-            return transcript.text
+            return await self.runtime.transcribe_audio(audio_file_path)
         except openai.RateLimitError as e:
             raise exceptions.RateLimitError(str(e)) from e
         except Exception as e:

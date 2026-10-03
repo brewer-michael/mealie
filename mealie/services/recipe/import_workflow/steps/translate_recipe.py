@@ -1,4 +1,5 @@
 from mealie.core.root_logger import get_logger
+from mealie.schema.group.ai_providers import AIProviderSlot
 from mealie.schema.openai.recipe import (
     OpenAIRecipe,
     OpenAIRecipeIngredient,
@@ -92,6 +93,7 @@ class TranslateRecipeStep(WorkflowStep):
             ctx.ai.get_prompt(TRANSLATE_RECIPE_PROMPT),
             self._build_message(ctx, recipe),
             response_schema=OpenAIRecipe,
+            slot=AIProviderSlot.fast,
         )
 
         if not (response and (response.ingredients or response.instructions)):

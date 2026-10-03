@@ -14,6 +14,26 @@ class AIProviderUnsupportedError(AIProviderError):
     """The provider, or its protocol, can't do what was asked (e.g. audio attachments on Claude)"""
 
 
+class AIProviderLimitReachedError(AIProviderError):
+    """Every provider that could handle a request has used up its monthly token limit"""
+
+
+class AIProviderRefusedError(AIProviderError):
+    """The model declined the request (Claude's `refusal` stop reason)"""
+
+
+class AIProviderOutputTruncatedError(AIProviderError):
+    """The model ran out of output tokens before finishing its answer (Claude's `max_tokens` stop reason)"""
+
+
+def is_rate_limit_error(error: BaseException) -> bool:
+    """Whether `error` is a provider's rate limit (HTTP 429) response, from either SDK"""
+    import anthropic
+    import openai
+
+    return isinstance(error, openai.RateLimitError | anthropic.RateLimitError)
+
+
 def describe_provider_error(error: BaseException) -> str:
     """
     A user-safe description of a failed provider call: the error's type and HTTP status only, as

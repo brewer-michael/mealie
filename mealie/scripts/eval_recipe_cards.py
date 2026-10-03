@@ -20,8 +20,9 @@ import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 from rapidfuzz import fuzz
@@ -33,13 +34,15 @@ from mealie.lang import get_locale_provider
 from mealie.lang.providers import Translator
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
-from mealie.schema.group.ai_providers import AIProviderOut
+from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
 from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe.recipe_ingredient import RecipeIngredient
 from mealie.services import ocr as ocr_service
-from mealie.services.openai import OpenAIService
+from mealie.services.ai.runtime import AIRuntime
+from mealie.services.ai.usage import AITokenUsage
+from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.recipe.import_workflow import (
     DEFAULT_WORKFLOW_STEPS,
     RecipeImportWorkflow,
@@ -50,11 +53,6 @@ from mealie.services.recipe.import_workflow import (
 )
 from mealie.services.recipe.import_workflow.compilers import ImageCompiler, OCRImageCompiler, SourceCompiler
 from mealie.services.recipe.import_workflow.steps import CompileSourceStep
-
-if TYPE_CHECKING:
-    # the HTTP client library the OpenAI SDK is built on
-    import httpx2
-    from openai import AsyncOpenAI
 
 logger = root_logger.get_logger()
 
@@ -640,10 +638,53 @@ class EvalConfig:
         }
 
 
+class EvalAIRuntime(AIRuntime):
+    """
+    Sends every request to the provider under test for its slot, never to the group's fallback routes, and
+    tallies the tokens each provider reports using, to put a price on a run. An eval run isn't real usage,
+    so nothing goes in the group's usage log.
+    """
+
+    service: EvalOpenAIService
+
+    def __init__(self, service: EvalOpenAIService) -> None:
+        super().__init__(service)
+        self.usage: dict[str, TokenUsage] = {}
+
+    def candidates(self, slot: AIProviderSlot) -> list[AIProviderOut]:
+        if slot is AIProviderSlot.image:
+            provider = self.service.image_provider
+        elif slot in (AIProviderSlot.default, AIProviderSlot.fast, AIProviderSlot.planner):
+            provider = self.service.default_provider
+        else:
+            provider = None
+
+        if not provider:
+            raise OpenAINotEnabledException(f"No {slot.value} provider set")
+
+        return [provider]
+
+    def record_attempt(
+        self,
+        provider: AIProviderOut,
+        *,
+        slot: AIProviderSlot,
+        feature: str,
+        usage: AITokenUsage,
+        latency_ms: int,
+        error: BaseException | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        tally = self.usage.setdefault(provider.name, TokenUsage())
+        tally.requests += 1
+        tally.prompt_tokens += usage.prompt_tokens
+        tally.completion_tokens += usage.completion_tokens
+
+
 class EvalOpenAIService(OpenAIService):
     """
-    An `OpenAIService` pinned to the providers under test instead of the group's configured ones,
-    which also tallies the tokens each provider reports using, to put a price on a run.
+    An `OpenAIService` pinned to the providers under test instead of the group's configured ones (see
+    `EvalAIRuntime`), whichever API they speak.
     """
 
     def __init__(
@@ -653,41 +694,15 @@ class EvalOpenAIService(OpenAIService):
         self.image_provider = image_provider
         self.default_provider = text_provider
         self.audio_provider = None
-        self.usage: dict[str, TokenUsage] = {}
-        self._http_clients: list[httpx2.AsyncClient] = []
 
-    def get_client(self, provider: AIProviderOut) -> AsyncOpenAI:
-        from openai import DefaultAsyncHttpxClient
+    @cached_property
+    def runtime(self) -> EvalAIRuntime:
+        return EvalAIRuntime(self)
 
-        async def record_usage(response: httpx2.Response) -> None:
-            await self._record_usage(provider, response)
-
-        http_client = DefaultAsyncHttpxClient(event_hooks={"response": [record_usage]})
-        self._http_clients.append(http_client)
-        return super().get_client(provider).with_options(http_client=http_client)
-
-    async def aclose(self) -> None:
-        for http_client in self._http_clients:
-            await http_client.aclose()
-        self._http_clients.clear()
-
-    async def _record_usage(self, provider: AIProviderOut, response: httpx2.Response) -> None:
-        if response.is_error:
-            return
-
-        try:
-            # reading the body here leaves it cached on the response for the client to parse as usual
-            await response.aread()
-            usage = response.json().get("usage") or {}
-            prompt_tokens = int(usage.get("prompt_tokens") or 0)
-            completion_tokens = int(usage.get("completion_tokens") or 0)
-        except Exception:
-            return
-
-        tally = self.usage.setdefault(provider.name, TokenUsage())
-        tally.requests += 1
-        tally.prompt_tokens += prompt_tokens
-        tally.completion_tokens += completion_tokens
+    @property
+    def usage(self) -> dict[str, TokenUsage]:
+        """The tokens each provider reported using, by provider name"""
+        return self.runtime.usage
 
 
 def capture_errors(compiler: type[SourceCompiler], errors: list[str]) -> type[SourceCompiler]:
@@ -821,7 +836,6 @@ async def run_card(
             result.error = compile_errors[0] if compile_errors else f"{type(e).__name__}: {e}"
         finally:
             result.latency_s = round(time.perf_counter() - start, 3)
-            await ai.aclose()
 
     result.usage = ai.usage
     result.cost_usd = run_cost(ai.usage, prices or {})

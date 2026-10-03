@@ -10,6 +10,8 @@ import pytest
 import mealie.services.openai.openai as openai_module
 from mealie.schema.group.ai_providers import AIProviderOut
 from mealie.schema.openai._base import OpenAIBase
+from mealie.services.ai.runtime import track_usage
+from mealie.services.ai.usage import AITokenUsage
 from mealie.services.openai.openai import OpenAIService
 
 
@@ -268,21 +270,23 @@ def _make_provider() -> MagicMock:
     return provider
 
 
-def _make_body(content: str | None, finish_reason: str = "stop") -> str:
+def _make_body(content: str | None, finish_reason: str = "stop", usage: tuple[int, int] | None = None) -> str:
     choices = (
         [{"message": {"content": content, "role": "assistant"}, "finish_reason": finish_reason, "index": 0}]
         if content is not None
         else []
     )
-    return json.dumps(
-        {
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "test-model",
-            "choices": choices,
-        }
-    )
+    body = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": choices,
+    }
+    if usage:
+        body["usage"] = {"prompt_tokens": usage[0], "completion_tokens": usage[1], "total_tokens": sum(usage)}
+
+    return json.dumps(body)
 
 
 class _FakeStream:
@@ -387,3 +391,24 @@ async def test_get_response_raises_on_content_filter_finish_reason(settings_stub
 
     with pytest.raises(Exception, match="content filter"):
         await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
+
+
+@pytest.mark.asyncio
+async def test_get_response_reports_token_usage_for_the_usage_log(settings_stub):
+    """The fork's usage log (docs/ai/PHASE1.md §4) reads the completion's usage, also when it's then rejected"""
+    svc = OpenAIService(_make_mock_repos())
+    completions = _FakeCompletions(parse_result=_make_body('{"answer": "hi"}', usage=(120, 30)))
+    svc.get_client = MagicMock(return_value=_FakeClient(completions))
+
+    with track_usage() as usage:
+        await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
+    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=30)
+
+    completions._parse_result = _make_body('{"answer": "h', finish_reason="length", usage=(120, 16000))
+    with track_usage() as usage, pytest.raises(Exception, match="length limit"):
+        await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
+    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=16000)
+
+    # Outside an attempt the fork logs, there's nothing to report to
+    completions._parse_result = _make_body('{"answer": "hi"}', usage=(120, 30))
+    assert await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())

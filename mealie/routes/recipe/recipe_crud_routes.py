@@ -60,6 +60,7 @@ from mealie.schema.response.responses import (
     SuccessResponse,
 )
 from mealie.services import urls
+from mealie.services.ai.errors import AIProviderLimitReachedError
 from mealie.services.event_bus_service.event_types import (
     EventOperation,
     EventRecipeBulkData,
@@ -256,6 +257,10 @@ class RecipeController(BaseRecipeController):
 
         if isinstance(ex, exceptions.VideoDownloadError):
             return self.t("recipe.import-errors.video-download-failed")
+
+        if isinstance(ex, AIProviderLimitReachedError) or isinstance(ex.__cause__, AIProviderLimitReachedError):
+            # also when wrapped, as the video importers wrap it in an `OpenAIServiceError`
+            return self.t("recipe.import-errors.ai-limit-reached")
 
         if isinstance(ex, exceptions.OpenAIServiceError):
             return self.t("recipe.import-errors.ai-request-failed")

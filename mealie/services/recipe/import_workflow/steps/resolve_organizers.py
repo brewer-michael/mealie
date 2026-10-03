@@ -1,3 +1,4 @@
+from mealie.schema.group.ai_providers import AIProviderSlot
 from mealie.schema.openai.organizers import OpenAIOrganizers
 from mealie.services.openai import OpenAIDataInjection
 from mealie.services.openai.content import truncate_source_content
@@ -105,6 +106,7 @@ class ResolveOrganizersStep(WorkflowStep):
             ctx.ai.get_prompt(RESOLVE_ORGANIZERS_PROMPT, data_injections=self._build_injections(resolver)),
             self._build_message(ctx),
             response_schema=OpenAIOrganizers,
+            slot=AIProviderSlot.fast,
         )
 
         if not response:

@@ -9,7 +9,13 @@ import openai
 import pytest
 
 from mealie.lang import get_locale_provider
-from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut, AIProviderSettingsUpdate
+from mealie.schema.group.ai_providers import (
+    AIProviderCreate,
+    AIProviderOut,
+    AIProviderProtocol,
+    AIProviderSettingsUpdate,
+    AIProviderSlot,
+)
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
 from mealie.schema.openai.general import OpenAIText
 from mealie.schema.openai.recipe import OpenAIRecipe, OpenAIRecipeIngredient, OpenAIRecipeInstruction
@@ -17,7 +23,8 @@ from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe.recipe_ingredient import RecipeIngredient
 from mealie.schema.recipe.recipe_step import RecipeStep
 from mealie.scripts import eval_recipe_cards as ev
-from mealie.services.openai import OpenAIService
+from mealie.services.ai import anthropic_adapter
+from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.openai.openai import OpenAIImageBase
 from mealie.services.recipe.import_workflow import DEFAULT_WORKFLOW_STEPS
 from mealie.services.recipe.import_workflow.compilers import ImageCompiler, OCRImageCompiler
@@ -779,40 +786,108 @@ def test_run_card_with_ocr(
     assert "1 banana" in ai.calls[0]["message"]
 
 
-def test_eval_service_tallies_token_usage(
-    unique_user: TestUser, providers: dict[str, AIProviderOut], monkeypatch: pytest.MonkeyPatch
-):
+def mock_openai_api(monkeypatch: pytest.MonkeyPatch, answer: dict | None = None) -> list[str]:
+    """
+    Stands in for the OpenAI-compatible providers' API behind the real client, answering `answer` (or failing
+    with a 500 when it's None) and reporting 120 prompt and 30 completion tokens. Returns the providers asked.
+    """
+    calls: list[str] = []
     completion = {
         "id": "chatcmpl-1",
         "object": "chat.completion",
         "created": 0,
         "model": "t",
         "choices": [
-            {
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": json.dumps({"text": "hello"})},
-            }
+            {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(answer)}}
         ],
         "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
     }
+    get_client = OpenAIService.get_client
 
-    default_http_client = openai.DefaultAsyncHttpxClient
+    def mocked_client(self: OpenAIService, provider: AIProviderOut) -> openai.AsyncOpenAI:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            calls.append(provider.name)
+            return httpx2.Response(200, json=completion) if answer else httpx2.Response(500, json={})
 
-    def http_client(**kwargs) -> httpx2.AsyncClient:
-        transport = httpx2.MockTransport(lambda _: httpx2.Response(200, json=completion))
-        return default_http_client(transport=transport, **kwargs)
+        transport = httpx2.MockTransport(handler)
+        http_client = openai.DefaultAsyncHttpxClient(transport=transport)
+        return get_client(self, provider).with_options(http_client=http_client, max_retries=0)
 
-    monkeypatch.setattr(openai, "DefaultAsyncHttpxClient", http_client)
+    monkeypatch.setattr(OpenAIService, "get_client", mocked_client)
+    return calls
+
+
+def usage_log(user: TestUser, *providers: AIProviderOut) -> list:
+    ids = {provider.id for provider in providers}
+    return [row for row in user.repos.group_ai_usage.get_all() if row.provider_id in ids]
+
+
+def test_eval_service_tallies_token_usage(
+    unique_user: TestUser, providers: dict[str, AIProviderOut], monkeypatch: pytest.MonkeyPatch
+):
+    mock_openai_api(monkeypatch, {"text": "hello"})
     text = providers["text"]
     ai = ev.EvalOpenAIService(unique_user.repos, image_provider=None, text_provider=text)
 
     async def ask_twice() -> list[OpenAIText | None]:
-        responses = [await ai.get_response("prompt", "message", response_schema=OpenAIText) for _ in range(2)]
-        await ai.aclose()
-        return responses
+        return [await ai.get_response("prompt", "message", response_schema=OpenAIText) for _ in range(2)]
 
     responses = asyncio.run(ask_twice())
 
     assert [response.text if response else None for response in responses] == ["hello", "hello"]
     assert ai.usage == {text.name: ev.TokenUsage(requests=2, prompt_tokens=240, completion_tokens=60)}
+    # An eval run isn't the group's real usage
+    assert usage_log(unique_user, text) == []
+
+
+def test_eval_service_tallies_claude_tokens(unique_user: TestUser, monkeypatch: pytest.MonkeyPatch):
+    async def get_response(prompt, message, *, response_schema, provider, attachments=None, usage=None):
+        usage.prompt_tokens, usage.completion_tokens = 300, 70
+        return response_schema(text="hello"), usage
+
+    monkeypatch.setattr(anthropic_adapter, "get_response", get_response)
+    claude = AIProviderOut(id=uuid4(), name="Claude", model="c", api_key="k", protocol=AIProviderProtocol.anthropic)
+    ai = ev.EvalOpenAIService(unique_user.repos, image_provider=None, text_provider=claude)
+
+    asyncio.run(ai.get_response("prompt", "message", response_schema=OpenAIText))
+
+    assert ai.usage == {"Claude": ev.TokenUsage(requests=1, prompt_tokens=300, completion_tokens=70)}
+
+
+@pytest.fixture()
+def default_route(unique_user: TestUser, providers: dict[str, AIProviderOut]) -> Generator[AIProviderOut]:
+    """A provider the group falls back to when its default provider fails"""
+    repos = unique_user.repos
+    backup = repos.group_ai_providers.create(AIProviderCreate(name=f"Backup {random_string()}", model="b", api_key="k"))
+    repos.group_ai_provider_routes.replace_routes({AIProviderSlot.default: [backup.id]})
+
+    yield backup
+
+    repos.group_ai_providers.delete(backup.id)
+
+
+@pytest.mark.parametrize("slot", [None, AIProviderSlot.fast])
+def test_eval_service_never_falls_back_to_the_groups_providers(
+    unique_user: TestUser,
+    providers: dict[str, AIProviderOut],
+    default_route: AIProviderOut,
+    monkeypatch: pytest.MonkeyPatch,
+    slot: AIProviderSlot | None,
+):
+    """A run scores the provider under test, even when it fails"""
+    calls = mock_openai_api(monkeypatch, answer=None)
+    text = providers["text"]
+    ai = ev.EvalOpenAIService(unique_user.repos, image_provider=None, text_provider=text)
+
+    with pytest.raises(Exception, match="OpenAI Request Failed"):
+        asyncio.run(ai.get_response("prompt", "message", response_schema=OpenAIText, slot=slot))
+
+    assert calls == [text.name]
+    assert usage_log(unique_user, text, default_route) == []
+
+
+def test_eval_service_without_a_provider_for_the_slot(unique_user: TestUser, providers: dict[str, AIProviderOut]):
+    ai = ev.EvalOpenAIService(unique_user.repos, image_provider=None, text_provider=providers["text"])
+
+    with pytest.raises(OpenAINotEnabledException, match="No image provider set"):
+        ai.runtime.candidates(AIProviderSlot.image)
