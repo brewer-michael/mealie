@@ -1,0 +1,75 @@
+# Mealie voice: local (no-LLM) sentences for Home Assistant Assist.
+#
+# Copy to <config>/custom_sentences/en/mealie.yaml. The intents are handled by
+# intent_script in packages/mealie_voice.yaml. See ../../README.md.
+#
+# Template syntax: https://developers.home-assistant.io/docs/voice/intent-recognition/template-sentence-syntax
+# Names are prefixed with "mealie_" so they can't clash with Home Assistant's
+# built-in lists and expansion rules, which are merged into the same namespace.
+language: "en"
+
+intents:
+  # "What's for dinner?", "What's for lunch tomorrow?", "What's on the menu today?"
+  # Slots: meal (optional, all meals when missing), day (optional, today when missing).
+  MealieWhatsForMeal:
+    data:
+      - sentences:
+          - "<mealie_whats> (for|planned for|on the menu for|on the meal plan for) {mealie_meal:meal} [<mealie_when>]"
+          - "what (are|am) (we|i) (having|eating|making|cooking) for {mealie_meal:meal} [<mealie_when>]"
+          - "<mealie_whats> (on the menu|on the meal plan|planned) [<mealie_when>]"
+
+  # "What's on the shopping list?", "Read me the grocery list"
+  MealieShoppingList:
+    data:
+      - sentences:
+          - "<mealie_whats> [left] on <mealie_our> <mealie_list>"
+          - "(read|tell) [me] <mealie_our> <mealie_list>"
+          - "what do (we|i) need (from|at) the (store|shop|supermarket)"
+
+lists:
+  mealie_meal:
+    values:
+      - "breakfast"
+      - in: "brunch"
+        out: "breakfast"
+      - "lunch"
+      - "dinner"
+      - in: "supper"
+        out: "dinner"
+      - "dessert"
+      - in: "pudding"
+        out: "dessert"
+      - "snack"
+      - in: "snacks"
+        out: "snack"
+      - "side"
+      - in: "side dish"
+        out: "side"
+      - "drink"
+      - in: "drinks"
+        out: "drink"
+
+  # Out values are read by the intent_script in packages/mealie_voice.yaml.
+  mealie_day:
+    values:
+      - "today"
+      - in: "tonight"
+        out: "today"
+      - in: "this evening"
+        out: "today"
+      - "tomorrow"
+      - in: "tomorrow night"
+        out: "tomorrow"
+      - "monday"
+      - "tuesday"
+      - "wednesday"
+      - "thursday"
+      - "friday"
+      - "saturday"
+      - "sunday"
+
+expansion_rules:
+  mealie_whats: "(what's|whats|what is)"
+  mealie_when: "[on] {mealie_day:day}"
+  mealie_our: "[the|my|our]"
+  mealie_list: "(shopping|grocery|groceries) list"

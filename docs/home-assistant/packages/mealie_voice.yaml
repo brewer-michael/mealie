@@ -1,0 +1,367 @@
+# Mealie voice package for Home Assistant (Layer A: no Mealie code needed).
+#
+# Uses only Home Assistant's built-in Mealie integration (HA 2026.9+, Mealie 3.2.0+).
+# Copy to <config>/packages/mealie_voice.yaml and the sentences file to
+# <config>/custom_sentences/en/mealie.yaml. Setup and examples: ../README.md
+#
+# What's in here:
+#   script.mealie_voice_settings   the ONE place to change settings (config entry, shopping list)
+#   intent_script                  local, no-LLM answers for the custom sentences
+#   script.mealie_search_recipes   } tools for an LLM conversation agent:
+#   script.mealie_get_recipe       } expose these three scripts to Assist
+#   script.mealie_get_meal_plan    }
+#
+# Template notes: Mealie action responses are plain dicts. Read lists with
+# x['items'], not x.items (that is the dict method). Meal types compare as
+# strings ("dinner"), dates are date objects.
+
+script:
+  # ---------------------------------------------------------------------------
+  # Settings. Edit the values below if the defaults don't fit.
+  # Everything else in this package calls this script to read them.
+  # ---------------------------------------------------------------------------
+  mealie_voice_settings:
+    alias: "Mealie voice: settings"
+    description: >-
+      Internal helper for the Mealie voice package. Returns the Mealie config
+      entry and the default shopping list. Don't expose this script to Assist.
+    icon: mdi:cog
+    mode: parallel
+    max: 20
+    sequence:
+      - variables:
+          settings:
+            # Mealie config entry ID. The default reads it from any Mealie entity.
+            # With more than one Mealie instance, replace the template with the
+            # ID of the one to use (README: "Mealie config entry").
+            config_entry_id: >-
+              {%- set entities = integration_entities('mealie') | sort -%}
+              {{ config_entry_id(entities | first) if entities else '' }}
+            # Mealie to-do list read by "what's on the shopping list", for example
+            # todo.mealie_supermarket. The default picks a list whose entity ID
+            # contains "shopping" or "grocer", else the first one alphabetically.
+            shopping_list: >-
+              {%- set lists = integration_entities('mealie') | select('match', 'todo[.]') | sort | list -%}
+              {{ ((lists | select('search', 'shopping|grocer') | list) or lists) | first | default('') }}
+            # Longest list read out loud before saying "and N more".
+            max_spoken_items: 8
+      - stop: ""
+        response_variable: settings
+
+  # ---------------------------------------------------------------------------
+  # LLM tools. Expose these to Assist (Settings > Voice assistants > Expose).
+  # Home Assistant turns the description and fields into the tool schema.
+  # ---------------------------------------------------------------------------
+  mealie_search_recipes:
+    alias: "Mealie: search recipes"
+    description: >-
+      Search the household's Mealie recipe collection by keyword. Mealie matches
+      words in the recipe name, description and ingredients, not meaning, and
+      any one word is enough for a match, so pass one or two food words such as
+      "chicken" or "lasagna" (not "quick" or "under 30 minutes"). Best matches on
+      the name come first. Returns recipes with name, slug, a short description
+      and total time. Pass a slug to mealie_get_recipe for ingredients and steps.
+    icon: mdi:book-search
+    mode: parallel
+    max: 10
+    fields:
+      query:
+        name: Query
+        description: >-
+          Key words to search for, for example "chicken", "soup" or "chocolate cake".
+        required: true
+        example: chicken
+        selector:
+          text:
+      limit:
+        name: Limit
+        description: Maximum number of recipes to return, from 1 to 20. Defaults to 5.
+        required: false
+        default: 5
+        example: 5
+        selector:
+          number:
+            min: 1
+            max: 20
+            mode: box
+    sequence:
+      - action: script.mealie_voice_settings
+        response_variable: mealie
+      # The data is one template so the query stays a string even when it
+      # looks like a number or a boolean ("1984", "7", "true").
+      - action: mealie.get_recipes
+        data: >-
+          {{ {
+            'config_entry_id': mealie.config_entry_id,
+            'search_terms': query | default('') | string,
+            'result_limit': [[limit | default(5) | int(5), 1] | max, 20] | min,
+          } }}
+        response_variable: found
+      - variables:
+          result:
+            query: "{{ query | default('') }}"
+            count: "{{ found.recipes['items'] | count }}"
+            recipes: >-
+              {%- set ns = namespace(out=[]) -%}
+              {%- for r in found.recipes['items'] -%}
+                {%- set ns.out = ns.out + [{
+                  'name': r.name,
+                  'slug': r.slug,
+                  'description': (r.description or '') | truncate(160),
+                  'total_time': r.total_time or '',
+                }] -%}
+              {%- endfor -%}
+              {{ ns.out }}
+      - stop: ""
+        response_variable: result
+
+  mealie_get_recipe:
+    alias: "Mealie: get recipe"
+    description: >-
+      Get one Mealie recipe with its ingredients and numbered steps, for reading
+      a recipe aloud or answering questions while cooking ("what's step 3?",
+      "how much flour?"). Needs the recipe slug from mealie_search_recipes or
+      mealie_get_meal_plan.
+    icon: mdi:book-open-variant
+    mode: parallel
+    max: 10
+    fields:
+      recipe:
+        name: Recipe
+        description: >-
+          The recipe slug, for example "original-sacher-torte", as returned by
+          mealie_search_recipes or mealie_get_meal_plan. A recipe ID also works.
+        required: true
+        example: original-sacher-torte
+        selector:
+          text:
+    sequence:
+      - action: script.mealie_voice_settings
+        response_variable: mealie
+      # One template for the data, so a numeric slug ("1984") stays a string.
+      - action: mealie.get_recipe
+        data: >-
+          {{ {
+            'config_entry_id': mealie.config_entry_id,
+            'recipe_id': recipe | default('') | string,
+          } }}
+        response_variable: found
+      - variables:
+          result:
+            name: "{{ found.recipe.name }}"
+            slug: "{{ found.recipe.slug }}"
+            description: "{{ (found.recipe.description or '') | truncate(300) }}"
+            servings: "{{ found.recipe.recipe_yield or found.recipe.recipe_servings or '' }}"
+            total_time: "{{ found.recipe.total_time or '' }}"
+            prep_time: "{{ found.recipe.prep_time or '' }}"
+            cook_time: "{{ found.recipe.perform_time or '' }}"
+            # Section headings ("For the sauce:") are kept as their own entries.
+            ingredients: >-
+              {%- set ns = namespace(out=[]) -%}
+              {%- for i in found.recipe.ingredients -%}
+                {%- if i.title -%}
+                  {%- set ns.out = ns.out + [i.title ~ ':'] -%}
+                {%- endif -%}
+                {%- set ns.out = ns.out + [i.display or i.note or i.original_text or ''] -%}
+              {%- endfor -%}
+              {{ ns.out }}
+            steps: >-
+              {%- set ns = namespace(out=[]) -%}
+              {%- for s in found.recipe.instructions -%}
+                {%- set ns.out = ns.out + [{
+                  'step': loop.index,
+                  'text': ((s.title ~ ': ') if s.title else '') ~ s.text,
+                }] -%}
+              {%- endfor -%}
+              {{ ns.out }}
+      - stop: ""
+        response_variable: result
+
+  mealie_get_meal_plan:
+    alias: "Mealie: get meal plan"
+    description: >-
+      Get what is planned in the Mealie meal plan for a day or a date range:
+      date, meal (breakfast, lunch, dinner, side, snack, drink or dessert),
+      title, and the recipe slug when the entry is a recipe. Without dates it
+      returns today. Keep ranges to two weeks or less.
+    icon: mdi:calendar-month
+    mode: parallel
+    max: 10
+    fields:
+      start_date:
+        name: Start date
+        description: First day to include, as YYYY-MM-DD. Defaults to today.
+        required: false
+        example: "2026-10-05"
+        selector:
+          date:
+      end_date:
+        name: End date
+        description: Last day to include, as YYYY-MM-DD. Defaults to the start date.
+        required: false
+        example: "2026-10-11"
+        selector:
+          date:
+    sequence:
+      - action: script.mealie_voice_settings
+        response_variable: mealie
+      - variables:
+          start: "{{ start_date if start_date | default('') else now().date().isoformat() }}"
+          end: "{{ end_date if end_date | default('') else start }}"
+      - action: mealie.get_mealplan
+        data:
+          config_entry_id: "{{ mealie.config_entry_id }}"
+          start_date: "{{ start }}"
+          end_date: "{{ end }}"
+        response_variable: plan
+      - variables:
+          result:
+            start_date: "{{ start }}"
+            end_date: "{{ end }}"
+            # Sorted by date, then in Mealie's meal order.
+            entries: >-
+              {%- set meals = ['breakfast', 'lunch', 'dinner', 'side', 'snack', 'drink', 'dessert'] -%}
+              {%- set ns = namespace(out=[]) -%}
+              {%- for day in plan.mealplan | map(attribute='mealplan_date') | unique | sort -%}
+                {%- for meal in meals -%}
+                  {%- for e in plan.mealplan
+                        | selectattr('mealplan_date', 'eq', day)
+                        | selectattr('entry_type', 'eq', meal) -%}
+                    {%- set ns.out = ns.out + [{
+                      'date': day | string,
+                      'meal': meal,
+                      'title': e.recipe.name if e.recipe else (e.title or 'Note'),
+                      'recipe_slug': e.recipe.slug if e.recipe else '',
+                      'note': '' if e.recipe else (e.description or ''),
+                    }] -%}
+                  {%- endfor -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ ns.out }}
+      - stop: ""
+        response_variable: result
+
+# -----------------------------------------------------------------------------
+# Local intents for custom_sentences/en/mealie.yaml. These answer without an
+# LLM, also when an LLM agent is used with "Prefer handling commands locally".
+#
+# `platforms: [mealie]` keeps them out of the LLM's tool list (HA only offers
+# an intent_script to an LLM when an entity of one of its platforms is exposed,
+# and no entity has the "mealie" domain). LLM agents use the scripts above.
+# -----------------------------------------------------------------------------
+intent_script:
+  MealieWhatsForMeal:
+    description: Says what the Mealie meal plan has for a meal (or all meals) on a day.
+    platforms:
+      - mealie
+    mode: parallel
+    action:
+      - action: script.mealie_voice_settings
+        response_variable: mealie
+      - variables:
+          # Slots from the sentence: meal (optional), day (optional).
+          weekdays: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+          day_slot: "{{ day | default('today') }}"
+          offset: >-
+            {%- if day_slot == 'tomorrow' -%} 1
+            {%- elif day_slot in weekdays -%} {{ (weekdays.index(day_slot) - now().weekday()) % 7 }}
+            {%- else -%} 0
+            {%- endif -%}
+          target_date: "{{ (now() + timedelta(days=offset | int(0))).date().isoformat() }}"
+          # Spoken day: "today", "tomorrow" or "on Friday".
+          when: >-
+            {%- if offset | int(0) == 0 -%} today
+            {%- elif offset | int(0) == 1 -%} tomorrow
+            {%- else -%} on {{ day_slot | capitalize }}
+            {%- endif -%}
+      - action: mealie.get_mealplan
+        data:
+          config_entry_id: "{{ mealie.config_entry_id }}"
+          start_date: "{{ target_date }}"
+          end_date: "{{ target_date }}"
+        response_variable: plan
+        continue_on_error: true
+      - variables:
+          result:
+            speech: >-
+              {%- macro say(names) -%}
+                {{- names | join('') if names | count < 2 else names[:-1] | join(', ') ~ ' and ' ~ names[-1] -}}
+              {%- endmacro -%}
+              {%- macro titles(entries) -%}
+                {%- set ns = namespace(out=[]) -%}
+                {%- for e in entries -%}
+                  {%- set ns.out = ns.out + [e.recipe.name if e.recipe else (e.title or 'a note')] -%}
+                {%- endfor -%}
+                {{- say(ns.out) -}}
+              {%- endmacro -%}
+              {%- if plan is not defined or plan.mealplan is not defined -%}
+                {{- "Sorry, I couldn't reach Mealie." -}}
+              {%- elif meal is defined -%}
+                {%- set entries = plan.mealplan | selectattr('entry_type', 'eq', meal) | list -%}
+                {%- if entries -%}
+                  {{- meal | capitalize ~ ' ' ~ when ~ ' is ' ~ titles(entries) ~ '.' -}}
+                {%- else -%}
+                  {{- 'Nothing is planned for ' ~ meal ~ ' ' ~ when ~ '.' -}}
+                {%- endif -%}
+              {%- else -%}
+                {%- set ns = namespace(parts=[]) -%}
+                {%- for m in ['breakfast', 'lunch', 'dinner', 'side', 'snack', 'drink', 'dessert'] -%}
+                  {%- set entries = plan.mealplan | selectattr('entry_type', 'eq', m) | list -%}
+                  {%- if entries -%}
+                    {%- set ns.parts = ns.parts + [m ~ ' is ' ~ titles(entries)] -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- if ns.parts -%}
+                  {{- when[:1] | upper ~ when[1:] ~ ': ' ~ ns.parts | join('; ') ~ '.' -}}
+                {%- else -%}
+                  {{- 'Nothing is planned ' ~ when ~ '.' -}}
+                {%- endif -%}
+              {%- endif -%}
+      - stop: ""
+        response_variable: result
+    speech:
+      text: "{{ action_response.speech }}"
+
+  MealieShoppingList:
+    description: Reads the open items on the Mealie shopping list.
+    platforms:
+      - mealie
+    mode: parallel
+    action:
+      - action: script.mealie_voice_settings
+        response_variable: mealie
+      - action: mealie.get_shopping_list_items
+        target:
+          entity_id: "{{ mealie.shopping_list }}"
+        response_variable: shopping
+        continue_on_error: true
+      - variables:
+          result:
+            speech: >-
+              {%- set data = shopping.get(mealie.shopping_list) if shopping is defined else none -%}
+              {%- if not data -%}
+                {{- "Sorry, I couldn't read the shopping list from Mealie." -}}
+              {%- else -%}
+                {%- set ns = namespace(names=[]) -%}
+                {%- for item in data['items'] if not item.checked -%}
+                  {%- set ns.names = ns.names + [item.display or item.note] -%}
+                {%- endfor -%}
+                {%- set total = ns.names | count -%}
+                {%- set limit = [mealie.max_spoken_items | int(8), 1] | max -%}
+                {%- if total == 0 -%}
+                  {{- 'The ' ~ data.name ~ ' list is empty.' -}}
+                {%- else -%}
+                  {%- set head = total ~ (' item' if total == 1 else ' items') ~ ' on the ' ~ data.name ~ ' list: ' -%}
+                  {%- if total > limit -%}
+                    {{- head ~ ns.names[:limit] | join(', ') ~ ', and ' ~ (total - limit) ~ ' more.' -}}
+                  {%- elif total > 1 -%}
+                    {{- head ~ ns.names[:-1] | join(', ') ~ ' and ' ~ ns.names[-1] ~ '.' -}}
+                  {%- else -%}
+                    {{- head ~ ns.names[0] ~ '.' -}}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+      - stop: ""
+        response_variable: result
+    speech:
+      text: "{{ action_response.speech }}"
