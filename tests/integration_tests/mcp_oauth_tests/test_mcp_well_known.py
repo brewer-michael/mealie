@@ -108,10 +108,13 @@ def production_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator
     (tmp_path / "index.html").write_text(shell)
     (tmp_path / "404.html").write_text(shell)
 
-    settings = get_app_settings()
-    monkeypatch.setattr(settings, "STATIC_FILES", str(tmp_path))
-    monkeypatch.setattr(settings, "PRODUCTION", True)
-    monkeypatch.setattr(settings, "TESTING", False)
+    # The settings `mealie.app` and the SPA module read: some tests replace `get_app_settings()`'s since they were
+    # imported (by clearing its cache), so these can be other objects than the current one
+    settings_objects = {id(s): s for s in (get_app_settings(), mealie_app.settings, getattr(spa, "__app_settings"))}
+    for settings in settings_objects.values():
+        monkeypatch.setattr(settings, "STATIC_FILES", str(tmp_path))
+        monkeypatch.setattr(settings, "PRODUCTION", True)
+        monkeypatch.setattr(settings, "TESTING", False)
     # mount_spa replaces the SPA module's HTML; put it back afterwards
     monkeypatch.setattr(spa, "__contents", getattr(spa, "__contents"))
 
