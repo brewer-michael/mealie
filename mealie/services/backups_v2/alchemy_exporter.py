@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from mealie.db import init_db
 from mealie.db.fixes.fix_migration_data import fix_migration_data
+from mealie.db.fork_compat import fix_legacy_fork_backup
 from mealie.db.init_db import ALEMBIC_DIR
 from mealie.db.models._model_utils.guid import GUID
 from mealie.services._base_service import BaseService
@@ -200,6 +201,9 @@ class AlchemyExporter(BaseService):
         return jsonable_encoder(result)
 
     def restore(self, db_dump: dict) -> None:
+        # backups from this fork's old build are on a revision alembic can't locate; rewind them first
+        fix_legacy_fork_backup(db_dump)
+
         # setup alembic to run migrations up the version of the backup
         alembic_data = db_dump["alembic_version"]
         alembic_version = alembic_data[0]["version_num"]
