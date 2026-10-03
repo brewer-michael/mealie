@@ -40,6 +40,9 @@
             <GroupAIProviderSettingsEditor
               v-if="group.aiProviderSettings"
               v-model="group.aiProviderSettings"
+              v-model:routes="aiProviderRoutes"
+              :routes-load-failed="aiProviderRoutesLoadFailed"
+              :unreadable-key-provider-ids="aiProvidersWithUnreadableKeys"
               @create="handleCreateProvider"
               @update="handleUpdateProvider"
               @delete="handleDeleteProvider"
@@ -53,14 +56,24 @@
         </div>
       </v-form>
     </div>
+
+    <div v-if="group.aiProviderSettings" class="mt-6">
+      <v-card variant="outlined" style="border-color: lightgray;">
+        <v-card-text>
+          <GroupAIProviderUsage ref="refAIProviderUsage" />
+        </v-card-text>
+      </v-card>
+    </div>
   </v-container>
 </template>
 
 <script setup lang="ts">
 import GroupPreferencesEditor from "~/components/Domain/Group/GroupPreferencesEditor.vue";
 import GroupAIProviderSettingsEditor from "~/components/Domain/Group/GroupAIProviderSettingsEditor.vue";
+import GroupAIProviderUsage from "~/components/Domain/Group/GroupAIProviderUsage.vue";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useAIProviders } from "~/composables/use-ai-providers";
+import { useAIProviderKeyStatus, useAIProviderRoutes } from "~/composables/use-ai-provider-routing";
 import { alert } from "~/composables/use-toast";
 import type { AIProviderCreate, AIProviderUpdate } from "~/lib/api/types/group";
 import type { VForm } from "~/types/auto-forms";
@@ -70,6 +83,13 @@ definePageMeta({
 });
 
 const { group, actions: groupActions } = useGroupSelf();
+const {
+  routes: aiProviderRoutes,
+  loadFailed: aiProviderRoutesLoadFailed,
+  load: loadAIProviderRoutes,
+  save: saveAIProviderRoutes,
+} = useAIProviderRoutes();
+const { unreadableIds: aiProvidersWithUnreadableKeys, load: loadAIProviderKeyStatus } = useAIProviderKeyStatus();
 const i18n = useI18n();
 
 useSeoMeta({
@@ -82,10 +102,19 @@ useSeoMeta({
 // in the same session. Force a revalidation whenever this page is entered.
 onMounted(() => {
   groupActions.refresh();
+  loadAIProviderRoutes();
+  loadAIProviderKeyStatus();
 });
 
 const refGroupPrefsEditForm = ref<VForm | null>(null);
 const refGroupAISettingsForm = ref<VForm | null>(null);
+const refAIProviderUsage = ref<InstanceType<typeof GroupAIProviderUsage> | null>(null);
+
+// The usage table and the unreadable API key warnings depend on the providers
+function reloadAIProviderDetails() {
+  refAIProviderUsage.value?.load();
+  loadAIProviderKeyStatus();
+}
 
 async function handlePrefsSubmit() {
   if (!refGroupPrefsEditForm.value?.validate() || !group.value?.preferences) {
@@ -107,11 +136,18 @@ async function handleAISettingsSubmit() {
   }
 
   const data = await groupActions.updateAIProviderSettings();
-  if (data) {
+  if (!data) {
+    alert.error(i18n.t("settings.settings-update-failed"));
+    return;
+  }
+
+  // Fallback routes have their own endpoint. They're saved once the primaries are, since each slot's
+  // primary is left out of its fallbacks.
+  if (await saveAIProviderRoutes(data)) {
     alert.success(i18n.t("settings.settings-updated"));
   }
   else {
-    alert.error(i18n.t("settings.settings-update-failed"));
+    alert.error(i18n.t("group.ai-provider-settings.fallbacks-update-failed"));
   }
 }
 
@@ -121,6 +157,7 @@ async function handleCreateProvider(data: AIProviderCreate) {
   const result = await createOne(data);
   if (result.data) {
     await groupActions.refresh();
+    reloadAIProviderDetails();
     alert.success(i18n.t("group.ai-provider-settings.provider-created"));
   }
   else {
@@ -132,6 +169,7 @@ async function handleUpdateProvider(id: string, data: AIProviderUpdate) {
   const result = await updateOne(id, data);
   if (result.data) {
     await groupActions.refresh();
+    reloadAIProviderDetails();
     alert.success(i18n.t("group.ai-provider-settings.provider-updated"));
   }
   else {
@@ -143,6 +181,7 @@ async function handleDeleteProvider(id: string) {
   const result = await deleteOne(id);
   if (result.data) {
     await groupActions.refresh();
+    reloadAIProviderDetails();
     alert.success(i18n.t("group.ai-provider-settings.provider-deleted"));
   }
   else {

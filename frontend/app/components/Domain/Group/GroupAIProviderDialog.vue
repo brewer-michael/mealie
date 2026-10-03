@@ -21,14 +21,26 @@
           variant="outlined"
           class="mb-4"
         />
-        <v-text-field
-          v-model="formData.model"
-          :label="$t('group.ai-provider-settings.model')"
-          :hint="$t('group.ai-provider-settings.model-description')"
-          :rules="[validators.required]"
+        <v-select
+          v-model="formData.protocol"
+          :label="$t('group.ai-provider-settings.api-type')"
+          :hint="$t('group.ai-provider-settings.api-type-description')"
+          :items="protocolOptions"
+          persistent-hint
           density="compact"
           variant="outlined"
           class="mb-4"
+        />
+        <GroupAIProviderModelField
+          ref="modelField"
+          v-model="formData.model"
+          :protocol="formData.protocol"
+          :base-url="formData.baseUrl"
+          :timeout="formData.timeout"
+          :request-headers="formData.requestHeaders"
+          :request-params="formData.requestParams"
+          :api-key="formData.apiKey"
+          :provider-id="providerId"
         />
         <v-text-field
           v-model="formData.apiKey"
@@ -45,10 +57,24 @@
           type="password"
           class="mb-4"
         />
+        <v-alert
+          v-if="apiKeyNotice"
+          :type="apiKeyNotice.type"
+          density="compact"
+          variant="tonal"
+          class="mb-4"
+        >
+          {{ apiKeyNotice.text }}
+        </v-alert>
         <v-text-field
           v-model="formData.baseUrl"
           :label="$t('group.ai-provider-settings.base-url')"
-          :hint="$t('group.ai-provider-settings.base-url-description')"
+          :hint="$t(
+            formData.protocol === 'anthropic'
+              ? 'group.ai-provider-settings.base-url-description-anthropic'
+              : 'group.ai-provider-settings.base-url-description',
+          )"
+          :rules="[baseUrlRule]"
           density="compact"
           variant="outlined"
           class="mb-4"
@@ -59,6 +85,20 @@
           type="number"
           :min="0"
           hide-details
+          density="compact"
+          variant="outlined"
+          class="mb-4"
+        />
+        <v-number-input
+          v-model="formData.monthlyTokenLimit"
+          :label="$t('group.ai-provider-settings.monthly-token-limit')"
+          :hint="$t('group.ai-provider-settings.monthly-token-limit-description')"
+          :min="1"
+          :max="maxMonthlyTokenLimit"
+          control-variant="hidden"
+          grouping
+          clearable
+          persistent-hint
           density="compact"
           variant="outlined"
           class="mb-4"
@@ -115,6 +155,7 @@
 
 <script setup lang="ts">
 import { useAIProviders } from "~/composables/use-ai-providers";
+import { apiKeyDestination, baseUrlHasQueryOrFragment } from "~/composables/use-ai-provider-routing";
 import { validators } from "~/composables/use-validators";
 import type { AIProviderCreate, AIProviderTestResult, AIProviderUpdate } from "~/lib/api/types/group";
 
@@ -137,6 +178,7 @@ const { loading, getOne, testOne, testSavedOne } = useAIProviders();
 const init = ref(false);
 
 const form = ref();
+const modelField = ref<{ reset: () => void }>();
 const advancedPanel = ref<number | undefined>(undefined);
 
 const isEdit = computed(() => !!props.providerId);
@@ -147,18 +189,51 @@ const defaultForm = () => ({
   apiKey: "",
   baseUrl: "",
   timeout: 300,
+  protocol: "openai" as NonNullable<AIProviderCreate["protocol"]>,
+  monthlyTokenLimit: null as number | null,
   requestHeaders: {} as Record<string, string>,
   requestParams: {} as Record<string, string>,
 });
 
 const formData = reactive(defaultForm());
 
+const protocolOptions = computed(() => [
+  { title: i18n.t("group.ai-provider-settings.api-type-openai"), value: "openai" },
+  { title: i18n.t("group.ai-provider-settings.api-type-anthropic"), value: "anthropic" },
+]);
+
+// The largest limit the backend stores (a 32-bit integer)
+const maxMonthlyTokenLimit = 2_147_483_647;
+
 const testing = ref(false);
 const testResult = ref<AIProviderTestResult | null>(null);
 
-const submitDisabled = computed(() => {
-  return !formData.name?.trim() || !formData.model?.trim() || (!isEdit.value && !formData.apiKey?.trim());
+// The saved key can't be decrypted (e.g. the server's secret changed), so it has to be entered again
+const apiKeyUnreadable = ref(false);
+// While the key is left blank, the saved one is only used where it was saved for
+const savedApiKeyDestination = ref<string | null>(null);
+
+const apiKeyNotice = computed(() => {
+  if (formData.apiKey) {
+    return null;
+  }
+  if (apiKeyUnreadable.value) {
+    return { type: "warning" as const, text: i18n.t("group.ai-provider-settings.api-key-unreadable") };
+  }
+  if (savedApiKeyDestination.value && apiKeyDestination(formData) !== savedApiKeyDestination.value) {
+    return { type: "info" as const, text: i18n.t("group.ai-provider-settings.api-key-needed-for-changes") };
+  }
+  return null;
 });
+
+const submitDisabled = computed(() => {
+  return !formData.name?.trim() || !formData.model?.trim() || (!isEdit.value && !formData.apiKey?.trim())
+    || baseUrlHasQueryOrFragment(formData.baseUrl);
+});
+
+function baseUrlRule(value: string | null) {
+  return !baseUrlHasQueryOrFragment(value) || i18n.t("group.ai-provider-settings.base-url-no-query");
+}
 
 const connectionMessage = computed(() => {
   const result = testResult.value;
@@ -198,6 +273,10 @@ watch(
       formData.apiKey = "";
       formData.baseUrl = data.baseUrl ?? "";
       formData.timeout = data.timeout ?? 300;
+      formData.protocol = data.protocol ?? "openai";
+      formData.monthlyTokenLimit = data.monthlyTokenLimit ?? null;
+      apiKeyUnreadable.value = data.apiKeySet === false;
+      savedApiKeyDestination.value = apiKeyDestination(data);
       formData.requestHeaders = { ...(data.requestHeaders ?? {}) };
       formData.requestParams = { ...(data.requestParams ?? {}) };
     }
@@ -216,6 +295,8 @@ function handleSubmit() {
       model: formData.model,
       baseUrl: formData.baseUrl || null,
       timeout: formData.timeout,
+      protocol: formData.protocol,
+      monthlyTokenLimit: formData.monthlyTokenLimit || null,
       requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
       requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
     };
@@ -231,6 +312,8 @@ function handleSubmit() {
       apiKey: formData.apiKey,
       baseUrl: formData.baseUrl || null,
       timeout: formData.timeout,
+      protocol: formData.protocol,
+      monthlyTokenLimit: formData.monthlyTokenLimit || null,
       requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
       requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
     };
@@ -243,6 +326,9 @@ function resetForm() {
   form.value?.reset();
   advancedPanel.value = undefined;
   testResult.value = null;
+  apiKeyUnreadable.value = false;
+  savedApiKeyDestination.value = null;
+  modelField.value?.reset();
 }
 
 async function handleTest() {
@@ -259,6 +345,7 @@ async function handleTest() {
         model: formData.model,
         baseUrl: formData.baseUrl || null,
         timeout: formData.timeout,
+        protocol: formData.protocol,
         requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
         requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
       };
@@ -274,6 +361,7 @@ async function handleTest() {
         apiKey: formData.apiKey,
         baseUrl: formData.baseUrl || null,
         timeout: formData.timeout,
+        protocol: formData.protocol,
         requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
         requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
       } as AIProviderCreate));
