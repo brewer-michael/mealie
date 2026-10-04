@@ -48,6 +48,7 @@ dependencies = [
     "httpx-curl-cffi==0.1.5",
     "anthropic==1.8.0",
     "mcp==1.30.0",
+    "pypdfium2==5.13.0",
 ]
 
 [project.scripts]
