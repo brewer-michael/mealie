@@ -24,6 +24,8 @@ dev/data/templates/*
 dev/data/users/*
 dev/data/groups/*
 dev/data/postgres/*
+# fork: the migration lock's file (mealie/db/migration_lock.py)
+dev/data/.mealie-migrate.lock
 
 .DS_Store
 node_modules
