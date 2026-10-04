@@ -1,13 +1,14 @@
 """
 Image URLs in the upload API (`fetch_url`, docs/ai/PHASE2.md §1.2): off by default, only public addresses unless
-allowed, redirects checked hop by hop, the size cap from the header and the stream, no compressed bodies, the deadline,
-and nothing of the URL but its host in the logs. No network: hostnames resolve through a patched `getaddrinfo`, and
-responses are served by an httpx `MockTransport` behind safehttp's own address checks, or (for what curl itself does
-with a body) by a local server on 127.0.0.1.
+allowed, redirects checked hop by hop, the size cap from the header and the stream, no compressed bodies, the deadline
+(the host's lookup included, which never holds up the event loop), and nothing of the URL but its host in the logs. No
+network: hostnames resolve through a patched `getaddrinfo`, and responses are served by an httpx `MockTransport`
+behind safehttp's own address checks, or (for what curl itself does with a body) by a local server on 127.0.0.1.
 """
 
 import asyncio
 import http.server
+import itertools
 import socket
 import threading
 import time
@@ -59,12 +60,13 @@ class Served:
     def transport(
         self, allow_hosts: list[str], deny_hosts: list[str], timeout: int, max_bytes: int
     ) -> httpx.AsyncBaseTransport:
-        safe = AsyncSafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout)
+        safe = fetch_url._OffLoopTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout)
+        assert isinstance(safe, AsyncSafeTransport)
         mock = httpx.MockTransport(self.serve)
 
         class Checked(httpx.AsyncBaseTransport):
             async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-                safe._validate(request)  # the address checks the real transport makes before connecting
+                await safe.validate(request)  # the address checks the real transport makes before connecting
                 return await mock.handle_async_request(request)
 
             async def aclose(self) -> None:
@@ -347,7 +349,60 @@ def test_a_network_error_fails(serve, monkeypatch: pytest.MonkeyPatch):
 
     serve(unreachable)
     assert fetch("http://camera.example/card.jpg") == IngestRejectReason.url_fetch_failed
-    assert fetch("http://nowhere.example/card.jpg") == IngestRejectReason.url_not_allowed  # doesn't resolve
+
+
+def test_a_host_that_doesnt_resolve_fails(serve, monkeypatch: pytest.MonkeyPatch):
+    # a lookup that fails is a failed fetch (as a network error is), not an address that isn't allowed
+    settings(monkeypatch)
+    real_transport = fetch_url._transport
+    serve(lambda request: httpx.Response(200, content=JPEG))
+    assert fetch("http://nowhere.example/card.jpg") == IngestRejectReason.url_fetch_failed
+    serve(redirecting("http://nowhere.example/card.jpg"))
+    assert fetch("http://camera.example/start") == IngestRejectReason.url_fetch_failed
+
+    monkeypatch.setattr(fetch_url, "_transport", real_transport)  # nothing is sent: the lookup fails first
+    assert fetch("http://nowhere.example/card.jpg") == IngestRejectReason.url_fetch_failed
+
+
+def test_a_slow_lookup_never_holds_up_the_event_loop(monkeypatch: pytest.MonkeyPatch):
+    # a DNS server that answers late (glibc waits up to 30 s for one): the lookup runs in a worker thread, the event
+    # loop (every other request) goes on meanwhile, and the URL's deadline covers the lookup too
+    settings(monkeypatch, URL_TIMEOUT=1)
+    release = threading.Event()
+    resolved_on: list[str] = []
+
+    def slow_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list:
+        resolved_on.append(threading.current_thread().name)
+        release.wait(10)
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_getaddrinfo)
+
+    async def main() -> tuple[FetchedImage | IngestRejectReason, float, float]:
+        ticks: list[float] = []
+
+        async def tick() -> None:
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.05)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0.2)
+        started = time.monotonic()
+        result = await fetch_image("http://slow-dns.example/card.jpg")
+        ended = time.monotonic()
+        ticker.cancel()
+        stall = max(later - earlier for earlier, later in itertools.pairwise([*ticks, ended]))
+        return result, ended - started, stall
+
+    try:
+        result, elapsed, stall = asyncio.run(main())
+    finally:
+        release.set()
+    assert result == IngestRejectReason.url_fetch_failed
+    assert elapsed < 3, f"the lookup took {elapsed:.1f} s against a 1 s deadline"
+    assert stall < 0.5, f"the event loop stood still for {stall:.1f} s"
+    assert resolved_on and resolved_on[0] != threading.main_thread().name
 
 
 # ==========================================

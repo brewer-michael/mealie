@@ -140,6 +140,7 @@ class RecipeIngestUploadController(IngestController):
                 "content": {
                     "multipart/form-data": {"schema": {"type": "object"}},
                     "image/*": {"schema": {"type": "string", "format": "binary"}},
+                    "application/pdf": {"schema": {"type": "string", "format": "binary"}},
                     "application/json": {"schema": {"type": "object"}},
                 }
             }
@@ -149,12 +150,12 @@ class RecipeIngestUploadController(IngestController):
         """
         Uploads one recipe card (front first), or with `split=true` one card per file, as a multipart form (any file
         field, `files` by convention; text fields `batchId`, `position`, `split`, `localOnly`, `allowDuplicate`,
-        `done`), a raw image body (options in the query string) or JSON `{"images": [{"data": "<base64>", "filename":
-        ...}]}`; with `AI_INGEST_URL_FETCH` on, a JSON image may be `{"url": "http://..."}`, which the server fetches.
-        A PDF or a multi-page TIFF gives the card all its pages (at most 4). `done=true` seals the card's batch once
-        the card is in. Needs the `Authorization` header. Answers 202 with the queued jobs, the rejected images and a
-        `summary` for a notification; 400 (the same body in `detail`) when nothing was accepted. Every refusal has a
-        top-level `summary` too.
+        `done`), a raw image or PDF body (options in the query string) or JSON `{"images": [{"data": "<base64>",
+        "filename": ...}]}`; with `AI_INGEST_URL_FETCH` on, a JSON image may be `{"url": "http://..."}`, which the
+        server fetches. A PDF or a multi-page TIFF gives the card all its pages (at most 4). `done=true` seals the
+        card's batch once the card is in. Needs the `Authorization` header. Answers 202 with the queued jobs, the
+        rejected images and a `summary` for a notification; 400 (the same body in `detail`) when nothing was
+        accepted. Every refusal has a top-level `summary` too.
         """
         handler = UploadHandler(request, self.session, self.user, self.integration_id)
         try:

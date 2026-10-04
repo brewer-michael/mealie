@@ -30,6 +30,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -50,6 +51,7 @@ from mealie.core.root_logger import get_logger
 from mealie.schema.recipe_ingest import IngestRejectReason, PageMeta, PageRotationSource
 
 from . import limits
+from .settings import get_ingest_settings
 from .storage import atomic_save_image, atomic_write_bytes
 
 logger = get_logger(__name__)
@@ -136,6 +138,13 @@ class PageRejected(Exception):
     def __init__(self, reason: IngestRejectReason) -> None:
         super().__init__(reason.value)
         self.reason = reason
+
+
+class RenderTimedOut(PageRejected):
+    """A PDF that ran out of render time (`PDF_RENDER_TIMEOUT`, or its CPU time): `pdf_not_supported`"""
+
+    def __init__(self) -> None:
+        super().__init__(IngestRejectReason.pdf_not_supported)
 
 
 class Region(NamedTuple):
@@ -581,8 +590,9 @@ def expand_document(raw: BinaryIO) -> list[DocumentPage]:
 
     `raw` is an open, seekable binary file, never reopened by path. Raises `PageRejected` with `unsupported_format`,
     `too_large`, `too_many_pages` (more than `MAX_PAGES_PER_CARD`), `pdf_not_supported` (encrypted, empty, damaged,
-    or not rendered within `PDF_RENDER_TIMEOUT`) or `unreadable_image` (a TIFF whose frames can't be read). Blocking;
-    `close_pages` closes the rendered files. Needs no write lock: nothing is written to `DATA_DIR`.
+    not rendered within its time, a `RenderTimedOut` then, or on a system that can't confine the renderer without
+    `AI_INGEST_PDF_UNCONFINED`) or `unreadable_image` (a TIFF whose frames can't be read). Blocking; `close_pages`
+    closes the rendered files. Needs no write lock: nothing is written to `DATA_DIR`.
     """
     raw.seek(0)
     kind = sniff(raw.read(SNIFF_BYTES))
@@ -640,8 +650,13 @@ def _tiff_page_frames(raw: BinaryIO) -> list[int]:
     return frames
 
 
-PDF_RENDER_TIMEOUT = 60
-"""How long a PDF's pages may take to render"""
+PDF_RENDER_CPU_SECONDS = 20
+"""
+The CPU time a PDF's pages may take to render (the renderer's `RLIMIT_CPU`): a scanned card of 4 pages at 300 dpi
+takes about 4 s on a current x86-64 core, so this leaves a slow NAS or ARM board room to spare
+"""
+PDF_RENDER_TIMEOUT = 30
+"""How long a PDF's pages may take to render in all, waiting for a CPU included"""
 _PDF_RENDERER = Path(__file__).with_name("pdf_render.py")
 _CHILD_ENVIRONMENT = ("SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
 """What the renderer's process gets of the server's environment: nothing secret"""
@@ -650,6 +665,10 @@ _PAGE_FRAME, _RESULT_FRAME, _FRAME_HEADER = b"P", b"R", 9
 MAX_RENDERED_PAGE_BYTES = 256 * 1024 * 1024
 """A larger page frame is a broken renderer (its own limit is the same)"""
 MAX_RESULT_BYTES = 64 * 1024
+_UNCONFINED = "unconfined"
+"""The renderer's error where it couldn't be confined and rendered nothing (`AI_INGEST_PDF_UNCONFINED` is off)"""
+_TIME_LIMIT_SIGNALS = (-signal.SIGKILL, -signal.SIGXCPU)
+"""The exit statuses of a renderer stopped by its CPU time limit (`RLIMIT_CPU`, soft and hard alike)"""
 _sandbox_logged = False
 
 
@@ -713,19 +732,32 @@ class _BrokenFrame(Exception):
     pass
 
 
-def _log_sandbox(protections: object) -> None:
-    """Once per process: how the renderer was confined (`pdf_render.sandbox`)"""
+def _log_sandbox(result: dict) -> None:
+    """Once per process: how the renderer was confined (`pdf_render.sandbox`), or why it rendered nothing"""
     global _sandbox_logged
     if _sandbox_logged:
         return
     _sandbox_logged = True
+    protections = result.get("sandbox")
     applied = [str(item) for item in protections] if isinstance(protections, list) else []
-    if any(item.startswith("landlock-files") for item in applied):
-        logger.info(f"PDF pages are rendered in a confined process: {', '.join(applied)}")
+    listed = ", ".join(applied) or "time and memory limits only"
+    if result.get("error") == _UNCONFINED:
+        logger.error(
+            "PDFs are refused (pdf_not_supported): this system can't confine the PDF renderer (neither Landlock nor "
+            f"a seccomp filter applied; it has {listed}). AI_INGEST_PDF_UNCONFINED=true renders them anyway, with "
+            "time and memory limits only."
+        )
+    elif any(item.startswith("landlock-files") for item in applied):
+        logger.info(f"PDF pages are rendered in a confined process: {listed}")
+    elif "seccomp-files" in applied:
+        logger.info(
+            "PDF pages are rendered in a confined process, without Landlock: it can open no file, so a PDF's fonts "
+            f"that aren't in it are drawn with PDFium's own: {listed}"
+        )
     else:
         logger.warning(
-            "PDF pages are rendered in a process the kernel can't confine to its own files (no Landlock), with: "
-            + (", ".join(applied) or "time and memory limits only")
+            "PDF pages are rendered in a process this system can't confine (no Landlock, no seccomp filter), as "
+            f"AI_INGEST_PDF_UNCONFINED allows: {listed}"
         )
 
 
@@ -746,7 +778,7 @@ def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentP
 
     try:
         result = frames.result or {}
-        _log_sandbox(result.get("sandbox"))
+        _log_sandbox(result)
         if result.get("error") == IngestRejectReason.too_many_pages.value:
             raise PageRejected(IngestRejectReason.too_many_pages)
         count = result.get("pages")
@@ -770,7 +802,10 @@ def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentP
 
 
 def _run_renderer(document: Path) -> _RenderedFrames:
-    """The renderer's run on `document` within `PDF_RENDER_TIMEOUT`; `PageRejected` when it didn't end in time"""
+    """
+    The renderer's run on `document` within `PDF_RENDER_TIMEOUT` and `PDF_RENDER_CPU_SECONDS`; `RenderTimedOut` when it
+    ran out of either, `PageRejected` when it failed
+    """
     deadline = time.monotonic() + PDF_RENDER_TIMEOUT
     try:
         process = subprocess.Popen(  # the renderer's path and our own numbers: no shell, no user input
@@ -782,6 +817,8 @@ def _run_renderer(document: Path) -> _RenderedFrames:
                 str(limits.PAGE_MAX_SIDE),
                 str(limits.MAX_PIXELS),
                 str(limits.MAX_PAGES_PER_CARD),
+                str(PDF_RENDER_CPU_SECONDS),
+                "1" if get_ingest_settings().PDF_UNCONFINED else "0",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -817,10 +854,12 @@ def _run_renderer(document: Path) -> _RenderedFrames:
     finally:
         process.stdout.close()
 
-    if timed_out:
+    if timed_out or (not frames.broken and returncode in _TIME_LIMIT_SIGNALS):
         frames.close()
-        logger.info(f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds")
-        raise PageRejected(IngestRejectReason.pdf_not_supported)
+        logger.info(
+            f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds or {PDF_RENDER_CPU_SECONDS} seconds of CPU time"
+        )
+        raise RenderTimedOut()
     if frames.result is None or frames.broken or returncode != 0:
         # killed by a resource limit, or PDFium crashed: logged without the document's content
         logger.info(f"The PDF renderer failed (exit status {returncode})")

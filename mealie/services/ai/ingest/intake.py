@@ -6,6 +6,12 @@ directory, then one transaction checks for a duplicate, touches the batch (unsea
 extraction queued; the dispatcher is woken. The uploaded bytes never reach `DATA_DIR`. Used by the upload route and the
 inbox.
 
+**PDF rendering is shared fairly.** The process renders one PDF at a time, its uploads in the order they asked, and
+each group has at most one card waiting for that slot or holding it (`ingest_async`), so another group's PDF waits for
+one card per group rendering at most. Once a PDF of one sender (a request's cards, or one inbox scan's cards of a group:
+`RenderBudget`) runs out of render time, the sender's later PDFs are refused `pdf_not_supported` without being
+rendered.
+
 **One household's intakes take turns.** The transaction starts with the household's intake lock
 (`lock_household_intake`): a transaction-level advisory lock on PostgreSQL, the database's write lock on SQLite (plus
 a lock per household in this process, so its own threads queue there rather than in SQLite's busy wait). So the
@@ -20,10 +26,11 @@ image, a duplicate, a lost inbox claim or a database error. A pause is found bef
 Public interface:
 - `IntakePage`, `IntakeCard`, `IntakeOptions`: what an upload or the inbox hands over.
 - `IntakeAccepted`, `IntakeRejected` (`IntakeOutcome`): what became of the card.
-- `IntakeService(session, group_id, household_id)`: `ingest(card, options, *, confirm=None)` (blocking, takes one of
-  the process's intake slots and the write lock; raises `IngestPaused`, `NoEntryFound` for an unknown batch,
-  `ClaimLost`, `QuotaReached`) and `ingest_async(...)`, which waits for a slot on the event loop and runs `ingest` in a
-  worker thread.
+- `IntakeService(session, group_id, household_id, renders=None)`: `ingest(card, options, *, confirm=None)` (blocking,
+  takes one of the process's intake slots and the write lock; raises `IngestPaused`, `NoEntryFound` for an unknown
+  batch, `ClaimLost`, `QuotaReached`) and `ingest_async(...)`, which waits for a slot on the event loop and runs
+  `ingest` in a worker thread. Its cards share a `RenderBudget` (their own, unless `renders` is given).
+- `RenderBudget`: one sender's PDF rendering; refused once one of its PDFs ran out of render time.
 - `QuotaReached`: the group's or the uploader's processing cap (`IntakeOptions.group_cap`, `user_cap`), counted under
   the household's intake lock (and the group's, `lock_group_cap`, for the group cap), was reached before the insert.
 - `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots, the inbox's
@@ -87,7 +94,12 @@ _intake_slots = threading.BoundedSemaphore(limits.INTAKE_CONCURRENCY)
 RENDER_CONCURRENCY = 1
 """PDFs rendered at once per process"""
 _render_limiter = anyio.CapacityLimiter(RENDER_CONCURRENCY)
-"""Uploads whose PDFs wait to be rendered wait on the event loop"""
+"""Uploads whose PDFs wait to be rendered wait on the event loop, first come, first served"""
+_group_render_locks: dict[UUID, anyio.Lock] = {}
+"""
+One card of each group at a time waits for `_render_limiter` or holds it (`ingest_async`): a group's backlog of PDFs
+holds up another group's for one card at most
+"""
 _render_slots = threading.BoundedSemaphore(RENDER_CONCURRENCY)
 """
 The same bound for every caller of `ingest`, apart from the intake slots: a PDF can take `images.PDF_RENDER_TIMEOUT`
@@ -113,6 +125,17 @@ class QuotaReached(Exception):
     def __init__(self, which: Literal["group", "user"]) -> None:
         super().__init__(f"the {which}'s processing cap is reached")
         self.which = which
+
+
+@dataclass
+class RenderBudget:
+    """
+    One sender's PDF rendering: a request's cards (an `IntakeService`'s), or one inbox scan's cards of a group. Once
+    one of its PDFs runs out of render time (`images.RenderTimedOut`), its later PDFs are refused `pdf_not_supported`
+    without being rendered: the process's render slot is everyone's.
+    """
+
+    timed_out: bool = False
 
 
 def _household_lock(household_id: UUID) -> threading.Lock:
@@ -271,12 +294,18 @@ def _wake_dispatcher() -> None:
 
 
 class IntakeService:
-    """Creates recipe card jobs for one group and household"""
+    """
+    Creates recipe card jobs for one group and household; its cards share `renders` (a `RenderBudget` of their own
+    unless given)
+    """
 
-    def __init__(self, session: Session, group_id: UUID, household_id: UUID) -> None:
+    def __init__(
+        self, session: Session, group_id: UUID, household_id: UUID, renders: RenderBudget | None = None
+    ) -> None:
         self.session = session
         self.group_id = group_id
         self.household_id = household_id
+        self.renders = renders if renders is not None else RenderBudget()
 
     @property
     def repos(self) -> IngestRepos:
@@ -286,16 +315,22 @@ class IntakeService:
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
     ) -> IntakeOutcome:
         """
-        `ingest` from async code: a card's PDFs are rendered once one of the process's render slots is free, then it
-        waits for one of its intake slots; it waits on the event loop each time, so waiting uploads hold no worker
-        thread, and runs in worker threads.
+        `ingest` from async code: a card's PDFs are rendered once one of the process's render slots is free (behind
+        at most one card of each other group: the group's other cards wait for its turn first), then it waits for one
+        of its intake slots; it waits on the event loop each time, so waiting uploads hold no worker thread, and runs
+        in worker threads. Once one of the service's PDFs ran out of render time, a card's PDF is refused without
+        waiting.
         """
         rejected = self._check_card(card)
         if rejected is not None:
             return rejected
         rendered: _Rendered | None = None
         if await anyio.to_thread.run_sync(_has_pdf, card):
-            rendering = await anyio.to_thread.run_sync(self._render, card, limiter=_render_limiter)
+            if self.renders.timed_out:
+                rendering = await anyio.to_thread.run_sync(self._render, card)  # refused, unrendered
+            else:
+                async with _group_render_locks.setdefault(self.group_id, anyio.Lock()):
+                    rendering = await anyio.to_thread.run_sync(self._render, card, limiter=_render_limiter)
             if isinstance(rendering, IntakeRejected):
                 return rendering
             rendered = rendering
@@ -324,8 +359,9 @@ class IntakeService:
         inbox checks that its claimed file is still there) and inserts the job, `processing` with its extraction
         queued. The dispatcher is woken.
 
-        A rejected file or a duplicate is an `IntakeRejected` (naming the file: a PDF's refusal comes first), and
-        leaves nothing on disk. Raises `IngestPaused` (nothing written) while a restore pauses ingestion,
+        A rejected file or a duplicate is an `IntakeRejected` (naming the file: a PDF's refusal comes first, and once
+        one of the service's PDFs ran out of render time, every later PDF's), and leaves nothing on disk. Raises
+        `IngestPaused` (nothing written) while a restore pauses ingestion,
         `NoEntryFound` for an unknown batch, `ClaimLost` when `confirm` says no and `QuotaReached` at a cap the options
         set (nothing left on disk either). Blocking: call it from a worker thread.
         """
@@ -378,20 +414,26 @@ class IntakeService:
             _wake_dispatcher()
         return outcome
 
-    @staticmethod
-    def _render(card: IntakeCard) -> _Rendered | IntakeRejected:
+    def _render(self, card: IntakeCard) -> _Rendered | IntakeRejected:
         """
         The card's PDFs' pages (`images.expand_document`), each PDF rendered in one of the process's render slots
         (waiting for one) and before the write lock, which a restore may be waiting for; or the rejection of the
-        first that can't be rendered, or that takes the card over `MAX_PAGES_PER_CARD` pages. Empty without a PDF.
+        first that can't be rendered, or that takes the card over `MAX_PAGES_PER_CARD` pages, or comes after a PDF of
+        the service's that ran out of render time (`renders`). Empty without a PDF.
         """
         rendered: _Rendered = {}
         try:
             for position, upload in enumerate(card.pages):
                 if not _is_pdf(upload):
                     continue
+                if self.renders.timed_out:
+                    raise images.PageRejected(IngestRejectReason.pdf_not_supported)
                 with _render_slots:
-                    rendered[position] = images.expand_document(upload.file)
+                    try:
+                        rendered[position] = images.expand_document(upload.file)
+                    except images.RenderTimedOut:
+                        self.renders.timed_out = True
+                        raise
                 if sum(len(pages) for pages in rendered.values()) > limits.MAX_PAGES_PER_CARD:
                     raise images.PageRejected(IngestRejectReason.too_many_pages)
         except images.PageRejected as e:

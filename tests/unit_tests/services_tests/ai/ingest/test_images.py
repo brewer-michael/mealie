@@ -796,6 +796,45 @@ def _pdf_of(*colors: tuple[int, int, int], size: tuple[int, int] = (300, 200)) -
     return _encoded(pages[0], "PDF", save_all=True, append_images=pages[1:], resolution=100)
 
 
+def nested_pdf(depth: int = 5, fanout: int = 10) -> bytes:
+    """
+    A 4 KB PDF whose page draws nested form XObjects, each level drawing the next `fanout` times: at depth 5 PDFium
+    renders it for minutes (a hostile upload holding the render slot), at depth 3 in about 2 s
+    """
+    objects: list[bytes] = []
+
+    def stream(head: bytes, data: bytes) -> int:
+        objects.append(head + b" /Length %d >>\nstream\n" % len(data) + data + b"\nendstream")
+        return len(objects)
+
+    curves = b" ".join(b"%d %d m %d %d %d %d %d %d c h" % (i, i, i + 50, i, i, i + 50, i + 3, i + 3) for i in range(50))
+    drawn = stream(b"<< /Type /XObject /Subtype /Form /BBox [0 0 600 800]", b"0 0 0 rg " + curves + b" f")
+    for _ in range(depth):
+        uses = b" ".join(b"q 1 0 0 1 %d %d cm /X Do Q" % (j % 7, j % 5) for j in range(fanout))
+        drawn = stream(
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 600 800] /Resources << /XObject << /X %d 0 R >> >>" % drawn,
+            uses,
+        )
+    content = stream(b"<<", b"/X Do")
+    objects.append(
+        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 600 800] /Contents %d 0 R "
+        b"/Resources << /XObject << /X %d 0 R >> >> >>" % (len(objects) + 2, content, drawn)
+    )
+    objects.append(b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % len(objects))
+    objects.append(b"<< /Type /Catalog /Pages %d 0 R >>" % len(objects))
+
+    data = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    data += b"trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, len(objects), xref)
+    return bytes(data)
+
+
 def _normalized(pages: list[images.DocumentPage], root: Path, name: str) -> list[tuple[PageMeta, Path]]:
     out = []
     for index, page in enumerate(pages):
@@ -1037,10 +1076,29 @@ def test_a_renderer_that_hangs_is_stopped(fake_renderer, monkeypatch: pytest.Mon
     fake_renderer("import time\ntime.sleep(30)\n")
     monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 0.5)
     started = time.monotonic()
-    with pytest.raises(PageRejected) as e:
+    with pytest.raises(images.RenderTimedOut) as e:
         images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
     assert e.value.reason == IngestRejectReason.pdf_not_supported
     assert time.monotonic() - started < 10
+
+
+def test_a_pdf_that_takes_too_much_cpu_time_is_stopped_by_its_limit(monkeypatch: pytest.MonkeyPatch):
+    # the real renderer on a 4 KB PDF PDFium would render for minutes: the CPU limit it's given stops it long before
+    # the wall-clock limit, and that's running out of time too
+    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 1)
+    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 60)
+    started = time.monotonic()
+    with pytest.raises(images.RenderTimedOut) as e:
+        images.expand_document(io.BytesIO(nested_pdf()))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+    assert time.monotonic() - started < 30
+
+
+def test_the_render_budget_leaves_a_scanned_card_room():
+    # a scanned card of 4 pages at 300 dpi takes about 4 s of CPU on a current x86-64 core (measured when the budget
+    # was set): the budget leaves a 5x slower machine room, and the wall clock some more for a busy one
+    assert images.PDF_RENDER_CPU_SECONDS >= 20
+    assert images.PDF_RENDER_TIMEOUT > images.PDF_RENDER_CPU_SECONDS
 
 
 def test_a_renderer_that_crashes_is_a_refusal_not_an_error(fake_renderer):
@@ -1048,6 +1106,7 @@ def test_a_renderer_that_crashes_is_a_refusal_not_an_error(fake_renderer):
     with pytest.raises(PageRejected) as e:
         images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
     assert e.value.reason == IngestRejectReason.pdf_not_supported
+    assert not isinstance(e.value, images.RenderTimedOut)  # a crash isn't running out of time
 
 
 _FRAME_WRITER = (

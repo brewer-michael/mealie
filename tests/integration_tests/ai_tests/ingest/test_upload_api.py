@@ -44,6 +44,7 @@ from mealie.services.ai.ingest import images, intake, limits, storage
 from mealie.services.ai.ingest import upload as upload_service
 from mealie.services.ai.ingest.settings import IngestSettings
 from tests.integration_tests.ai_tests.ingest.card_flow_testing import make_notifier
+from tests.unit_tests.services_tests.ai.ingest.test_images import nested_pdf
 from tests.utils.fixture_schemas import TestUser
 
 INGEST = "/api/ai/ingest"
@@ -702,6 +703,53 @@ def test_a_pdfs_pages_are_one_card(api_client: TestClient, reader: TestUser, mon
         (400, 600, "pdf", "scan.pdf (page 2)"),
     ]
     assert row.source_name == "upload/scan.pdf"
+
+
+@pytest.mark.parametrize("content_type", ["application/pdf", "application/octet-stream", "image/jpeg"])
+def test_a_raw_pdf_body_is_a_card(
+    api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch, content_type: str
+):
+    # what iOS Shortcuts sends for a PDF (`application/pdf`), or any raw type: intake reads the bytes, not the type
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 300)
+    response = api_client.post(
+        f"{INGEST}?filename=scan.pdf",
+        content=pdf((60, 40), (40, 60)),
+        headers={**reader.token, "Content-Type": content_type},
+    )
+    assert response.status_code == 202, response.text
+    (job,) = response.json()["jobs"]
+    assert job["pageCount"] == 2
+    assert job_row(job["id"]).source_name == "upload/scan.pdf"
+
+
+def test_once_a_pdf_runs_out_of_time_the_requests_other_pdfs_arent_rendered(
+    api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the render slot is everyone's: a request's PDF that takes all its time leaves the request's other PDFs unrendered
+    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 300)
+    rendered: list[Path] = []
+    real_run = images._run_renderer
+    monkeypatch.setattr(images, "_run_renderer", lambda document: rendered.append(document) or real_run(document))
+
+    response = api_client.post(
+        INGEST,
+        files=files(nested_pdf(), pdf((60, 40)), jpeg(), names=["hostile.pdf", "scan.pdf", "photo.jpg"]),
+        data={"split": "true"},
+        headers=reader.token,
+    )
+    assert response.status_code == 202, response.text
+    assert [(item["filename"], item["reason"]) for item in response.json()["rejected"]] == [
+        ("hostile.pdf", "pdf_not_supported"),
+        ("scan.pdf", "pdf_not_supported"),
+    ]
+    assert len(response.json()["jobs"]) == 1  # the photo
+    assert len(rendered) == 1
+
+    # the next request's PDFs are rendered again
+    response = api_client.post(INGEST, files=files(pdf((60, 40)), names=["scan.pdf"]), headers=reader.token)
+    assert response.status_code == 202, response.text
+    assert len(rendered) == 2
 
 
 def test_a_pdf_and_photos_make_a_card_of_at_most_four_pages(

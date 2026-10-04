@@ -42,7 +42,12 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   rename to a fresh claim time, so only one process retries it. A card already inserted is then found by its content
   hash, and the file is just moved to `processed/`.
 - **Paused** for a restore: the scan stops before each file while the marker is set. A group that can't read cards, or
-  is at its processing quota, keeps its files where they are until it can.
+  is at its processing quota, keeps its files where they are until it can. The quota is counted again inside each
+  card's insert (`IntakeOptions.group_cap`), with uploads and other processes' scans: a card that finds it reached
+  there keeps its claim, retried after `INBOX_CLAIM_RETRY` once the group has room, and the group takes nothing more
+  in that scan.
+- **PDFs:** once one of a group's PDFs runs out of render time in a scan, the group's other PDFs of that scan are
+  refused `pdf_not_supported` without being rendered (`intake.RenderBudget`).
 - **Folders Mealie creates** get `AI_INGEST_INBOX_DIR_MODE` (2775 by default: setgid and group-writable, so whatever
   writes the photos as a member of Mealie's group can write there), set on the open folder so the umask can't strip
   it. Folders that already exist are never changed.
@@ -106,7 +111,9 @@ from .intake import (
     IntakePage,
     IntakeRejected,
     IntakeService,
+    QuotaReached,
     ReadingReadiness,
+    RenderBudget,
     reading_readiness,
     source_name,
 )
@@ -1206,6 +1213,10 @@ class _GroupGate:
 
     readiness: ReadingReadiness
     taken: int = 0
+    full: bool = False
+    """A card's insert found the group at its processing quota (uploads, or another process's scan, got in first)"""
+    renders: RenderBudget = field(default_factory=RenderBudget)
+    """The group's PDFs in this scan"""
 
     @property
     def readable(self) -> bool:
@@ -1213,7 +1224,7 @@ class _GroupGate:
 
     @property
     def open(self) -> bool:
-        return waiting_reason(self.readiness, self.taken) is None
+        return not self.full and waiting_reason(self.readiness, self.taken) is None
 
 
 def _gate(session: Session, folder: HouseholdFolder, gates: dict[UUID, _GroupGate]) -> _GroupGate:
@@ -1250,8 +1261,13 @@ def _ingest_claimed(
     local_only: bool,
     recovered: bool,
     locale: str,
+    renders: RenderBudget | None = None,
 ) -> _Taken:
-    """Intake for one claimed entry, then where it goes; `locale` is the household's (`household_locale`)"""
+    """
+    Intake for one claimed entry, then where it goes; `locale` is the household's (`household_locale`), `renders` the
+    group's PDFs in this scan. Raises `QuotaReached` (the claim stays) when the group's processing quota, counted in
+    the insert, is reached.
+    """
     folder = dirs.folder
     parsed = _parse_claim(claimed)
     name = parsed[1] if parsed else claimed
@@ -1277,13 +1293,16 @@ def _ingest_claimed(
             source_key=folder.key,
             local_only=local_only,
             locale=locale,
+            # the scan's gate counted the group's cards before it began: uploads and other processes' scans may have
+            # inserted since, so the quota is counted again in the insert's transaction
+            group_cap=limits.MAX_PROCESSING_JOBS_PER_GROUP,
         )
 
         def still_claimed() -> bool:
             # a retry by another scanner would have renamed it
             return _lexists(claimed, dirs.claim_dir())
 
-        outcome = IntakeService(session, folder.group_id, folder.household_id).ingest(
+        outcome = IntakeService(session, folder.group_id, folder.household_id, renders).ingest(
             card, options, confirm=still_claimed
         )
     except ClaimLost:
@@ -1382,9 +1401,19 @@ def _scan_folder(
                 local_only=gate.readiness.group_local_only,
                 recovered=kind == "stale",
                 locale=locale,
+                renders=gate.renders,
             )
         except IngestPaused:
             result.paused = True  # the claim stays; it's retried after INBOX_CLAIM_RETRY
+            return result
+        except QuotaReached:
+            # the group reached its quota since the scan counted (uploads, or another process's scan): the claim stays,
+            # retried after INBOX_CLAIM_RETRY once the group has room, and the group's other cards wait
+            logger.info(
+                f"A recipe card in the inbox of {folder.key} waits: its group has "
+                f"{limits.MAX_PROCESSING_JOBS_PER_GROUP} cards waiting to be read"
+            )
+            gate.full = True
             return result
         except _UnsafeFolder:
             raise  # failed/ or processed/ was swapped for a link: the claim stays

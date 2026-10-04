@@ -60,7 +60,8 @@ class IngestSettings(BaseSettings):
     """At most this many cards of one group are read at once, across worker processes; 0: no cap"""
     MAX_PROCESSING_PER_USER: int = Field(0, ge=0)
     """An upload is refused with 429 while this many of its sender's cards wait to be read, counted before its body
-    and again when its first card goes in; a request that gets in queues all its cards (at most 20). 0: no cap"""
+    and again as each card goes in: a request whose first card finds the cap reached is a 429, and a later card past
+    it is refused on its own (`quota`). 0: no cap"""
     URL_FETCH: bool = False
     """Accept image URLs in the upload API's JSON (`{"images": [{"url": ...}]}`), downloaded by the server; off: they
     are refused `url_not_allowed` and nothing is fetched"""
@@ -69,6 +70,13 @@ class IngestSettings(BaseSettings):
     private network (Home Assistant's, say); on top of `HTTP_ALLOW_LIST`. `HTTP_DISALLOW_LIST` still wins."""
     URL_TIMEOUT: int = Field(20, ge=1, le=300)
     """Seconds one image URL's download may take in all, redirects included"""
+    PDF_UNCONFINED: bool = False
+    """
+    Render PDFs even where the system can't confine the renderer (neither Landlock nor its seccomp filter applies: a
+    kernel or container without Landlock, on an architecture other than x86-64 and arm64 or without seccomp), with only
+    an isolated interpreter and its time and memory limits; off: such PDFs are refused `pdf_not_supported`, and the log
+    says why
+    """
 
     # an empty variable is unset: Unraid and compose files pass unused ones as `''`
     model_config = SettingsConfigDict(env_prefix="AI_INGEST_", extra="ignore", env_ignore_empty=True)

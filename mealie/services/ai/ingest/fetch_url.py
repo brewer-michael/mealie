@@ -9,7 +9,9 @@ it's on, a URL is fetched by the server, so it's held to what a server-side fetc
 - **Only public addresses** (safehttp's `AsyncSafeTransport`, a fresh one per URL): a host resolving to a private,
   loopback or link-local address is refused unless it's in `HTTP_ALLOW_LIST` or `AI_INGEST_URL_ALLOW_HOSTS` (Home
   Assistant's address, say); `HTTP_DISALLOW_LIST` refuses whatever it names. The connection is pinned to the address
-  that was checked (no DNS rebinding), TLS is verified, and no proxy from the environment is used.
+  that was checked (no DNS rebinding), TLS is verified, and no proxy from the environment is used. The host is looked
+  up in a worker thread (`_OffLoopTransport`), so a slow DNS server never holds up the event loop, and the deadline
+  below covers the lookup too; a host that doesn't resolve is `url_fetch_failed`.
 - **At most `MAX_REDIRECTS` redirects**, each checked like the first, and never off http(s) or from https to http.
 - **The body** is asked for and taken uncompressed only (`Accept-Encoding: identity`, and curl decodes nothing): a few
   MB of gzip could inflate to gigabytes before anything counted them, so a response encoded anyway is
@@ -26,12 +28,14 @@ What comes back goes through intake like any upload, so a page that isn't an ima
 import contextvars
 import http.cookiejar
 import logging
+import socket
 from dataclasses import dataclass
 from tempfile import SpooledTemporaryFile
 from typing import BinaryIO, cast
 from urllib.parse import unquote
 
 import anyio
+import anyio.to_thread
 import httpx
 from curl_cffi import CurlECode, CurlOpt
 
@@ -51,6 +55,12 @@ SPOOL_MAX_BYTES = 1024 * 1024
 ACCEPT = "image/*,*/*;q=0.5"
 IDENTITY = "identity"
 """The only content coding asked for and accepted"""
+RESOLVER_THREADS = 4
+"""
+Host lookups waited for at once in this process, counted apart from the default thread limiter (sync routes use it); a
+lookup given up on at the deadline finishes in its thread, no longer counted
+"""
+_resolver_limiter = anyio.CapacityLimiter(RESOLVER_THREADS)
 
 _fetching: contextvars.ContextVar[bool] = contextvars.ContextVar("ingest_url_fetching", default=False)
 
@@ -108,12 +118,30 @@ def _host(url: str) -> str:
         return "?"
 
 
+class _OffLoopTransport(AsyncSafeTransport):
+    """
+    safehttp's transport, its address check (`_validate`, whose `getaddrinfo` blocks for as long as DNS takes) run in
+    a worker thread: the event loop goes on meanwhile, and the download's deadline gives up on the lookup (its thread
+    finishes on its own)
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self._apply_pin(await self.validate(request))
+        return await super(AsyncSafeTransport, self).handle_async_request(request)  # the curl transport's own
+
+    async def validate(self, request: httpx.Request) -> list[str] | None:
+        """`_validate` in one of the resolver threads"""
+        return await anyio.to_thread.run_sync(
+            self._validate, request, abandon_on_cancel=True, limiter=_resolver_limiter
+        )
+
+
 def _transport(allow_hosts: list[str], deny_hosts: list[str], timeout: int, max_bytes: int) -> httpx.AsyncBaseTransport:
     """
     A fresh SSRF-checking transport for one URL (tests serve their own responses behind the same checks). curl decodes
     no content coding, and stops receiving a body (each hop's) past `max_bytes` (`_over_the_cap`).
     """
-    return AsyncSafeTransport(
+    return _OffLoopTransport(
         allow_hosts=allow_hosts,
         deny_hosts=deny_hosts,
         timeout=timeout,
@@ -209,8 +237,9 @@ async def _read_body(response: httpx.Response, max_bytes: int) -> FetchedImage:
 async def fetch_image(url: str, *, max_bytes: int = limits.MAX_FILE_BYTES) -> FetchedImage | IngestRejectReason:
     """
     Downloads one image URL, or says why not: `url_not_allowed` (fetching is off, the URL isn't plain http(s), or it
-    leads somewhere it may not go), `url_fetch_failed` (network error, timeout, an HTTP error, too many redirects, a
-    compressed body) or `too_large` (more than `max_bytes`). The caller closes the file.
+    leads somewhere it may not go), `url_fetch_failed` (a host that doesn't resolve, a network error, the timeout, an
+    HTTP error, too many redirects, a compressed body) or `too_large` (more than `max_bytes`). The caller closes the
+    file.
     """
     settings = get_ingest_settings()
     host = _host(url)
@@ -226,8 +255,11 @@ async def fetch_image(url: str, *, max_bytes: int = limits.MAX_FILE_BYTES) -> Fe
     except _Refused as e:
         logger.info(f"An image URL on {host} wasn't fetched: {e}")
         return e.reason
-    except InvalidDomainError:
-        # the address (or a redirect's) isn't allowed; the transport's own message would name the whole URL
+    except InvalidDomainError as e:
+        # the transport's own message would name the whole URL
+        if isinstance(e.__cause__, socket.gaierror):
+            logger.info(f"An image URL on {host} wasn't fetched: its host (or a redirect's) didn't resolve")
+            return IngestRejectReason.url_fetch_failed
         logger.info(f"An image URL on {host} wasn't fetched: it leads to an address that isn't allowed")
         return IngestRejectReason.url_not_allowed
     except TimeoutError, httpx.TimeoutException:

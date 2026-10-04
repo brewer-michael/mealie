@@ -44,6 +44,7 @@ from mealie.services import ocr
 from mealie.services.ai.ingest import images, inbox, limits, storage
 from mealie.services.ai.ingest import settings as ingest_settings
 from mealie.services.ai.ingest.i18n import translator_for
+from mealie.services.ai.ingest.intake import IntakeCard, IntakeOptions, IntakePage, IntakeService, QuotaReached
 from mealie.services.ai.ingest.settings import IngestSettings
 from tests.integration_tests.ai_tests.ingest.card_flow_testing import (
     Notified,
@@ -51,6 +52,7 @@ from tests.integration_tests.ai_tests.ingest.card_flow_testing import (
     make_notifier,
     sent_to,
 )
+from tests.unit_tests.services_tests.ai.ingest.test_images import nested_pdf
 from tests.utils.fixture_schemas import TestUser
 
 OLD = 60
@@ -409,6 +411,136 @@ def test_a_group_at_its_quota_keeps_its_files(root: Path, reader: TestUser, monk
     _drop(folder, "later.jpg")
     assert _scan_twice() == 0
     assert (folder / "later.jpg").exists()
+
+
+def _processing(user: TestUser) -> int:
+    with session_context() as session:
+        return IngestRepos(session, UUID(user.group_id), UUID(user.household_id)).processing_jobs_in_group()
+
+
+def _upload(user: TestUser) -> str:
+    """An app upload of one photo, counted against the group's quota in its insert, as the upload route's are"""
+    card = IntakeCard(pages=[IntakePage(io.BytesIO(_jpeg()), "upload.jpg", 0)], source_name="upload/upload.jpg")
+    options = IntakeOptions(
+        source=IngestSource.api,
+        created_by=UUID(str(user.user_id)),
+        group_cap=limits.MAX_PROCESSING_JOBS_PER_GROUP,
+    )
+    with session_context() as session:
+        try:
+            IntakeService(session, UUID(user.group_id), UUID(user.household_id)).ingest(card, options)
+        except QuotaReached as e:
+            return f"quota:{e.which}"
+    return "accepted"
+
+
+def test_uploads_during_a_scan_count_against_the_inboxs_quota(
+    root: Path, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the scan counted the group's cards before it began; uploads that went in since count in the inbox card's insert,
+    # so the group never passes its quota: the card that finds it reached keeps its claim (no traceback), and the
+    # group takes nothing more in that scan
+    user = unique_user_fn_scoped
+    _configure(user)
+    cap = _processing(user) + 2
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", cap)
+    folder = _folder(root, user)
+    _drop(folder, "a.jpg")
+    _drop(folder, "b.jpg")
+    assert inbox.scan_once() == 0  # the first scan sees the files
+
+    real_readiness = inbox.reading_readiness
+    uploads: list[str] = []
+
+    def readiness_then_uploads(*args: Any, **kwargs: Any) -> Any:
+        counted = real_readiness(*args, **kwargs)
+        uploads.extend([_upload(user), _upload(user)])  # the app's uploads, right after the scan counted
+        return counted
+
+    monkeypatch.setattr(inbox, "reading_readiness", readiness_then_uploads)
+    failures: list[str] = []
+    monkeypatch.setattr(inbox.logger, "exception", failures.append)
+
+    assert inbox.scan_once() == 0
+    assert uploads == ["accepted", "accepted"]
+    assert _processing(user) == cap
+    assert failures == []
+    [claimed] = _claimed(folder)  # the first card waits in its claim; the second wasn't taken
+    assert claimed.endswith("__a.jpg")
+    assert (folder / "b.jpg").exists()
+    assert not (folder / inbox.FAILED_DIR).exists()
+
+    # once the group has room, the claim is retried (after INBOX_CLAIM_RETRY) and the other file taken
+    monkeypatch.setattr(inbox, "reading_readiness", real_readiness)
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", cap + 2)
+    stale_ms = inbox._now_ms() - (limits.INBOX_CLAIM_RETRY + 1) * 1000
+    os.rename(folder / inbox.CLAIM_DIR / claimed, folder / inbox.CLAIM_DIR / f"{stale_ms}__{uuid4().hex}__a.jpg")
+    assert inbox.scan_once() == 2
+    assert _claimed(folder) == []
+    assert sorted(os.listdir(folder / "processed" / _month())) == ["a.jpg", "b.jpg"]
+    assert _processing(user) == cap + 2
+
+
+def test_two_processes_scanning_at_once_never_pass_the_quota(
+    root: Path, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # every worker process scans, each counting the group's cards before the other's are in
+    user = unique_user_fn_scoped
+    _configure(user)
+    cap = _processing(user) + 2
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", cap)
+    monkeypatch.setattr(limits, "INBOX_FILES_PER_TICK", 2)
+    folder = _folder(root, user)
+    for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg"):
+        _drop(folder, name)
+    assert inbox.scan_once() == 0
+
+    real_readiness = inbox.reading_readiness
+    counted: list[Any] = []
+
+    def counted_once(*args: Any, **kwargs: Any) -> Any:
+        if not counted:
+            counted.append(real_readiness(*args, **kwargs))
+        return counted[0]  # the second process counted at the same moment as the first
+
+    monkeypatch.setattr(inbox, "reading_readiness", counted_once)
+    assert inbox.scan_once() == 2
+    assert inbox.scan_once() == 0
+    assert _processing(user) == cap
+    assert len(_claimed(folder)) == 1  # the second process's card waits in its claim
+
+
+def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_of_the_scan_arent_rendered(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
+    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 30)
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 200)
+    rendered: list[int] = []
+    real_run = images._run_renderer
+
+    def run_renderer(document: Path) -> Any:
+        rendered.append(len(document.read_bytes()))
+        return real_run(document)
+
+    monkeypatch.setattr(images, "_run_renderer", run_renderer)
+    folder = _folder(root, reader)
+    hostile = nested_pdf()
+    _drop(folder, "1-hostile.pdf", hostile, age=OLD + 10)  # taken first: the oldest
+    _drop(folder, "2-scan.pdf", _pdf((60, 40)))
+    _drop(folder, "3-photo.jpg")
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 1  # the photo
+    assert rendered == [len(hostile)]  # the scan's second PDF wasn't rendered
+    for name in ("1-hostile.pdf", "2-scan.pdf"):
+        assert "pdf_not_supported" in (folder / "failed" / f"{name}.error.txt").read_text()
+    assert len(_jobs(reader)) == before + 1
+
+    # the next scan renders the group's PDFs again
+    _drop(folder, "4-scan.pdf", _pdf((60, 40)))
+    assert _scan_twice() == 1
+    assert len(rendered) == 2
 
 
 def test_the_per_user_cap_leaves_inbox_cards_alone(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):

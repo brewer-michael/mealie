@@ -24,6 +24,7 @@ NEW_VARIABLES = (
     "URL_FETCH",
     "URL_ALLOW_HOSTS",
     "URL_TIMEOUT",
+    "PDF_UNCONFINED",
 )
 
 
@@ -45,6 +46,7 @@ def test_the_defaults():
     assert settings.URL_FETCH is False  # image URLs are refused unless switched on
     assert settings.url_allow_hosts == []
     assert settings.URL_TIMEOUT == 20
+    assert settings.PDF_UNCONFINED is False  # PDFs aren't rendered where the renderer can't be confined
 
 
 def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -57,6 +59,7 @@ def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv("AI_INGEST_URL_FETCH", "true")
     monkeypatch.setenv("AI_INGEST_URL_ALLOW_HOSTS", " homeassistant.local, 192.168.1.0/24 ,,")
     monkeypatch.setenv("AI_INGEST_URL_TIMEOUT", "45")
+    monkeypatch.setenv("AI_INGEST_PDF_UNCONFINED", "true")
     settings = IngestSettings()
     assert settings.ORIENT is False
     assert settings.INBOX_PROCESSED_DAYS == 30
@@ -67,6 +70,7 @@ def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch,
     assert settings.URL_FETCH is True
     assert settings.url_allow_hosts == ["homeassistant.local", "192.168.1.0/24"]
     assert settings.URL_TIMEOUT == 45
+    assert settings.PDF_UNCONFINED is True
 
 
 @pytest.mark.parametrize("name", ["INBOX_DIR", *NEW_VARIABLES, "CONCURRENCY", "RETENTION_DAYS"])

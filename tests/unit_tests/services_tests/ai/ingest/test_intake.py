@@ -58,6 +58,7 @@ from mealie.services.ai.ingest.intake import (
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
 from mealie.services.ai.routing import AIProviderRouter
 from mealie.services.ai.runtime import AIRuntime
+from tests.unit_tests.services_tests.ai.ingest.test_images import nested_pdf
 from tests.utils.fixture_schemas import TestUser
 
 ORIENTATION = 0x0112
@@ -881,6 +882,121 @@ def test_the_inboxs_pdfs_slow_to_render_hold_up_no_intake_slot(
         for thread in scans:
             thread.join(30)
     assert [outcome.reason for outcome in outcomes[1:]] == [IngestRejectReason.pdf_not_supported] * 2
+
+
+def _small_pdf() -> bytes:
+    buffer = io.BytesIO()
+    Image.frombytes("RGB", (60, 40), os.urandom(60 * 40 * 3)).save(buffer, format="PDF")
+    return buffer.getvalue()
+
+
+@pytest.fixture()
+def short_renders(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """
+    The real renderer with 2 s of CPU time (a hostile PDF runs out of it, a small one renders in a fraction), and the
+    names of the PDFs it was started on, in order
+    """
+    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
+    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 30)
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 200)
+    started: list[str] = []
+    real_expand = images.expand_document
+
+    def expand_document(raw: Any) -> list[images.DocumentPage]:
+        if getattr(raw, "name", None):
+            started.append(raw.name)
+        return real_expand(raw)
+
+    monkeypatch.setattr(images, "expand_document", expand_document)
+    return started
+
+
+def _named(data: bytes, name: str) -> io.BytesIO:
+    raw = io.BytesIO(data)
+    raw.name = name  # type: ignore[attr-defined]
+    return raw
+
+
+def test_once_a_pdf_runs_out_of_time_the_requests_other_pdfs_arent_rendered(
+    db: Session, unique_user_fn_scoped: TestUser, short_renders: list[str]
+):
+    # one request (one service): its first PDF holds the render slot until its time runs out; the request's later
+    # PDFs are refused unrendered, its photos still go in, and another request's PDFs render again
+    user = unique_user_fn_scoped
+    service = _service(db, user)
+    hostile = IntakeCard(pages=[IntakePage(_named(nested_pdf(), "hostile.pdf"), "hostile.pdf", 0)])
+    later = IntakeCard(pages=[IntakePage(_named(_small_pdf(), "later.pdf"), "later.pdf", 1)])
+    photo_then_pdf = IntakeCard(
+        pages=[IntakePage(io.BytesIO(_jpeg()), "front.jpg", 2), IntakePage(_named(_small_pdf(), "back.pdf"), None, 3)]
+    )
+
+    async def main() -> list[Any]:
+        return [
+            await service.ingest_async(hostile, _options(user)),
+            await service.ingest_async(later, _options(user)),
+            await service.ingest_async(photo_then_pdf, _options(user)),
+            await service.ingest_async(_card(_jpeg()), _options(user)),
+        ]
+
+    outcomes = anyio.run(main)
+    assert outcomes[:3] == [
+        IntakeRejected(0, "hostile.pdf", IngestRejectReason.pdf_not_supported),
+        IntakeRejected(1, "later.pdf", IngestRejectReason.pdf_not_supported),
+        IntakeRejected(3, None, IngestRejectReason.pdf_not_supported),
+    ]
+    _accepted(outcomes[3])
+    assert short_renders == ["hostile.pdf"]  # only the first was rendered
+
+    # the inbox's scan calls `ingest` with the group's budget for the scan: the same
+    budget = intake.RenderBudget()
+    scan = IntakeService(db, UUID(user.group_id), UUID(user.household_id), budget)
+    hostile.pages[0].file.seek(0)
+    assert scan.ingest(hostile, _options(user)).reason == IngestRejectReason.pdf_not_supported
+    assert budget.timed_out
+    assert scan.ingest(_card(_small_pdf(), names=["next.pdf"]), _options(user)).reason == (
+        IngestRejectReason.pdf_not_supported
+    )
+    assert short_renders == ["hostile.pdf", "hostile.pdf"]
+
+    # a new request starts afresh
+    _accepted(
+        _service(db, user).ingest(IntakeCard(pages=[IntakePage(_named(_small_pdf(), "new.pdf"))]), _options(user))
+    )
+    assert short_renders[-1] == "new.pdf"
+
+
+def test_a_groups_pdfs_hold_up_another_groups_for_one_card_at_most(
+    db: Session, unique_user_fn_scoped: TestUser, g2_user: TestUser, short_renders: list[str]
+):
+    # requests at once from one group, each a PDF that takes all its render time: another group's PDF is rendered
+    # after the first of them, not after all (the render slot's queue is first come, first served, and a group has
+    # one card in it at a time)
+    user = unique_user_fn_scoped
+    outcomes: dict[str, Any] = {}
+
+    async def send(service: IntakeService, card: IntakeCard, options: IntakeOptions, name: str) -> None:
+        outcomes[name] = await service.ingest_async(card, options)
+
+    async def main() -> None:
+        async with anyio.create_task_group() as group:
+            for name in ("a1.pdf", "a2.pdf", "a3.pdf"):
+                card = IntakeCard(pages=[IntakePage(_named(nested_pdf(), name), name)])
+                group.start_soon(send, _service(db, g2_user), card, _options(g2_user), name)  # a request each
+            with anyio.fail_after(30):
+                while not short_renders:  # the first one renders
+                    await anyio.sleep(0.05)
+                group_lock = intake._group_render_locks[UUID(g2_user.group_id)]
+                while group_lock.statistics().tasks_waiting < 2:  # the others wait for their group's turn
+                    await anyio.sleep(0.05)
+            card = IntakeCard(pages=[IntakePage(_named(_small_pdf(), "b.pdf"), "b.pdf")])
+            group.start_soon(send, _service(db, user), card, _options(user), "b.pdf")
+
+    anyio.run(main)
+    assert short_renders == ["a1.pdf", "b.pdf", "a2.pdf", "a3.pdf"]
+    _accepted(outcomes["b.pdf"])
+    assert [outcomes[name].reason for name in ("a1.pdf", "a2.pdf", "a3.pdf")] == [
+        IngestRejectReason.pdf_not_supported
+    ] * 3
 
 
 # ==========================================

@@ -1,6 +1,6 @@
 """
 `POST /api/ai/ingest`'s request handling (docs/ai/PHASE2.md §1.2): the checks made before any body byte is read, the
-byte-capped body stream, and the three body shapes (multipart, a raw image, JSON with base64 images).
+byte-capped body stream, and the three body shapes (multipart, a raw image or PDF, JSON with base64 images).
 
 **Order** (the route's only parameter is `request: Request`, so FastAPI reads nothing before the controller's auth):
 1. the controller's auth; then the `Authorization` header must carry a Bearer token: a cookie alone is `401`, even
@@ -14,14 +14,16 @@ byte-capped body stream, and the three body shapes (multipart, a raw image, JSON
    request whose first card finds a cap reached (another upload got in first, the same user's at once, say) gets the
    same `429`, with nothing in; a later card that would pass a cap is refused on its own, `quota` in `rejected`, so
    requests running at once can't each add more past it;
-5. `413` by `Content-Length` (45 MiB for JSON), and `415` for any other content type;
+5. `413` by `Content-Length` (45 MiB for JSON), and `415` for a content type that isn't multipart, JSON, `image/*`,
+   `application/pdf` (what iOS Shortcuts sends for a PDF) or `application/octet-stream`;
 6. the body, through a byte counter that also stops chunked bodies at the same caps.
 
 Multipart is parsed by Starlette's `MultiPartParser` over the capped stream; its file parts spool to the system temp
-directory (never `DATA_DIR`) and go to intake as open file objects, closed when the request ends. A raw image body is
-spooled the same way, and so is a JSON body, which is then decoded in one of the process's intake slots (it takes about
-three times its size in memory): leniently (line breaks, a `data:` prefix, URL-safe letters), each image into a spooled
-file of its own, so cards waiting for intake hold no decoded images in memory. A JSON image may instead be a URL
+directory (never `DATA_DIR`) and go to intake as open file objects, closed when the request ends. A raw body (an image
+or a PDF: intake tells them apart by their bytes, whatever the content type says) is spooled the same way, and so is a
+JSON body, which is then decoded in one of the process's intake slots (it takes about three times its size in memory):
+leniently (line breaks, a `data:` prefix, URL-safe letters), each image into a spooled file of its own, so cards
+waiting for intake hold no decoded images in memory. A JSON image may instead be a URL
 (`{"url": ...}`, a bare string is always base64): fetched after every check above and the batch's, one after another in
 its place, when `AI_INGEST_URL_FETCH` allows it (`fetch_url`), else refused `url_not_allowed`. Each card then goes
 through `IntakeService.ingest_async`.
@@ -281,7 +283,7 @@ def body_kind(content_type: str | None) -> BodyKind | None:
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
     if media_type == "multipart/form-data":
         return "multipart"
-    if media_type.startswith("image/") or media_type == "application/octet-stream":
+    if media_type.startswith("image/") or media_type in ("application/pdf", "application/octet-stream"):
         return "raw"
     if media_type == "application/json" or (media_type.startswith("application/") and media_type.endswith("+json")):
         return "json"
@@ -692,6 +694,7 @@ class UploadHandler:
         options = body.options
         cards = [[image] for image in body.images] if options.split else ([body.images] if body.images else [])
 
+        # one service for the request's cards: once one of their PDFs runs out of render time, the rest aren't rendered
         service = IntakeService(self.session, self.group_id, self.household_id)
         batch_id = options.batch_id
         position = options.position
