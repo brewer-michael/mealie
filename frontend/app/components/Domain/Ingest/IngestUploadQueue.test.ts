@@ -150,7 +150,7 @@ describe("IngestUploadQueue", () => {
     await flushPromises();
 
     expect(wrapper.get(".upload-rejected").text())
-      .toBe("Not used: PDFs can't be scanned. Upload a photo of the card instead.");
+      .toBe("Not used: This PDF can't be opened. It may need a password or be damaged.");
     // Sending the same file again can't help
     expect(wrapper.find(".upload-retry").exists()).toBe(false);
   });

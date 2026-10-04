@@ -139,7 +139,7 @@ const emit = defineEmits<{
 }>();
 
 const i18n = useI18n();
-const { ingestErrorText, progressText } = useRecipeIngestText();
+const { cardTitle, ingestErrorText, progressText } = useRecipeIngestText();
 
 /** The file a card came from: shown for inbox and API cards, whose capture order means nothing to the user */
 const fileName = computed(() => sourceFileName(props.job.sourceName));
@@ -148,17 +148,7 @@ const fileName = computed(() => sourceFileName(props.job.sourceName));
  * The card's name; before it's read (or when it couldn't be), its file for inbox and API cards, else its place in the
  * batch
  */
-const title = computed(() => {
-  if (props.job.title) {
-    return props.job.title;
-  }
-  if (props.job.source !== "app" && fileName.value) {
-    return fileName.value;
-  }
-  return props.job.status === "processing" || props.job.status === "failed"
-    ? i18n.t("recipe-ingest.capture.card-number", { number: props.job.position + 1 })
-    : i18n.t("recipe-ingest.queue.untitled");
-});
+const title = computed(() => cardTitle(props.job));
 /** A failed card names its file, so it can be found and sent again */
 const subtitle = computed(() =>
   props.job.status === "failed" && fileName.value && fileName.value !== title.value ? fileName.value : null,

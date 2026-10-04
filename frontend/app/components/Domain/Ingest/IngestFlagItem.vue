@@ -36,8 +36,12 @@
               :class="{ 'ingest-flag-item__mark': segment.mark }"
             >{{ segment.text }}</span>
           </div>
-          <div v-if="texts.explanation" class="text-body-2 text-medium-emphasis mt-1">
-            {{ texts.explanation }}
+          <!-- "Check this ingredient": what the parser made of the line, and what it lost -->
+          <div v-if="reading" class="text-body-2 mt-1 ingest-flag-item__reading">
+            {{ $t("recipe-ingest.flag.check_parse.read-as", { reading }) }}
+          </div>
+          <div v-if="explanation" class="text-body-2 text-medium-emphasis mt-1 ingest-flag-item__explanation">
+            {{ explanation }}
           </div>
 
           <IngestProposalBanner
@@ -109,6 +113,15 @@
               {{ texts.action }}
             </v-btn>
             <v-btn
+              v-if="reading"
+              size="small"
+              variant="tonal"
+              :disabled="readonly"
+              @click="emit('keep-as-text', item.flag)"
+            >
+              {{ $t("recipe-ingest.flag.check_parse.keep-as-text") }}
+            </v-btn>
+            <v-btn
               v-if="onField"
               size="small"
               variant="text"
@@ -134,6 +147,9 @@ import {
   fieldLabel,
   flagAlternatives,
   highlightSegments,
+  isParsedIngredient,
+  parsedReading,
+  parseLoss,
   type NeedsALookItem,
 } from "~/composables/use-recipe-ingest-review";
 import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/recipe-ingest";
@@ -141,7 +157,8 @@ import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/rec
 /**
  * One "Needs a look" item (docs/ai/PHASE2.md §6.2): the line as read with the problem highlighted, then its one-tap
  * fixes: alternative readings, a fill-in box for a blank, Re-read, Keep as written (errors) or Looks right
- * (warnings), and Edit. A resolved item collapses with a check mark and can be undone; a fixed one just collapses.
+ * (warnings), and Edit. "Check this ingredient" also shows what the parser read ("Read as: 2 cup flour, to 3"), what
+ * it lost, and Keep as text. A resolved item collapses with a check mark and can be undone; a fixed one just collapses.
  */
 const props = withDefaults(defineProps<{
   item: NeedsALookItem;
@@ -156,7 +173,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   /** an alternative reading to apply, or the value typed over a blank */
   (e: "alternative" | "fill", flag: CardFlag, text: string): void;
-  (e: "reread" | "edit", flag: CardFlag): void;
+  /** "Keep as text": the flagged ingredient line kept as written, with no amount, unit or food */
+  (e: "reread" | "edit" | "keep-as-text", flag: CardFlag): void;
   (e: "resolve", flag: CardFlag, resolution: FlagResolution | null): void;
   (e: "use-proposal", proposal: CardProposal, mode: "replace" | "append"): void;
   (e: "dismiss-proposal", proposal: CardProposal): void;
@@ -167,7 +185,23 @@ const { flagText } = useRecipeIngestText();
 
 const texts = computed(() => flagText(props.item.flag));
 const label = computed(() => fieldLabel((key, named) => i18n.t(key, named ?? {}), props.item.field, props.item.line));
-const segments = computed(() => highlightSegments(props.item.text, props.item.fragment));
+const segments = computed(() => highlightSegments(props.item.text, props.item.fragment, props.item.span));
+
+/** For "Check this ingredient" on a parsed line: what the parser read, which Keep as text replaces with the line */
+const reading = computed(() => {
+  const ingredient = props.item.ingredient;
+  return props.item.flag.kind === "check_parse" && ingredient && isParsedIngredient(ingredient) ? parsedReading(ingredient) : null;
+});
+
+/** What the parser lost, said plainly ("The 3 of 2-3 is kept in the note."), in place of the general explanation */
+const explanation = computed(() => {
+  const loss = reading.value ? parseLoss(props.item.flag, props.item.ingredient) : null;
+  if (!loss) {
+    return texts.value.explanation;
+  }
+  const key = loss.kind === "in-name" ? "in-name" : `${loss.kind}-${loss.kept ? "kept" : "lost"}`;
+  return i18n.t(`recipe-ingest.flag.check_parse.${key}`, { ...loss });
+});
 const alternatives = computed(() => flagAlternatives(props.item.flag));
 const fillable = computed(() => canFillFlag(props.item.flag));
 /** Edit and Re-read need a place in the editor; a re-read for an ingredient or step flag without a line adds one */

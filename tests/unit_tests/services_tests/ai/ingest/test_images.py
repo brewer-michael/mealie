@@ -2,9 +2,12 @@
 
 import hashlib
 import io
+import json
+import math
 import os
 import struct
 import tempfile
+import time
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -210,7 +213,8 @@ def test_an_mpo_is_read_from_its_first_frame(page_dir: Path):
     _assert_no_metadata(page_dir)
 
 
-def test_a_multi_page_tiff_is_read_from_its_first_page(page_dir: Path):
+def test_normalize_page_alone_reads_a_multi_page_tiffs_first_page(page_dir: Path):
+    # expand_document gives each page (below)
     raw = _encoded(
         Image.new("RGB", (50, 50), RED), "TIFF", save_all=True, append_images=[Image.new("RGB", (50, 50), "blue")]
     )
@@ -436,6 +440,127 @@ def test_the_pixel_cap_uses_width_times_height(page_dir: Path, monkeypatch: pyte
     assert e.value.reason == IngestRejectReason.too_many_pixels
 
 
+@pytest.fixture()
+def small_pixel_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pixel caps scaled down, so small images stand in for 200-megapixel phone photos"""
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 1024)
+    monkeypatch.setattr(limits, "MAX_PIXELS", 2_000_000)
+    monkeypatch.setattr(images, "MAX_JPEG_SOURCE_PIXELS", 10_000_000)
+
+
+def test_a_jpeg_over_the_pixel_cap_is_read_at_a_reduced_scale(
+    page_dir: Path, small_pixel_caps, monkeypatch: pytest.MonkeyPatch
+):
+    # 6 megapixels, three times the cap: decoded at half size it's 1.5
+    decoded: list[tuple[int, int]] = []
+    real_page_rgb = images._page_rgb
+
+    def page_rgb(image: Image.Image) -> Image.Image:
+        decoded.append(image.size)
+        return real_page_rgb(image)
+
+    monkeypatch.setattr(images, "_page_rgb", page_rgb)
+    meta = normalize_page(
+        io.BytesIO(_encoded(_left_third_red(3000, 2000), "JPEG")), page_dir, 0, original_filename=None
+    )
+
+    assert decoded == [(1500, 1000)]
+    assert (meta.width, meta.height) == (1024, 683)
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert _close(page.getpixel((100, 300)), RED) and _close(page.getpixel((900, 300)), WHITE)
+
+
+def test_other_formats_keep_the_pixel_cap(page_dir: Path, small_pixel_caps):
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(_encoded(_left_third_red(3000, 2000), "PNG")), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+
+
+def test_a_jpeg_over_its_own_source_cap_is_refused(page_dir: Path, small_pixel_caps):
+    # 12 megapixels: over the JPEG cap, though its 1/4-scale decoding would fit
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(_encoded(_left_third_red(4000, 3000), "JPEG")), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+    assert not any(page_dir.iterdir())
+
+
+def test_a_cmyk_jpeg_over_the_pixel_cap_becomes_an_rgb_page(page_dir: Path, small_pixel_caps):
+    cmyk = Image.new("CMYK", (3000, 2000), (0, 255, 255, 0))  # red
+    meta = normalize_page(io.BytesIO(_encoded(cmyk, "JPEG")), page_dir, 0, original_filename=None)
+
+    assert (meta.width, meta.height) == (1024, 683)
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert page.mode == "RGB"
+        assert _close(page.getpixel((500, 300)), RED, tolerance=60)
+
+
+def test_an_mpo_over_the_pixel_cap_is_read_from_its_first_frame_at_a_reduced_scale(page_dir: Path, small_pixel_caps):
+    raw = _encoded(
+        Image.new("RGB", (3000, 2000), RED),
+        "MPO",
+        save_all=True,
+        append_images=[Image.new("RGB", (3000, 2000), "blue")],
+    )
+    meta = normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+
+    assert meta.format == "mpo"
+    assert (meta.width, meta.height) == (1024, 683)
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert _close(page.getpixel((500, 300)), RED)
+
+
+@pytest.mark.filterwarnings("error::PIL.Image.DecompressionBombWarning")
+@pytest.mark.parametrize(
+    "size, format",
+    [
+        ((40, 30), "PNG"),  # between Pillow's warning and its refusal
+        ((60, 60), "PNG"),  # over Pillow's refusal, under ours
+        ((40, 30), "JPEG"),
+        ((100, 60), "JPEG"),
+    ],
+)
+def test_pillows_decompression_bomb_check_doesnt_apply(
+    page_dir: Path, monkeypatch: pytest.MonkeyPatch, size: tuple[int, int], format: str
+):
+    # Pillow warns above MAX_IMAGE_PIXELS and refuses above twice that; our own caps apply instead, and a warning
+    # (an error here, as anywhere warnings are errors) is never raised. The global is lowered for the test only.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    meta = normalize_page(io.BytesIO(_encoded(_left_third_red(*size), format)), page_dir, 0, original_filename=None)
+
+    assert (meta.width, meta.height) == size
+    assert Image.MAX_IMAGE_PIXELS == 1000
+
+
+def _jpeg_header_claiming(width: int, height: int) -> bytes:
+    """A small JPEG whose frame header claims another size: opening it is cheap, and libjpeg pads the missing data"""
+    raw = bytearray(_encoded(Image.new("RGB", (16, 16), RED), "JPEG"))
+    sof = raw.index(b"\xff\xc0")
+    raw[sof + 5 : sof + 9] = struct.pack(">HH", height, width)
+    return bytes(raw)
+
+
+def test_a_200_megapixel_phone_jpeg_is_accepted(page_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 1024)  # decoded at 1/8 scale: a small allocation for the test
+    meta = normalize_page(io.BytesIO(_jpeg_header_claiming(16320, 12240)), page_dir, 0, original_filename=None)
+    assert (meta.width, meta.height) == (1024, 768)
+
+
+def test_a_jpeg_over_260_megapixels_is_refused_before_decoding(page_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    def no_decoding(*args, **kwargs):
+        raise AssertionError("decoded")
+
+    monkeypatch.setattr(images, "_page_rgb", no_decoding)
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(_jpeg_header_claiming(18000, 15000)), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+
+
+def test_pillows_own_pixel_limit_is_left_alone(page_dir: Path, small_pixel_caps):
+    before = Image.MAX_IMAGE_PIXELS
+    normalize_page(io.BytesIO(_encoded(_left_third_red(3000, 2000), "JPEG")), page_dir, 0, original_filename=None)
+    assert Image.MAX_IMAGE_PIXELS == before
+
+
 def test_files_over_the_size_limit_are_rejected(page_dir: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(limits, "MAX_FILE_BYTES", 100)
     with pytest.raises(PageRejected) as e:
@@ -455,6 +580,323 @@ def test_no_temporary_files_are_left_behind(page_dir: Path):
     assert sorted(path.name for path in page_dir.iterdir()) == sorted(
         [images.PAGE_FILE, images.VIEW_FILE, images.THUMB_FILE]
     )
+
+
+# ==========================================
+# expand_document: multi-page TIFFs and PDFs
+
+BLUE = (0, 0, 255)
+
+
+def _tiff(*colors: tuple[int, int, int], size: tuple[int, int] = (60, 40)) -> bytes:
+    frames = [Image.new("RGB", size, color) for color in colors]
+    return _encoded(frames[0], "TIFF", save_all=True, append_images=frames[1:])
+
+
+def _pdf_of(*colors: tuple[int, int, int], size: tuple[int, int] = (300, 200)) -> bytes:
+    """A PDF with one page per colour, as Pillow writes it (each page an embedded image)"""
+    pages = [Image.new("RGB", size, color) for color in colors]
+    return _encoded(pages[0], "PDF", save_all=True, append_images=pages[1:], resolution=100)
+
+
+def _normalized(pages: list[images.DocumentPage], root: Path, name: str) -> list[tuple[PageMeta, Path]]:
+    out = []
+    for index, page in enumerate(pages):
+        page_dir = root / str(index)
+        page_dir.mkdir(parents=True)
+        meta = images.normalize_document_page(
+            page, page_dir, index, original_filename=images.page_filename(name, page.number)
+        )
+        out.append((meta, page_dir))
+    return out
+
+
+def _center(page_dir: Path) -> tuple:
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        return page.getpixel((page.width // 2, page.height // 2))
+
+
+def test_a_single_image_is_one_page_identified_by_its_bytes():
+    raw = _encoded(_left_third_red(30, 20), "PNG")
+    pages = images.expand_document(io.BytesIO(raw))
+
+    assert len(pages) == 1
+    page = pages[0]
+    assert (page.kind, page.number, page.frame, page.rendered) == ("png", None, 0, False)
+    assert page.raw_sha256 == hashlib.sha256(raw).hexdigest() and page.raw_bytes == len(raw)
+
+
+def test_a_two_page_tiff_gives_two_pages(tmp_path: Path):
+    raw = _tiff(RED, BLUE)
+    pages = images.expand_document(io.BytesIO(raw))
+
+    assert [(page.number, page.frame) for page in pages] == [(1, 0), (2, 1)]
+    # each page has an identity of its own, derived from the file's: the same file again is the same pages
+    assert len({page.raw_sha256 for page in pages}) == 2
+    assert hashlib.sha256(raw).hexdigest() not in {page.raw_sha256 for page in pages}
+    assert [page.raw_sha256 for page in images.expand_document(io.BytesIO(raw))] == [p.raw_sha256 for p in pages]
+
+    normalized = _normalized(pages, tmp_path, "scan.tiff")
+    assert [meta.original_filename for meta, _ in normalized] == ["scan.tiff (page 1)", "scan.tiff (page 2)"]
+    assert all(meta.format == "tiff" and meta.raw_bytes == len(raw) for meta, _ in normalized)
+    assert _close(_center(normalized[0][1]), RED) and _close(_center(normalized[1][1]), BLUE)
+    for _, page_dir in normalized:
+        _assert_no_metadata(page_dir)
+
+
+def test_a_16_bit_tiff_page_keeps_its_tones(tmp_path: Path):
+    width, height = 256, 64
+    values = _gradient_16(width, height)
+    gray = Image.frombytes("I;16", (width, height), struct.pack(f"<{len(values)}H", *values))
+    raw = _encoded(Image.new("RGB", (width, height), RED), "TIFF", save_all=True, append_images=[gray])
+
+    pages = images.expand_document(io.BytesIO(raw))
+    (_, _), (_, second) = _normalized(pages, tmp_path, "scan.tif")
+    with Image.open(second / images.PAGE_FILE) as page:
+        left, middle, right = (page.getpixel((x, 32)) for x in (2, 128, 253))
+    assert all(value < 20 for value in left), left
+    assert all(100 < value < 155 for value in middle), middle
+    assert all(value > 235 for value in right), right
+
+
+def test_a_tiffs_reduced_resolution_copy_isnt_a_page():
+    from PIL import TiffImagePlugin
+
+    buffer = io.BytesIO()
+    with TiffImagePlugin.AppendingTiffWriter(buffer, new=True) as tiff:
+        Image.new("RGB", (200, 100), RED).save(tiff, format="TIFF")
+        tiff.newFrame()
+        Image.new("RGB", (20, 10), RED).save(tiff, format="TIFF", tiffinfo={254: 1})  # a thumbnail
+        tiff.newFrame()
+
+    pages = images.expand_document(io.BytesIO(buffer.getvalue()))
+    assert [(page.number, page.frame) for page in pages] == [(None, 0)]
+
+
+def test_a_tiff_with_more_pages_than_a_card_is_refused():
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_tiff(RED, BLUE, RED, BLUE, RED)))
+    assert e.value.reason == IngestRejectReason.too_many_pages
+
+
+def test_a_two_page_pdf_gives_two_rendered_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 800)
+    raw = _pdf_of(RED, BLUE)
+    pages = images.expand_document(io.BytesIO(raw))
+    try:
+        assert [(page.number, page.kind, page.format, page.rendered) for page in pages] == [
+            (1, "png", "pdf", True),
+            (2, "png", "pdf", True),
+        ]
+        assert len({page.raw_sha256 for page in pages}) == 2
+        normalized = _normalized(pages, tmp_path, "scan.pdf")
+    finally:
+        images.close_pages(pages)
+
+    assert all(page.file.closed for page in pages)
+    assert [meta.original_filename for meta, _ in normalized] == ["scan.pdf (page 1)", "scan.pdf (page 2)"]
+    for meta, page_dir in normalized:
+        assert meta.format == "pdf" and meta.raw_bytes == len(raw)
+        assert (meta.width, meta.height) == (800, 534)  # rendered at the page's long side (PDFium rounds up)
+        _assert_no_metadata(page_dir)
+    assert _close(_center(normalized[0][1]), RED) and _close(_center(normalized[1][1]), BLUE)
+
+
+def test_a_one_page_pdf_is_identified_by_its_bytes(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 400)
+    raw = _pdf_of(RED)
+    pages = images.expand_document(io.BytesIO(raw))
+    images.close_pages(pages)
+
+    assert [(page.number, page.raw_sha256) for page in pages] == [(None, hashlib.sha256(raw).hexdigest())]
+    assert images.page_filename("scan.pdf", None) == "scan.pdf"
+
+
+def test_a_pdf_page_is_rendered_within_the_pixel_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 1000)
+    monkeypatch.setattr(limits, "MAX_PIXELS", 100_000)
+    pages = images.expand_document(io.BytesIO(_pdf_of(RED, size=(300, 300))))
+    try:
+        ((meta, _),) = _normalized(pages, tmp_path, "square.pdf")
+    finally:
+        images.close_pages(pages)
+    assert meta.width * meta.height <= 100_000
+    assert meta.width >= 310  # as large as the cap allows
+
+
+@pytest.mark.parametrize("pixels", [100_000, 99_999, 2_000_000])
+def test_render_scale_never_exceeds_the_pixel_cap(pixels: int):
+    from mealie.services.ai.ingest.pdf_render import render_scale
+
+    for width, height in [(612, 792), (300.3, 200.7), (1, 5000), (14400, 14400)]:
+        scale = render_scale(width, height, 4096, pixels)
+        assert math.ceil(width * scale) * math.ceil(height * scale) <= pixels
+        assert max(width, height) * scale <= 4096 + 1
+
+
+def test_a_pdf_with_more_pages_than_a_card_is_refused():
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_pdf_of(RED, BLUE, RED, BLUE, RED, size=(30, 20))))
+    assert e.value.reason == IngestRejectReason.too_many_pages
+
+
+def _pdf_document(objects: list[bytes], trailer: bytes = b"") -> bytes:
+    """A PDF from numbered objects (1, 2, ...), with a correct cross-reference table"""
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R %s >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, trailer, xref)
+    return bytes(out)
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) % 256
+        state[i], state[j] = state[j], state[i]
+    i = j = 0
+    out = bytearray()
+    for byte in data:
+        i = (i + 1) % 256
+        j = (j + state[i]) % 256
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) % 256])
+    return bytes(out)
+
+
+_PDF_PADDING = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+
+
+def _password_protected_pdf(password: bytes) -> bytes:
+    """A one-page PDF that needs `password` to open (the standard security handler, revision 2, RC4 40-bit)"""
+    padded = (password + _PDF_PADDING)[:32]
+    owner = _rc4(hashlib.md5(padded).digest()[:5], padded)  # the owner password is the user's
+    permissions = -4
+    file_id = b"0123456789abcdef"
+    key = hashlib.md5(padded + owner + struct.pack("<i", permissions) + file_id).digest()[:5]
+    user = _rc4(key, _PDF_PADDING)
+    encrypt = b"<< /Filter /Standard /V 1 /R 2 /O <%s> /U <%s> /P %d >>" % (
+        owner.hex().encode(),
+        user.hex().encode(),
+        permissions,
+    )
+    return _pdf_document(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+            encrypt,
+        ],
+        trailer=b"/Encrypt 4 0 R /ID [<%s> <%s>]" % (file_id.hex().encode(), file_id.hex().encode()),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(b"%PDF-1.7\n" + os.urandom(2000), id="damaged"),
+        pytest.param(
+            _pdf_document([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [] /Count 0 >>"]),
+            id="no pages",
+        ),
+        pytest.param(_password_protected_pdf(b"secret"), id="password"),
+    ],
+)
+def test_a_pdf_that_cant_be_opened_is_refused(raw: bytes):
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(raw))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+
+
+def test_the_password_protected_test_pdf_is_otherwise_valid():
+    # the refusal above is the password's: with it, PDFium opens the same file
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(_password_protected_pdf(b"secret"), password="secret")
+    assert len(pdf) == 1
+    pdf.close()
+
+
+@pytest.fixture()
+def fake_renderer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Points the PDF renderer at a script of the test's"""
+
+    def install(code: str) -> Path:
+        script = tmp_path / "renderer.py"
+        script.write_text(code)
+        monkeypatch.setattr(images, "_PDF_RENDERER", script)
+        return script
+
+    return install
+
+
+def test_a_renderer_that_hangs_is_stopped(fake_renderer, monkeypatch: pytest.MonkeyPatch):
+    fake_renderer("import time\ntime.sleep(30)\n")
+    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 0.5)
+    started = time.monotonic()
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+    assert time.monotonic() - started < 10
+
+
+def test_a_renderer_that_crashes_is_a_refusal_not_an_error(fake_renderer):
+    fake_renderer("import os\nos.abort()\n")
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+
+
+def test_the_renderer_gets_none_of_the_servers_environment(fake_renderer, monkeypatch: pytest.MonkeyPatch):
+    fake_renderer(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(sys.argv[2], 'environment.json').write_text(json.dumps(dict(os.environ)))\n"
+        "Path(sys.argv[2], 'page-1.png').write_bytes(b'')\n"
+        "print(json.dumps({'pages': 1}))\n"
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    seen: dict = {}
+    real_copy = images.shutil.copyfileobj
+
+    def copyfileobj(source, target, *args):
+        name = getattr(source, "name", "")
+        if isinstance(name, str) and name.endswith("page-1.png"):
+            seen.update(json.loads((Path(name).parent / "environment.json").read_text()))
+        return real_copy(source, target, *args)
+
+    monkeypatch.setattr(images.shutil, "copyfileobj", copyfileobj)
+    pages = images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    images.close_pages(pages)
+
+    assert "OPENAI_API_KEY" not in seen
+    assert set(seen) <= set(images._CHILD_ENVIRONMENT) | {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+
+
+def test_normalize_page_alone_still_refuses_a_pdf(page_dir: Path):
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(_pdf_of(RED, size=(30, 20))), page_dir, 0, original_filename="scan.pdf")
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+
+
+@pytest.mark.parametrize(
+    "name, number, expected",
+    [
+        ("scan.pdf", None, "scan.pdf"),
+        ("scan.pdf", 2, "scan.pdf (page 2)"),
+        (None, 3, "Page 3"),
+        ("x" * 300 + ".tiff", 4, "x" * 106 + ".tiff (page 4)"),
+    ],
+)
+def test_page_names_say_which_page_of_the_file(name: str | None, number: int | None, expected: str):
+    assert images.page_filename(name, number) == expected
+    assert len(expected) <= images.MAX_FILENAME_LENGTH
 
 
 # ==========================================

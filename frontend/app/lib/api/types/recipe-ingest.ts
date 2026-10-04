@@ -429,6 +429,7 @@ export interface RecipeIngestionJobOut {
   title?: string | null;
   pageCount: number;
   thumbUrl?: string | null;
+  draftVersion: number;
   errorCount?: number;
   warningCount?: number;
   task?: RecipeIngestionJobTask | null;
@@ -440,7 +441,6 @@ export interface RecipeIngestionJobOut {
   committedAt?: string | null;
   autoRetryAt?: string | null;
   expiresAt?: string | null;
-  draftVersion: number;
   pages?: PageOut[];
   transcription?: string | null;
   read?: CardReadInfo | null;
@@ -486,6 +486,7 @@ export interface RecipeIngestionJobSummary {
   title?: string | null;
   pageCount: number;
   thumbUrl?: string | null;
+  draftVersion: number;
   errorCount?: number;
   warningCount?: number;
   task?: RecipeIngestionJobTask | null;

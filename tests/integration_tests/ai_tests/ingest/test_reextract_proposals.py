@@ -17,11 +17,13 @@ from mealie.schema.recipe.recipe_ingredient import SaveIngredientUnit
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
+    CardDraftNote,
     CardDraftRef,
     CardDraftStep,
     CardFlagKind,
     CardFlagSource,
     ExtractionMeta,
+    ExtractionUnsure,
     IngestTaskKind,
     IngestTaskState,
 )
@@ -51,13 +53,19 @@ def _reading_flags(flags: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return sorted((flag["kind"], flag["field"]) for flag in flags if flag["kind"] in reading)
 
 
-def _reextract(job_id: UUID, draft: CardDraft, transcription: str, ocr: str | None = None) -> None:
+def _reextract(
+    job_id: UUID,
+    draft: CardDraft,
+    transcription: str,
+    ocr: str | None = None,
+    extraction: ExtractionMeta | None = None,
+) -> None:
     """A re-extract of the job, finished: its result finalized as the runner does (`ocr`: Tesseract's printed text)"""
     token = uuid4()
     set_columns(
         job_id, task_kind=IngestTaskKind.extract.value, task_state=IngestTaskState.running.value, lease_token=token
     )
-    extraction = _reading()
+    extraction = extraction or _reading()
     pages = job_row(job_id)["pages"]
     if ocr is not None:
         pages = [{**page, "ocr": {"text": ocr, "confidence": 95.0}} for page in pages]
@@ -177,3 +185,32 @@ def test_accepting_a_reading_raises_its_unit_and_ocr_flags(api_client: TestClien
     assert lost_unit["params"]["token"] == "stk"
     [ocr] = [flag for flag in flags if flag["source"] == CardFlagSource.ocr.value]
     assert (ocr["kind"], ocr["params"]["value"], ocr["params"]["read"]) == ("read_disagreement", "375", "350")
+
+
+def test_a_reading_of_notes_alone_keeps_its_note_flags_when_accepted_with_an_edit(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    A reading with notes and no ingredients or steps (a card of tips) is found in the accepted draft by its note ids
+    (PL-08): its `unsure` flag on the note is raised even when the same save also changes the name
+    """
+    user = unique_user_fn_scoped
+    job_id = _edited_job(user)
+    tip = "Keeps 3 days in the fridge."
+    proposed = CardDraft(name="Banana Tips", notes=[CardDraftNote(title="Storage", text=tip)])
+    unsure = ExtractionUnsure(text="3 days", reason="faded", alternatives=["5 days"])
+    extraction = _reading().model_copy(update={"unsure": [unsure]})
+    _reextract(job_id, proposed, f"Banana Tips\nStorage\n{tip}", extraction=extraction)
+
+    job = api_client.get(job_url(job_id), headers=user.token).json()
+    [proposal] = job["proposals"]
+    accepted = {**proposal["draft"], "name": "Banana Storage Tips"}
+    saved = api_client.put(
+        job_url(job_id),
+        json={"draftVersion": job["draftVersion"], "draft": accepted, "resolvedProposalIds": [proposal["id"]]},
+        headers=user.token,
+    )
+    assert saved.status_code == 200, saved.text
+    [flag] = [flag for flag in saved.json()["flags"] if flag["kind"] == CardFlagKind.unsure.value]
+    note_id = proposal["draft"]["notes"][0]["id"]
+    assert (flag["field"], flag["ref"], flag["params"]["text"]) == ("notes", note_id, "3 days")

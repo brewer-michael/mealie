@@ -1,8 +1,10 @@
 """
 Retention (docs/ai/PHASE2.md §16): the daily purge of committed and failed cards' files, empty batches and orphan
-job directories. Ready and committing jobs, eval cases and `recipes/` are never touched. Empty batches go a day after
-their last upload (`EMPTY_BATCH_AGE`), sealed or not: an upload whose only card was refused as a duplicate, or one the
-app abandoned, leaves a batch nobody seals.
+job directories (and of readings a restore cut off that no task used). Ready and committing jobs, eval cases and
+`recipes/` are never touched. A failed card waiting for the monthly limits to reset counts its retention from its
+automatic retry (`failed_card_expires_at`). Empty batches go a day after their last upload (`EMPTY_BATCH_AGE`),
+sealed or not: an upload whose only card was refused as a duplicate, or one the app abandoned, leaves a batch nobody
+seals.
 
 `purge_once` is idempotent, so every worker process running it once a day is harmless. Each job's file work runs inside
 the ingest write lock (§3.9), and every row change is conditional on the state that made it purgeable, so a job retried
@@ -85,12 +87,31 @@ def _purge_committed(session: Session, cutoff: datetime) -> int:
     return purged
 
 
+def _failed_since() -> sa.ColumnElement[datetime]:
+    """
+    What a failed card's retention counts from: its automatic retry for one waiting for a monthly limit to reset
+    (`auto_retry_at`, so it's kept until then and `RETENTION_DAYS` after), else its last change
+    """
+    return sa.func.coalesce(Job.auto_retry_at, Job.update_at, Job.created_at)
+
+
+def failed_card_expires_at(job: RecipeIngestionJob) -> datetime | None:
+    """When the purge removes a failed card (row and photos), counted as `_purge_failed` counts it; None otherwise"""
+    if job.status != IngestStatus.failed.value:
+        return None
+    since = job.auto_retry_at or job.update_at or job.created_at
+    return since + timedelta(days=get_ingest_settings().RETENTION_DAYS) if since else None
+
+
 def _purge_failed(session: Session, cutoff: datetime) -> int:
-    """Failed cards past retention: row and files"""
+    """
+    Failed cards past retention: row and files. A card waiting for the monthly limits to reset is kept until
+    `RETENTION_DAYS` after its automatic retry, which reads it again before then.
+    """
     stmt = sa.select(Job.id, Job.group_id).where(
         Job.status == IngestStatus.failed.value,
         Job.task_state.is_(None),
-        sa.func.coalesce(Job.update_at, Job.created_at) < cutoff,
+        _failed_since() < cutoff,
     )
     rows = session.execute(stmt).all()
     session.commit()
@@ -102,7 +123,7 @@ def _purge_failed(session: Session, cutoff: datetime) -> int:
                 Job.id == row.id,
                 Job.status == IngestStatus.failed.value,
                 Job.task_state.is_(None),
-                sa.func.coalesce(Job.update_at, Job.created_at) < cutoff,
+                _failed_since() < cutoff,
             )
             if _execute(session, delete) == 1:
                 storage.remove_job_dir(row.group_id, row.id)
@@ -181,6 +202,8 @@ def _purge_orphan_dirs(session: Session, now: datetime) -> int:
 
 def purge_once(now: datetime) -> None:
     """One idempotent pass of the purge; each job's file work runs inside the ingest write lock"""
+    from .runner import results
+
     cutoff = now - timedelta(days=get_ingest_settings().RETENTION_DAYS)
     with session_context() as session:
         try:
@@ -191,9 +214,11 @@ def purge_once(now: datetime) -> None:
         except IngestPaused:
             logger.info("The recipe card purge stopped: a backup restore is pausing ingestion")
             return
+    # readings a restore cut off that no task used within a day (a runtime folder: no write lock needed)
+    kept = results.purge(now.replace(tzinfo=UTC).timestamp())
 
-    if committed or failed or batches or orphans:
+    if committed or failed or batches or orphans or kept:
         logger.info(
             f"Recipe card purge: {committed} committed card(s) slimmed, {failed} failed card(s), "
-            f"{batches} empty batch(es) and {orphans} orphan folder(s) removed"
+            f"{batches} empty batch(es), {orphans} orphan folder(s) and {kept} kept reading(s) removed"
         )

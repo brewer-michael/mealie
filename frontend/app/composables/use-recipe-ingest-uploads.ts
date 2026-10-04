@@ -2,7 +2,8 @@
  * The recipe card upload queue (docs/ai/PHASE2.md §1.1, §1.4): photos grouped into cards, one upload request per card,
  * two at a time, three retries with backoff, one browser re-encode when the server finds a photo too large, a batch
  * created with the first card and sealed once Done was tapped and every card of the batch has uploaded or failed for
- * good.
+ * good. While the capture page is shown, its open batch is touched every 3 minutes, so a pause in a stack doesn't end
+ * the batch (the server ends an app batch after 10 idle minutes).
  *
  * Everything lives at module level, so the queue keeps going while the user reviews a card and comes back, and it is
  * kept in IndexedDB per user (`use-recipe-ingest-upload-storage.ts`), so a reload or a closed tab resumes it. The
@@ -52,6 +53,8 @@ export const PREVIEW_QUALITY = 0.8;
 export const PREVIEW_CONCURRENCY = 2;
 /** The server's limit (`limits.maxPagesPerCard`) */
 export const DEFAULT_MAX_PAGES_PER_CARD = 4;
+/** How often the capture page touches its open batch: well inside the server's 10 idle minutes for an app batch */
+export const BATCH_HEARTBEAT_MS = 3 * 60_000;
 export const CAPTURE_MODE_STORAGE_KEY = "mealie.recipe-ingest.capture-mode";
 export const DATA_SAVER_STORAGE_KEY = "mealie.recipe-ingest.data-saver";
 /** "Keep these cards on this server", per user: `<key>.<user id>` */
@@ -246,6 +249,7 @@ export type UploadQueueAction
     | { type: "downscaled"; key: string; photos: readonly Blob[] }
     | { type: "batch-created"; batchKey: string; serverId: string }
     | { type: "batch-lost"; batchKey: string; serverId: string }
+    | { type: "batch-ended"; batchKey: string; serverId: string }
     | { type: "uploaded"; key: string; response: IngestResponse }
     | { type: "attempt-failed"; key: string; error: string | null; retryAt: number }
     | { type: "failed"; key: string; error: string | null; retryable: boolean }
@@ -417,6 +421,14 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
       return updateBatch(state, action.batchKey, b => (b.serverId ? b : withServerId(b, action.serverId)));
     case "batch-lost":
       return updateBatch(state, action.batchKey, b => (b.serverId === action.serverId ? { ...b, serverId: null } : b));
+    case "batch-ended":
+      // sealed on the server (idle while the page was away) or gone: it's neither touched nor sealed again, and the
+      // next card starts a new server batch
+      return updateBatch(state, action.batchKey, b => ({
+        ...b,
+        serverId: b.serverId === action.serverId ? null : b.serverId,
+        sealedIds: b.sealedIds.includes(action.serverId) ? b.sealedIds : [...b.sealedIds, action.serverId],
+      }));
     case "uploaded":
       return applyUploaded(state, action.key, action.response);
     case "attempt-failed":
@@ -666,6 +678,10 @@ const batchRequests = new Map<string, Promise<BatchResult>>();
 const sealsInFlight = new Set<string>();
 const sealFailures = new Map<string, number>();
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
+/** Capture pages shown now: while there's one, the open batch is touched every `BATCH_HEARTBEAT_MS` */
+let heartbeatHolders = 0;
+let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+let heartbeatInFlight = false;
 /** The uploads in flight, aborted by a reset (logout), so no photo leaves after its user has gone */
 const uploadsInFlight = new Set<AbortController>();
 /** Bumped by a reset, so requests still in flight change nothing */
@@ -1088,6 +1104,8 @@ async function restoreFrom(target: UploadStorage, gen: number) {
   }
   schedulePersist();
   pump();
+  // a capture page shown before the queue came back keeps the restored open batch open from now
+  void beat();
 }
 
 function localOnlyKey(userId: string): string {
@@ -1482,6 +1500,114 @@ function pump() {
   scheduleRetries();
 }
 
+// ---- the open batch's heartbeat
+
+/** The server batch new cards go to, while it's open as far as this page knows */
+function openServerBatch(): { batchKey: string; serverId: string } | null {
+  const key = state.value.openBatchKey;
+  const batch = key ? findBatch(key) : undefined;
+  if (!batch || batch.sealing || !batch.serverId || batch.sealedIds.includes(batch.serverId)) {
+    return null;
+  }
+  return { batchKey: batch.key, serverId: batch.serverId };
+}
+
+function pageVisible(): boolean {
+  return typeof document === "undefined" || document.visibilityState !== "hidden";
+}
+
+function clearHeartbeatTimer() {
+  if (heartbeatTimer !== null) {
+    clearTimeout(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function scheduleHeartbeat() {
+  clearHeartbeatTimer();
+  if (heartbeatHolders > 0 && pageVisible()) {
+    heartbeatTimer = setTimeout(() => {
+      heartbeatTimer = null;
+      void beat();
+    }, BATCH_HEARTBEAT_MS);
+  }
+}
+
+/**
+ * Touches the open batch now, then again in 3 minutes. Quiet: a batch the server ended anyway (sealed after a longer
+ * absence, or gone) is let go, and the next card starts a new one without a word; other failures (offline, a
+ * restore) wait for the next beat.
+ */
+async function beat() {
+  clearHeartbeatTimer();
+  if (heartbeatHolders === 0 || !pageVisible() || heartbeatInFlight) {
+    return;
+  }
+  const open = openServerBatch();
+  if (open && api) {
+    const gen = generation;
+    heartbeatInFlight = true;
+    try {
+      const { error } = await client().touchBatch(open.serverId, { suppressAlert: true });
+      if (gen !== generation) {
+        return;
+      }
+      const status = error ? errorStatusOf(error) : null;
+      if (status === 409 || status === 404) {
+        dispatch({ type: "batch-ended", batchKey: open.batchKey, serverId: open.serverId });
+      }
+    }
+    finally {
+      if (gen === generation) {
+        heartbeatInFlight = false;
+      }
+    }
+  }
+  scheduleHeartbeat();
+}
+
+function onHeartbeatVisibility() {
+  if (pageVisible()) {
+    // back on the page: the batch may have been idle for minutes
+    void beat();
+  }
+  else {
+    clearHeartbeatTimer();
+  }
+}
+
+function stopHeartbeat() {
+  clearHeartbeatTimer();
+  if (typeof document !== "undefined") {
+    document.removeEventListener("visibilitychange", onHeartbeatVisibility);
+  }
+}
+
+/**
+ * The capture page is shown: its open batch is touched at once and every 3 minutes while the page is
+ * visible, so the batch stays open through a pause. Returns what to call when the page closes.
+ */
+function keepBatchOpen(): () => void {
+  const gen = generation;
+  heartbeatHolders += 1;
+  if (heartbeatHolders === 1 && typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onHeartbeatVisibility);
+  }
+  void beat();
+  let released = false;
+  return () => {
+    // a reset (logout) has let go already
+    if (released || gen !== generation) {
+      return;
+    }
+    released = true;
+    heartbeatHolders = Math.max(0, heartbeatHolders - 1);
+    if (heartbeatHolders === 0) {
+      stopHeartbeat();
+    }
+  };
+}
+
 // ---- capture
 
 function readMode(): CaptureMode {
@@ -1778,6 +1904,7 @@ export function useRecipeIngestUploads() {
     scanAgain,
     remove,
     openCardsPage,
+    keepBatchOpen,
     /**
      * Whose queue this is (the default layout passes the signed-in user): their stored queue comes back and resumes.
      * `open` gives the storage (IndexedDB by default).
@@ -1864,6 +1991,9 @@ export function resetRecipeIngestUploads() {
     clearTimeout(retryTimer);
     retryTimer = null;
   }
+  heartbeatHolders = 0;
+  heartbeatInFlight = false;
+  stopHeartbeat();
   scope?.stop();
   scope = null;
   if (typeof window !== "undefined") {

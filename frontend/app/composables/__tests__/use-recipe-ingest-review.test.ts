@@ -9,17 +9,21 @@ import {
   editFlaggedText,
   fieldText,
   fillBlank,
+  findFragment,
   firstCardToReview,
   flagAlternatives,
   flagsForField,
   fixIngredient,
   formatQuantity,
   highlightSegments,
+  ingredientAsText,
   ingredientDisplay,
   nextBatchCard,
   nextCardInBatch,
   normalizeDraft,
   nudgeRegion,
+  parsedReading,
+  parseLoss,
   parseQuantity,
   regionFromCropResult,
   rereadTargets,
@@ -217,7 +221,7 @@ describe("batches", () => {
   });
 
   function summary(id: string, batchId: string, position: number, createdAt: string, errorCount = 0): RecipeIngestionJobSummary {
-    return { id, batchId, position, status: "ready", source: "app", pageCount: 1, createdAt, errorCount, warningCount: 0 };
+    return { id, batchId, position, status: "ready", source: "app", pageCount: 1, draftVersion: 1, createdAt, errorCount, warningCount: 0 };
   }
 
   test("after a batch's last card, the review goes on to the batch whose ready cards waited longest", () => {
@@ -363,6 +367,197 @@ describe("flags", () => {
     expect(draft.notes[0]!.text).toBe("Grandma Jo's, 1962");
     // a note that's gone points at nothing
     expect(editFlaggedText(draft, flag({ id: "blank:notes:5", field: "notes", ref: "5" }), "x", "fill")).toBe(false);
+  });
+});
+
+describe("flag positions", () => {
+  // the server's params.start/end: where the flagged part is in the text the flag was computed on (PL-12)
+  const microwave = "Add 1/2 c. milk. Microwave 2 minutes.";
+  const invented = flag({
+    id: "blank:steps:s2",
+    source: "cross_read",
+    params: { value: "2", start: 27, end: 28 },
+  });
+
+  test("a fill and the highlight hit the number the flag means, not the 2 of 1/2", () => {
+    const draft = normalizeDraft(bananaDraft({ steps: [{ id: "s1", text: "Mix." }, { id: "s2", text: microwave }] }));
+    const { items } = buildNeedsALook([invented], [invented], new Set(), draft, []);
+    expect(items[0]!.span).toEqual({ start: 27, end: 28 });
+    expect(highlightSegments(items[0]!.text, items[0]!.fragment, items[0]!.span)).toEqual([
+      { text: "Add 1/2 c. milk. Microwave ", mark: false },
+      { text: "2", mark: true },
+      { text: " minutes.", mark: false },
+    ]);
+
+    expect(editFlaggedText(draft, invented, "3", "fill")).toBe(true);
+    expect(draft.steps[1]!.text).toBe("Add 1/2 c. milk. Microwave 3 minutes.");
+  });
+
+  test("without a position, the first whole number matches: never a 2 inside 1/2 or 12", () => {
+    const unplaced = flag({ ...invented, params: { value: "2" } });
+    expect(fillBlank(microwave, "3", "2")).toBe("Add 1/2 c. milk. Microwave 3 minutes.");
+    expect(applyAlternative(microwave, unplaced, "3")).toBe("Add 1/2 c. milk. Microwave 3 minutes.");
+    expect(highlightSegments(microwave, "2").filter(segment => segment.mark)).toHaveLength(1);
+    expect(findFragment("Beat 12 eggs", "2")).toBeNull();
+    expect(findFragment("1/2 c. milk", "1")).toBeNull();
+    expect(findFragment("1 can (10 3/4 oz.) soup", "1")).toEqual({ start: 0, end: 1 });
+    expect(findFragment("Bake 1½ hours, then 1 more", "1")).toEqual({ start: 20, end: 21 });
+    expect(findFragment("1.5 c. flour, 5 eggs", "5")).toEqual({ start: 14, end: 15 });
+    // a word matches as a whole word; text that isn't a number or word (a marker) anywhere
+    expect(findFragment("1 Tbsp. butter, 1 T. sugar", "T")).toEqual({ start: 18, end: 19 });
+    expect(findFragment("a[blank]b", "[blank]")).toEqual({ start: 1, end: 8 });
+    // shorthand: a number right before a unit's letters is still that number
+    expect(findFragment("2T. butter", "2")).toEqual({ start: 0, end: 1 });
+  });
+
+  test("a position the text no longer holds falls back to the first whole match", () => {
+    // edited since: the step is shorter, or something else is at that place now
+    expect(findFragment("Microwave 2 minutes.", "2", { start: 27, end: 28 })).toEqual({ start: 10, end: 11 });
+    expect(findFragment(microwave, "2", { start: 4, end: 5 })).toEqual({ start: 27, end: 28 });
+    expect(findFragment("Add 1/2 c. milk.", "2", { start: 27, end: 28 })).toBeNull();
+    // the server's position is trusted where the text holds the fragment
+    expect(findFragment("1/2 c. milk", "1/2", { start: 0, end: 3 })).toEqual({ start: 0, end: 3 });
+    // a longer reading whatever its case, as the server matched it; a unit letter only as written
+    expect(findFragment("1/4 T. salt", "1/4 t.", { start: 0, end: 6 })).toEqual({ start: 0, end: 6 });
+    expect(findFragment("1 t. salt, 1 T. sugar", "T", { start: 2, end: 3 })).toEqual({ start: 13, end: 14 });
+  });
+
+  test("a check on the second of two equal amounts highlights the second", () => {
+    const draft = normalizeDraft(bananaDraft({
+      ingredients: [{
+        referenceId: "i1",
+        originalText: "1 c. sugar, 1 c. flour",
+        quantity: 1,
+        unit: { id: "u-cup", name: "cup" },
+        food: { id: null, name: "sugar flour" },
+        note: "",
+      }],
+    }));
+    const check = flag({
+      id: "check_parse:ingredients:i1",
+      kind: "check_parse",
+      severity: "warning",
+      source: "parser",
+      field: "ingredients",
+      ref: "i1",
+      params: { value: "1", start: 12, end: 13 },
+    });
+    const { items } = buildNeedsALook([check], [check], new Set(), draft, []);
+    expect(items[0]!.span).toEqual({ start: 12, end: 13 });
+    expect(highlightSegments(items[0]!.text, items[0]!.fragment, items[0]!.span)).toEqual([
+      { text: "1 c. sugar, ", mark: false },
+      { text: "1", mark: true },
+      { text: " c. flour", mark: false },
+    ]);
+  });
+
+  test("a position in a note's text is shifted past its title in the item's text", () => {
+    const draft = normalizeDraft(bananaDraft({ notes: [{ title: "Doubled 2x", text: "Bake 2 hours at 2 racks" }] }));
+    const noteFlag = flag({
+      id: "not_on_card:notes:0#abc",
+      kind: "not_on_card",
+      severity: "warning",
+      source: "validator",
+      field: "notes",
+      ref: "0",
+      params: { value: "2", start: 16, end: 17 },
+    });
+    const { items } = buildNeedsALook([noteFlag], [noteFlag], new Set(), draft, []);
+    expect(items[0]!.text).toBe("Doubled 2x\nBake 2 hours at 2 racks");
+    expect(items[0]!.span).toEqual({ start: 27, end: 28 });
+
+    const fill = flag({ ...noteFlag, kind: "blank", severity: "error", source: "cross_read" });
+    expect(editFlaggedText(draft, fill, "3", "fill")).toBe(true);
+    expect(draft.notes[0]).toMatchObject({ title: "Doubled 2x", text: "Bake 2 hours at 3 racks" });
+  });
+
+  test("a fix on a parsed line changes the part that holds the flagged spot", () => {
+    const eggs = {
+      referenceId: "i1",
+      originalText: "2 eggs, beaten with 2 T. water",
+      quantity: 2,
+      unit: null,
+      food: { id: "f-egg", name: "eggs" },
+      note: "beaten with 2 T. water",
+    };
+    const first = flag({ id: "blank:ingredients:i1", source: "cross_read", field: "ingredients", ref: "i1", params: { value: "2", start: 0, end: 1 } });
+    const second = flag({ ...first, params: { value: "2", start: 20, end: 21 } });
+
+    expect(fixIngredient(eggs, first, "3", "fill")).toMatchObject({ quantity: 3, note: "beaten with 2 T. water" });
+    expect(fixIngredient(eggs, second, "3", "fill")).toMatchObject({ quantity: 2, note: "beaten with 3 T. water" });
+
+    // the 1 of the amount, not the 1 in the note's "10 3/4"
+    const soup = {
+      referenceId: "i2",
+      originalText: "1 can (10 3/4 oz.) soup",
+      quantity: 1,
+      unit: { id: null, name: "can" },
+      food: { id: null, name: "soup" },
+      note: "(10 3/4 oz.)",
+    };
+    const amount = flag({ ...first, ref: "i2", params: { value: "1" } });
+    expect(fixIngredient(soup, amount, "2", "fill")).toMatchObject({ quantity: 2, note: "(10 3/4 oz.)" });
+    const inNote = flag({ ...first, ref: "i2", params: { value: "10 3/4", start: 7, end: 13 } });
+    expect(fixIngredient(soup, inNote, "10 1/2", "fill")).toMatchObject({ quantity: 1, note: "(10 1/2 oz.)" });
+  });
+});
+
+describe("check this ingredient", () => {
+  const check = (params: Record<string, unknown>) => flag({
+    id: "check_parse:ingredients:i1",
+    kind: "check_parse",
+    severity: "warning",
+    source: "parser",
+    field: "ingredients",
+    ref: "i1",
+    params,
+  });
+  const line = (originalText: string, quantity: number | null, unit: string | null, food: string | null, note: string) => ({
+    referenceId: "i1",
+    originalText,
+    quantity,
+    unit: unit ? { id: null, name: unit } : null,
+    food: food ? { id: null, name: food } : null,
+    note,
+  });
+
+  test("the parser's reading reads amount, unit and food, then the note", () => {
+    expect(parsedReading(line("2-3 c. flour", 2, "cup", "flour", "to 3"))).toBe("2 cup flour, to 3");
+    expect(parsedReading(line("1 can (10 3/4 oz.) soup", 1, "can", "soup", "(10 3/4 oz.)"))).toBe("1 can soup, (10 3/4 oz.)");
+    expect(parsedReading(line("1 egg", 1, null, "egg", ""))).toBe("1 egg");
+  });
+
+  test("what the fields lost is named from the flag's value, and whether the note keeps it", () => {
+    expect(parseLoss(check({ value: "2-3", start: 0, end: 3 }), line("2-3 c. flour", 2, "cup", "flour", "to 3")))
+      .toEqual({ kind: "range", value: "2-3", end: "3", kept: true });
+    expect(parseLoss(check({ value: "1 to 2" }), line("1 to 2 c. water", 1, "cup", "water", "to 2")))
+      .toEqual({ kind: "range", value: "1 to 2", end: "2", kept: true });
+    // a draft parsed before notes kept what the fields lose
+    expect(parseLoss(check({ value: "2-3" }), line("2-3 c. flour", 2, "cup", "flour", "")))
+      .toEqual({ kind: "range", value: "2-3", end: "3", kept: false });
+    expect(parseLoss(check({ value: "10 3/4" }), line("1 can (10 3/4 oz.) soup", 1, "can", "soup", "(10 3/4 oz.)")))
+      .toEqual({ kind: "amount", value: "10 3/4", kept: true });
+    expect(parseLoss(check({ value: "3" }), line("2 or 3 eggs", 2, null, "eggs", "or 3 eggs")))
+      .toEqual({ kind: "amount", value: "3", kept: true });
+    expect(parseLoss(check({ value: "1" }), line("1 c. sugar, 1 c. flour", 1, "cup", "sugar flour", "")))
+      .toEqual({ kind: "amount", value: "1", kept: false });
+    expect(parseLoss(check({ value: "scant" }), line("1 scant cup sugar", 1, "cup scant", "sugar", "")))
+      .toEqual({ kind: "in-name", value: "scant" });
+    // a low-confidence parse says nothing more specific; other flags never do
+    expect(parseLoss(check({ confidence: 60 }), line("1 sq chocolate", 1, null, "sq chocolate", ""))).toBeNull();
+    expect(parseLoss(unsureFlag, line("1/4 t. salt", 0.25, "teaspoon", "salt", ""))).toBeNull();
+  });
+
+  test("Keep as text keeps the card's line as written, with no amount, unit or food", () => {
+    expect(ingredientAsText({ ...line("2-3 c. flour", 2, "cup", "flour", "to 3"), title: "Crust" })).toMatchObject({
+      referenceId: "i1",
+      title: "Crust",
+      quantity: null,
+      unit: null,
+      food: null,
+      note: "2-3 c. flour",
+      display: "2-3 c. flour",
+    });
   });
 });
 
@@ -682,6 +877,67 @@ describe("useRecipeIngestReview", () => {
 
     expect(review.draft.value.ingredients[1]).toMatchObject({ quantity: 0.5, display: "1/2 teaspoon salt" });
     expect(review.needsALook.value.find(item => item.flag.id === unsureFlag.id)!.state).toBe("fixed");
+  });
+
+  test("the card photo is attached as the draft says, else as the household's default; public households are warned", async () => {
+    api.getJob.mockResolvedValue(ok(job({ householdRecipesPublic: true, cardPhotoDefault: false, draft: bananaDraft({ useCardAsCover: false }) })));
+    const { review } = await loaded();
+
+    expect(review.draft.value.attachCardPhoto ?? null).toBeNull();
+    expect(review.attachCardPhoto.value).toBe(false);
+    expect(review.cardPhotoPublic.value).toBe(false);
+    // reading the default doesn't change the draft
+    expect(review.isDirty.value).toBe(false);
+
+    review.attachCardPhoto.value = true;
+    expect(review.draft.value.attachCardPhoto).toBe(true);
+    expect(review.cardPhotoPublic.value).toBe(true);
+    review.attachCardPhoto.value = false;
+    review.draft.value.useCardAsCover = true;
+    expect(review.cardPhotoPublic.value).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft).toMatchObject({ attachCardPhoto: false, useCardAsCover: true });
+  });
+
+  test("a private household attaches the card photo by default and isn't warned", async () => {
+    api.getJob.mockResolvedValue(ok(job({ householdRecipesPublic: false, cardPhotoDefault: true })));
+    const { review } = await loaded();
+
+    expect(review.attachCardPhoto.value).toBe(true);
+    expect(review.cardPhotoPublic.value).toBe(false);
+  });
+
+  test("Keep as text on Check this ingredient keeps the card's line, and the line's parser flags are done", async () => {
+    const flour = { referenceId: "i4", originalText: "2-3 c. flour", quantity: 2, unit: { id: "u-cup", name: "cup" }, food: { id: "f-flour", name: "flour" }, note: "to 3" };
+    const check = flag({ id: "check_parse:ingredients:i4", kind: "check_parse", severity: "warning", source: "parser", field: "ingredients", ref: "i4", params: { value: "2-3", start: 0, end: 3 } });
+    const unit = flag({ id: "unit_unclear:ingredients:i4", kind: "unit_unclear", severity: "warning", source: "parser", field: "ingredients", ref: "i4", params: { token: "c." } });
+    const draft = bananaDraft();
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...draft, ingredients: [...draft.ingredients!, flour] }, flags: [blankFlag, check, unit] })));
+    const { review } = await loaded();
+    expect(review.needsALook.value.find(item => item.flag.id === check.id)!.ingredient).toMatchObject({ referenceId: "i4", quantity: 2 });
+
+    review.keepIngredientAsText(check);
+    await nextTick();
+
+    expect(review.draft.value.ingredients[3]).toMatchObject({ referenceId: "i4", quantity: null, unit: null, food: null, note: "2-3 c. flour", display: "2-3 c. flour" });
+    expect(review.needsALook.value.map(item => [item.flag.id, item.state])).toEqual([
+      ["check_parse:ingredients:i4", "fixed"],
+      ["unit_unclear:ingredients:i4", "fixed"],
+      ["blank:steps:s2", "open"],
+    ]);
+
+    // saved as an edit: the server no longer raises the parser's flags on the line
+    api.updateJob.mockResolvedValueOnce(ok({ draftVersion: 4, flags: [blankFlag], errorCount: 1, warningCount: 0 }));
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft.ingredients[3]).toMatchObject({ quantity: null, note: "2-3 c. flour" });
+    expect(review.needsALook.value.map(item => item.state)).toEqual(["fixed", "fixed", "open"]);
+
+    // a flag that isn't on an ingredient has no line to keep
+    review.keepIngredientAsText(blankFlag);
+    expect(review.draft.value.steps[1]!.text).toBe("Microwave on high for [blank] minutes.");
   });
 
   test("a busy job queues the re-read, which is sent once the job is idle", async () => {

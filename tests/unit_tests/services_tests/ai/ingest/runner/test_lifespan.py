@@ -207,7 +207,10 @@ def test_a_failing_sweep_doesnt_stop_claims(
 def test_the_phases_run_on_their_schedules(
     jobs: Jobs, handlers: FakeHandlers, phases: PhaseCalls, monkeypatch: pytest.MonkeyPatch
 ):
-    """Housekeeping, stale commits and the inbox at once and then every interval; the purge 10 minutes after start"""
+    """
+    Housekeeping, stale commits, limit retries and the inbox at once and then every interval; the purge 10 minutes
+    after start
+    """
     instance = IngestDispatcher(concurrency=1)
 
     async def two_ticks() -> None:
@@ -216,6 +219,7 @@ def test_the_phases_run_on_their_schedules(
 
     run(two_ticks())
     assert (len(phases.housekeeping), len(phases.commits), phases.inbox, len(phases.purge)) == (1, 1, 1, 0)
+    assert len(phases.retries) == 1
 
     monkeypatch.setattr(limits, "PURGE_FIRST_DELAY", 0)
     instance = IngestDispatcher(concurrency=1)

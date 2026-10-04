@@ -37,13 +37,23 @@ the lock. On Linux, NFS included, `flock` locks belong to the open file descript
 byte-range locks owned by it; flock(2), "NFS details"): two descriptors conflict even within one process, and closing
 one never drops a lock held through another. The gate is defence in depth for platforms where `flock` locks belong
 to the process instead, as POSIX record locks do: those never conflict between a process's own threads, and closing
-any descriptor of the file drops them all. Where the filesystem doesn't support locks at all (`ENOLCK`,
-`EOPNOTSUPP`), one warning is logged; the marker and the gate still apply, but a restore can't wait for other worker
-processes' writes, and a stale marker is told only by its process.
+any descriptor of the file drops them all.
+
+**Where the locks live** (`lock_path`): `AI_INGEST_LOCK_DIR/.ai-ingest-lock` when that's set; else
+`DATA_DIR/.ai-ingest-lock`, unless `DATA_DIR`'s filesystem doesn't support locks (`ENOLCK`, `EOPNOTSUPP`: some network
+filesystems). Then `/tmp/mealie-ai-ingest-<sha1 of DATA_DIR, 12 hex digits>.lock` is used, which every worker process
+of the container shares, and a warning says so. A lock outside `DATA_DIR` only works within one host, so a stale-marker
+check trusts the restore lock beside it only for a marker this host wrote. Only where no lock works at all is one
+warning logged and the marker and the gate apply alone: a restore then can't wait for other worker processes' writes,
+and a stale marker is told only by its process.
 
 **The dispatcher's presence file** `DATA_DIR/.ai-ingest-dispatcher`: every running dispatcher sets its modification time
 at most once every `DISPATCHER_SEEN_INTERVAL` (one atomic `utime`, no content), paused or not, so
 `dispatcher_seen_at()` tells whether any process reads cards.
+
+**Kept results** (`runner/results.py`) live in `DATA_DIR/.ai-ingest-results/`, a runtime folder backups leave out and
+restores leave alone. Every restore records when it ended there (`mark_restored`, before it queues the running tasks
+again), so a task tells whether a restore took its lease after it began (`restored_since`).
 
 This module imports only the standard library and `mealie.core`, since the backup service imports it.
 """
@@ -51,6 +61,7 @@ This module imports only the standard library and `mealie.core`, since the backu
 import errno
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import shutil
@@ -79,10 +90,16 @@ EVAL_CARDS_DIR_NAME = "eval-cards"
 PAUSE_MARKER_NAME = ".ai-ingest-paused"
 LOCK_FILE_NAME = ".ai-ingest-lock"
 DISPATCHER_SEEN_NAME = ".ai-ingest-dispatcher"
+RESULTS_DIR_NAME = ".ai-ingest-results"
+"""Results of tasks a backup restore cut off, kept for the task that reads the card again; a runtime folder"""
+RESTORED_NAME = "restored"
+"""In the results folder: when the last backup restore ended (a Unix time)"""
 RESTORE_LOCK_SUFFIX = ".restore"
 """The restore lock is named after the write lock, with this suffix (`.ai-ingest-lock.restore`)"""
 RESTORE_LOCK_HOLD_WAIT = 5.0
 """How long a restore waits for a stale-marker check to let go of the restore lock (it holds it for moments)"""
+FALLBACK_LOCK_DIR = Path("/tmp")
+"""Where the locks go when `DATA_DIR` doesn't support them: a local folder every process of the container shares"""
 
 _UNSUPPORTED_LOCK_ERRORS = {errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS}
 
@@ -198,6 +215,67 @@ def dispatcher_seen_at() -> float | None:
 
 
 # ==========================================
+# Kept results and restores
+
+
+def results_dir() -> Path:
+    """`DATA_DIR/.ai-ingest-results`: kept results and tasks in flight (`runner/results.py`); not created here"""
+    return _data_dir() / RESULTS_DIR_NAME
+
+
+def ensure_results_dir() -> Path:
+    """The results folder, created (owner only) if it doesn't exist yet"""
+    path = results_dir()
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def mark_restored(when: float | None = None) -> None:
+    """Records that a backup restore ended now (or at `when`, a Unix time), atomically"""
+    path = ensure_results_dir() / RESTORED_NAME
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(f"{time.time() if when is None else when:.6f}")
+    os.replace(temp, path)
+
+
+def restored_at() -> float | None:
+    """When the last backup restore ended (a Unix time), or None when none did since the results folder was made"""
+    path = results_dir() / RESTORED_NAME
+    try:
+        return float(path.read_text().strip())
+    except FileNotFoundError:
+        return None
+    except OSError, ValueError:
+        return _mtime(path)
+
+
+def restored_since(moment: float) -> bool:
+    """Whether a backup restore ended at or after `moment` (a Unix time): one that may have taken a lease since"""
+    ended = restored_at()
+    return ended is not None and ended >= moment
+
+
+def process_identity() -> tuple[str, int, int | None]:
+    """This process as files it leaves name it: its host identity, process id and start time"""
+    pid = os.getpid()
+    return _host_identity(), pid, _process_started(pid)
+
+
+def process_gone(host: str, pid: int, started: int | None) -> bool | None:
+    """
+    Whether the process a file names (`process_identity()`) is gone: True or False on this host; True for this
+    container before a restart (the same host name with another boot or process namespace); None for another host,
+    which can't be told from here
+    """
+    here = _host_identity()
+    if host == here:
+        return _process_gone(pid, started)
+    if host.split("/", 1)[0] == here.split("/", 1)[0]:
+        return True
+    return None
+
+
+# ==========================================
 # The pause
 
 
@@ -209,8 +287,76 @@ def pause_marker_path() -> Path:
     return _data_dir() / PAUSE_MARKER_NAME
 
 
+_lock_locations: dict[tuple[str, str | None], Path] = {}
+"""The write lock's path, by data directory and `AI_INGEST_LOCK_DIR`, decided once per process"""
+_lock_location_guard = threading.Lock()
+
+
+def _locks_work(path: Path) -> bool:
+    """
+    Whether `flock` works on the file at `path` (created if needed): False only for "not supported here". Called
+    before this process holds that lock, so closing the descriptor can't drop a lock it holds.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return True  # it can't even be opened: using it says why
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True  # a restore holds it: locks work
+    except OSError as e:
+        return e.errno not in _UNSUPPORTED_LOCK_ERRORS
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _choose_lock_path(data_dir: Path, lock_dir: Path | None) -> Path:
+    if lock_dir is not None:
+        try:
+            lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            return lock_dir / LOCK_FILE_NAME
+        except OSError as e:
+            logger.warning(f"AI_INGEST_LOCK_DIR ({lock_dir}) can't be used ({type(e).__name__}); using DATA_DIR's")
+
+    path = data_dir / LOCK_FILE_NAME
+    if _locks_work(path):
+        return path
+    digest = hashlib.sha1(str(data_dir.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
+    fallback = FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{digest}.lock"
+    logger.warning(
+        f"DATA_DIR ({data_dir}) doesn't support file locks: recipe card ingestion locks {fallback} instead, which "
+        "every worker process of this container shares. Set AI_INGEST_LOCK_DIR to choose another local folder."
+    )
+    return fallback
+
+
 def lock_path() -> Path:
-    return _data_dir() / LOCK_FILE_NAME
+    """
+    The ingest write lock: `AI_INGEST_LOCK_DIR/.ai-ingest-lock`, else `DATA_DIR/.ai-ingest-lock`, or a file under
+    `/tmp` named after `DATA_DIR` where `DATA_DIR` doesn't support locks. Decided once per process (logged then).
+    """
+    from .settings import get_ingest_settings  # here: the backup service imports this module
+
+    data_dir = _data_dir()
+    lock_dir = get_ingest_settings().LOCK_DIR
+    key = (str(data_dir), str(lock_dir) if lock_dir is not None else None)
+    with _lock_location_guard:
+        path = _lock_locations.get(key)
+        if path is None:
+            path = _lock_locations[key] = _choose_lock_path(data_dir, lock_dir)
+        return path
+
+
+def _lock_shared_by_hosts() -> bool:
+    """Whether the locks are in `DATA_DIR`, where every host sharing it sees them (else they're this host's own)"""
+    try:
+        return lock_path().parent.resolve() == _data_dir().resolve()
+    except OSError:
+        return False
 
 
 def restore_lock_path() -> Path:
@@ -438,7 +584,11 @@ def _remove_if_stale() -> bool:
             if _active_pauses > 0:
                 return False  # this process's own restore
 
-        if marker.lock is not None and marker.lock == str(restore_lock_path()):
+        # a lock outside DATA_DIR is this host's own: another host's restore holds its own one, not this
+        trusted_lock = marker.lock is not None and marker.lock == str(restore_lock_path())
+        if trusted_lock and not _lock_shared_by_hosts():
+            trusted_lock = marker.host == _host_identity()
+        if trusted_lock:
             state, fd = _probe_restore_lock()
             if state == _RestoreLock.held:
                 return False
@@ -522,7 +672,10 @@ _restoring = False
 
 
 def flock_supported() -> bool:
-    """Whether `flock` works on `DATA_DIR`; logs one warning when it doesn't. For a startup check."""
+    """
+    Whether `flock` works on the write lock (`lock_path`: chosen now if it wasn't yet, logged when it isn't in
+    `DATA_DIR`); logs one warning when it doesn't. For a startup check.
+    """
     with _gate:
         if _writers or _restoring:
             # the process holds the lock: closing another descriptor of the file could drop it (POSIX locks)
@@ -661,6 +814,18 @@ def _requeue_running_tasks() -> None:
         logger.info(f"Backup restore: {requeued} recipe card task(s) that were running are queued again")
 
 
+def _record_restore() -> None:
+    """
+    After a restore, before its running tasks are queued again: records when it ended (`mark_restored`), so a task
+    whose lease it takes keeps its result for the card's next task. A failure is logged: those results are then
+    dropped, and the cards are read again, as before.
+    """
+    try:
+        mark_restored()
+    except OSError as e:
+        logger.warning(f"Couldn't record the backup restore for recipe card ingestion: {type(e).__name__}")
+
+
 def _lock_exclusively(deadline: float) -> int | None:
     """
     Waits until `deadline` for the exclusive lock (other processes' writers holding it shared) and returns its file
@@ -759,6 +924,7 @@ def pauses_ingest[**P, R](func: Callable[P, R]) -> Callable[P, R]:
                 try:
                     return func(*args, **kwargs)
                 finally:
+                    _record_restore()
                     _requeue_running_tasks()
             finally:
                 stop.set()

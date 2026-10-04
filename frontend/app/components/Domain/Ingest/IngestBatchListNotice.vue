@@ -1,0 +1,90 @@
+<template>
+  <div
+    class="commit-notice d-flex align-center ga-2"
+    :class="`commit-notice--${notice.kind}`"
+    :data-type="notice.kind"
+    role="status"
+    aria-live="polite"
+  >
+    <v-icon size="small" :color="notice.kind" :icon="$globals.icons[icon]" />
+    <div class="commit-notice-body flex-grow-1 text-body-2">
+      <div class="commit-notice-text">
+        {{ notice.text }}
+      </div>
+      <div v-if="notice.detail" class="commit-notice-detail text-caption">
+        {{ notice.detail }}
+      </div>
+      <ul v-if="notice.items.length" class="commit-notice-items text-caption ps-4">
+        <li v-for="(item, index) in notice.items" :key="index" class="commit-notice-item">
+          {{ item }}
+        </li>
+      </ul>
+    </div>
+    <v-btn
+      class="commit-notice-close"
+      icon
+      size="x-small"
+      variant="text"
+      :aria-label="$t('general.close')"
+      @click="emit('dismiss')"
+    >
+      <v-icon :icon="$globals.icons.close" />
+    </v-btn>
+  </div>
+</template>
+
+<script setup lang="ts">
+import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
+
+/**
+ * A dismissible line in the cards list (what the review said about a batch's last card, what "Add N clean cards"
+ * did): it takes its own place in the page, so it never covers the page title the way a toast does. Fork-owned.
+ */
+const props = defineProps<{
+  notice: RecipeIngestQueueNotice;
+}>();
+
+const emit = defineEmits<{
+  (e: "dismiss"): void;
+}>();
+
+/** The icon, by its name in `$globals.icons` */
+const icon = computed(() => {
+  switch (props.notice.kind) {
+    case "error":
+      return "alertCircle";
+    case "warning":
+      return "alert";
+    case "info":
+      return "informationOutline";
+    default:
+      return "check";
+  }
+});
+</script>
+
+<style scoped>
+.commit-notice {
+  min-height: 40px;
+  padding: 4px 4px 4px 12px;
+  border-radius: 4px;
+  background: rgba(var(--v-theme-success), 0.12);
+}
+
+.commit-notice--warning {
+  background: rgba(var(--v-theme-warning), 0.14);
+}
+
+.commit-notice--info {
+  background: rgba(var(--v-theme-info), 0.12);
+}
+
+.commit-notice--error {
+  background: rgba(var(--v-theme-error), 0.12);
+}
+
+.commit-notice-body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+</style>

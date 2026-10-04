@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from ingest_runner_testing import FakeHandlers, Jobs, PhaseCalls, blocking, reread_result, run, settle, wait_for
 from sqlalchemy import event
 from sqlalchemy.orm import Session
@@ -22,6 +23,8 @@ from mealie.schema.recipe_ingest import IngestStatus, IngestTaskKind, IngestTask
 from mealie.services.ai.ingest import events, limits
 from mealie.services.ai.ingest.runner.dispatcher import Claim, IngestDispatcher, claim_tasks
 from mealie.services.ai.ingest.runner.sweep import sweep_expired
+from mealie.services.ai.ingest.settings import get_ingest_settings
+from tests.fixtures.fixture_users import _unique_user
 
 
 def _claim(session: Session, *, general: int, reread: int, owner: str = "test") -> list[Claim]:
@@ -253,3 +256,104 @@ def test_a_dispatcher_waits_for_slots(dispatcher: IngestDispatcher, jobs: Jobs, 
 
     run(scenario())
     assert [jobs.row(job_id)["status"] for job_id in queued] == [IngestStatus.ready] * 4
+
+
+# ==========================================
+# Fair shares across groups (§3.4)
+
+
+class _SeenBy(set):
+    """A job id set that also lets the test's queue filter (`jobs.ids`) see the ids"""
+
+    def __init__(self, filter_ids: set[UUID]) -> None:
+        super().__init__()
+        self.filter_ids = filter_ids
+
+    def add(self, job_id: UUID) -> None:  # type: ignore[override]
+        super().add(job_id)
+        self.filter_ids.add(job_id)
+
+
+@pytest.fixture()
+def groups(db: Session, jobs: Jobs, session: Session, api_client: TestClient) -> tuple[Jobs, Jobs]:
+    """Jobs in two new groups, with nothing running yet, which this test's claims see"""
+    made: list[Jobs] = []
+    for _ in range(2):
+        group = Jobs(db, next(_unique_user(session, api_client)))
+        group.ids = _SeenBy(jobs.ids)
+        made.append(group)
+    return made[0], made[1]
+
+
+@pytest.fixture()
+def group_cap(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """`AI_INGEST_GROUP_CONCURRENCY=1`"""
+    monkeypatch.setattr(get_ingest_settings(), "GROUP_CONCURRENCY", 1)
+    yield
+
+
+def test_a_groups_backlog_doesnt_hold_up_another_groups_card(db: Session, groups: tuple[Jobs, Jobs]):
+    jobs, other_group = groups
+    now = utcnow()
+    backlog = [jobs.create(created_at=now - timedelta(minutes=30 - i)) for i in range(10)]
+    theirs = other_group.create(created_at=now)
+
+    claims = _claim(db, general=2, reread=0)
+    assert sorted(claim.job_id for claim in claims) == sorted([backlog[0], theirs])  # one of each, oldest first
+
+    # with two of its cards being read, the backlog's next waits for the other group's next
+    later = other_group.create(created_at=now + timedelta(minutes=1))
+    assert [claim.job_id for claim in _claim(db, general=1, reread=0)] == [backlog[1]]  # 1 running each: oldest
+    assert [claim.job_id for claim in _claim(db, general=1, reread=0)] == [later]  # 2 running for the backlog
+
+
+def test_a_group_cap_holds_back_a_groups_readings_but_not_its_rereads(
+    db: Session, groups: tuple[Jobs, Jobs], group_cap: None
+):
+    jobs, other_group = groups
+    mine = [jobs.create() for _ in range(3)]
+    theirs = other_group.create()
+
+    claims = _claim(db, general=3, reread=0)
+    assert sorted(claim.job_id for claim in claims) == sorted([mine[0], theirs])  # one per group at most
+    assert _claim(db, general=3, reread=0) == []
+
+    # a reviewer's re-read isn't held back by the group's cards being read
+    reread = jobs.ready(kind=IngestTaskKind.reread, state=IngestTaskState.queued)
+    assert [claim.job_id for claim in _claim(db, general=0, reread=1)] == [reread]
+
+    # the cap is checked again by the claim itself: a card listed before another was claimed isn't taken
+    queue = IngestQueue(db)
+    assert not queue.claim(mine[1], token=uuid4(), owner="test", now=utcnow())
+    jobs.update(mine[0], task_state=None, lease_token=None)  # its reading finished
+    assert queue.claim(mine[1], token=uuid4(), owner="test", now=utcnow())
+    assert not queue.claim(mine[2], token=uuid4(), owner="test", now=utcnow(), group_cap=1)
+    assert queue.claim(mine[2], token=uuid4(), owner="test", now=utcnow(), group_cap=0)  # no cap
+
+
+def test_a_group_cap_holds_across_dispatchers_claiming_at_once(groups: tuple[Jobs, Jobs], group_cap: None):
+    """Four processes' claims at the same moment: still never two of the group's cards read at once"""
+    jobs = groups[0]
+    queued = {jobs.create() for _ in range(8)}
+    for _ in range(3):
+        start = threading.Barrier(4)
+        claimed: dict[str, list[Claim]] = {}
+
+        def claimer(owner: str, start: threading.Barrier = start, claimed: dict[str, list[Claim]] = claimed) -> None:
+            with session_context() as session:
+                start.wait(5)
+                batch = claim_tasks(session, owner=owner, general_slots=3, reread_slots=0)
+                claimed[owner] = batch.claims  # a writer that lost SQLite's lock stops there, as a dispatcher would
+
+        threads = [threading.Thread(target=claimer, args=(f"process-{i}",)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+
+        every = [claim for claims in claimed.values() for claim in claims]
+        assert len(every) == 1
+        running = [job_id for job_id in queued if jobs.row(job_id)["task_state"] == IngestTaskState.running]
+        assert running == [every[0].job_id]
+        jobs.update(every[0].job_id, task_state=None, lease_token=None)  # read: the next can go
+        queued.discard(every[0].job_id)

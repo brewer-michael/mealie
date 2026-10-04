@@ -1,13 +1,20 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import IngestBatchList from "./IngestBatchList.vue";
-import { resetRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import {
+  leaveRecipeIngestCommitNotice,
+  resetRecipeIngestCounts,
+  resetRecipeIngestReviewState,
+  takeRecipeIngestCommitNotice,
+} from "~/composables/use-recipe-ingest";
 import { resetRecipeIngestUploads, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
   getJobs: vi.fn(),
+  getJobState: vi.fn(),
+  commitClean: vi.fn(),
   getCounts: vi.fn(),
   retry: vi.fn(),
   cancel: vi.fn(),
@@ -60,6 +67,7 @@ const stubs = {
       </div>
     `,
   },
+  VCardTitle: slot(),
 };
 
 const HOUR = 60 * 60 * 1000;
@@ -78,6 +86,7 @@ function job(overrides: Partial<RecipeIngestionJobSummary> = {}): RecipeIngestio
     title: "Banana Mug Cake",
     pageCount: 1,
     thumbUrl: null,
+    draftVersion: 1,
     errorCount: 0,
     warningCount: 0,
     task: null,
@@ -140,6 +149,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetRecipeIngestUploads();
   resetRecipeIngestCounts();
+  resetRecipeIngestReviewState();
   setVisibility("visible");
   serverJobs = [];
   api.getJobs.mockImplementation(async (query: RecipeIngestJobsQuery) => {
@@ -147,6 +157,12 @@ beforeEach(() => {
     return page(serverJobs.filter(j => (!statuses || statuses.includes(j.status)) && (!query.batchId || j.batchId === query.batchId)));
   });
   api.getCounts.mockResolvedValue({ data: { processing: 0, ready: 1, needsAttention: 0, failed: 0 }, error: null });
+  api.getJobState.mockImplementation(async (id: string) => {
+    const found = serverJobs.find(j => j.id === id);
+    return found
+      ? { data: { draftVersion: found.draftVersion, status: found.status, task: found.task ?? null, error: found.error ?? null }, error: null }
+      : { data: null, error: { response: { status: 404, data: { detail: { code: "not_found" } } } } };
+  });
   api.createBatch.mockResolvedValue({ data: { id: "b3", source: "app" }, error: null });
 });
 
@@ -379,6 +395,69 @@ describe("IngestBatchList", () => {
     expect(wrapper.get(".show-all").attributes("href")).toBe("/g/home/recipes/cards");
   });
 
+  test("one batch: cards still being read or failed are counted, and it's done only when none is being read", async () => {
+    vi.useFakeTimers();
+    serverJobs = [
+      job({ id: "c1", status: "committed", title: "Banana Mug Cake", recipe: { id: "r1", slug: "banana-mug-cake" } }),
+      job({ id: "c2", position: 1, status: "committed", title: "Scones", recipe: { id: "r2", slug: "scones" } }),
+      job({ id: "p1", position: 2, status: "processing", title: null, task: { kind: "extract", state: "running" } }),
+      job({ id: "p2", position: 3, status: "processing", title: null, task: { kind: "extract", state: "queued" } }),
+      job({ id: "f1", position: 4, status: "failed", title: null, error: { code: "timeout" } }),
+    ];
+    const wrapper = await mountList({ batchId: "b1" });
+    expect(wrapper.get(".batch-summary").text()).toBe("2 added, 2 still being read, 1 failed");
+
+    // the cards are read: one to review, one more failed
+    serverJobs = serverJobs.map((j) => {
+      if (j.id === "p1") {
+        return { ...j, status: "ready", task: null, title: "Pancakes" };
+      }
+      return j.id === "p2" ? { ...j, status: "failed", task: null, error: { code: "no_recipe_found" } } : j;
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(wrapper.get(".batch-summary").text()).toBe("Batch done: 2 added, 1 left to review, 2 failed");
+  });
+
+  test("one batch with nothing added yet still says what's going on", async () => {
+    serverJobs = [
+      job({ id: "r1" }),
+      job({ id: "p1", position: 1, status: "processing", title: null, task: { kind: "extract", state: "running" } }),
+    ];
+    const wrapper = await mountList({ batchId: "b1" });
+    expect(wrapper.get(".batch-summary").text()).toBe("1 left to review, 1 still being read");
+  });
+
+  test("the review's notice for the batch's last card shows inline by the summary, and can be dismissed", async () => {
+    serverJobs = [
+      job({ id: "c1", status: "committed", title: "Banana Mug Cake", recipe: { id: "r1", slug: "banana-mug-cake" } }),
+      job({ id: "p1", position: 1, status: "processing", title: null, task: { kind: "extract", state: "running" } }),
+    ];
+    leaveRecipeIngestCommitNotice({ text: "Added Banana Mug Cake · 1 card is still being read", warning: null });
+    const wrapper = await mountList({ batchId: "b1" });
+
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.text()).toContain("Added Banana Mug Cake · 1 card is still being read");
+    expect(notice.attributes("data-type")).toBe("success");
+    // it follows the summary line, inside the list: never a toast over the page title
+    expect(wrapper.find(".batch-summary + .commit-notice").exists()).toBe(true);
+    expect(toast.success).not.toHaveBeenCalled();
+    // taken once: another visit doesn't show it again
+    expect(takeRecipeIngestCommitNotice()).toBeNull();
+
+    await notice.get(".commit-notice-close").trigger("click");
+    expect(wrapper.find(".commit-notice").exists()).toBe(false);
+  });
+
+  test("a commit notice with a warning says what was left out", async () => {
+    serverJobs = [job({ id: "c1", status: "committed", recipe: { id: "r1", slug: "banana-mug-cake" } })];
+    leaveRecipeIngestCommitNotice({ text: "Added Banana Mug Cake", warning: "The tag \"Dessert\" was left out: it was deleted." });
+    const wrapper = await mountList({ batchId: "b1" });
+
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.attributes("data-type")).toBe("warning");
+    expect(notice.get(".commit-notice-detail").text()).toBe("The tag \"Dessert\" was left out: it was deleted.");
+  });
+
   test("cards that arrive elsewhere show up: the counts are checked every 20 s, and a change reloads the list", async () => {
     vi.useFakeTimers();
     serverJobs = [job()];
@@ -472,5 +551,194 @@ describe("IngestBatchList", () => {
     await flushPromises();
     expect(toast.error).toHaveBeenCalledExactlyOnceWith("This card no longer exists.");
     expect(wrapper.find(".job-cancel").exists()).toBe(false);
+  });
+});
+
+describe("adding a batch's clean cards", () => {
+  const clean = (id: string, position: number, title: string) => job({ id, position, title });
+
+  function commitAll() {
+    api.commitClean.mockImplementation(async (_batchId: string, payload: { jobIds: string[] }) => {
+      const recipe = (id: string) => ({ id: `r-${id}`, slug: `recipe-${id}` });
+      serverJobs = serverJobs.map(j => (payload.jobIds.includes(j.id) ? { ...j, status: "committed", recipe: recipe(j.id) } : j));
+      return {
+        data: { committed: payload.jobIds.map(id => ({ jobId: id, recipeId: `r-${id}`, slug: `recipe-${id}` })), skipped: [] },
+        error: null,
+      };
+    });
+  }
+
+  test("a batch with two or more clean cards offers to add them; a flagged, unread or lone clean card doesn't count", async () => {
+    serverJobs = [
+      clean("a", 0, "Banana Mug Cake"),
+      clean("b", 1, "Scones"),
+      job({ id: "c", position: 2, title: "Pancakes", warningCount: 1 }),
+      job({ id: "d", position: 3, title: "Waffles", errorCount: 1 }),
+      job({ id: "e", position: 4, status: "processing", title: null, task: { kind: "extract", state: "running" } }),
+      job({ id: "f", position: 5, title: "Fudge", task: { kind: "reread", state: "queued" } }),
+      job({ id: "x", batchId: "b2", title: "Lone", createdAt: ago(3 * HOUR) }),
+    ];
+    const wrapper = await mountList();
+
+    const [b1, b2] = batchSections(wrapper);
+    expect(b1!.get(".batch-add-clean").text()).toBe("Add 2 clean cards");
+    expect(b2!.find(".batch-add-clean").exists()).toBe(false);
+  });
+
+  test("asks first, listing the cards, then adds them and says so", async () => {
+    serverJobs = [
+      { ...clean("a", 0, "Banana Mug Cake"), draftVersion: 3 },
+      { ...clean("b", 1, "Scones"), draftVersion: 5 },
+      job({ id: "c", position: 2, title: "Pancakes", warningCount: 2 }),
+    ];
+    commitAll();
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    expect(api.commitClean).not.toHaveBeenCalled();
+    const dialog = wrapper.get(".confirm-dialog");
+    expect(dialog.attributes("data-title")).toBe("Add 2 cards as recipes?");
+    expect(dialog.text()).toContain("Nothing is highlighted on these cards. They're added as they were read:");
+    expect(dialog.findAll(".clean-card").map(item => item.text())).toEqual(["Banana Mug Cake", "Scones"]);
+
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.commitClean).toHaveBeenCalledExactlyOnceWith("b1", { jobIds: ["a", "b"], draftVersions: { a: 3, b: 5 } });
+    // the batch's list gave each card's draft version: no request per card
+    expect(api.getJobState).not.toHaveBeenCalled();
+
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.attributes("data-type")).toBe("success");
+    expect(notice.text()).toContain("Added 2 cards");
+    // by its batch, which is still in the list
+    expect(wrapper.find(".ingest-batch[data-batch='b1'] .commit-notice").exists()).toBe(true);
+    // the list follows: the flagged card stays to review, the two are in Recently added
+    expect(rowTitles(wrapper)).toEqual(["Pancakes"]);
+    expect(rowTitles(wrapper, ".recently-added").sort()).toEqual(["Banana Mug Cake", "Scones"]);
+    expect(api.getCounts).toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  test("once every card of the batch is added, the notice stays at the top of the list", async () => {
+    serverJobs = [
+      clean("a", 0, "Banana Mug Cake"),
+      clean("b", 1, "Scones"),
+      job({ id: "x", batchId: "b2", title: "Other", createdAt: ago(3 * HOUR) }),
+    ];
+    commitAll();
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    expect(batchSections(wrapper).map(section => section.attributes("data-batch"))).toEqual(["b2"]);
+    expect(wrapper.find(".ingest-batch .commit-notice").exists()).toBe(false);
+    expect(wrapper.get(".commit-notice").text()).toContain("Added 2 cards");
+
+    await wrapper.get(".commit-notice-close").trigger("click");
+    expect(wrapper.find(".commit-notice").exists()).toBe(false);
+  });
+
+  test("cards left out are listed with the reason", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones"), clean("c", 2, "Fudge")];
+    api.commitClean.mockImplementation(async () => {
+      serverJobs = serverJobs.map(j => (j.id === "a" ? { ...j, status: "committed", recipe: { id: "r-a", slug: "banana" } } : j));
+      return {
+        data: {
+          committed: [{ jobId: "a", recipeId: "r-a", slug: "banana" }],
+          skipped: [{ jobId: "b", code: "version_conflict" }, { jobId: "c", code: "not_clean" }],
+        },
+        error: null,
+      };
+    });
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.attributes("data-type")).toBe("warning");
+    expect(notice.get(".commit-notice-text").text()).toBe("Added 1 card");
+    expect(notice.get(".commit-notice-detail").text()).toBe("2 were left to review:");
+    expect(notice.findAll(".commit-notice-item").map(item => item.text())).toEqual([
+      "Scones: changed after this list loaded",
+      "Fudge: has something to check now",
+    ]);
+  });
+
+  test("a card that changed before the question isn't listed", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones"), clean("c", 2, "Fudge")];
+    commitAll();
+    const wrapper = await mountList();
+
+    // meanwhile, elsewhere: Scones got a flag, Fudge is being read again
+    serverJobs = serverJobs.map((j) => {
+      if (j.id === "b") {
+        return { ...j, warningCount: 1 };
+      }
+      return j.id === "c" ? { ...j, task: { kind: "reread", state: "queued" } } : j;
+    });
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get(".confirm-dialog").attributes("data-title")).toBe("Add 1 card as a recipe?");
+    expect(wrapper.findAll(".clean-card").map(item => item.text())).toEqual(["Banana Mug Cake"]);
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.commitClean).toHaveBeenCalledExactlyOnceWith("b1", { jobIds: ["a"], draftVersions: { a: 1 } });
+  });
+
+  test("none left clean by then: says so, without asking", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones")];
+    const wrapper = await mountList();
+    serverJobs = serverJobs.map(j => ({ ...j, warningCount: 1 }));
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".confirm-dialog").exists()).toBe(false);
+    expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("info");
+    expect(wrapper.get(".commit-notice").text()).toContain("No cards in this batch are clean any more.");
+    expect(wrapper.find(".batch-add-clean").exists()).toBe(false);
+  });
+
+  test("a failed check or add says so", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones")];
+    const wrapper = await mountList();
+
+    // reading the batch again fails
+    api.getJobs.mockResolvedValueOnce({ data: null, error: { message: "Network Error" } });
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".confirm-dialog").exists()).toBe(false);
+    expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("error");
+    expect(wrapper.get(".commit-notice").text()).toContain("Couldn't check the cards. Try again.");
+
+    api.commitClean.mockResolvedValue({ data: null, error: { response: { status: 500, data: {} } } });
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("error");
+    expect(wrapper.get(".commit-notice").text()).toContain("Couldn't add the cards");
+  });
+
+  test("a refusal the API client already showed (a restore running) isn't shown again", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones")];
+    api.commitClean.mockResolvedValue({
+      data: null,
+      error: { response: { status: 503, data: { detail: { code: "paused_for_restore", message: "Paused" } } } },
+    });
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".commit-notice").exists()).toBe(false);
   });
 });

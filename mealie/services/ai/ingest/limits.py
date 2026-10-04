@@ -47,6 +47,10 @@ AUTO_BATCH_IDLE = 2 * 60
 """API and inbox uploads join a batch that saw an upload this recently; it seals after this long without one"""
 NOTIFY_CUTOFF = 24 * 60 * 60
 """Batches whose cards were last written longer ago never notify, so a restore doesn't replay old notifications"""
+NOTIFY_LEASE = 5 * 60
+"""Seconds a process has to send a batch's notification before housekeeping may try again"""
+NOTIFY_ATTEMPTS = 5
+"""Attempts at a batch's notification before it's given up on"""
 
 # ==========================================
 # The runner (§3)
@@ -76,8 +80,12 @@ SHUTDOWN_GRACE = 5
 """How long shutdown waits for cancelled tasks before releasing their leases"""
 PROGRESS_INTERVAL = 1
 """At most one progress write a second"""
+LOCAL_ONLY_RECHECK = 5
+"""How often a running task reads its group's local-only setting again: switching it on covers the task's next calls"""
 HOUSEKEEPING_INTERVAL = 60
-"""Sealing idle batches, sending due notifications, resuming stale commits"""
+"""Sealing idle batches, sending due notifications, resuming stale commits, retrying cards after a monthly limit"""
+LIMIT_RECHECK_INTERVAL = 10 * 60
+"""How often a group's monthly limits are checked again for its cards waiting for them to reset"""
 COMMIT_LEASE = 120
 """A commit not finished this long after it started is resumed"""
 PURGE_INTERVAL = 24 * 60 * 60
@@ -113,6 +121,12 @@ PAUSED_TASK_POLL = 5
 """How often a task that hit the pause checks whether it's over"""
 PAUSED_RELEASE_DELAY = 60
 """A task released because of a pause isn't claimed again for this long"""
+KEPT_RESULT_TTL = 24 * 60 * 60
+"""A result a restore cut off is kept this long for the card's next task; the daily purge removes older ones"""
+KEPT_RESULT_POLL = 0.5
+"""How often a task waiting for the result of one a restore cut off (still running) looks for it"""
+KEPT_RESULT_WAIT = 5 * 60
+"""How long a task waits for that result at most, then reads the card itself (a provider call takes a minute or two)"""
 
 # ==========================================
 # The inbox (§1.3)

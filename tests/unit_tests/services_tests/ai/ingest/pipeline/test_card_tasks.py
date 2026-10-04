@@ -18,6 +18,7 @@ from mealie.schema.recipe.recipe_ingredient import SaveIngredientUnit
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
+    CardDraftNote,
     CardProposalKind,
     ExtractionMeta,
     IngestErrorCode,
@@ -115,7 +116,8 @@ async def test_handle_extract_reads_the_card_and_writes_nothing(
     _providers(user)
     seed_foods_and_units(user)
     fake = FakeCardAI(banana_answers()).install(monkeypatch)
-    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)  # no OCR fallback
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)  # and no orientation
     job_id, token = create_job(user, pages=2)
     before = row(job_id)
     progress: list[str] = []
@@ -141,10 +143,8 @@ async def test_a_turned_page_is_saved_at_once_fenced_on_the_lease(
     # every read fails after the page turned: the turn must not be lost with it
     failures = {"Vision": RuntimeError("down"), "Text": RuntimeError("down")}
     FakeCardAI(banana_answers(), failures=failures).install(monkeypatch)
-    monkeypatch.setattr(ocr, "is_available", lambda: True)
-    monkeypatch.setattr(
-        ocr, "extract_text", lambda path, *, min_ratio=1.0: ocr.OCRResult(text="Banana Mug Cake", rotation=90)
-    )
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)  # orientation on
+    monkeypatch.setattr(ocr, "extract_text", lambda path, **_: ocr.OCRResult(text="Banana Mug Cake", rotation=90))
     job_id, token = create_job(user)
     before = row(job_id)
     progress: list[str] = []
@@ -167,8 +167,8 @@ async def test_a_lost_lease_stops_the_task(unique_user_fn_scoped: TestUser, monk
     user = unique_user_fn_scoped
     _providers(user)
     fake = FakeCardAI(banana_answers()).install(monkeypatch)
-    monkeypatch.setattr(ocr, "is_available", lambda: True)
-    monkeypatch.setattr(ocr, "extract_text", lambda path, *, min_ratio=1.0: ocr.OCRResult(text="x", rotation=180))
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)  # orientation on
+    monkeypatch.setattr(ocr, "extract_text", lambda path, **_: ocr.OCRResult(text="x", rotation=180))
     job_id, _ = create_job(user)
     before = row(job_id)
 
@@ -183,7 +183,8 @@ async def test_a_lost_lease_stops_the_task(unique_user_fn_scoped: TestUser, monk
 @pytest.mark.asyncio
 async def test_a_missing_job_household_or_file(unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch):
     user = unique_user_fn_scoped
-    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)  # no OCR fallback
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)  # and no orientation
 
     with pytest.raises(TaskFailed) as gone:
         await tasks.handle_extract(task(user, uuid4(), uuid4(), []))
@@ -285,6 +286,32 @@ async def test_handle_reread_of_a_step(unique_user_fn_scoped: TestUser, monkeypa
 
     assert result.proposal.text == "Microwave for [blank] minutes."
     assert result.proposal.draft is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_position", [False, True], ids=["by-id", "by-position"])
+async def test_handle_reread_of_a_note_compares_with_that_note(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, by_position: bool
+):
+    """
+    A note's re-read names it by id, as its flags do (PL-08), or by position from a client older than note ids: the
+    model is shown that note's text to compare with, not another note's
+    """
+    user = unique_user_fn_scoped
+    _providers(user)
+    region = {"readable": True, "text": "Keeps 3 days.", "alternatives": []}
+    fake = FakeCardAI(banana_answers(OpenAIRecipeCardRegion=region)).install(monkeypatch)
+    notes = [CardDraftNote(title="Serving", text="Serve warm."), CardDraftNote(title="Storage", text="Keeps 2 days.")]
+    draft = CardDraft(name="Banana Mug Cake", notes=notes)
+    job_id, token = create_job(user, status="ready", draft=draft.model_dump(mode="json"))
+    target = ProposalTarget(field="notes", ref="1" if by_position else str(notes[1].id))
+    payload = RereadRequest(page=0, x=0.1, y=0.6, width=0.8, height=0.1, target=target).model_dump(mode="json")
+
+    result = await tasks.handle_reread(task(user, job_id, token, [], kind=IngestTaskKind.reread, payload=payload))
+
+    assert (result.proposal.target, result.proposal.text) == (target, "Keeps 3 days.")
+    assert '"""\nKeeps 2 days.\n"""' in fake.calls[0].message
+    assert "Serve warm." not in fake.calls[0].message
 
 
 @pytest.mark.asyncio

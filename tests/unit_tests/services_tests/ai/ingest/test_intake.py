@@ -11,6 +11,8 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -28,7 +30,9 @@ from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestion
 from mealie.repos.repository_recipe_ingest import IngestBatchesRepo, IngestJobsRepo, IngestRepos, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
+from mealie.schema.recipe.recipe_category import TagSave
 from mealie.schema.recipe_ingest import (
+    IngestLimitedFeature,
     IngestRejectReason,
     IngestSource,
     IngestStatus,
@@ -219,6 +223,67 @@ def test_a_card_has_at_most_four_pages(db: Session, unique_user: TestUser):
     outcome = _service(db, unique_user).ingest(_card(*pages), _options(unique_user))
     assert isinstance(outcome, IntakeRejected)
     assert (outcome.index, outcome.reason) == (4, IngestRejectReason.too_many_pages)
+
+
+def _tiff(*sizes: tuple[int, int]) -> bytes:
+    frames = [Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)) for size in sizes]
+    buffer = io.BytesIO()
+    frames[0].save(buffer, format="TIFF", save_all=True, append_images=frames[1:])
+    return buffer.getvalue()
+
+
+def test_a_multi_page_files_pages_fill_the_card(db: Session, unique_user_fn_scoped: TestUser, woken: list[int]):
+    user = unique_user_fn_scoped
+    scan, note = _tiff((40, 30), (30, 40)), _jpeg((20, 10))
+    outcome = _accepted(_service(db, user).ingest(_card(scan, note, names=["scan.tiff", "note.jpg"]), _options(user)))
+
+    assert outcome.page_count == 3
+    pages = [PageMeta.model_validate(page) for page in _job(outcome.job_id).pages]
+    assert [(page.index, page.width, page.height, page.original_filename) for page in pages] == [
+        (0, 40, 30, "scan.tiff (page 1)"),
+        (1, 30, 40, "scan.tiff (page 2)"),
+        (2, 20, 10, "note.jpg"),
+    ]
+    for page in pages:
+        assert (storage.page_dir(UUID(user.group_id), outcome.job_id, page.index) / images.PAGE_FILE).is_file()
+
+    # the same files again are the same card; the scan alone is another
+    again = _service(db, user).ingest(_card(scan, note, names=["scan.tiff", "note.jpg"]), _options(user))
+    assert again == IntakeRejected(0, "scan.tiff", IngestRejectReason.duplicate, duplicate_of=outcome.job_id)
+    alone = _accepted(_service(db, user).ingest(_card(scan, names=["scan.tiff"]), _options(user)))
+    assert _service(db, user).ingest(_card(scan, names=["copy.tiff"]), _options(user)) == IntakeRejected(
+        0, "copy.tiff", IngestRejectReason.duplicate, duplicate_of=alone.job_id
+    )
+
+
+def test_a_card_whose_files_hold_more_than_four_pages_is_refused(db: Session, unique_user: TestUser):
+    before_dirs, before_counts = _dirs(unique_user), _counts(unique_user)
+    outcome = _service(db, unique_user).ingest(
+        _card(_jpeg((8, 8)), _tiff((8, 8), (8, 8), (8, 8)), _jpeg((8, 8)), names=["a.jpg", "b.tiff", "c.jpg"]),
+        _options(unique_user),
+    )
+    assert outcome == IntakeRejected(2, "c.jpg", IngestRejectReason.too_many_pages)
+    assert _dirs(unique_user) == before_dirs
+    assert _counts(unique_user) == before_counts
+
+
+def test_a_pdfs_rendered_pages_are_closed_whatever_happens(
+    db: Session, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    opened: list[images.DocumentPage] = []
+    real_expand = images.expand_document
+
+    def expand_document(raw: Any) -> list[images.DocumentPage]:
+        pages = real_expand(raw)
+        rendered = [replace(page, rendered=True, file=io.BytesIO(page.file.read())) for page in pages]
+        opened.extend(rendered)
+        return rendered
+
+    monkeypatch.setattr(images, "expand_document", expand_document)
+    service = _service(db, unique_user)
+    _accepted(service.ingest(_card(_jpeg()), _options(unique_user)))
+    service.ingest(_card(_jpeg(), b"not an image", names=["a.jpg", "b.bin"]), _options(unique_user))
+    assert opened and all(page.file.closed for page in opened)
 
 
 def test_a_group_switched_to_local_only_during_the_upload_gets_a_local_only_job(
@@ -636,32 +701,43 @@ def test_intake_runs_two_cards_at_a_time_whoever_calls_it(
     db: Session, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
 ):
     # the inbox's scan calls `ingest` directly, beside uploads that went through `ingest_async`'s limiter: together
-    # they normalize at most INTAKE_CONCURRENCY photos at once (each can take hundreds of megabytes)
-    running = 0
-    most = 0
+    # they expand (a PDF is rendered then) and normalize at most INTAKE_CONCURRENCY files at once (each can take
+    # hundreds of megabytes)
+    running = {"expand": 0, "normalize": 0}
+    most = {"expand": 0, "normalize": 0}
     lock = threading.Lock()
+    real_expand = images.expand_document
+
+    @contextmanager
+    def counted(phase: str) -> Iterator[None]:
+        with lock:
+            running[phase] += 1
+            most[phase] = max(most[phase], running[phase])
+        time.sleep(0.2)
+        yield
+        with lock:
+            running[phase] -= 1
+
+    def expand_document(raw: Any) -> Any:
+        with counted("expand"):
+            return real_expand(raw)
 
     def normalize_and_insert(self: IntakeService, *args: Any) -> Any:
-        nonlocal running, most
-        with lock:
-            running += 1
-            most = max(most, running)
-        time.sleep(0.2)
-        with lock:
-            running -= 1
-        return IntakeRejected(0, None, IngestRejectReason.unreadable_image)
+        with counted("normalize"):
+            return IntakeRejected(0, None, IngestRejectReason.unreadable_image)
 
+    monkeypatch.setattr(images, "expand_document", expand_document)
     monkeypatch.setattr(IntakeService, "_normalize_and_insert", normalize_and_insert)
     service = _service(db, unique_user)
     threads = [
-        threading.Thread(target=service.ingest, args=(_card(b""), _options(unique_user)))
+        threading.Thread(target=service.ingest, args=(_card(_jpeg()), _options(unique_user)))
         for _ in range(limits.INTAKE_CONCURRENCY + 2)
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(10)
-    assert most == limits.INTAKE_CONCURRENCY
+    assert most == {"expand": limits.INTAKE_CONCURRENCY, "normalize": limits.INTAKE_CONCURRENCY}
 
 
 # ==========================================
@@ -794,6 +870,109 @@ def test_a_local_provider_over_its_limit_still_reads_local_only_cards(
     )
     over = reading_readiness(db, group_id, household_id)
     assert (over.can_read, over.local_ready, over.limit_reached) == (True, True, True)
+
+
+def _provider_over_its_limit(user: TestUser, name: str, *, local: bool = False) -> UUID:
+    """A provider whose monthly token limit this month's usage already passed"""
+    repos = user.repos
+    provider = repos.group_ai_providers.create(
+        AIProviderCreate(
+            name=name,
+            model="m",
+            api_key="k",
+            monthly_token_limit=100,
+            **({"base_url": "http://127.0.0.1:11434/v1", "runs_locally": True} if local else {}),
+        )
+    )
+    repos.group_ai_usage.create(
+        AIUsageLogCreate(
+            provider_id=provider.id,
+            provider_name=name,
+            model="m",
+            protocol=provider.protocol,
+            slot=AIProviderSlot.default,
+            prompt_tokens=400,
+            completion_tokens=100,
+            success=True,
+        )
+    )
+    return provider.id
+
+
+def test_a_fast_slot_over_its_limit_limits_suggestions(
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    _providers(user, image=True)
+    user.repos.group_ai_provider_routes.replace_routes({AIProviderSlot.fast: [_provider_over_its_limit(user, "Fast")]})
+
+    # nothing to suggest: no tags, categories or tools, so nothing is missed
+    nothing = reading_readiness(db, group_id, household_id)
+    assert (nothing.can_read, nothing.limit_reached, nothing.limited_features) == (True, False, ())
+
+    user.repos.tags.create(TagSave(name="Dessert", group_id=user.repos.group_id))
+    limited = reading_readiness(db, group_id, household_id)
+    assert (limited.can_read, limited.limit_reached) == (True, False)
+    assert limited.limited_features == (IngestLimitedFeature.suggestions,)
+    assert not db.in_transaction()
+
+
+def test_an_image_slot_over_its_limit_limits_the_cross_read_when_ocr_reads(
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+    repos = user.repos
+    default = repos.group_ai_providers.create(AIProviderCreate(name="Text", model="m", api_key="k"))
+    image = _provider_over_its_limit(user, "Vision")
+    repos.group_ai_provider_settings.update(
+        repos.group_id,
+        AIProviderSettingsUpdate(default_provider_id=default.id, image_provider_id=image, audio_provider_id=None),
+    )
+    monkeypatch.setattr(ocr, "is_available", lambda: True)
+
+    # OCR reads the card; without the second reading, nothing else is missed
+    assert reading_readiness(db, group_id, household_id).limited_features == ()
+
+    IngestRepos(db, group_id, household_id).settings.upsert(RecipeIngestionSettingsUpdate(cross_read=True))
+    limited = reading_readiness(db, group_id, household_id)
+    assert (limited.can_read, limited.limit_reached) == (True, False)
+    assert limited.limited_features == (IngestLimitedFeature.cross_read,)
+
+    # without OCR the card can't be read at all: that's `limit_reached`, not a missed extra
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    stopped = reading_readiness(db, group_id, household_id)
+    assert (stopped.limit_reached, stopped.limited_features) == (True, ())
+
+
+def test_local_only_limits_count_the_local_providers(
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # under "local only" a cloud fast provider within its limit doesn't count: the local one over its limit does
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    repos = user.repos
+    local = repos.group_ai_providers.create(
+        AIProviderCreate(name="Ollama", model="m", api_key="k", base_url="http://127.0.0.1:11434/v1", runs_locally=True)
+    )
+    repos.group_ai_provider_settings.update(
+        repos.group_id,
+        AIProviderSettingsUpdate(default_provider_id=local.id, image_provider_id=local.id, audio_provider_id=None),
+    )
+    cloud = repos.group_ai_providers.create(AIProviderCreate(name="Cloud", model="m", api_key="k"))
+    repos.group_ai_provider_routes.replace_routes(
+        {AIProviderSlot.fast: [_provider_over_its_limit(user, "Small", local=True), cloud.id]}
+    )
+    repos.tags.create(TagSave(name="Dessert", group_id=repos.group_id))
+
+    assert reading_readiness(db, group_id, household_id).limited_features == ()  # the cloud one answers
+    IngestRepos(db, group_id, household_id).settings.upsert(RecipeIngestionSettingsUpdate(local_only=True))
+    local_only = reading_readiness(db, group_id, household_id)
+    assert (local_only.local_ready, local_only.limit_reached) == (True, False)
+    assert local_only.limited_features == (IngestLimitedFeature.suggestions,)
 
 
 def test_source_names_and_the_duplicate_key(tmp_path: Path):

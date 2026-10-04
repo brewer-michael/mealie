@@ -41,6 +41,7 @@ from mealie.services import ocr
 from mealie.services.ai.ingest import images, intake, limits, storage
 from mealie.services.ai.ingest import upload as upload_service
 from mealie.services.ai.ingest.settings import IngestSettings
+from tests.integration_tests.ai_tests.ingest.card_flow_testing import make_notifier
 from tests.utils.fixture_schemas import TestUser
 
 INGEST = "/api/ai/ingest"
@@ -335,7 +336,7 @@ def test_a_multipart_card_with_front_and_back(api_client: TestClient, reader: Te
     assert response.status_code == 202, response.text
     body = response.json()
     assert_no_message_anywhere(body)
-    assert body["summary"] == "1 recipe card queued. You'll be notified when it's ready."
+    assert body["summary"] == "1 recipe card queued for review in Mealie."  # no notifier tells the household
     assert body["rejected"] == []
     [item] = body["jobs"]
     assert item["status"] == "processing"
@@ -433,10 +434,61 @@ def test_split_makes_each_image_a_card_and_partial_success_is_202(api_client: Te
     body = response.json()
     assert len(body["jobs"]) == 2
     assert body["rejected"] == [{"index": 1, "filename": "b.pdf", "reason": "pdf_not_supported", "duplicateOf": None}]
-    assert body["summary"] == ("2 recipe cards queued. You'll be notified when they're ready. 1 card couldn't be used.")
+    assert body["summary"] == "2 recipe cards queued for review in Mealie. 1 card couldn't be used."
     jobs = [job_row(item["id"]) for item in body["jobs"]]
     assert {str(job.batch_id) for job in jobs} == {body["batchId"]}
     assert [job.position for job in jobs] == [0, 1]
+
+
+def pdf(*sizes: tuple[int, int]) -> bytes:
+    """A PDF with one page per size, each a different image (so never a duplicate)"""
+    pages = [Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)) for size in sizes]
+    buffer = io.BytesIO()
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:], resolution=72)
+    return buffer.getvalue()
+
+
+def test_a_pdfs_pages_are_one_card(api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 600)  # rendered small: quicker
+    response = api_client.post(
+        INGEST,
+        files=[("files", ("scan.pdf", pdf((300, 200), (200, 300)), "application/pdf"))],
+        data={"split": "true"},  # each file a card: the PDF's two pages stay together
+        headers=reader.token,
+    )
+    assert response.status_code == 202, response.text
+    (job,) = response.json()["jobs"]
+    assert job["pageCount"] == 2
+    row = job_row(job["id"])
+    pages = [PageMeta.model_validate(page) for page in row.pages]
+    assert [(page.width, page.height, page.format, page.original_filename) for page in pages] == [
+        (600, 400, "pdf", "scan.pdf (page 1)"),
+        (400, 600, "pdf", "scan.pdf (page 2)"),
+    ]
+    assert row.source_name == "upload/scan.pdf"
+
+
+def test_a_pdf_and_photos_make_a_card_of_at_most_four_pages(
+    api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 300)
+    response = api_client.post(
+        INGEST,
+        files=files(jpeg(), pdf((60, 40), (60, 40), (60, 40)), jpeg(), names=["front.jpg", "scan.pdf", "back.jpg"]),
+        headers=reader.token,
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["rejected"] == [
+        {"index": 2, "filename": "back.jpg", "reason": "too_many_pages", "duplicateOf": None}
+    ]
+
+    response = api_client.post(
+        INGEST,
+        files=files(pdf((60, 40), (60, 40), (60, 40)), jpeg(), names=["scan.pdf", "back.jpg"]),
+        headers=reader.token,
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["jobs"][0]["pageCount"] == 4
 
 
 def test_nothing_accepted_is_400_with_the_same_body(api_client: TestClient, reader: TestUser):
@@ -540,9 +592,30 @@ def test_the_summary_counts_cards_and_says_which_were_already_scanned(api_client
         "unsupported_format",
     ]
     assert response.json()["summary"] == (
-        "2 recipe cards queued. You'll be notified when they're ready. 1 card was already scanned. "
-        "2 cards couldn't be used."
+        "2 recipe cards queued for review in Mealie. 1 card was already scanned. 2 cards couldn't be used."
     )
+
+
+def test_the_summary_promises_a_notification_only_when_one_will_come(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    assert post_card(api_client, user, jpeg()).json()["summary"] == "1 recipe card queued for review in Mealie."
+
+    # a notifier that doesn't send "recipe cards ready", or is switched off, promises nothing either
+    make_notifier(api_client, user, cards_ready=False)
+    off = make_notifier(api_client, user, cards_ready=True)
+    user.repos.group_event_notifier.patch(off.id, {"enabled": False})
+    response = api_client.post(INGEST, files=files(jpeg(), jpeg()), data={"split": "true"}, headers=user.token)
+    assert response.json()["summary"] == "2 recipe cards queued for review in Mealie."
+
+    make_notifier(api_client, user, cards_ready=True)
+    assert post_card(api_client, user, jpeg()).json()["summary"] == (
+        "1 recipe card queued. You'll be notified when it's ready."
+    )
+    response = api_client.post(INGEST, files=files(jpeg(), jpeg()), data={"split": "true"}, headers=user.token)
+    assert response.json()["summary"] == "2 recipe cards queued. You'll be notified when they're ready."
 
 
 # ==================================================================================================================
@@ -562,13 +635,13 @@ def test_the_summary_is_in_the_requests_language(
     monkeypatch.setattr(upload_service, "get_locale_provider", Translator)
     response = post_card(api_client, reader, jpeg(), headers={"Accept-Language": "fr-CA;q=0.4, de-DE,de;q=0.9"})
     assert response.status_code == 202
-    assert response.json()["summary"] == "[de-DE] recipe-ingest.upload-summary 1"
+    assert response.json()["summary"] == "[de-DE] recipe-ingest.upload-summary-in-app 1"
     assert job_row(response.json()["jobs"][0]["id"]).locale == "de-DE"
 
 
 def test_a_language_without_the_text_falls_back_to_english(api_client: TestClient, reader: TestUser):
     response = post_card(api_client, reader, jpeg(), headers={"Accept-Language": "de-DE"})
-    assert response.json()["summary"] == "1 recipe card queued. You'll be notified when it's ready."
+    assert response.json()["summary"] == "1 recipe card queued for review in Mealie."
 
     response = api_client.post(
         INGEST, content=b"x", headers={**reader.token, "Content-Type": "text/plain", "Accept-Language": "de-DE"}

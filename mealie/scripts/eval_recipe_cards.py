@@ -387,6 +387,7 @@ from mealie.services.ai.ingest.pipeline import (  # noqa: E402
     extract_card,
     options_for_group,
     orient_page,
+    orientation_available,
 )
 from mealie.services.ai.ingest.pipeline.cardtext import strip_from_prefix  # noqa: E402
 from mealie.services.ai.ingest.pipeline.compilers import CapturedError, capture_errors  # noqa: E402
@@ -728,7 +729,7 @@ class IngredientView:
 class StepView:
     text: str
     ref: str | None = None
-    """The draft step's `id`, which flags are keyed to"""
+    """The draft step's or note's `id`, which flags are keyed to"""
 
 
 @dataclass
@@ -743,8 +744,8 @@ class RecipeView:
     times: dict[str, str | None]
     ingredients: list[IngredientView]
     steps: list[StepView]
-    notes: list[str]
-    """Every note's text, by position (flags on a note are keyed to its index)"""
+    notes: list[StepView]
+    """Every note's text and, for a draft, its `id` (flags on a note are keyed to it)"""
     source: Any
     """The recipe or draft itself, for `find_inventions`"""
 
@@ -779,7 +780,7 @@ def recipe_view(recipe: Recipe) -> RecipeView:
             StepView(text=step.text or "", ref=str(step.id) if step.id else None)
             for step in recipe.recipe_instructions or []
         ],
-        notes=[note.text or "" for note in recipe.notes or []],
+        notes=[StepView(text=note.text or "") for note in recipe.notes or []],
         source=recipe,
     )
 
@@ -807,7 +808,7 @@ def draft_view(draft: CardDraft) -> RecipeView:
             for i in draft.ingredients
         ],
         steps=[StepView(text=step.text, ref=str(step.id)) for step in draft.steps],
-        notes=[note.text for note in draft.notes],
+        notes=[StepView(text=note.text, ref=str(note.id)) for note in draft.notes],
         source=draft,
     )
 
@@ -1141,9 +1142,7 @@ def _blank_target(blank: ExpectedBlank, view: RecipeView) -> tuple[str | None, l
     if blank.field == "ingredients":
         candidates = [(i.ref, i.texts) for i in view.ingredients]
     else:
-        items = (
-            view.steps if blank.field == "steps" else [StepView(text=n, ref=str(i)) for i, n in enumerate(view.notes)]
-        )
+        items = view.steps if blank.field == "steps" else view.notes
         candidates = [(step.ref, [step.text]) for step in items]
 
     best: tuple[float, str | None, list[str]] | None = None
@@ -1720,7 +1719,8 @@ def orient_pages(pages: Sequence[CardPage]) -> tuple[list[CardPage], float]:
 
 def prepare_card(card: Card, directory: Path, *, intake_ocr: bool = True) -> PreparedCard:
     """
-    Normalizes the card's images and, with Tesseract and unless `intake_ocr` is off, orients them: once per card,
+    Normalizes the card's images and, when production would (`orientation_available`: Tesseract installed and
+    `AI_INGEST_ORIENT` on, whatever `OCR_ENABLED` says) and unless `intake_ocr` is off, orients them: once per card,
     since both are deterministic. Under `--no-intake-ocr` the probe still runs on a throwaway copy, to report the
     turns it would have made. Blocking; never raises.
     """
@@ -1732,7 +1732,7 @@ def prepare_card(card: Card, directory: Path, *, intake_ocr: bool = True) -> Pre
         return PreparedCard(pages=[], error=f"{type(e).__name__}: {e}")
 
     unturned = [page.meta.rotation for page in pages]
-    if not ocr_service.is_available():
+    if not orientation_available():
         return PreparedCard(pages=pages, rotations=unturned)
 
     if intake_ocr:

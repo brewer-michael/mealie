@@ -3,7 +3,11 @@ Turning an uploaded photo into a card page, and the page operations after that (
 
 `normalize_page` runs inside the upload request (or the inbox scan), so the uploaded bytes, GPS included, never
 outlive it: what's stored is an upright, metadata-free JPEG plus two smaller copies. One Pillow path covers every
-accepted format and enforces the pixel cap before anything is decoded.
+accepted format and enforces the pixel caps before anything is decoded: `limits.MAX_PIXELS` for every format, after a
+JPEG's reduced-scale decoding (`draft`), so a 200-megapixel phone JPEG (up to `MAX_JPEG_SOURCE_PIXELS`) is read at
+half size. Images are opened with their format's own Pillow opener, not `Image.open`, whose decompression-bomb check
+would refuse those photos (and warn from about 89 megapixels): these caps apply instead, and Pillow's global
+`MAX_IMAGE_PIXELS` is never changed.
 
 **Turning a page is staged**, so a crash can't leave its files turned and its stored metadata not (or the reverse):
 1. `stage_rotation` writes the turned page beside the current one (`page.next.jpg` first, then `view.next.jpg` and
@@ -18,19 +22,31 @@ stored metadata were committed and are swapped in; any others are discarded. Cal
 
 import hashlib
 import io
+import json
 import os
 import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
 import unicodedata
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Literal, NamedTuple, Protocol
+from tempfile import SpooledTemporaryFile
+from typing import BinaryIO, Literal, NamedTuple, Protocol, cast
 
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, UnidentifiedImageError
 
 import mealie.pkgs.img  # noqa: F401  (registers the HEIF opener)
+from mealie.core.root_logger import get_logger
 from mealie.schema.recipe_ingest import IngestRejectReason, PageMeta, PageRotationSource
 
 from . import limits
 from .storage import atomic_save_image, atomic_write_bytes
+
+logger = get_logger(__name__)
 
 PAGE_FILE = "page.jpg"
 VIEW_FILE = "view.jpg"
@@ -42,6 +58,14 @@ SWAP_ORDER = (THUMB_FILE, VIEW_FILE, PAGE_FILE)
 
 SNIFF_BYTES = 16
 """How much of a file `sniff` needs"""
+SPOOL_MAX_BYTES = 1024 * 1024
+"""A rendered PDF page is kept in memory up to this size, then in an unnamed file in the system temp directory"""
+
+MAX_JPEG_SOURCE_PIXELS = 260_000_000
+"""
+The most pixels a JPEG may have. A JPEG is decoded at 1/2, 1/4 or 1/8 scale when the page is that much smaller
+(`draft`), and the decoded size must still fit `limits.MAX_PIXELS`: a 200-megapixel phone photo is read at half size.
+"""
 
 _HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"}
 _AVIF_BRANDS = {b"avif", b"avis"}
@@ -113,8 +137,8 @@ class RegionLike(Protocol):
 
 def sniff(head: bytes) -> str | None:
     """
-    The image format of a file, from its first `SNIFF_BYTES` bytes, never its name: `jpeg` (MPO included), `png`,
-    `webp`, `heif`, `avif` or `tiff`; `pdf` for a PDF, which is refused with its own reason; None for anything else.
+    The format of a file, from its first `SNIFF_BYTES` bytes, never its name: `jpeg` (MPO included), `png`, `webp`,
+    `heif`, `avif` or `tiff`; `pdf` for a PDF, whose pages `expand_document` renders; None for anything else.
     """
     if head.startswith(b"\xff\xd8\xff"):
         return "jpeg"
@@ -136,8 +160,11 @@ def sniff(head: bytes) -> str | None:
     return None
 
 
-def sanitize_filename(name: str | None) -> str | None:
-    """The base name of an uploaded file, with control characters and path separators removed; display only"""
+def sanitize_filename(name: str | None, *, max_length: int = MAX_FILENAME_LENGTH) -> str | None:
+    """
+    The base name of an uploaded file, with control characters and path separators removed, at most `max_length`
+    characters (the extension kept); display only
+    """
     if not name:
         return None
     base = re.split(r"[/\\]", name)[-1]
@@ -145,13 +172,63 @@ def sanitize_filename(name: str | None) -> str | None:
     base = unicodedata.normalize("NFC", _UNSAFE_FILENAME_CHARS.sub("", base)).strip()
     if base in ("", ".", ".."):
         return None
-    if len(base) > MAX_FILENAME_LENGTH:
+    if len(base) > max_length:
         stem, dot, suffix = base.rpartition(".")
         if dot and len(suffix) <= 10:
-            base = stem[: MAX_FILENAME_LENGTH - len(suffix) - 1] + "." + suffix
+            base = stem[: max_length - len(suffix) - 1] + "." + suffix
         else:
-            base = base[:MAX_FILENAME_LENGTH]
+            base = base[:max_length]
     return base
+
+
+class _Borrowed:
+    """
+    The caller's file, as Pillow reads it: closing an image (`_replace` does, to free its memory) closes its file
+    whoever opened it, and the caller's file may have more pages to give (a multi-page TIFF) or be the caller's to
+    close. Without `fileno` or `getvalue`, libtiff is handed the bytes, never the descriptor.
+    """
+
+    def __init__(self, file: BinaryIO) -> None:
+        self._file = file
+
+    def read(self, size: int = -1) -> bytes:
+        return self._file.read(size)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._file.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._file.tell()
+
+    def close(self) -> None:
+        pass
+
+
+def _open_image(raw: BinaryIO, kind: str) -> Image.Image:
+    """
+    `raw` opened (its header only) with the sniffed format's own Pillow openers, in `PIL_FORMATS` order, as
+    `Image.open(raw, formats=...)` does, but without its decompression-bomb check: that check warns above Pillow's
+    `MAX_IMAGE_PIXELS` (about 89 megapixels) and refuses above twice that, before a JPEG's reduced-scale decoding is
+    possible. The callers' own pixel caps apply instead, before anything is decoded, and no warning is raised (an error
+    wherever warnings are errors). Changing Pillow's global limit, or its warning filters, would affect every thread.
+    """
+    raw.seek(0)
+    prefix = raw.read(SNIFF_BYTES)
+    Image.init()  # every opener registered (once)
+    for name in PIL_FORMATS[kind]:
+        opener = Image.OPEN.get(name)
+        if opener is None:
+            continue
+        factory, accept = opener
+        accepted = accept(prefix) if accept is not None else True
+        if isinstance(accepted, str) or not accepted:
+            continue  # a string is Pillow's reason for not taking it
+        raw.seek(0)
+        try:
+            return factory(cast(BinaryIO, _Borrowed(raw)), "")
+        except SyntaxError, IndexError, TypeError, struct.error:
+            continue  # not this format after all: the next opener, as `Image.open` goes on
+    raise UnidentifiedImageError(f"Not a {kind} image")
 
 
 def _hash_stream(raw: BinaryIO) -> tuple[str, int]:
@@ -274,6 +351,205 @@ def _write_page_files(page_dir: Path, page: Image.Image, icc: bytes | None, *, s
     return _PageFiles(hashlib.sha256(page_bytes).hexdigest(), page_image.size, view.size)
 
 
+@dataclass(frozen=True)
+class DocumentPage:
+    """One card page an uploaded file holds (`expand_document`), ready for `normalize_document_page`"""
+
+    file: BinaryIO
+    """What's decoded: the upload itself, or a PDF page rendered as a PNG (`rendered`)"""
+    kind: str
+    """`file`'s sniffed format"""
+    raw_sha256: str
+    raw_bytes: int
+    """
+    The page's identity, stored as its `PageMeta.raw_sha256` and `raw_bytes`: the upload's SHA-256 and size; for one
+    of several pages, the SHA-256 of the upload's and the page number (the size stays the upload's). So the same file
+    sent again is found as a duplicate, whatever version of PDFium rendered it.
+    """
+    number: int | None = None
+    """The page's number in the uploaded file, from 1, when the file holds several pages"""
+    frame: int = 0
+    """Which frame of `file` is the page (a multi-page TIFF's)"""
+    format: str | None = None
+    """The uploaded file's format when `file` isn't the upload (`pdf`)"""
+    rendered: bool = False
+    """`file` was made here: `close_pages` closes it"""
+
+
+def close_pages(pages: Iterable[DocumentPage]) -> None:
+    """Closes the files `expand_document` made (a PDF's rendered pages); the uploads stay with their callers"""
+    for page in pages:
+        if page.rendered:
+            page.file.close()
+
+
+def page_filename(name: str | None, number: int | None) -> str | None:
+    """A page's display name: the uploaded file's, sanitized, with `(page 2)` for a page of a multi-page file"""
+    if number is None:
+        return sanitize_filename(name)
+    suffix = f" (page {number})"
+    base = sanitize_filename(name, max_length=MAX_FILENAME_LENGTH - len(suffix))
+    return f"{base}{suffix}" if base else suffix.strip(" ()").capitalize()
+
+
+def expand_document(raw: BinaryIO) -> list[DocumentPage]:
+    """
+    The card pages one uploaded file holds, in order: an image is one page; a multi-page TIFF gives one per frame
+    (reduced-resolution copies and masks left out); a PDF one per page, rendered at a long side of `PAGE_MAX_SIDE`
+    (within `MAX_PIXELS`) in a process of its own (`pdf_render`), so a hostile PDF can't crash or hang the server. The
+    file is sniffed and hashed here (its identity is each page's `raw_sha256`); nothing is decoded but a PDF.
+
+    `raw` is an open, seekable binary file, never reopened by path. Raises `PageRejected` with `unsupported_format`,
+    `too_large`, `too_many_pages` (more than `MAX_PAGES_PER_CARD`), `pdf_not_supported` (encrypted, empty, damaged,
+    or not rendered within `PDF_RENDER_TIMEOUT`) or `unreadable_image` (a TIFF whose frames can't be read). Blocking;
+    `close_pages` closes the rendered files. Needs no write lock: nothing is written to `DATA_DIR`.
+    """
+    raw.seek(0)
+    kind = sniff(raw.read(SNIFF_BYTES))
+    if kind is None:
+        raise PageRejected(IngestRejectReason.unsupported_format)
+    raw.seek(0)
+    raw_sha256, raw_bytes = _hash_stream(raw)
+    raw.seek(0)
+
+    if kind == "pdf":
+        return _pdf_pages(raw, raw_sha256, raw_bytes)
+    frames = _tiff_page_frames(raw) if kind == "tiff" else [0]
+    if len(frames) == 1:
+        return [DocumentPage(raw, kind, raw_sha256, raw_bytes, frame=frames[0])]
+    return [
+        DocumentPage(raw, kind, _page_identity(raw_sha256, number), raw_bytes, number=number, frame=frame)
+        for number, frame in enumerate(frames, start=1)
+    ]
+
+
+def _page_identity(raw_sha256: str, number: int) -> str:
+    return hashlib.sha256(f"{raw_sha256}:page:{number}".encode("ascii")).hexdigest()
+
+
+_TIFF_SUBFILE_TYPE = 254
+_TIFF_NOT_A_PAGE = 0b101
+"""`NewSubfileType` bits of a frame that isn't a page of its own: a reduced-resolution copy (1), a mask (4)"""
+MAX_TIFF_FRAMES = 32
+"""Frames looked at in a TIFF: more, and it has too many pages for a card whatever they are"""
+
+
+def _tiff_page_frames(raw: BinaryIO) -> list[int]:
+    """The frames of a TIFF that are pages (its headers only are read)"""
+    frames: list[int] = []
+    try:
+        with _open_image(raw, "tiff") as image:
+            for frame in range(MAX_TIFF_FRAMES + 1):
+                try:
+                    image.seek(frame)
+                except EOFError:
+                    break
+                if frame == MAX_TIFF_FRAMES:
+                    raise PageRejected(IngestRejectReason.too_many_pages)
+                subfile_type = getattr(image, "tag_v2", {}).get(_TIFF_SUBFILE_TYPE, 0)
+                if frame == 0 or not (isinstance(subfile_type, int) and subfile_type & _TIFF_NOT_A_PAGE):
+                    frames.append(frame)
+                if len(frames) > limits.MAX_PAGES_PER_CARD:
+                    raise PageRejected(IngestRejectReason.too_many_pages)
+    except PageRejected:
+        raise
+    except Exception as e:
+        raise PageRejected(IngestRejectReason.unreadable_image) from e
+    finally:
+        raw.seek(0)
+    return frames
+
+
+PDF_RENDER_TIMEOUT = 60
+"""How long a PDF's pages may take to render"""
+_PDF_RENDERER = Path(__file__).with_name("pdf_render.py")
+_CHILD_ENVIRONMENT = ("SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
+"""What the renderer's process gets of the server's environment: nothing secret"""
+
+
+def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentPage]:
+    """A PDF's pages rendered as PNG files by `pdf_render` in a child process; spooled into unnamed temporary files"""
+    if not sys.executable:
+        logger.error("Couldn't start the PDF renderer: the Python interpreter's path is unknown")
+        raise PageRejected(IngestRejectReason.pdf_not_supported)
+    with tempfile.TemporaryDirectory(prefix="mealie-pdf-") as work:
+        document = Path(work) / "document.pdf"
+        with document.open("wb") as copy:
+            shutil.copyfileobj(raw, copy)
+        raw.seek(0)
+
+        try:
+            completed = subprocess.run(  # the renderer's path and our own numbers: no shell, no user input
+                [
+                    sys.executable,
+                    "-I",
+                    str(_PDF_RENDERER),
+                    str(document),
+                    work,
+                    str(limits.PAGE_MAX_SIDE),
+                    str(limits.MAX_PIXELS),
+                    str(limits.MAX_PAGES_PER_CARD),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=PDF_RENDER_TIMEOUT,
+                env={name: os.environ[name] for name in _CHILD_ENVIRONMENT if name in os.environ},
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            logger.info(f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds")
+            raise PageRejected(IngestRejectReason.pdf_not_supported) from e
+        except OSError as e:
+            logger.error(f"Couldn't start the PDF renderer: {e}")
+            raise PageRejected(IngestRejectReason.pdf_not_supported) from e
+
+        result = _renderer_result(completed)
+        if result.get("error") == IngestRejectReason.too_many_pages.value:
+            raise PageRejected(IngestRejectReason.too_many_pages)
+        count = result.get("pages")
+        if not isinstance(count, int) or not 1 <= count <= limits.MAX_PAGES_PER_CARD:
+            raise PageRejected(IngestRejectReason.pdf_not_supported)
+
+        pages: list[DocumentPage] = []
+        try:
+            for number in range(1, count + 1):
+                rendered: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
+                pages.append(
+                    DocumentPage(
+                        rendered,  # type: ignore[arg-type]
+                        "png",
+                        raw_sha256 if count == 1 else _page_identity(raw_sha256, number),
+                        raw_bytes,
+                        number=None if count == 1 else number,
+                        format="pdf",
+                        rendered=True,
+                    )
+                )
+                with (Path(work) / f"page-{number}.png").open("rb") as png:
+                    shutil.copyfileobj(png, rendered)
+                rendered.seek(0)
+        except BaseException as e:
+            close_pages(pages)
+            if isinstance(e, OSError):
+                raise PageRejected(IngestRejectReason.pdf_not_supported) from e
+            raise
+        return pages
+
+
+def _renderer_result(completed: subprocess.CompletedProcess[bytes]) -> dict:
+    """The renderer's JSON answer; empty when it crashed or answered nothing usable"""
+    lines = completed.stdout.decode("utf-8", errors="replace").strip().splitlines()
+    try:
+        result = json.loads(lines[-1]) if completed.returncode == 0 and lines else {}
+    except ValueError:
+        result = {}
+    if not isinstance(result, dict) or not result:
+        # killed by a resource limit, or PDFium crashed: logged without the document's content
+        logger.info(f"The PDF renderer failed (exit status {completed.returncode})")
+        return {}
+    return result
+
+
 def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filename: str | None) -> PageMeta:
     """
     Turns one uploaded image into page `index` in `page_dir` (which must exist): an upright RGB `page.jpg` (long side
@@ -281,7 +557,8 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
     (480, aspect kept), each written atomically.
 
     `raw` is an open, seekable binary file: a multipart part's spooled file, a `BytesIO` or the inbox's file object.
-    It's read from the start and never reopened by path.
+    It's read from the start and never reopened by path. A multi-page TIFF gives its first page; a PDF is refused
+    (`expand_document` turns either into pages for `normalize_document_page`).
 
     Raises `PageRejected` with `too_large`, `unsupported_format`, `pdf_not_supported`, `too_many_pixels` or
     `unreadable_image`. Callers hold `storage.ingest_write()`.
@@ -296,24 +573,40 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
     raw.seek(0)
     raw_sha256, raw_bytes = _hash_stream(raw)
     raw.seek(0)
+    page = DocumentPage(raw, kind, raw_sha256, raw_bytes)
+    return normalize_document_page(page, page_dir, index, original_filename=original_filename)
 
+
+def normalize_document_page(
+    page: DocumentPage, page_dir: Path, index: int, *, original_filename: str | None
+) -> PageMeta:
+    """
+    `normalize_page` for one page `expand_document` found: its frame of the file, its own identity, and the uploaded
+    file's format. `original_filename` is the page's display name (`page_filename`). Raises `PageRejected` with
+    `too_many_pixels` or `unreadable_image`. Callers hold `storage.ingest_write()`.
+    """
+    raw = page.file
+    kind = page.kind
+    raw.seek(0)
     try:
-        with Image.open(raw, formats=PIL_FORMATS[kind]) as image:
-            if image.width * image.height > limits.MAX_PIXELS:
-                raise PageRejected(IngestRejectReason.too_many_pixels)
-            if getattr(image, "n_frames", 1) > 1:
-                image.seek(0)  # MPO and TIFF: the first frame only
+        with _open_image(raw, kind) as image:
+            if page.frame or getattr(image, "n_frames", 1) > 1:
+                image.seek(page.frame)  # MPO: the first frame; TIFF: the page's
             if kind == "jpeg":
+                if image.width * image.height > MAX_JPEG_SOURCE_PIXELS:
+                    raise PageRejected(IngestRejectReason.too_many_pixels)
                 # decoded at 1/2, 1/4 or 1/8 scale when the page is that much smaller: never below the page's size
                 image.draft(None, _draft_size(image.size, limits.PAGE_MAX_SIDE))
+            if image.width * image.height > limits.MAX_PIXELS:  # a JPEG's as it will be decoded
+                raise PageRejected(IngestRejectReason.too_many_pixels)
             image.load()  # what finds a truncated file
-            format_name = (image.format or kind).lower()
+            format_name = page.format or (image.format or kind).lower()
             icc = _rgb_icc_profile(image)
             transpose = _EXIF_TRANSPOSE.get(image.getexif().get(ExifTags.Base.Orientation, 1))
-            page = _page_rgb(image)
+            rgb = _page_rgb(image)
         if transpose is not None:
-            page = _replace(page, page.transpose(transpose))  # upright by its EXIF orientation
-        page.info = {}  # nothing of the original's metadata may reach the files
+            rgb = _replace(rgb, rgb.transpose(transpose))  # upright by its EXIF orientation
+        rgb.info = {}  # nothing of the original's metadata may reach the files
     except PageRejected:
         raise
     except Image.DecompressionBombError as e:
@@ -322,8 +615,10 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
         # anything a damaged or hostile file makes the decoders raise (OSError for a truncated file, SyntaxError,
         # struct.error or ValueError for broken headers and EXIF): never a server error
         raise PageRejected(IngestRejectReason.unreadable_image) from e
+    finally:
+        raw.seek(0)
 
-    files = _write_page_files(page_dir, page, icc)
+    files = _write_page_files(page_dir, rgb, icc)
     return PageMeta(
         index=index,
         width=files.page_size[0],
@@ -333,11 +628,11 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
         rotation=0,
         rotation_source=PageRotationSource.none,
         oriented=False,
-        raw_sha256=raw_sha256,
+        raw_sha256=page.raw_sha256,
         page_sha256=files.page_sha256,
         original_filename=sanitize_filename(original_filename),
         format=format_name,
-        raw_bytes=raw_bytes,
+        raw_bytes=page.raw_bytes,
         ocr=None,
     )
 

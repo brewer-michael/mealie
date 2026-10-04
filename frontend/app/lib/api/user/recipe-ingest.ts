@@ -6,6 +6,8 @@ import type { PaginationData } from "../types/non-generated";
 import type {
   AINotifierEventsOut,
   AINotifierEventsUpdate,
+  BulkCommitOut,
+  BulkCommitRequest,
   CardDraftSaved,
   CardDraftUpdate,
   CommitOut,
@@ -13,10 +15,15 @@ import type {
   EvalCaseOut,
   EvalCaseRequest,
   EvalCaseSummary,
+  EvalCaseUpdate,
   IngestAbout,
   IngestResponse,
   IngestStatus,
+  MergeRequest,
   PageOut,
+  ParseLinesRequest,
+  ProposalTarget,
+  RebuildRequest,
   RecipeIngestionBatchOut,
   RecipeIngestionJobCounts,
   RecipeIngestionJobOut,
@@ -24,8 +31,10 @@ import type {
   RecipeIngestionJobSummary,
   RecipeIngestionSettingsOut,
   RecipeIngestionSettingsUpdate,
+  RegionHintOut,
   RereadRequest,
   RotateRequest,
+  UncommitRequest,
 } from "~/lib/api/types/recipe-ingest";
 
 const prefix = "/api/ai/ingest";
@@ -37,6 +46,8 @@ const routes = {
   batches: `${prefix}/batches`,
   batchesId: (id: string) => `${prefix}/batches/${id}`,
   batchesIdSeal: (id: string) => `${prefix}/batches/${id}/seal`,
+  batchesIdTouch: (id: string) => `${prefix}/batches/${id}/touch`,
+  batchesIdCommitClean: (id: string) => `${prefix}/batches/${id}/commit-clean`,
   jobs: `${prefix}/jobs`,
   jobsCounts: `${prefix}/jobs/counts`,
   jobsId: (id: string) => `${prefix}/jobs/${id}`,
@@ -45,12 +56,19 @@ const routes = {
   jobsIdReread: (id: string) => `${prefix}/jobs/${id}/reread`,
   jobsIdRetry: (id: string) => `${prefix}/jobs/${id}/retry`,
   jobsIdCancel: (id: string) => `${prefix}/jobs/${id}/cancel`,
+  jobsIdReadWithCloud: (id: string) => `${prefix}/jobs/${id}/read-with-cloud`,
+  jobsIdMerge: (id: string) => `${prefix}/jobs/${id}/merge`,
+  jobsIdRebuild: (id: string) => `${prefix}/jobs/${id}/rebuild`,
+  jobsIdParseLines: (id: string) => `${prefix}/jobs/${id}/parse-lines`,
+  jobsIdRegionHint: (id: string) => `${prefix}/jobs/${id}/region-hint`,
   jobsIdPagesNRotate: (id: string, n: number) => `${prefix}/jobs/${id}/pages/${n}/rotate`,
   jobsIdPagesNImage: (id: string, n: number, kind: PageImageKind) => `${prefix}/jobs/${id}/pages/${n}/${kind}`,
   jobsIdCommit: (id: string) => `${prefix}/jobs/${id}/commit`,
+  jobsIdUncommit: (id: string) => `${prefix}/jobs/${id}/uncommit`,
   jobsIdEvalCase: (id: string) => `${prefix}/jobs/${id}/eval-case`,
   evalCases: `${prefix}/eval-cases`,
   evalCasesSlug: (slug: string) => `${prefix}/eval-cases/${encodeURIComponent(slug)}`,
+  evalCasesSlugDownload: (slug: string) => `${prefix}/eval-cases/${encodeURIComponent(slug)}/download`,
   settings: `${prefix}/settings`,
   notifiersIdEvents: (id: string) => `/api/ai/notifiers/${id}/events`,
   notifiersIdEventsTest: (id: string) => `/api/ai/notifiers/${id}/events/test`,
@@ -87,6 +105,10 @@ export interface RecipeIngestUploadConfig extends RecipeIngestRequestConfig {
 export interface RecipeIngestJobsQuery {
   status?: IngestStatus | IngestStatus[] | null;
   batchId?: string | null;
+  /** Only cards added as recipes since then */
+  committedSince?: Date | string | null;
+  /** `committedAt`: the latest commit first (by default the newest card first) */
+  orderBy?: "committedAt" | null;
   page?: number;
   perPage?: number;
 }
@@ -164,8 +186,24 @@ export class RecipeIngestAPI extends BaseAPI {
     return await this.requests.post<RecipeIngestionBatchOut>(routes.batchesIdSeal(id), {}, requestOptions(config));
   }
 
+  /**
+   * The capture page's heartbeat for its open batch, so a pause in a stack doesn't end the batch: a 409 whose
+   * `detail.code` is `batch_sealed` means it ended anyway (the next card starts a new one)
+   */
+  async touchBatch(id: string, config: RecipeIngestRequestConfig = {}) {
+    return await this.requests.post<RecipeIngestionBatchOut>(routes.batchesIdTouch(id), {}, requestOptions(config));
+  }
+
   async getBatch(id: string) {
     return await this.requests.get<RecipeIngestionBatchOut>(routes.batchesId(id));
+  }
+
+  /**
+   * Adds the listed cards of a batch as recipes, each only while it's ready at the draft version given and has
+   * nothing to check; the others come back in `skipped` with the reason
+   */
+  async commitClean(batchId: string, payload: BulkCommitRequest) {
+    return await this.requests.post<BulkCommitOut>(routes.batchesIdCommitClean(batchId), payload);
   }
 
   // ==========================================
@@ -179,6 +217,14 @@ export class RecipeIngestAPI extends BaseAPI {
     }
     if (query.batchId) {
       params.batchId = query.batchId;
+    }
+    if (query.committedSince) {
+      params.committedSince = query.committedSince instanceof Date
+        ? query.committedSince.toISOString()
+        : query.committedSince;
+    }
+    if (query.orderBy) {
+      params.orderBy = query.orderBy;
     }
     if (query.page) {
       params.page = query.page;
@@ -224,6 +270,42 @@ export class RecipeIngestAPI extends BaseAPI {
     return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdCancel(id), {});
   }
 
+  /** Reads a card that failed because it had to stay on this server again, with the group's cloud providers */
+  async readWithCloud(id: string) {
+    return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdReadWithCloud(id), {});
+  }
+
+  /** Adds this card's photos to another card as its next pages; answers the other card's state (being read) */
+  async merge(id: string, payload: MergeRequest) {
+    return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdMerge(id), payload);
+  }
+
+  /** Builds the recipe again from an edited transcription of the card */
+  async rebuild(id: string, payload: RebuildRequest) {
+    return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdRebuild(id), payload);
+  }
+
+  /** Parses the given ingredient lines with the AI (`refs`: the lines' ids) */
+  async parseLines(id: string, payload: ParseLinesRequest) {
+    return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdParseLines(id), payload);
+  }
+
+  /**
+   * Where on the card a field's text is, to start a re-read selection there. A 404 means there's no hint: it's
+   * never shown as an error.
+   */
+  async regionHint(id: string, target: ProposalTarget) {
+    const params: Record<string, QueryValue> = { field: target.field };
+    if (target.ref) {
+      params.ref = target.ref;
+    }
+    return await this.requests.get<RegionHintOut>(
+      route(routes.jobsIdRegionHint(id), params),
+      undefined,
+      requestOptions({ suppressAlert: true }),
+    );
+  }
+
   async rotatePage(id: string, page: number, payload: RotateRequest) {
     return await this.requests.post<PageOut>(routes.jobsIdPagesNRotate(id, page), payload);
   }
@@ -236,6 +318,14 @@ export class RecipeIngestAPI extends BaseAPI {
   /** 201 with the new recipe; 200 if it was already committed; 422 `unresolved_flags`; 409 otherwise */
   async commit(id: string, payload: CommitRequest) {
     return await this.requests.post<CommitOut>(routes.jobsIdCommit(id), payload);
+  }
+
+  /**
+   * Back to review: deletes the recipe the card became and makes the card ready again. A 409 whose `detail.code` is
+   * `recipe_edited` asks first: send `force` to delete the edited recipe anyway.
+   */
+  async uncommit(id: string, payload: UncommitRequest = {}) {
+    return await this.requests.post<RecipeIngestionJobState>(routes.jobsIdUncommit(id), payload);
   }
 
   async discard(id: string) {
@@ -251,6 +341,22 @@ export class RecipeIngestAPI extends BaseAPI {
 
   async getEvalCases() {
     return await this.requests.get<EvalCaseSummary[]>(routes.evalCases);
+  }
+
+  /** Ticks or unticks "verified", or changes a case's tags or notes */
+  async updateEvalCase(slug: string, payload: EvalCaseUpdate) {
+    return await this.requests.put<EvalCaseSummary, EvalCaseUpdate>(routes.evalCasesSlug(slug), payload);
+  }
+
+  /**
+   * A zip of the case's JSON and photos, as a Blob. Quiet: an error's body is a Blob too, so the caller says what
+   * went wrong by the status.
+   */
+  async downloadEvalCase(slug: string) {
+    return await this.requests.get<Blob>(routes.evalCasesSlugDownload(slug), undefined, {
+      responseType: "blob",
+      suppressAlert: true,
+    });
   }
 
   async deleteEvalCase(slug: string) {

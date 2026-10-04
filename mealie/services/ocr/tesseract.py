@@ -60,6 +60,20 @@ _TRANSPOSE = {
 
 
 @dataclass(frozen=True)
+class OCRLine:
+    """
+    Fork: a line of text Tesseract found, and the box around its words in fractions (0 to 1) of the image's width and
+    height as it was read, turned by `OCRResult.rotation`
+    """
+
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+@dataclass(frozen=True)
 class OCRResult:
     text: str = ""
     """The text read, one line per line found, with a blank line between paragraphs"""
@@ -82,6 +96,9 @@ class OCRResult:
     something for good, like a page's orientation, tries again later)
     """
 
+    lines: tuple[OCRLine, ...] = ()
+    """Fork: the lines found, in reading order, each with its box (so a caller can point at where a line is)"""
+
 
 @dataclass(frozen=True)
 class _Word:
@@ -92,6 +109,8 @@ class _Word:
     height: int
     confidence: float
     text: str
+    left: int = 0
+    top: int = 0
 
     @property
     def characters(self) -> int:
@@ -106,7 +125,16 @@ def _tesseract_path() -> str | None:
 def is_available() -> bool:
     """Whether OCR is enabled and the `tesseract` command can be found"""
 
-    return get_app_settings().OCR_ENABLED and _tesseract_path() is not None
+    return get_app_settings().OCR_ENABLED and binary_available()
+
+
+def binary_available() -> bool:
+    """
+    Fork: whether the `tesseract` command can be found, whatever `OCR_ENABLED` says. `OCR_ENABLED` is about reading
+    recipes with OCR; a caller using Tesseract for something else (turning a recipe card upright) has its own switch.
+    """
+
+    return _tesseract_path() is not None
 
 
 def _prepare(path: Path) -> Image.Image:
@@ -150,6 +178,8 @@ def _parse_tsv(tsv: str) -> list[_Word]:
                 height=int(fields[9]),
                 confidence=float(fields[10]),
                 text=fields[11].strip(),
+                left=int(fields[6]),
+                top=int(fields[7]),
             )
         except ValueError:
             continue
@@ -230,17 +260,52 @@ def _to_text(words: list[_Word]) -> str:
     return "\n".join(lines)
 
 
-def extract_text(path: Path, *, min_ratio: float = 1.0) -> OCRResult:
+def _to_lines(words: list[_Word], size: tuple[int, int]) -> tuple[OCRLine, ...]:
+    """
+    Fork: the words grouped into Tesseract's lines (by block, paragraph and line, as `_to_text` joins them), each with
+    the box around its words in fractions of `size`, the image's width and height as it was read
+    """
+    image_width, image_height = size
+    if image_width <= 0 or image_height <= 0:
+        return ()
+
+    grouped: list[list[_Word]] = []
+    previous: tuple[int, int, int] | None = None
+    for word in words:
+        position = (word.block, word.paragraph, word.line)
+        if position == previous:
+            grouped[-1].append(word)
+        else:
+            grouped.append([word])
+        previous = position
+
+    lines: list[OCRLine] = []
+    for group in grouped:
+        left = _fraction(min(word.left for word in group), image_width)
+        top = _fraction(min(word.top for word in group), image_height)
+        right = _fraction(max(word.left + word.width for word in group), image_width)
+        bottom = _fraction(max(word.top + word.height for word in group), image_height)
+        text = " ".join(word.text for word in group)
+        lines.append(OCRLine(text=text, x=left, y=top, width=round(right - left, 4), height=round(bottom - top, 4)))
+    return tuple(lines)
+
+
+def _fraction(value: int, whole: int) -> float:
+    return round(min(max(value / whole, 0.0), 1.0), 4)
+
+
+def extract_text(path: Path, *, min_ratio: float = 1.0, require_enabled: bool = True) -> OCRResult:
     """
     Reads the text in an image, whichever way up it was photographed. This blocks, so run it off
     the event loop. Returns an empty result if OCR is unavailable or the image can't be read.
 
     Fork: the image is turned only when the best rotation scores at least `min_ratio` times the upright
     one (docs/ai/PHASE2.md §4.4), and the text is read at the rotation chosen. The default of 1 keeps
-    upstream's behaviour: the best rotation wins.
+    upstream's behaviour: the best rotation wins. `require_enabled=False` reads whenever Tesseract is
+    installed, even with `OCR_ENABLED` off (recipe card orientation has its own switch).
     """
 
-    if not is_available():
+    if not (is_available() if require_enabled else binary_available()):
         return OCRResult()
 
     deadline = time.monotonic() + get_app_settings().OCR_TIMEOUT
@@ -251,7 +316,8 @@ def extract_text(path: Path, *, min_ratio: float = 1.0) -> OCRResult:
             scores = _probe_rotations(image, read)
             rotation = _choose_rotation(scores, min_ratio)
             long_side = min(max(max(image.size), MIN_DIMENSION), MAX_DIMENSION)
-            words = read(_fit(_rotate(image, rotation), long_side))
+            turned = _fit(_rotate(image, rotation), long_side)
+            words = read(turned)
     except subprocess.TimeoutExpired:
         logger.warning(f"OCR timed out reading {path.name}")
         return OCRResult(failed=True)
@@ -267,4 +333,10 @@ def extract_text(path: Path, *, min_ratio: float = 1.0) -> OCRResult:
 
     confidence = sum(word.confidence for word in words) / len(words)
     logger.debug(f"OCR read {len(words)} words from {path.name} (rotation {rotation}, confidence {confidence:.0f})")
-    return OCRResult(text=_to_text(words), confidence=confidence, rotation=rotation, rotation_scores=scores)
+    return OCRResult(
+        text=_to_text(words),
+        confidence=confidence,
+        rotation=rotation,
+        rotation_scores=scores,
+        lines=_to_lines(words, turned.size),
+    )

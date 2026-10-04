@@ -62,6 +62,9 @@ def _matches(if_none_match: str | None, etag: str) -> bool:
 
 
 def _image_headers(image: PageImage, requested_version: str | None) -> dict[str, str]:
+    if not image.settled:
+        # a turn of the page may still be swapping in: never kept, so the next request gets the page as it ends up
+        return {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
     # a URL carrying the page's current version never changes; any other is checked against the ETag each time
     cache = "private, max-age=31536000, immutable" if requested_version == image.version else "private, no-cache"
     return {"Cache-Control": cache, "ETag": image.etag, "X-Content-Type-Options": "nosniff"}
@@ -212,13 +215,13 @@ class RecipeIngestJobsController(IngestController):
     def get_page_image(self, request: Request, job_id: UUID4, index: int, kind: PageImageKind) -> Response:
         """
         A page's `page.jpg` (up to 4096 px), `view.jpg` (2048 px) or `thumb.webp`, for the job's household only, with
-        an ETag that changes when the page is turned
+        an ETag that changes when the page is turned; `no-store` while a turn of the page may still be swapping in
         """
         with self._answer():
             image = self.review.page_image(job_id, index, kind)
 
         headers = _image_headers(image, request.query_params.get("v"))
-        if _matches(request.headers.get("if-none-match"), image.etag):
+        if image.settled and _matches(request.headers.get("if-none-match"), image.etag):
             return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
         return FileResponse(image.path, media_type=image.media_type, headers=headers, stat_result=image.stat)
 

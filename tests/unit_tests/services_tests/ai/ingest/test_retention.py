@@ -292,3 +292,63 @@ def test_a_job_retried_meanwhile_is_left_alone(seeder: Seeder, monkeypatch: pyte
     retention.purge_once(utcnow())
     assert _row(failed)["status"] == "processing"
     assert seeder.dir(failed).is_dir()
+
+
+def test_a_failed_card_waiting_for_the_monthly_limit_is_kept_until_after_its_retry(seeder: Seeder):
+    """
+    A card that failed `limit_reached` on the 5th waits for the reset on the 1st: its retention counts from then, so it
+    isn't deleted before it's read again, and goes `RETENTION_DAYS` after the retry if it's still failed then
+    """
+    retention_days = get_ingest_settings().RETENTION_DAYS
+    old = timedelta(days=retention_days + 10)
+    waiting = seeder.job(
+        IngestStatus.failed, age=old, error_code="limit_reached", auto_retry_at=utcnow() + timedelta(days=5)
+    )
+    retried_long_ago = seeder.job(
+        IngestStatus.failed,
+        age=old,
+        error_code="limit_reached",
+        auto_retry_at=utcnow() - timedelta(days=retention_days + 1),
+    )
+    retried_lately = seeder.job(
+        IngestStatus.failed, age=old, error_code="limit_reached", auto_retry_at=utcnow() - timedelta(days=1)
+    )
+
+    retention.purge_once(utcnow())
+
+    assert _row(waiting) is not None and seeder.dir(waiting).is_dir()
+    assert _row(retried_lately) is not None
+    assert _row(retried_long_ago) is None and not seeder.dir(retried_long_ago).exists()
+
+    # when the card says it goes: its retry plus the retention
+    with session_context() as session:
+        job = session.get(RecipeIngestionJob, waiting)
+        assert job is not None
+        expires = retention.failed_card_expires_at(job)
+        assert expires is not None
+        assert abs(expires.replace(tzinfo=None) - (utcnow() + timedelta(days=5 + retention_days))) < timedelta(
+            minutes=1
+        )
+        job_ready = session.get(RecipeIngestionJob, seeder.job(IngestStatus.ready))
+        assert job_ready is not None and retention.failed_card_expires_at(job_ready) is None
+
+
+def test_the_purge_removes_readings_a_restore_cut_off_that_no_task_used(seeder: Seeder):
+    from mealie.services.ai.ingest.runner import results
+
+    job_id = uuid4()
+    key = results.TaskKey.of(job_id, "extract", None, ("b" * 64,))
+    reading = results.ExtractResult(
+        draft=CardDraft(name="Banana Mug Cake"),
+        flags=[],
+        transcription="",
+        extraction=ExtractionMeta(),
+        pages=[_page()],
+    )
+    assert results.keep(key, result=reading)
+    kept = storage.results_dir() / f"{job_id}.extract.json"
+    day_ago = time.time() - limits.KEPT_RESULT_TTL - 60
+    os.utime(kept, (day_ago, day_ago))
+
+    retention.purge_once(utcnow())
+    assert not kept.exists()

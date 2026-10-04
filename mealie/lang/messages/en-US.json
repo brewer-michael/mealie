@@ -154,6 +154,7 @@
     },
     "recipe-ingest": {
         "upload-summary": "{count} recipe card queued. You'll be notified when it's ready. | {count} recipe cards queued. You'll be notified when they're ready.",
+        "upload-summary-in-app": "{count} recipe card queued for review in Mealie. | {count} recipe cards queued for review in Mealie.",
         "upload-summary-none": "No recipe cards were queued.",
         "upload-summary-duplicate": "{count} card was already scanned. | {count} cards were already scanned.",
         "upload-summary-rejected": "{count} card couldn't be used. | {count} cards couldn't be used.",
@@ -219,7 +220,8 @@
             "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
             "busy-restore": "Mealie is still saving changes. Try the restore again in a minute.",
             "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again.",
-            "unknown-batch": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one."
+            "unknown-batch": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one.",
+            "notification-failed": "The test notification wasn't delivered. Check the notifier's URL and that the service it sends to is running."
         },
         "restore": {
             "writes-paused": "A backup is being restored. Try again in a minute."

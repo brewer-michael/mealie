@@ -16,9 +16,14 @@
       </v-btn>
     </div>
 
-    <p v-if="batchId && loaded && batchSummary" class="batch-summary text-body-2">
+    <div v-if="batchId && loaded && batchSummary" class="batch-summary text-body-2 mb-2">
       {{ batchSummary }}
-    </p>
+    </div>
+    <!--
+      what the review said about the batch's last card, or what "Add N clean cards" did when its batch has gone: here,
+      by the summary, where a toast would cover the page title
+    -->
+    <IngestBatchListNotice v-if="notice && !noticeInBatch" class="mb-3" :notice="notice" @dismiss="notice = null" />
 
     <v-alert
       v-if="loadFailed"
@@ -67,6 +72,18 @@
           {{ $t("recipe-ingest.queue.retry-failed") }}
         </v-btn>
         <v-btn
+          v-if="batch.clean.length >= MIN_CLEAN_CARDS"
+          class="batch-add-clean"
+          size="small"
+          color="primary"
+          variant="text"
+          :loading="cleanBusy === batch.id"
+          :disabled="cleanBusy !== null && cleanBusy !== batch.id"
+          @click="askAddClean(batch)"
+        >
+          {{ $t("recipe-ingest.queue.add-clean", batch.clean.length) }}
+        </v-btn>
+        <v-btn
           v-if="batch.ready"
           class="batch-review"
           size="small"
@@ -77,6 +94,13 @@
           {{ $t("recipe-ingest.queue.review-batch") }}
         </v-btn>
       </div>
+      <!-- what "Add N clean cards" did, by the batch -->
+      <IngestBatchListNotice
+        v-if="notice && notice.batchId === batch.id"
+        class="my-2"
+        :notice="notice"
+        @dismiss="notice = null"
+      />
       <v-list class="py-0" density="comfortable">
         <IngestJobListItem
           v-for="job in batch.jobs"
@@ -118,14 +142,43 @@
         {{ $t("recipe-ingest.queue.discard-confirm") }}
       </v-card-text>
     </BaseDialog>
+
+    <BaseDialog
+      v-model="cleanDialog"
+      bottom-sheet
+      :title="$t('recipe-ingest.queue.add-clean-title', cleanCards.length)"
+      :icon="$globals.icons.check"
+      can-confirm
+      @confirm="addClean"
+    >
+      <v-card-text>
+        <p class="mb-2">
+          {{ $t("recipe-ingest.queue.add-clean-confirm") }}
+        </p>
+        <ul class="clean-cards ps-4">
+          <li v-for="card in cleanCards" :key="card.id" class="clean-card">
+            {{ cardTitle(card) }}
+          </li>
+        </ul>
+      </v-card-text>
+    </BaseDialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { useDocumentVisibility } from "@vueuse/core";
+import IngestBatchListNotice from "./IngestBatchListNotice.vue";
 import IngestJobListItem from "./IngestJobListItem.vue";
 import { useUserApi } from "~/composables/api";
-import { errorCodeOf, errorStatusOf, useRecipeIngestCounts, useRecipeIngestText } from "~/composables/use-recipe-ingest";
+import {
+  errorCodeOf,
+  errorMessageOf,
+  errorStatusOf,
+  takeRecipeIngestCommitNotice,
+  useRecipeIngestCounts,
+  useRecipeIngestText,
+} from "~/composables/use-recipe-ingest";
+import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import { alert } from "~/composables/use-toast";
 import type {
@@ -140,7 +193,8 @@ import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
  * The household's cards by batch, newest first (docs/ai/PHASE2.md §6.7), and the ones added in the last 7 days. It
  * polls the batches that are being read or uploaded every 3 s while the page is visible, and at once after an upload.
  * Cards that arrive or change elsewhere (the inbox, a Shortcut, another device) show too: while the page is visible
- * the shared counts are checked every 20 s and a change reloads the list, as does coming back to the page. Fork-owned.
+ * the shared counts are checked every 20 s and a change reloads the list, as does coming back to the page. With one
+ * batch it sums the batch up, and shows what the review said about the batch's last card. Fork-owned.
  */
 const props = defineProps<{
   groupSlug: string;
@@ -159,6 +213,8 @@ interface BatchView {
   source: IngestSource;
   ready: number;
   failed: number;
+  /** Ready cards with nothing to check and nothing reading them: "Add N clean cards" adds them */
+  clean: Job[];
 }
 
 const POLL_INTERVAL_MS = 3000;
@@ -170,10 +226,12 @@ const MAX_PAGES = 10;
 const RECENT_DAYS = 7;
 const RECENT_LIMIT = 50;
 const OPEN_STATUSES: IngestStatus[] = ["processing", "ready", "failed", "committing"];
+/** At least this many clean cards make "Add N clean cards" worth offering */
+const MIN_CLEAN_CARDS = 2;
 
 const i18n = useI18n();
 const api = useUserApi();
-const { ingestErrorText } = useRecipeIngestText();
+const { cardTitle, ingestErrorText } = useRecipeIngestText();
 const counts = useRecipeIngestCounts();
 const uploads = useRecipeIngestUploads();
 const visibility = useDocumentVisibility();
@@ -191,8 +249,19 @@ const retryingBatch = ref<string | null>(null);
 const discardDialog = ref(false);
 const discardTarget = ref<Job | null>(null);
 
+/** "Added Banana Mug Cake · 2 cards are still being read", left by the review page after the batch's last card */
+const left = takeRecipeIngestCommitNotice();
+const notice = ref<RecipeIngestQueueNotice | null>(left
+  ? { kind: left.warning ? "warning" : "success", text: left.text, detail: left.warning, items: [] }
+  : null);
+
 function isActive(job: Job): boolean {
   return job.status === "processing" || job.status === "committing" || !!job.task;
+}
+
+/** Ready, with nothing highlighted to check and nothing reading it again */
+function isClean(job: Job): boolean {
+  return job.status === "ready" && !job.task && !job.errorCount && !job.warningCount;
 }
 
 function isRecent(job: Job, now = Date.now()): boolean {
@@ -222,6 +291,7 @@ const batches = computed<BatchView[]>(() => {
       source: first?.source ?? "app",
       ready: sorted.filter(job => job.status === "ready").length,
       failed: sorted.filter(job => job.status === "failed").length,
+      clean: sorted.filter(isClean),
     };
   });
   // Newest batch first: the one whose latest card arrived last
@@ -229,13 +299,34 @@ const batches = computed<BatchView[]>(() => {
   return views.sort((a, b) => latest(b) - latest(a));
 });
 
+/** The notice is about a batch the list shows: it goes in that batch's section */
+const noticeInBatch = computed(() => !!notice.value?.batchId && batches.value.some(b => b.id === notice.value?.batchId));
+
+/**
+ * The batch so far: "3 added, 1 left to review, 2 still being read, 1 failed". "Batch done" only once none of its
+ * cards is being read; a card being added counts as added.
+ */
 const batchSummary = computed(() => {
   if (!props.batchId) {
     return null;
   }
-  const added = recent.value.filter(job => job.batchId === props.batchId).length;
-  const left = jobs.value.filter(job => job.batchId === props.batchId && job.status === "ready").length;
-  return added ? i18n.t("recipe-ingest.queue.batch-summary", { added, left }) : null;
+  const open = jobs.value.filter(job => job.batchId === props.batchId);
+  const count = (status: IngestStatus) => open.filter(job => job.status === status).length;
+  const added = recent.value.filter(job => job.batchId === props.batchId).length + count("committing");
+  const reading = count("processing");
+  const parts = [
+    { key: "summary-added", count: added },
+    { key: "summary-left", count: count("ready") },
+    { key: "summary-reading", count: reading },
+    { key: "summary-failed", count: count("failed") },
+  ]
+    .filter(part => part.count > 0)
+    .map(part => i18n.t(`recipe-ingest.queue.${part.key}`, { count: part.count }));
+  if (!parts.length) {
+    return null;
+  }
+  const summary = parts.join(", ");
+  return reading ? summary : i18n.t("recipe-ingest.queue.batch-done", { summary });
 });
 
 function formatDate(value: string | null): string {
@@ -500,6 +591,7 @@ watch(() => props.batchId, () => {
   loaded.value = false;
   jobs.value = [];
   recent.value = [];
+  notice.value = null;
   void load();
 });
 
@@ -531,7 +623,7 @@ function markBusy(jobId: string, on: boolean) {
  * household manager, discards someone else's card).
  */
 function notifyRefusal(error: unknown) {
-  if ((error as { response?: { data?: { detail?: { message?: unknown } } } } | null)?.response?.data?.detail?.message) {
+  if (errorMessageOf(error)) {
     return;
   }
   const code = errorCodeOf(error);
@@ -608,6 +700,124 @@ async function retryFailed(batch: BatchView) {
   void pollNow();
 }
 
+// ==========================================
+// Adding a batch's clean cards
+
+/** The batch whose clean cards are being checked or added */
+const cleanBusy = ref<string | null>(null);
+const cleanDialog = ref(false);
+const cleanBatchId = ref<string | null>(null);
+/** The cards the question lists, in capture order, with the draft version each was checked at */
+const cleanCards = ref<Job[]>([]);
+let cleanVersions: Record<string, number> = {};
+
+function showNotice(
+  batchId: string,
+  kind: RecipeIngestQueueNotice["kind"],
+  text: string,
+  detail: string | null = null,
+  items: string[] = [],
+) {
+  notice.value = { kind, text, detail, items, batchId };
+}
+
+/**
+ * "Add N clean cards": the batch is read again, so the question lists the cards as they are now, each with the draft
+ * version it was read at, and only those are added (a card changed after this is left for review)
+ */
+async function askAddClean(batch: BatchView) {
+  cleanBusy.value = batch.id;
+  try {
+    const items = await fetchAll({ batchId: batch.id });
+    if (disposed) {
+      return;
+    }
+    if (!items) {
+      showNotice(batch.id, "error", i18n.t("recipe-ingest.queue.clean-check-failed"));
+      return;
+    }
+    mergeBatch(batch.id, items);
+    const listed = items.filter(isClean).sort((a, b) => a.position - b.position);
+    const versions = Object.fromEntries(listed.map(job => [job.id, job.draftVersion]));
+    if (!listed.length) {
+      showNotice(batch.id, "info", i18n.t("recipe-ingest.queue.clean-none"));
+      return;
+    }
+    cleanBatchId.value = batch.id;
+    cleanCards.value = listed;
+    cleanVersions = versions;
+    cleanDialog.value = true;
+  }
+  finally {
+    cleanBusy.value = null;
+  }
+}
+
+/** Why a card was left for review when the clean cards were added */
+function cleanSkipReason(code: string): string {
+  const key = `recipe-ingest.queue.clean-skip.${code}`;
+  return i18n.te(key) ? i18n.t(key) : ingestErrorText(code);
+}
+
+/** Adds the cards the question listed, one by one on the server; then says what was added and what was left */
+async function addClean() {
+  const batchId = cleanBatchId.value;
+  const cards = cleanCards.value;
+  if (!batchId || !cards.length) {
+    return;
+  }
+  cleanBusy.value = batchId;
+  try {
+    const { data, error } = await api.recipeIngest.commitClean(batchId, {
+      jobIds: cards.map(card => card.id),
+      draftVersions: cleanVersions,
+    });
+    if (disposed) {
+      return;
+    }
+    if (!data) {
+      // a message the API client showed (a restore running) isn't said again
+      if (!errorMessageOf(error)) {
+        showNotice(batchId, "error", i18n.t("recipe-ingest.queue.add-clean-failed"));
+      }
+    }
+    else {
+      const added = data.committed?.length ?? 0;
+      const skipped = data.skipped ?? [];
+      const names = new Map(cards.map(card => [card.id, cardTitle(card)]));
+      const text = added
+        ? i18n.t("recipe-ingest.queue.added-clean", added)
+        : i18n.t("recipe-ingest.queue.added-clean-none");
+      if (!skipped.length) {
+        showNotice(batchId, "success", text);
+      }
+      else {
+        showNotice(
+          batchId,
+          added ? "warning" : "error",
+          text,
+          i18n.t("recipe-ingest.queue.clean-left", skipped.length),
+          skipped.map(item => i18n.t("recipe-ingest.queue.clean-skipped", {
+            title: names.get(item.jobId) ?? i18n.t("recipe-ingest.queue.untitled"),
+            reason: cleanSkipReason(item.code),
+          })),
+        );
+      }
+    }
+  }
+  finally {
+    cleanBusy.value = null;
+    cleanCards.value = [];
+    cleanBatchId.value = null;
+  }
+  // the list shows what happened: added cards move to Recently added, the others stay
+  const items = await fetchAll({ batchId });
+  if (items && !disposed) {
+    mergeBatch(batchId, items);
+  }
+  void refreshCounts();
+}
+
 function askDiscard(job: Job) {
   discardTarget.value = job;
   discardDialog.value = true;
@@ -631,3 +841,11 @@ async function confirmDiscard() {
   }
 }
 </script>
+
+<style scoped>
+/* a long batch's clean cards scroll inside the question, so its buttons stay on screen */
+.clean-cards {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+</style>

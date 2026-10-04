@@ -1,6 +1,7 @@
 """
-Intake (docs/ai/PHASE2.md §2): turning one card's uploaded images into a job, inside the ingest write lock. Pages are
-normalized into the new job's directory, then one transaction checks for a duplicate, touches the batch (unsealed
+Intake (docs/ai/PHASE2.md §2): turning one card's uploaded files into a job. Each file gives its pages (a multi-page
+TIFF or a PDF several, a PDF's rendered in a child process before the write lock); inside the ingest write lock they
+are normalized into the new job's directory, then one transaction checks for a duplicate, touches the batch (unsealed
 only) and inserts the job with its extraction queued; the dispatcher is woken. The uploaded bytes never reach
 `DATA_DIR`. Used by the upload route and the inbox.
 
@@ -27,7 +28,8 @@ Public interface:
 - `lock_household_intake(session, household_id)`: the household's intake lock, held until the transaction ends.
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
   local providers only or at all, its own local-only setting, its processing jobs (the upload's checks 3 and 4,
-  and the inbox's) and whether the monthly token limits stop a card being read now (the capture page's warning).
+  and the inbox's), whether the monthly token limits stop a card being read now (the capture page's warning), and
+  which optional parts of the read they skip (`limited_features`).
 """
 
 import hashlib
@@ -47,8 +49,9 @@ from mealie.core.root_logger import get_logger
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
-from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
+from mealie.schema.group.ai_providers import AIProviderSlot
 from mealie.schema.recipe_ingest import (
+    IngestLimitedFeature,
     IngestRejectReason,
     IngestSource,
     IngestStatus,
@@ -58,9 +61,7 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services import ocr
 from mealie.services.ai.errors import AIProviderLimitReachedError, AIProviderLocalOnlyError
-from mealie.services.ai.local import is_local_provider
-from mealie.services.ai.policy import ai_call_policy, current_policy
-from mealie.services.ai.routing import AIProviderRouter
+from mealie.services.ai.policy import ai_call_policy
 
 from . import batches, images, limits, storage
 
@@ -235,16 +236,17 @@ class IntakeService:
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
     ) -> IntakeOutcome:
         """
-        Turns one card into a job, holding the ingest write lock from its directory's creation through the insert,
-        and one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one). Each image is normalized into
-        `pages/<n>/`; then one transaction takes the household's intake lock, chooses and touches the batch (choosing
-        again if it was sealed meanwhile), checks for a duplicate (unless allowed), calls `confirm` (the inbox checks
-        that its claimed file is still there) and inserts the job, `processing` with its extraction queued. The
-        dispatcher is woken.
+        Turns one card into a job, holding one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one),
+        and the ingest write lock from its directory's creation through the insert. Each file gives its pages first
+        (`images.expand_document`: a multi-page TIFF or a PDF fills several, at most `MAX_PAGES_PER_CARD` in all);
+        then each page is normalized into `pages/<n>/`, and one transaction takes the household's intake lock,
+        chooses and touches the batch (choosing again if it was sealed meanwhile), checks for a duplicate (unless
+        allowed), calls `confirm` (the inbox checks that its claimed file is still there) and inserts the job,
+        `processing` with its extraction queued. The dispatcher is woken.
 
-        A rejected image or a duplicate is an `IntakeRejected`, and leaves nothing on disk. Raises `IngestPaused`
-        (nothing written) while a restore pauses ingestion, `NoEntryFound` for an unknown batch and `ClaimLost` when
-        `confirm` says no. Blocking: call it from a worker thread.
+        A rejected file or a duplicate is an `IntakeRejected` (naming the file), and leaves nothing on disk. Raises
+        `IngestPaused` (nothing written) while a restore pauses ingestion, `NoEntryFound` for an unknown batch and
+        `ClaimLost` when `confirm` says no. Blocking: call it from a worker thread.
         """
         if not card.pages:
             raise ValueError("A card needs at least one page")
@@ -255,20 +257,49 @@ class IntakeService:
             )
 
         job_id = uuid4()
+        accepted = False
         # the slot first: a restore waiting for the write lock never waits for a card that's waiting for a slot
-        with _intake_slots, storage.ingest_write():
-            accepted = False
+        with _intake_slots:
+            # a PDF's pages are rendered before the write lock, which a restore may be waiting for
+            expanded = self._expand(card)
+            if isinstance(expanded, IntakeRejected):
+                return expanded
             try:
-                storage.create_job_dir(self.group_id, job_id, len(card.pages))
-                outcome = self._normalize_and_insert(job_id, card, options, confirm)
-                accepted = isinstance(outcome, IntakeAccepted)
+                with storage.ingest_write():
+                    try:
+                        storage.create_job_dir(self.group_id, job_id, len(expanded))
+                        outcome = self._normalize_and_insert(job_id, card, expanded, options, confirm)
+                        accepted = isinstance(outcome, IntakeAccepted)
+                    finally:
+                        if not accepted:
+                            self._remove_job_dir(job_id)
             finally:
-                if not accepted:
-                    self._remove_job_dir(job_id)
+                images.close_pages(page for _, page in expanded)
 
         if accepted:
             _wake_dispatcher()
         return outcome
+
+    @staticmethod
+    def _expand(card: IntakeCard) -> list[tuple[IntakePage, images.DocumentPage]] | IntakeRejected:
+        """
+        The card's pages in order, each uploaded file's own (`images.expand_document`: a multi-page TIFF or a PDF
+        gives several), with the file each came from; or the rejection of the first file that can't be used, or that
+        takes the card over `MAX_PAGES_PER_CARD` pages
+        """
+        expanded: list[tuple[IntakePage, images.DocumentPage]] = []
+        try:
+            for upload in card.pages:
+                expanded += [(upload, page) for page in images.expand_document(upload.file)]
+                if len(expanded) > limits.MAX_PAGES_PER_CARD:
+                    raise images.PageRejected(IngestRejectReason.too_many_pages)
+        except images.PageRejected as e:
+            images.close_pages(page for _, page in expanded)
+            return IntakeRejected(upload.index, images.sanitize_filename(upload.filename), e.reason)
+        except BaseException:
+            images.close_pages(page for _, page in expanded)
+            raise
+        return expanded
 
     def _remove_job_dir(self, job_id: UUID) -> None:
         try:
@@ -278,19 +309,24 @@ class IntakeService:
             logger.exception(f"Couldn't remove the directory of recipe card job {job_id} after intake")
 
     def _normalize_and_insert(
-        self, job_id: UUID, card: IntakeCard, options: IntakeOptions, confirm: Callable[[], bool] | None
+        self,
+        job_id: UUID,
+        card: IntakeCard,
+        expanded: list[tuple[IntakePage, images.DocumentPage]],
+        options: IntakeOptions,
+        confirm: Callable[[], bool] | None,
     ) -> IntakeOutcome:
         metas: list[PageMeta] = []
-        for number, page in enumerate(card.pages):
+        for number, (upload, page) in enumerate(expanded):
             try:
-                meta = images.normalize_page(
-                    page.file,
+                meta = images.normalize_document_page(
+                    page,
                     storage.page_dir(self.group_id, job_id, number),
                     number,
-                    original_filename=page.filename,
+                    original_filename=images.page_filename(upload.filename, page.number),
                 )
             except images.PageRejected as e:
-                return IntakeRejected(page.index, images.sanitize_filename(page.filename), e.reason)
+                return IntakeRejected(upload.index, images.sanitize_filename(upload.filename), e.reason)
             metas.append(meta)
         return self._insert(job_id, card, metas, options, confirm)
 
@@ -424,41 +460,30 @@ class ReadingReadiness:
     card read now fails `limit_reached`. Uploads are still accepted (the limit may reset before the card is read);
     the capture page warns.
     """
-
-
-class _EveryProvider(AIProviderRouter):
-    """A slot's providers in the router's order, whatever their monthly token limits"""
-
-    def _within_limits(self, providers: list[AIProviderOut]) -> list[AIProviderOut]:
-        return providers
+    limited_features: tuple[IngestLimitedFeature, ...] = ()
+    """
+    Cards are read, but an optional part of reading them is skipped because, under the group's policy, every provider
+    it needs is over its monthly token limit: tag, category and tool `suggestions` (the fast slot, when the group has
+    any to suggest) and the `cross_read` (the image slot, when the group reads every card twice and OCR does the main
+    read). Empty whenever `limit_reached`, which stops the whole read.
+    """
 
 
 def _slot_usable(service: OpenAIService, slot: AIProviderSlot, over_limit: set[AIProviderSlot] | None = None) -> bool:
     """
     Whether `slot` has a provider a card may use under the current policy. A slot whose providers are all over their
-    monthly limit is added to `over_limit`.
+    monthly limit counts as usable (a card read later fails `limit_reached` if it still is) and is added to
+    `over_limit`. Under "local only" that's about the local providers: the policy drops the others first.
     """
     from mealie.services.openai import OpenAINotEnabledException
 
     try:
         return bool(service.runtime.candidates(slot))
-    except AIProviderLimitReachedError, AIProviderLocalOnlyError:
-        # set up, just over this month's limit: a card read later fails `limit_reached` if it still is. The router
-        # drops providers over their limit before the policy filters, so under "local only" that holds only if a
-        # provider is local, and local ones all over their limit raise LocalOnly when a cloud fallback is left.
-        if current_policy().local_only:
-            primaries = {
-                AIProviderSlot.default: service.default_provider,
-                AIProviderSlot.image: service.image_provider,
-                AIProviderSlot.audio: service.audio_provider,
-            }
-            every = _EveryProvider(service.repos, primaries).candidates(slot)
-            if not any(is_local_provider(provider) for provider in every):
-                return False
+    except AIProviderLimitReachedError:
         if over_limit is not None:
             over_limit.add(slot)
         return True
-    except OpenAINotEnabledException:
+    except AIProviderLocalOnlyError, OpenAINotEnabledException:
         return False
 
 
@@ -479,12 +504,37 @@ def _limit_reached(over_limit: set[AIProviderSlot]) -> bool:
     return AIProviderSlot.image in over_limit and not ocr.is_available()
 
 
+def _limited_features(
+    session: Session, group_id: UUID, service: OpenAIService, *, local_only: bool, over_limit: set[AIProviderSlot]
+) -> tuple[IngestLimitedFeature, ...]:
+    """
+    The optional parts of a card's read that its providers' monthly limits skip (`ReadingReadiness.limited_features`),
+    when the main read itself still works. Asked of the group's options only when a slot is over its limit.
+    """
+    from .pipeline import options_for_group  # imported here: heavy, and only a group over a limit needs it
+
+    limited: list[IngestLimitedFeature] = []
+    fast_over: set[AIProviderSlot] = set()
+    with ai_call_policy(local_only=local_only):
+        _slot_usable(service, AIProviderSlot.fast, fast_over)  # without its own providers, the default slot's
+    image_over = AIProviderSlot.image in over_limit
+    if not (fast_over or image_over):
+        return ()
+
+    options = options_for_group(session, group_id)
+    if fast_over and options.suggest_organizers:
+        limited.append(IngestLimitedFeature.suggestions)
+    if image_over and options.cross_read:
+        limited.append(IngestLimitedFeature.cross_read)  # OCR reads the card; the second reading needs the image slot
+    return tuple(limited)
+
+
 def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> ReadingReadiness:
     """
     Whether the group can read cards at all and with local providers only, its local-only setting and its processing
     jobs. Blocking (provider settings, address lookups for "local", a count): call it from a worker thread. A monthly
     token limit doesn't count as "can't read": the card fails `limit_reached` when it's read, if it still applies, and
-    `limit_reached` says so beforehand.
+    `limit_reached` says so beforehand; `limited_features` names the optional parts it skips.
     """
     from mealie.services.openai import OpenAIService
 
@@ -497,14 +547,21 @@ def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> R
     over_limit: set[AIProviderSlot] = set()
     can_read = _can_read(service, local_only=False, over_limit=None if group_local_only else over_limit)
     local_ready = can_read and _can_read(service, local_only=True, over_limit=over_limit if group_local_only else None)
+    readable = local_ready if group_local_only else can_read
+    limit_reached = readable and _limit_reached(over_limit)
+    limited = (
+        _limited_features(session, group_id, service, local_only=group_local_only, over_limit=over_limit)
+        if readable and not limit_reached
+        else ()
+    )
     if session.in_transaction():
         session.commit()  # no transaction stays open while the body streams in
 
-    readable = local_ready if group_local_only else can_read
     return ReadingReadiness(
         can_read=can_read,
         local_ready=local_ready,
         group_local_only=group_local_only,
         processing=processing,
-        limit_reached=readable and _limit_reached(over_limit),
+        limit_reached=limit_reached,
+        limited_features=limited,
     )

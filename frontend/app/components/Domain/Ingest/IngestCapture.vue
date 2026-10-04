@@ -239,7 +239,15 @@ const {
   removeDraft,
   uploadDrafts,
   done,
+  keepBatchOpen,
 } = useRecipeIngestUploads();
+
+// a pause in the stack (a phone call, sorting cards) doesn't end the batch while this page is shown
+let releaseBatch: (() => void) | null = null;
+onMounted(() => {
+  releaseBatch = keepBatchOpen();
+});
+onBeforeUnmount(() => releaseBatch?.());
 
 const cameraInput = ref<HTMLInputElement | null>(null);
 const chooseInput = ref<HTMLInputElement | null>(null);

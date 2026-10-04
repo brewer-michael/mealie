@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from mealie.core import exceptions
-from mealie.core.config import get_app_dirs
+from mealie.core.config import get_app_dirs, get_app_settings
 from mealie.db.models.group.ai_routing import AIUsageLog
 from mealie.db.models.recipe import Category, IngredientFoodModel, IngredientUnitModel, RecipeModel, Tag, Tool
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
@@ -35,7 +35,7 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services import ocr
 from mealie.services.ai import runtime as ai_runtime
-from mealie.services.ai.errors import AIProviderLocalOnlyError
+from mealie.services.ai.errors import AIProviderLimitReachedError, AIProviderLocalOnlyError
 from mealie.services.ai.ingest.pipeline import CardPipelineOptions, extract_card, options_for_group
 from mealie.services.ai.ingest.pipeline.compilers import (
     CapturedError,
@@ -267,7 +267,7 @@ async def test_markers_survive_the_cleaner(
     assert {
         (CardFlagKind.illegible, "ingredients", str(flour.reference_id)),
         (CardFlagKind.blank, "steps", str(draft.steps[0].id)),
-        (CardFlagKind.illegible, "notes", "0"),
+        (CardFlagKind.illegible, "notes", str(draft.notes[0].id)),  # keyed to the note's id, like a step's
     } <= targets
 
 
@@ -409,6 +409,37 @@ async def test_no_reader_at_all_is_ai_not_enabled(
     with pytest.raises(OpenAINotEnabledException):
         await _extract(user, make_pages(tmp_path), CardPipelineOptions(suggest_organizers=False))
     assert fake.calls == []
+
+
+@pytest.fixture()
+def ocr_off(monkeypatch: pytest.MonkeyPatch):
+    """`OCR_ENABLED=false`: no OCR fallback reader (orientation has its own switch, `AI_INGEST_ORIENT`)"""
+    monkeypatch.setenv("OCR_ENABLED", "false")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_ocr_off_means_no_ocr_fallback_even_with_the_orientation_text(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ocr_off: None
+):
+    """Orientation stores what Tesseract read even with OCR off; the fallback reader still never uses it"""
+    user = unique_user_fn_scoped
+    configure(user, default=create_provider(user, "Text"))  # no image provider
+    fake = FakeCardAI(banana_answers()).install(monkeypatch)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)
+    pages = make_pages(tmp_path, ocr_text="Banana Mug Cake\n1 T. coconut oil")
+
+    with pytest.raises(OpenAINotEnabledException):
+        await _extract(user, pages, CardPipelineOptions(suggest_organizers=False))
+    assert fake.calls == []
+
+    # the same card with OCR on is read from that text
+    monkeypatch.setenv("OCR_ENABLED", "true")
+    get_app_settings.cache_clear()
+    result = await _extract(user, pages, CardPipelineOptions(suggest_organizers=False))
+    assert result.extraction.read_path == IngestReadPath.ocr
 
 
 @pytest.mark.asyncio
@@ -587,6 +618,69 @@ async def test_no_organizer_call_for_a_group_without_organizers(
     assert "OpenAIOrganizers" not in fake.schemas()
     assert (result.draft.tags, result.draft.categories, result.draft.tools) == ([], [], [])
     assert "resolve-organizers" not in result.extraction.step_outcomes
+
+
+def _organizers_skipped(result) -> list[tuple[str, dict]]:
+    return [(flag.field, flag.params) for flag in result.flags if flag.kind == CardFlagKind.organizers_skipped]
+
+
+@pytest.mark.asyncio
+async def test_tag_suggestions_that_fail_are_said_on_the_card(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    user = unique_user_fn_scoped
+    _vision_and_text(user)
+    user.repos.tags.create(TagSave(name="Dessert", group_id=user.repos.group_id))
+    fake = FakeCardAI(banana_answers(), failures={("Text", "OpenAIOrganizers"): provider_failure()}).install(
+        monkeypatch
+    )
+
+    result = await _extract(user, make_pages(tmp_path / "failed"), CardPipelineOptions())
+
+    assert result.extraction.step_outcomes["resolve-organizers"] == "failed"
+    assert _organizers_skipped(result) == [("card", {"reason": "failed"})]
+    assert result.draft.tags == []
+
+    # suggestions made: nothing to say
+    fake.failures.clear()
+    result = await _extract(user, make_pages(tmp_path / "made"), CardPipelineOptions())
+    assert result.extraction.step_outcomes["resolve-organizers"] == "completed"
+    assert _organizers_skipped(result) == []
+    assert [tag.name for tag in result.draft.tags] == ["Dessert"]
+
+
+@pytest.mark.asyncio
+async def test_tag_suggestions_no_provider_may_make_are_skipped_and_said(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """A local-only card whose fast slot is all cloud, or every fast provider over its monthly limit: no failure"""
+    user = unique_user_fn_scoped
+    local_vision = create_provider(user, "Ollama vision", base_url="http://192.168.1.20:11434/v1", runs_locally=True)
+    local_text = create_provider(user, "Ollama", base_url="http://192.168.1.20:11434/v1", runs_locally=True)
+    cloud_fast = create_provider(user, "Cloud fast")
+    configure(user, image=local_vision, default=local_text, routes={AIProviderSlot.fast: [cloud_fast]})
+    user.repos.tags.create(TagSave(name="Dessert", group_id=user.repos.group_id))
+    fake = FakeCardAI(banana_answers()).install(monkeypatch)
+
+    with ai_call_policy(local_only=True), caplog.at_level(logging.INFO):
+        result = await _extract(user, make_pages(tmp_path / "local"), CardPipelineOptions())
+
+    assert "Cloud fast" not in {call.provider for call in fake.calls}
+    assert result.extraction.step_outcomes["resolve-organizers"] == "skipped:local_only"
+    assert _organizers_skipped(result) == [("card", {"reason": "local_only"})]
+    assert not [record for record in caplog.records if record.exc_info]  # not logged as a failure
+
+    real_candidates = JobAIRuntime.candidates
+
+    def over_limit(self: JobAIRuntime, slot: AIProviderSlot):
+        if slot == AIProviderSlot.fast:
+            raise AIProviderLimitReachedError("Every provider for this task has reached its monthly token limit")
+        return real_candidates(self, slot)
+
+    monkeypatch.setattr(JobAIRuntime, "candidates", over_limit)
+    result = await _extract(user, make_pages(tmp_path / "limit"), CardPipelineOptions())
+    assert result.extraction.step_outcomes["resolve-organizers"] == "skipped:limit_reached"
+    assert _organizers_skipped(result) == [("card", {"reason": "limit_reached"})]
 
 
 def test_options_follow_the_group_settings(unique_user_fn_scoped: TestUser):

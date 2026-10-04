@@ -2,22 +2,23 @@
 The flags that say what to check on a card (docs/ai/PHASE2.md §4.6). `compute_flags` is pure, and the server runs it
 after extraction and on every save, so the flags always describe the current draft.
 
-**Ids and fields.** A flag is keyed to a field plus the ingredient's `reference_id` or the step's `id` (never an
-index, F4), with the stable id `"<kind>:<field>:<ref>"` (`ref` empty for single fields and the card). Fields are the
-draft's JSON names: `name`, `description`, `recipeYield`, `recipeServings`, `prepTime`, `performTime`, `totalTime`,
-`attribution`, `ingredients`, `steps`, `notes` and `card` for the card-level flags. Notes have no id, so their `ref`
-is the note's position, and their flag ids add a digest of the note (`"<kind>:notes:<position>#<digest>"`): a
-resolution stored by id then never moves to another note when one above it is deleted or the notes are reordered.
+**Ids and fields.** A flag is keyed to a field plus the ingredient's `reference_id`, the step's `id` or the note's
+`id` (never an index, F4), with the stable id `"<kind>:<field>:<ref>"` (`ref` empty for single fields and the card).
+Fields are the draft's JSON names: `name`, `description`, `recipeYield`, `recipeServings`, `prepTime`, `performTime`,
+`totalTime`, `attribution`, `ingredients`, `steps`, `notes` and `card` for the card-level flags. A resolution stored
+by id stays with its item when it's edited or moved, and never moves to another. Flags stored before notes had ids
+were keyed to the note's position and a digest of what it says (`"<kind>:notes:<position>#<digest>"`): their
+resolutions still apply to the note at that position saying that, and their reading flags find the note saying it.
 
 **Three kinds of flags.**
 - *Content flags* follow the draft as it is now, edits included: markers, `missing_name`, `implausible_*`,
-  `empty_section`, `new_food`, `new_unit` and the card-level `read_by_ocr`, `cross_read_failed`, `not_parsed`.
-- *Parse flags* (`check_parse`, `unit_unclear`, `shorthand_read`) describe the parser's reading of a line, so they
-  drop off once the line is edited: each ingredient keeps an `extracted_hash` of its parsed fields.
+  `empty_section`, `new_food`, `new_unit` and the card-level `read_by_ocr`, `cross_read_failed`, `not_parsed`,
+  `organizers_skipped`.
+- *Parse flags* (`check_parse`, `unit_unclear`, `shorthand_read`, `linked_fuzzy`) describe the parser's reading of a
+  line, so they drop off once the line is edited: each ingredient keeps an `extracted_hash` of its parsed fields.
 - *Reading flags* compare the draft with what was read: `unsure`, `not_on_card`, `marker_dropped`, and the cross-read's
   `read_disagreement` and `blank`. Typing a number into a blank must not raise them, so on a save (`previous` given)
-  a reading flag is kept only where it was raised before and still holds; only an extraction raises new ones. A
-  note's is found again by its digest wherever the note moved, and comes back unresolved.
+  a reading flag is kept only where it was raised before and still holds; only an extraction raises new ones.
 
 **Alternatives.** `unsure` alternatives replace `params.text` (the uncertain words) in the line; `implausible_amount`'s
 replace `params.value`; `read_disagreement`'s single alternative is the second reading's whole line (`params.text`).
@@ -33,13 +34,16 @@ import hashlib
 import json
 import math
 import re
+import string
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from uuid import UUID
 
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
+from text_unidecode import unidecode
 
 from mealie.schema.recipe_ingest import (
     CardDraft,
@@ -106,7 +110,9 @@ READING_KINDS = frozenset(
 )
 """Flags that compare the draft with what was read; a cross-read `blank` is one too (see the module docstring)"""
 
-PARSE_KINDS = frozenset({CardFlagKind.check_parse, CardFlagKind.unit_unclear, CardFlagKind.shorthand_read})
+PARSE_KINDS = frozenset(
+    {CardFlagKind.check_parse, CardFlagKind.unit_unclear, CardFlagKind.shorthand_read, CardFlagKind.linked_fuzzy}
+)
 """Flags about the parser's reading of a line, which drop off once the line is edited"""
 
 UNSURE_MIN_SCORE = 85
@@ -201,6 +207,7 @@ _SEVERITY = {
     CardFlagKind.read_disagreement: CardFlagSeverity.warning,
     CardFlagKind.check_parse: CardFlagSeverity.warning,
     CardFlagKind.unit_unclear: CardFlagSeverity.warning,
+    CardFlagKind.linked_fuzzy: CardFlagSeverity.warning,
     CardFlagKind.implausible_amount: CardFlagSeverity.warning,
     CardFlagKind.implausible_temperature: CardFlagSeverity.warning,
     CardFlagKind.empty_section: CardFlagSeverity.warning,
@@ -208,9 +215,36 @@ _SEVERITY = {
     CardFlagKind.cross_read_failed: CardFlagSeverity.info,
     CardFlagKind.shorthand_read: CardFlagSeverity.info,
     CardFlagKind.not_parsed: CardFlagSeverity.info,
+    CardFlagKind.organizers_skipped: CardFlagSeverity.info,
     CardFlagKind.new_food: CardFlagSeverity.info,
     CardFlagKind.new_unit: CardFlagSeverity.info,
 }
+
+
+ORGANIZERS_STEP = "resolve-organizers"
+"""Upstream's organizer step (`ResolveOrganizersStep.name`), by which `ExtractionMeta.step_outcomes` names it"""
+ORGANIZERS_SKIPPED_REASONS = ("local_only", "limit_reached")
+"""Why the organizer step asked no provider: no local one for a local-only card, or all over their monthly limit"""
+
+
+def organizers_outcome(reason: str) -> str:
+    """The organizer step's outcome when it asked no provider (`ORGANIZERS_SKIPPED_REASONS`): `"skipped:<reason>"`"""
+    return f"skipped:{reason}"
+
+
+def organizers_skipped(extraction: ExtractionMeta | None) -> str | None:
+    """
+    Why the card got no tag, category or tool suggestions, from its organizer step's outcome: `local_only` or
+    `limit_reached` (`organizers_outcome`), or `failed`. None when they were made, or weren't asked for (a group
+    without organizers, or suggestions turned off: the step didn't run or was plainly `skipped`).
+    """
+    outcome = extraction.step_outcomes.get(ORGANIZERS_STEP) if extraction else None
+    if outcome == "failed":
+        return "failed"
+    kind, _, reason = (outcome or "").partition(":")
+    if kind == "skipped" and reason in ORGANIZERS_SKIPPED_REASONS:
+        return reason
+    return None
 
 
 def flag_id(kind: CardFlagKind, field: str, ref: str | None = None) -> str:
@@ -290,8 +324,21 @@ class _Target:
     """Where its markers can be"""
     ingredient: CardDraftIngredient | None = None
     is_step: bool = False
-    id_ref: str | None = None
-    """What its flag ids are keyed to, when that isn't `ref` (a note's position and digest)"""
+    legacy_ref: str | None = None
+    """A note's position and digest: what flags stored before notes had ids were keyed to (`_legacy_note_ref`)"""
+
+
+_LEGACY_NOTE_REF = re.compile(rf"^{FIELD_NOTES}:\d+#(?P<digest>[0-9a-f]{{8}})$")
+"""The end of a note flag's id stored before notes had ids: `"notes:<position>#<digest>"`"""
+
+
+def _legacy_note_ref(index: int, title: str, text: str) -> str:
+    """
+    What a note's flags were keyed to before notes had ids: its position and a digest of its title and text
+    (`"<position>#<digest>"`)
+    """
+    digest = hashlib.sha256(json.dumps([title, text], ensure_ascii=False).encode()).hexdigest()[:8]
+    return f"{index}#{digest}"
 
 
 def _targets(draft: CardDraft) -> list[_Target]:
@@ -326,9 +373,14 @@ def _targets(draft: CardDraft) -> list[_Target]:
         targets.append(_Target(FIELD_STEPS, str(step.id), step.text, [text for text in texts if text], is_step=True))
     for index, note in enumerate(draft.notes):
         texts = [note.title, note.text]
-        digest = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode()).hexdigest()[:8]
         targets.append(
-            _Target(FIELD_NOTES, str(index), note.text, [text for text in texts if text], id_ref=f"{index}#{digest}")
+            _Target(
+                FIELD_NOTES,
+                str(note.id),
+                note.text,
+                [text for text in texts if text],
+                legacy_ref=_legacy_note_ref(index, note.title, note.text),
+            )
         )
 
     single(FIELD_ATTRIBUTION)
@@ -385,6 +437,9 @@ def _card_flags(flags: _Flags, draft: CardDraft, extraction: ExtractionMeta | No
     if not is_english(extraction.language) and any(_kept_as_text(line) for line in draft.ingredients):
         # the AI parser parses such a card's lines; the flag says when some stayed as text (it failed, or wasn't set)
         flags.add(CardFlagKind.not_parsed, FIELD_CARD, source=CardFlagSource.parser, params={})
+    if reason := organizers_skipped(extraction):
+        # so the reviewer knows why there are no suggestions, rather than seeing none
+        flags.add(CardFlagKind.organizers_skipped, FIELD_CARD, source=CardFlagSource.model, params={"reason": reason})
 
 
 def _kept_as_text(ingredient: CardDraftIngredient) -> bool:
@@ -409,7 +464,6 @@ def _marker_flags(flags: _Flags, target: _Target) -> None:
             target.ref,
             source=CardFlagSource.marker,
             params=_position(found.span()) if found else None,
-            id_ref=target.id_ref,
         )
 
 
@@ -681,7 +735,105 @@ def _looks_like_unit(token: str, dot: bool, units: Collection[str]) -> bool:
     )
 
 
-def _ingredient_flags(flags: _Flags, target: _Target, *, units: Collection[str], english: bool) -> None:
+# ==========================================
+# Links that aren't an exact name match
+
+LINK_SPAN_MIN_SCORE = 60
+"""A `linked_fuzzy` flag points at the part of the line its linked name matches best, if it scores this much"""
+UNIT_LINK_ID_SUFFIX = "#unit"
+"""Added to the id of a unit's `linked_fuzzy` flag, so it stands beside the food's on the same line"""
+
+_LINK_SEPARATORS = str.maketrans(dict.fromkeys(string.punctuation + "‘’“”", " "))
+
+
+def _link_words(text: str) -> list[str]:
+    """
+    `text` as linked names are compared: ASCII and lower case, as the matcher's `normalize` makes it, and split into
+    words at spaces and punctuation (apostrophes too: "confectioners' sugar" is "confectioners sugar")
+    """
+    return unidecode(text).translate(_LINK_SEPARATORS).lower().split()
+
+
+def _inflections(word: str) -> set[str]:
+    """A word and its simple English plurals ("onions", "tomatoes", "berries", "leaves")"""
+    forms = {word, f"{word}s", f"{word}es"}
+    if word.endswith("y"):
+        forms.add(f"{word[:-1]}ies")
+    if word.endswith("f"):
+        forms.add(f"{word[:-1]}ves")
+    if word.endswith("fe"):
+        forms.add(f"{word[:-2]}ves")
+    return forms
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Whether two words are the same but for a simple plural, either way round ("egg" on the line "2 eggs")"""
+    return a == b or b in _inflections(a) or a in _inflections(b)
+
+
+def _named_on_line(names: Iterable[str], lines: Iterable[list[str]]) -> bool:
+    """Whether one of `names` is on one of the `lines` (`_link_words` each) as a run of whole words"""
+    for name in names:
+        words = _link_words(name)
+        if not words:
+            continue
+        for line in lines:
+            for start in range(len(line) - len(words) + 1):
+                if all(_same_word(word, line[start + offset]) for offset, word in enumerate(words)):
+                    return True
+    return False
+
+
+def _fuzzy_links(
+    ingredient: CardDraftIngredient, linked: Mapping[UUID, Collection[str]], *, english: bool
+) -> list[tuple[str, str]]:
+    """
+    The food and unit the line links that none of their names is on: `("food" | "unit", the linked name)`. A linked
+    item goes by its name, plural and aliases (a unit by its abbreviations too, `linked`); the line is read as written
+    and, on an English card, with its shorthand written out ("1 T. sugar" says "tbsp"). An id `linked` doesn't hold
+    (no longer the group's) isn't judged.
+    """
+    line = ingredient.original_text
+    lines = [_link_words(line)]
+    if english:
+        lines.append(_link_words(prepare_line(line).text))
+
+    fuzzy: list[tuple[str, str]] = []
+    for kind, ref in (("food", ingredient.food), ("unit", ingredient.unit)):
+        if ref is None or ref.id is None or not ref.name.strip():
+            continue
+        names = linked.get(ref.id)
+        if names is not None and not _named_on_line([ref.name, *names], lines):
+            fuzzy.append((kind, ref.name))
+    return fuzzy
+
+
+def _link_span(name: str, line: str) -> tuple[int, int] | None:
+    """
+    Where on the line the words a linked name was matched from probably are ("rd onions" for "red onion"): the part
+    of the line most like the name, widened to whole words
+    """
+    alignment = fuzz.partial_ratio_alignment(name.lower(), line.lower())
+    if alignment is None or alignment.score < LINK_SPAN_MIN_SCORE or alignment.dest_end <= alignment.dest_start:
+        return None
+    start, end = stripped_span(line, (alignment.dest_start, alignment.dest_end))
+    if start >= end:
+        return None
+    while start > 0 and line[start].isalnum() and line[start - 1].isalnum():
+        start -= 1
+    while end < len(line) and line[end - 1].isalnum() and line[end].isalnum():
+        end += 1
+    return start, end
+
+
+def _ingredient_flags(
+    flags: _Flags,
+    target: _Target,
+    *,
+    units: Collection[str],
+    english: bool,
+    linked: Mapping[UUID, Collection[str]] | None = None,
+) -> None:
     ingredient = target.ingredient
     assert ingredient is not None
     field, ref = target.field, target.ref
@@ -727,6 +879,21 @@ def _ingredient_flags(flags: _Flags, target: _Target, *, units: Collection[str],
                     source=CardFlagSource.parser,
                     params={"token": token + dot, "start": lead.start("token"), "end": lead.end()},
                 )
+
+        # a food or unit the matcher linked by a near-miss name ("2 rd onions" -> "red onion"); a unit's flag gets an
+        # id of its own, so both can stand on one line
+        for kind, name in _fuzzy_links(ingredient, linked, english=english) if linked is not None else []:
+            params = {"name": name, "kind": kind}
+            if span := _link_span(name, ingredient.original_text):
+                params.update(_position(span))
+            flags.add(
+                CardFlagKind.linked_fuzzy,
+                field,
+                ref,
+                source=CardFlagSource.parser,
+                params=params,
+                id_ref=f"{ref}{UNIT_LINK_ID_SUFFIX}" if kind == "unit" else None,
+            )
 
     # what the line says now
     if ingredient.quantity and ingredient.unit and ingredient.quantity > MAX_PLAIN_AMOUNT:
@@ -942,7 +1109,7 @@ def _ocr_flags(flags: _Flags, target: _Target, lines: Sequence[str], after: int)
             source=CardFlagSource.ocr,
             params={"text": aligned, "value": mine.text, "read": theirs.text, "start": start, "end": end},
             alternatives=[target.text[:start] + theirs.text + target.text[end:]],
-            id_ref=f"{target.id_ref or target.ref}{OCR_ID_SUFFIX}",
+            id_ref=f"{target.ref}{OCR_ID_SUFFIX}",
         )
         break
     return index
@@ -973,7 +1140,6 @@ def _reading_flags(
                 source=CardFlagSource.model,
                 params={"text": entry.text, "reason": entry.reason, **(_position(span) if span else {})},
                 alternatives=entry.alternatives,
-                id_ref=target.id_ref,
             )
         if on_card is not None and target.field in (
             FIELD_INGREDIENTS,
@@ -1014,14 +1180,28 @@ def _is_reading_flag(flag: CardFlag) -> bool:
     return flag.kind in READING_KINDS or (flag.kind == CardFlagKind.blank and flag.source == CardFlagSource.cross_read)
 
 
-def _reading_key(flag: CardFlag) -> tuple[str, ...]:
+def _reading_key(flag: CardFlag, notes_by_digest: Mapping[str, str]) -> tuple[str, str]:
     """
-    What a reading flag raised before is matched by on a save: its id, but for a note its digest without the position,
-    so a note's flag stays raised when a note above it is deleted (its resolution, stored by id, doesn't follow it)
+    What a reading flag raised before is matched by on a save: its id and source. A note's flag stored before notes
+    had ids (`"<kind>:notes:<position>#<digest>"`) is matched as the flag of the note that says the same now, wherever
+    it is (`notes_by_digest`: a note's id by its digest).
     """
-    if flag.field == FIELD_NOTES and "#" in flag.id:
-        return (flag.kind.value, FIELD_NOTES, flag.id.rpartition("#")[2], flag.source.value)
-    return (flag.id, flag.source.value)
+    if flag.field == FIELD_NOTES and (legacy := _LEGACY_NOTE_REF.match(flag.id.removeprefix(f"{flag.kind.value}:"))):
+        note_id = notes_by_digest.get(legacy.group("digest"))
+        if note_id is not None:
+            return flag_id(flag.kind, FIELD_NOTES, note_id), flag.source.value
+    return flag.id, flag.source.value
+
+
+def _legacy_note_ids(flag: CardFlag, targets: Sequence[_Target]) -> str | None:
+    """The id a note's flag had before notes had ids (`_legacy_note_ref`), for the resolutions stored then"""
+    if flag.field != FIELD_NOTES or not flag.ref:
+        return None
+    target = next((target for target in targets if target.field == FIELD_NOTES and target.ref == flag.ref), None)
+    if target is None or target.legacy_ref is None:
+        return None
+    suffix = flag.id.removeprefix(flag_id(flag.kind, FIELD_NOTES, flag.ref))  # an OCR check's, if any
+    return flag_id(flag.kind, FIELD_NOTES, target.legacy_ref) + suffix
 
 
 def _carried_over(flag: CardFlag, targets: Sequence[_Target]) -> CardFlag | None:
@@ -1064,6 +1244,7 @@ def compute_flags(
     previous: Sequence[CardFlag] | None = None,
     units: Iterable[str] = (),
     ocr_lines: Sequence[str] | None = None,
+    linked: Mapping[UUID, Collection[str]] | None = None,
 ) -> list[CardFlag]:
     """
     Every flag the draft raises, in reading order (the card's own flags first), keyed `"<kind>:<field>:<ref>"`, with
@@ -1078,6 +1259,10 @@ def compute_flags(
     that is one of them is a lost unit, `unit_unclear`), and `ocr_lines` (`ocr_check_lines`) for a printed card's
     OCR check. A save passes neither: the flags they raised are kept from `previous` while they still hold (a
     `unit_unclear` while its line is as extracted).
+
+    `linked` holds every name of the group's foods and units the draft links, by id (`IngestMatcher.linked_names`):
+    a line still as parsed whose food or unit none of them is on gets `linked_fuzzy`. Without it, `linked_fuzzy`
+    flags are kept from `previous` while their lines are as extracted.
     """
     targets = _targets(draft)
     flags = _Flags()
@@ -1091,15 +1276,21 @@ def compute_flags(
     for target in targets:
         _marker_flags(flags, target)
         if target.ingredient is not None:
-            _ingredient_flags(flags, target, units=unit_names, english=english)
+            _ingredient_flags(flags, target, units=unit_names, english=english, linked=linked)
         if target.is_step:
             _temperature_flags(flags, target)
 
     if previous is not None:
-        # a lost unit judged by the group's units at extraction: kept while its line is as the parser read it
+        # a lost unit judged by the group's units at extraction, or a link judged by the linked names when they aren't
+        # at hand: kept while its line is as the parser read it
+        kept_kinds = (
+            {CardFlagKind.unit_unclear}
+            if linked is not None
+            else {CardFlagKind.unit_unclear, CardFlagKind.linked_fuzzy}
+        )
         unedited = {target.ref for target in targets if target.ingredient and is_unedited(target.ingredient)}
         for flag in previous:
-            if flag.kind == CardFlagKind.unit_unclear and flag.id not in flags.flags and flag.ref in unedited:
+            if flag.kind in kept_kinds and flag.id not in flags.flags and flag.ref in unedited:
                 flags.flags[flag.id] = flag.model_copy(update={"resolution": None}, deep=True)
 
     if not any(ingredient_line(ingredient).strip() for ingredient in draft.ingredients):
@@ -1119,8 +1310,13 @@ def compute_flags(
     if previous is None:
         reading_flags = list(reading.flags.values())
     else:
-        before = {_reading_key(flag): flag for flag in previous if _is_reading_flag(flag)}
-        reading_flags = [flag for flag in reading.flags.values() if _reading_key(flag) in before]
+        notes_by_digest = {
+            target.legacy_ref.rpartition("#")[2]: target.ref
+            for target in reversed(targets)  # the first note saying it, when two say the same
+            if target.field == FIELD_NOTES and target.legacy_ref and target.ref
+        }
+        before = {_reading_key(flag, notes_by_digest): flag for flag in previous if _is_reading_flag(flag)}
+        reading_flags = [flag for flag in reading.flags.values() if _reading_key(flag, {}) in before]
         for flag in before.values():
             if flag.id in reading.flags:
                 continue
@@ -1135,7 +1331,12 @@ def compute_flags(
         if flag.id not in flags.flags:
             flags.flags[flag.id] = flag
 
-    return [_resolved(flag, resolutions.get(flag.id)) for flag in _in_reading_order(flags.flags.values(), targets)]
+    def resolution(flag: CardFlag) -> FlagResolution | None:
+        if (stored := resolutions.get(flag.id)) is None and (legacy := _legacy_note_ids(flag, targets)):
+            stored = resolutions.get(legacy)  # stored before notes had ids, for the note still there saying that
+        return stored
+
+    return [_resolved(flag, resolution(flag)) for flag in _in_reading_order(flags.flags.values(), targets)]
 
 
 def _in_reading_order(flags: Iterable[CardFlag], targets: Sequence[_Target]) -> list[CardFlag]:

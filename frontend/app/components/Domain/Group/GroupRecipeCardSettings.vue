@@ -157,11 +157,64 @@
               <v-list-item-subtitle class="d-flex align-center flex-wrap ga-2 mt-1">
                 <code>{{ evalCase.slug }}</code>
                 <span>{{ $t("recipe-ingest.eval.pages", evalCase.pageCount ?? 0) }}</span>
-                <v-chip v-if="evalCase.verified" size="x-small" color="success" variant="tonal" class="verified">
-                  {{ $t("recipe-ingest.eval.verified-chip") }}
+                <!-- found from the card when it was saved: shown, not edited -->
+                <v-chip
+                  v-for="tag in foundTags(evalCase)"
+                  :key="tag"
+                  size="x-small"
+                  variant="outlined"
+                  class="found-tag"
+                >
+                  {{ tagText(tag) }}
                 </v-chip>
               </v-list-item-subtitle>
+              <!-- what the reviewer says about the card, and whether they checked the recipe: saved at once -->
+              <div class="d-flex align-center flex-wrap column-gap-4 eval-case-edit">
+                <v-chip-group
+                  :model-value="chosenTags(evalCase)"
+                  multiple
+                  column
+                  selected-class="text-primary"
+                  class="flex-grow-0 eval-tags"
+                  :disabled="updating.has(evalCase.slug)"
+                  @update:model-value="value => setTags(evalCase, value)"
+                >
+                  <v-chip
+                    v-for="tag in EVAL_TAGS"
+                    :key="tag"
+                    :value="tag"
+                    filter
+                    size="small"
+                    variant="outlined"
+                    :class="`eval-tag eval-tag-${tag}`"
+                  >
+                    {{ tagText(tag) }}
+                  </v-chip>
+                </v-chip-group>
+                <v-checkbox
+                  :model-value="!!evalCase.verified"
+                  :label="$t('recipe-ingest.eval.verified-chip')"
+                  :disabled="updating.has(evalCase.slug)"
+                  density="compact"
+                  color="success"
+                  hide-details
+                  class="flex-grow-0 eval-verified"
+                  @update:model-value="value => updateEvalCase(evalCase, { verified: !!value })"
+                />
+              </div>
+              <p v-if="evalCase.notes" class="text-caption text-medium-emphasis eval-case-notes">
+                {{ evalCase.notes }}
+              </p>
               <template #append>
+                <v-btn
+                  :icon="$globals.icons.download"
+                  :aria-label="$t('recipe-ingest.eval.download')"
+                  :loading="downloading === evalCase.slug"
+                  variant="text"
+                  size="small"
+                  class="download-eval-case"
+                  @click="downloadEvalCase(evalCase.slug)"
+                />
                 <v-btn
                   :icon="$globals.icons.delete"
                   :aria-label="$t('recipe-ingest.eval.delete')"
@@ -198,17 +251,29 @@
 import { useUserApi } from "~/composables/api";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useMealieAuth } from "~/composables/use-mealie-auth";
-import { useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
+import {
+  errorMessageOf,
+  errorStatusOf,
+  useRecipeIngestSettings,
+  useRecipeIngestText,
+} from "~/composables/use-recipe-ingest";
 import { alert } from "~/composables/use-toast";
-import type { EvalCaseSummary, RecipeIngestionSettingsUpdate } from "~/lib/api/types/recipe-ingest";
+import type {
+  EvalCaseSummary,
+  EvalCaseTag,
+  EvalCaseUpdate,
+  RecipeIngestionSettingsUpdate,
+} from "~/lib/api/types/recipe-ingest";
 
 /**
  * Group Settings → Recipe cards (docs/ai/PHASE2.md §10, §11.6): keep cards on this server (with which local providers
  * would read them), the second reading, the household's inbox folder, a way to the notifiers page, and the group's
- * eval cases. The switches save at once; only group managers change them. Fork-owned.
+ * eval cases, whose tags and "verified" save at once and which download as a zip. The switches save at once; only
+ * group managers change them. Fork-owned.
  */
 const api = useUserApi();
 const i18n = useI18n();
+const { ingestErrorText } = useRecipeIngestText();
 const auth = useMealieAuth();
 const { group } = useGroupSelf();
 const { settings, loading, loadFailed, saving, load, save: saveSettings } = useRecipeIngestSettings();
@@ -255,11 +320,126 @@ async function save(change: Partial<RecipeIngestionSettingsUpdate>) {
 // ==========================================
 // Eval cases (group managers)
 
+/** The tags a reviewer gives a case; the others (`sideways`, `two-sided`, `blank`) were found from the card */
+const EVAL_TAGS: EvalCaseTag[] = ["handwritten", "printed", "faded"];
+/** How long a downloaded zip's object URL is kept, so the browser has read it */
+const DOWNLOAD_URL_LIFETIME_MS = 60_000;
+
 const evalCases = ref<EvalCaseSummary[] | null>(null);
 const evalCasesLoading = ref(false);
 const evalCasesLoadFailed = ref(false);
 const deleteDialogOpen = ref(false);
 const deleteTarget = ref<string | null>(null);
+/** Cases with a change being saved */
+const updating = ref(new Set<string>());
+/** The case whose zip is being fetched */
+const downloading = ref<string | null>(null);
+
+function isEvalTag(tag: string): tag is EvalCaseTag {
+  return (EVAL_TAGS as string[]).includes(tag);
+}
+
+function chosenTags(evalCase: EvalCaseSummary): EvalCaseTag[] {
+  return (evalCase.tags ?? []).filter(isEvalTag);
+}
+
+function foundTags(evalCase: EvalCaseSummary): string[] {
+  return (evalCase.tags ?? []).filter(tag => !isEvalTag(tag));
+}
+
+/** A tag's name; one this page doesn't know shows as it is */
+function tagText(tag: string): string {
+  const key = `recipe-ingest.eval.tag-${tag}`;
+  return i18n.te(key) ? i18n.t(key) : tag;
+}
+
+function replaceEvalCase(evalCase: EvalCaseSummary) {
+  evalCases.value = evalCases.value?.map(item => (item.slug === evalCase.slug ? evalCase : item)) ?? null;
+}
+
+function markUpdating(slug: string, on: boolean) {
+  const next = new Set(updating.value);
+  if (on) {
+    next.add(slug);
+  }
+  else {
+    next.delete(slug);
+  }
+  updating.value = next;
+}
+
+/**
+ * Saves a change to a case. It shows at once, and is undone if the save fails: a case deleted meanwhile leaves the
+ * list, and a refusal the API client didn't already show (a restore running) says it couldn't be saved.
+ */
+async function updateEvalCase(evalCase: EvalCaseSummary, update: EvalCaseUpdate) {
+  const before = evalCase;
+  replaceEvalCase({
+    ...evalCase,
+    ...(update.verified !== undefined && update.verified !== null ? { verified: update.verified } : {}),
+    ...(update.tags ? { tags: [...update.tags, ...foundTags(evalCase)] } : {}),
+  });
+  markUpdating(evalCase.slug, true);
+  try {
+    const { data, error } = await api.recipeIngest.updateEvalCase(evalCase.slug, update);
+    if (data) {
+      replaceEvalCase(data);
+      return;
+    }
+    replaceEvalCase(before);
+    if (errorStatusOf(error) === 404) {
+      alert.error(i18n.t("recipe-ingest.eval.gone"));
+      await loadEvalCases();
+    }
+    else if (!errorMessageOf(error)) {
+      alert.error(i18n.t("recipe-ingest.eval.save-failed"));
+    }
+  }
+  finally {
+    markUpdating(evalCase.slug, false);
+  }
+}
+
+function setTags(evalCase: EvalCaseSummary, value: unknown) {
+  const tags = Array.isArray(value) ? value.filter((tag): tag is EvalCaseTag => typeof tag === "string" && isEvalTag(tag)) : [];
+  // in the order the chips show
+  void updateEvalCase(evalCase, { tags: EVAL_TAGS.filter(tag => tags.includes(tag)) });
+}
+
+/** Hands the browser a file to save */
+function saveFile(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_LIFETIME_MS);
+}
+
+/** Saves a case's zip (its JSON and photos), to add to tests/data/cards or run the eval elsewhere */
+async function downloadEvalCase(slug: string) {
+  downloading.value = slug;
+  try {
+    const { data, error } = await api.recipeIngest.downloadEvalCase(slug);
+    if (data) {
+      saveFile(data, `${slug}.zip`);
+      return;
+    }
+    const status = errorStatusOf(error);
+    if (status === 404) {
+      alert.error(i18n.t("recipe-ingest.eval.gone"));
+      await loadEvalCases();
+    }
+    else {
+      alert.error(status === 503 ? ingestErrorText("paused_for_restore") : i18n.t("recipe-ingest.eval.download-failed"));
+    }
+  }
+  finally {
+    downloading.value = null;
+  }
+}
 
 async function loadEvalCases() {
   evalCasesLoading.value = true;
@@ -288,8 +468,13 @@ async function deleteEvalCase() {
 
   const { error } = await api.recipeIngest.deleteEvalCase(slug);
   if (error) {
-    // already gone (404), or a restore is running (503, whose message the API's toast shows): show what's there
-    await loadEvalCases();
+    if (errorStatusOf(error) === 404 || errorMessageOf(error)) {
+      // already gone, or a restore is running (503, whose message the API's toast shows): show what's there
+      await loadEvalCases();
+    }
+    else {
+      alert.error(i18n.t("recipe-ingest.eval.delete-failed"));
+    }
     return;
   }
   evalCases.value = evalCases.value?.filter(evalCase => evalCase.slug !== slug) ?? null;
@@ -311,3 +496,9 @@ watch(() => group.value?.aiProviderSettings, (now, before) => {
   }
 });
 </script>
+
+<style scoped>
+.eval-case + .eval-case {
+  border-top: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+</style>

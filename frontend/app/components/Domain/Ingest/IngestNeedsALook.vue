@@ -26,6 +26,7 @@
           @fill="(flag, value) => emit('fill', flag, value)"
           @reread="flag => emit('reread', flag)"
           @edit="flag => emit('edit', flag)"
+          @keep-as-text="flag => emit('keep-as-text', flag)"
           @resolve="(flag, resolution) => emit('resolve', flag, resolution)"
           @use-proposal="(proposal, mode) => emit('use-proposal', proposal, mode)"
           @dismiss-proposal="proposal => emit('dismiss-proposal', proposal)"
@@ -57,7 +58,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   /** an alternative reading to apply, or the value typed over a blank */
   (e: "alternative" | "fill", flag: CardFlag, text: string): void;
-  (e: "reread" | "edit", flag: CardFlag): void;
+  (e: "reread" | "edit" | "keep-as-text", flag: CardFlag): void;
   (e: "resolve", flag: CardFlag, resolution: FlagResolution | null): void;
   (e: "use-proposal", proposal: CardProposal, mode: "replace" | "append"): void;
   (e: "dismiss-proposal", proposal: CardProposal): void;

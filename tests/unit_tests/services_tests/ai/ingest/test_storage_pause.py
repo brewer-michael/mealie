@@ -2,6 +2,7 @@
 
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -18,13 +19,20 @@ import pytest
 from mealie.core.config import get_app_dirs
 from mealie.services.ai.errors import IngestBusyError, IngestPaused
 from mealie.services.ai.ingest import limits, storage
+from mealie.services.ai.ingest.settings import get_ingest_settings
 
 
 @pytest.fixture()
 def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """The marker and the lock file in a directory of the test's own"""
-    monkeypatch.setattr(storage, "_data_dir", lambda: tmp_path)
-    yield tmp_path
+    """The marker and the lock file in a directory of the test's own (and the fallback lock folder too)"""
+    data = tmp_path / "data"
+    data.mkdir()
+    fallback = tmp_path / "tmp"
+    fallback.mkdir()
+    monkeypatch.setattr(storage, "_data_dir", lambda: data)
+    monkeypatch.setattr(storage, "FALLBACK_LOCK_DIR", fallback)
+    monkeypatch.setattr(storage, "_lock_locations", {})
+    yield data
 
 
 @pytest.fixture()
@@ -465,6 +473,15 @@ restore()
 """
 
 
+def _next_line(process: subprocess.Popen[str]) -> str:
+    """The next line a script printed, past the log lines settings may print first"""
+    assert process.stdout is not None
+    while line := process.stdout.readline():
+        if not line.startswith("["):
+            return line.strip()
+    return ""
+
+
 @pytest.fixture()
 def restore_in_another_process(data_dir: Path) -> Iterator[Callable[..., subprocess.Popen[str]]]:
     """Starts the real `pauses_ingest` in another process (a worker restoring), and waits until it's restoring"""
@@ -478,7 +495,7 @@ def restore_in_another_process(data_dir: Path) -> Iterator[Callable[..., subproc
         )
         started.append(process)
         assert process.stdout is not None
-        assert process.stdout.readline().strip() == "restoring"
+        assert _next_line(process) == "restoring"
         return process
 
     yield start
@@ -576,7 +593,7 @@ def test_a_restore_in_this_process_is_seen_from_another_one(data_dir: Path, fast
             text=True,
             timeout=60,
         )
-        seen.append(checked.stdout.strip())
+        seen.append(checked.stdout.strip().splitlines()[-1])  # its last line: settings may log before it
         seen.append("marker" if (data_dir / storage.PAUSE_MARKER_NAME).exists() else "no marker")
 
     restore()
@@ -714,3 +731,155 @@ def test_a_restore_that_gives_up_leaves_the_marker_of_one_running_in_another_pro
             second_restore()
     assert marker.exists()
     assert storage.is_paused()
+
+
+# ==========================================
+# Where DATA_DIR doesn't support file locks
+
+
+_NO_LOCKS_IN = """
+import errno, fcntl, os
+
+_flock = fcntl.flock
+
+
+def flock(fd, operation):
+    # DATA_DIR on a filesystem without locks (some NFS mounts): every lock there fails with ENOLCK
+    if os.readlink(f"/proc/self/fd/{fd}").startswith(NO_LOCKS + "/"):
+        raise OSError(errno.ENOLCK, "No locks available")
+    return _flock(fd, operation)
+
+
+fcntl.flock = flock
+"""
+
+
+def _no_locks_in(folder: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    namespace: dict[str, object] = {"NO_LOCKS": str(folder)}
+    real = fcntl.flock
+    exec(_NO_LOCKS_IN.replace("fcntl.flock = flock\n", ""), namespace)  # noqa: S102 (the same patch as the subprocess's)
+    namespace["_flock"] = real
+    monkeypatch.setattr(fcntl, "flock", namespace["flock"])
+
+
+_WRITE_IN_ANOTHER_PROCESS = (
+    """
+import sys
+from pathlib import Path
+
+NO_LOCKS = sys.argv[1]
+"""
+    + _NO_LOCKS_IN
+    + """
+from mealie.services.ai.ingest import storage
+
+storage._data_dir = lambda: Path(sys.argv[1])
+storage.FALLBACK_LOCK_DIR = Path(sys.argv[2])
+with storage.ingest_write():
+    print(f"writing {storage.lock_path()}", flush=True)
+    sys.stdin.readline()
+print("done", flush=True)
+"""
+)
+
+
+def test_where_data_dir_has_no_locks_a_shared_local_lock_is_used(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    _no_locks_in(data_dir, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        path = storage.lock_path()
+        assert storage.lock_path() == path  # decided once
+    digest = hashlib.sha1(str(data_dir.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
+    assert path == storage.FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{digest}.lock"
+    assert storage.restore_lock_path() == path.with_name(f"{path.name}{storage.RESTORE_LOCK_SUFFIX}")
+    [warning] = [record for record in caplog.records if "doesn't support file locks" in record.getMessage()]
+    assert str(path) in warning.getMessage()
+    assert storage.flock_supported()  # the lock works: no "the marker alone" warning
+    assert not any("File locks aren't supported" in record.getMessage() for record in caplog.records)
+
+    with storage.ingest_write():
+        assert not _flock_from_another_process(path)  # a write section holds it
+    assert _flock_from_another_process(path)
+
+
+def _flock_from_another_process(path: Path) -> bool:
+    """Whether another process could `flock` the file exclusively right now"""
+    script = (
+        "import fcntl, os, sys\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+        "try:\n"
+        "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "except OSError:\n"
+        "    sys.exit(1)\n"
+        "sys.exit(0)\n"
+    )
+    return subprocess.run([sys.executable, "-c", script, str(path)], timeout=30).returncode == 0
+
+
+def test_a_restore_waits_for_another_processs_write_through_the_fallback_lock(
+    data_dir: Path, fast_pause: None, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Where DATA_DIR has no file locks, another worker process's write section still holds a restore off: both use the
+    same lock under /tmp. Without it only the marker would apply, and the restore wouldn't wait for that write.
+    """
+    _no_locks_in(data_dir, monkeypatch)
+    monkeypatch.setattr(limits, "RESTORE_LOCK_WAIT", 0.5)
+    writer = subprocess.Popen(
+        [sys.executable, "-c", _WRITE_IN_ANOTHER_PROCESS, str(data_dir), str(storage.FALLBACK_LOCK_DIR)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    ran: list[bool] = []
+
+    @storage.pauses_ingest
+    def restore() -> None:
+        ran.append(storage.is_paused())
+
+    try:
+        assert _next_line(writer) == f"writing {storage.lock_path()}"
+        with pytest.raises(IngestBusyError):  # it waited for the other process's write, then gave up
+            restore()
+        assert ran == []
+
+        assert writer.stdin is not None
+        writer.stdin.write("go on\n")
+        writer.stdin.flush()
+        assert _next_line(writer) == "done"
+        restore()
+        assert ran == [True]
+    finally:
+        writer.kill()
+        writer.wait(10)
+        for stream in (writer.stdin, writer.stdout):
+            if stream is not None:
+                stream.close()
+
+
+def test_the_lock_folder_can_be_chosen(data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    chosen = tmp_path / "locks" / "ingest"
+    monkeypatch.setattr(get_ingest_settings(), "LOCK_DIR", chosen)
+    assert storage.lock_path() == chosen / storage.LOCK_FILE_NAME
+    assert storage.restore_lock_path().parent == chosen
+    with storage.ingest_write():
+        pass
+    assert (chosen / storage.LOCK_FILE_NAME).exists()
+
+
+def test_a_lock_outside_data_dir_is_trusted_only_for_this_hosts_marker(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    """
+    Another host's restore holds its own /tmp lock, not this one: its marker isn't removed because this host's lock of
+    that name is free, and is honoured until its time runs out
+    """
+    _no_locks_in(data_dir, monkeypatch)
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    lock = str(storage.restore_lock_path())
+    _write_json_marker(marker, host="another-host/boot/1", lock=lock)
+    assert storage.is_paused()
+    assert marker.exists()
+
+    _write_json_marker(marker, pid=_finished_process_id(), lock=lock)  # this host's, its restore gone
+    assert not storage.is_paused()
+    assert not marker.exists()

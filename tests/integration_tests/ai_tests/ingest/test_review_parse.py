@@ -13,7 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 from test_jobs_api import banana_draft, job_row, job_url, seed_job
 
+from mealie.schema.recipe.recipe_ingredient import SaveIngredientFood
 from mealie.schema.recipe_ingest import CardDraftIngredient, ExtractionMeta
+from mealie.schema.response.pagination import PaginationQuery
 from mealie.services.ai.ingest import review
 from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
 from tests.utils import api_routes
@@ -163,6 +165,42 @@ def test_new_and_edited_text_lines_are_parsed_but_unparseable_ones_stay_as_sent(
     assert (lines[4]["quantity"], lines[4]["unit"]["name"], lines[4]["food"]["name"]) == (2, "tablespoon", "butter")
     # a marker still in the line: it stays text, flagged, until it's filled or kept
     assert (lines[5]["quantity"], lines[5]["food"], lines[5]["note"]) == (None, None, "[illegible] flour")
+
+
+def test_a_line_parsed_on_save_is_checked_for_a_near_miss_link(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """
+    A line parsed on save is checked as a freshly read one is (PL-06): the parser linked "rd onions" to the group's
+    "red onion", none of whose names is on the line, so it gets `linked_fuzzy`; "Looks right" keeps it dismissed,
+    and it goes once the reviewer picks the food themselves
+    """
+    user = unique_user_fn_scoped
+    for name, plural in [("onion", "onions"), ("red onion", "red onions")]:
+        user.repos.ingredient_foods.create(
+            SaveIngredientFood(name=name, plural_name=plural, group_id=user.repos.group_id)
+        )
+    job_id = _card(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    draft["ingredients"][3] = _fill(draft["ingredients"][3], "2 rd onions")
+    saved = _put(api_client, user, job_id, draft)
+
+    line = job_row(job_id)["draft"]["ingredients"][3]
+    assert (line["quantity"], line["food"]["name"]) == (2, "red onion")
+    fuzzy = _flags_of(saved, line["reference_id"])["linked_fuzzy"]
+    assert fuzzy["params"] == {"name": "red onion", "kind": "food", "start": 2, "end": 11}
+    assert fuzzy["resolution"] is None
+
+    current = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    dismissed = _put(api_client, user, job_id, current, flagResolutions={fuzzy["id"]: "dismissed"})
+    assert _flags_of(dismissed, line["reference_id"])["linked_fuzzy"]["resolution"] == "dismissed"
+
+    onion = next(food for food in user.repos.ingredient_foods.page_all(_all()).items if food.name == "onion")
+    current["ingredients"][3] = {**current["ingredients"][3], "food": {"id": str(onion.id), "name": "onion"}}
+    picked = _put(api_client, user, job_id, current)
+    assert "linked_fuzzy" not in _flags_of(picked, line["reference_id"])
+
+
+def _all() -> PaginationQuery:
+    return PaginationQuery(page=1, per_page=-1)
 
 
 def test_a_card_in_another_language_isnt_parsed(api_client: TestClient, unique_user_fn_scoped: TestUser):

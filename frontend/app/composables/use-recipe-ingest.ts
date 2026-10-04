@@ -15,6 +15,7 @@ import type {
   IngestRejectReason,
   RecipeIngestionBatchOut,
   RecipeIngestionJobCounts,
+  RecipeIngestionJobSummary,
   RecipeIngestionSettingsOut,
   RecipeIngestionSettingsUpdate,
 } from "~/lib/api/types/recipe-ingest";
@@ -66,6 +67,7 @@ export const INGEST_API_ERROR_CODES = [
   "purged",
   "recipe_edited",
   "not_clean",
+  "notification_failed",
 ] as const;
 
 /** Kinds of the warnings a commit answers with (`tag_dropped:<name>`: an organizer that no longer exists) */
@@ -138,9 +140,39 @@ export function sourceFileName(sourceName: string | null | undefined): string | 
   return name.join("/") || null;
 }
 
+/** What a card's name in a list depends on */
+export type CardTitleFields = Pick<RecipeIngestionJobSummary, "title" | "source" | "sourceName" | "status" | "position">;
+
+/**
+ * A card's name in lists: its title; before it's read (or when it couldn't be), its file for inbox and API cards, else
+ * its place in the batch
+ */
+export function cardTitle(job: CardTitleFields, t: TranslateFn = globalT): string {
+  if (job.title) {
+    return job.title;
+  }
+  const fileName = sourceFileName(job.sourceName);
+  if (job.source !== "app" && fileName) {
+    return fileName;
+  }
+  return job.status === "processing" || job.status === "failed"
+    ? t("recipe-ingest.capture.card-number", { number: job.position + 1 })
+    : t("recipe-ingest.queue.untitled");
+}
+
 /** The HTTP status of a failed API call, if it got a response */
 export function errorStatusOf(error: unknown): number | null {
   return (error as { response?: { status?: number } } | null)?.response?.status ?? null;
+}
+
+/**
+ * The `detail.message` of a failed API call's response: the API client has already shown it as a toast (requests
+ * sent with `suppressAlert` lose it first), so the caller doesn't say it again
+ */
+export function errorMessageOf(error: unknown): string | null {
+  const detail = (error as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail;
+  const message = (detail as { message?: unknown } | null | undefined)?.message;
+  return typeof message === "string" && message ? message : null;
 }
 
 /**
@@ -538,6 +570,17 @@ export interface RecipeIngestCommitNotice {
   warning: string | null;
 }
 
+/** A line in the cards list: what the review left for it, or what adding a batch's clean cards did */
+export interface RecipeIngestQueueNotice {
+  kind: "success" | "info" | "warning" | "error";
+  text: string;
+  detail: string | null;
+  /** The cards it's about, one line each */
+  items: string[];
+  /** The batch it's about: shown in that batch's section while there is one, else at the top of the list */
+  batchId?: string | null;
+}
+
 /** A notice older than this is about an earlier visit (the next card's page didn't open) */
 const COMMIT_NOTICE_MAX_AGE_MS = 10_000;
 let commitNotice: { notice: RecipeIngestCommitNotice; at: number } | null = null;
@@ -570,5 +613,6 @@ export function useRecipeIngestText() {
     progressText: (key: string | null | undefined) => progressText(key, t),
     flagText: (flag: CardFlag, context?: FlagTextContext) => flagText(flag, t, context),
     commitWarningText: (warning: string) => commitWarningText(warning, t),
+    cardTitle: (job: CardTitleFields) => cardTitle(job, t),
   };
 }

@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from PIL import Image
 
 from mealie.core.config import get_app_dirs
@@ -27,11 +28,22 @@ from mealie.db.models.household import Household
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestRepos
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate
-from mealie.schema.recipe_ingest import PageMeta, RecipeIngestionSettingsUpdate
+from mealie.schema.recipe_ingest import (
+    InboxWaitingReason,
+    IngestRejectReason,
+    PageMeta,
+    RecipeIngestionSettingsUpdate,
+)
 from mealie.services import ocr
 from mealie.services.ai.ingest import inbox, limits, storage
 from mealie.services.ai.ingest import settings as ingest_settings
 from mealie.services.ai.ingest.settings import IngestSettings
+from tests.integration_tests.ai_tests.ingest.card_flow_testing import (
+    Notified,
+    apprise_sent,  # noqa: F401  (the fixture)
+    make_notifier,
+    sent_to,
+)
 from tests.utils.fixture_schemas import TestUser
 
 OLD = 60
@@ -301,6 +313,31 @@ def test_a_subfolder_is_one_card_with_its_pages_in_name_order(root: Path, reader
     assert [(page.original_filename, page.width) for page in pages] == [("1-front.jpg", 80), ("2-back.jpg", 60)]
     assert job.source_name.endswith("/grandmas-pie")
     assert (folder / "processed" / _month() / "grandmas-pie" / "2-back.jpg").is_file()
+
+
+def _pdf(*sizes: tuple[int, int]) -> bytes:
+    pages = [Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)) for size in sizes]
+    buffer = io.BytesIO()
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:], resolution=72)
+    return buffer.getvalue()
+
+
+def test_a_scanners_pdf_is_one_card_with_its_pages(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 500)  # rendered small: quicker
+    folder = _folder(root, reader)
+    _drop(folder, "scan.pdf", _pdf((300, 200), (200, 300)))
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 1
+
+    [job] = _jobs(reader)[before:]
+    pages = [PageMeta.model_validate(page) for page in job.pages]
+    assert [(page.original_filename, page.width, page.height, page.format) for page in pages] == [
+        ("scan.pdf (page 1)", 500, 334, "pdf"),
+        ("scan.pdf (page 2)", 334, 500, "pdf"),
+    ]
+    assert job.source_name.endswith("/scan.pdf")
+    assert (folder / "processed" / _month() / "scan.pdf").is_file()
 
 
 def test_a_rejected_file_goes_to_failed_with_the_reason(root: Path, reader: TestUser):
@@ -986,3 +1023,282 @@ def test_a_purge_that_stops_at_its_budget_goes_on_at_the_next_scan(
     inbox.scan_once()  # no day's wait: there's more to look at
     inbox.scan_once()
     assert not month.exists()
+
+
+# ==========================================
+# Telling about refusals, and the status the app shows
+
+
+@pytest.fixture()
+def told(monkeypatch: pytest.MonkeyPatch) -> list[tuple[UUID, UUID, list[Any]]]:
+    """The "not added" notifications the scan asks for (household, reasons), instead of sending them"""
+    calls: list[tuple[UUID, UUID, list[Any]]] = []
+
+    def notify(group_id: UUID, household_id: UUID, reasons: Any, **kwargs: Any) -> bool:
+        calls.append((group_id, household_id, sorted(str(reason) for reason in reasons)))
+        return True
+
+    monkeypatch.setattr(inbox.events, "notify_inbox_rejections", notify)
+    return calls
+
+
+@pytest.fixture()
+def info(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    logged: list[str] = []
+    monkeypatch.setattr(inbox.logger, "info", logged.append)
+    return logged
+
+
+def test_each_refusal_logs_its_code_and_nothing_of_the_file(root: Path, reader: TestUser, info: list[str], told: list):
+    folder = _folder(root, reader)
+    _drop(folder, "grandmas-secret-fudge.txt", b"not an image at all")
+    (folder / "empty-card").mkdir()
+    _drop(folder / "empty-card", "notes.txt", b"also not an image")
+    assert _scan_twice() == 0
+
+    group_slug, household_slug = _slugs(reader)
+    key = f"{group_slug}/{household_slug}"
+    assert sorted(message for message in info if "wasn't added" in message) == [
+        f"A file in the recipe card inbox of {key} wasn't added (unsupported_format)",
+        f"A file in the recipe card inbox of {key} wasn't added (unsupported_format)",
+    ]
+    assert not any("fudge" in message or "empty-card" in message for message in info)
+
+
+def test_a_burst_of_refusals_is_told_once(root: Path, reader: TestUser, told: list):
+    folder = _folder(root, reader)
+    _drop(folder, "notes.txt", b"not an image")
+    _drop(folder, "menu.pdf", b"%PDF-1.7 a menu")
+    _drop(folder, "card.jpg")
+
+    assert _scan_twice() == 1
+    assert told == [(UUID(reader.group_id), UUID(reader.household_id), ["pdf_not_supported", "unsupported_format"])]
+    assert _scan_twice() == 0
+    assert len(told) == 1  # nothing new: nothing more to tell
+
+    _drop(folder, "again.txt", b"still not an image")
+    _scan_twice()
+    assert [reasons for _, _, reasons in told] == [["pdf_not_supported", "unsupported_format"], ["unsupported_format"]]
+
+
+def test_a_burst_over_several_scans_is_told_when_its_last_file_is_taken(
+    root: Path, reader: TestUser, told: list, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(limits, "INBOX_FILES_PER_TICK", 1)
+    folder = _folder(root, reader)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _drop(folder, name, b"not an image")
+
+    inbox.scan_once()  # seen
+    inbox.scan_once()  # one taken, two left
+    inbox.scan_once()  # one taken, one left
+    assert told == []
+    inbox.scan_once()  # the last one: the burst is over
+    assert [reasons for _, _, reasons in told] == [["unsupported_format"] * 3]
+
+
+def test_a_long_burst_is_told_after_two_minutes(
+    root: Path, reader: TestUser, told: list, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(limits, "INBOX_FILES_PER_TICK", 1)
+    clock = [1000.0]
+    monkeypatch.setattr(inbox, "_monotonic", lambda: clock[0])
+    folder = _folder(root, reader)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _drop(folder, name, b"not an image")
+
+    inbox.scan_once()
+    inbox.scan_once()  # the first refusal
+    clock[0] += inbox.REFUSALS_BURST
+    inbox.scan_once()  # the second, and the burst is two minutes old
+    assert [reasons for _, _, reasons in told] == [["unsupported_format"] * 2]
+    inbox.scan_once()
+    assert [reasons for _, _, reasons in told] == [["unsupported_format"] * 2, ["unsupported_format"]]
+
+
+def test_refusals_arent_told_while_paused(root: Path, reader: TestUser, told: list, monkeypatch: pytest.MonkeyPatch):
+    folder = _folder(root, reader)
+    _drop(folder, "a.txt", b"not an image")
+    _drop(folder, "b.txt", b"not an image")
+    inbox.scan_once()
+
+    checks = [0]
+    real_is_paused = storage.is_paused
+
+    def paused_after_the_first_file() -> bool:
+        checks[0] += 1
+        return checks[0] > 2 or real_is_paused()  # scan_once's check, then the first file's
+
+    monkeypatch.setattr(storage, "is_paused", paused_after_the_first_file)
+    inbox.scan_once()
+    assert told == []
+    assert len(os.listdir(folder / "failed")) == 2  # one file and its note
+
+    monkeypatch.setattr(storage, "is_paused", real_is_paused)
+    inbox.scan_once()
+    assert [reasons for _, _, reasons in told] == [["unsupported_format"] * 2]
+
+
+def _status(user: TestUser, readiness: Any = None) -> inbox.InboxStatus:
+    group_slug, household_slug = _slugs(user)
+    return inbox.household_status(group_slug, household_slug, readiness)
+
+
+def _readiness(user: TestUser) -> Any:
+    with session_context() as session:
+        return inbox.reading_readiness(session, UUID(user.group_id), UUID(user.household_id))
+
+
+def test_the_status_counts_waiting_cards_and_says_why(root: Path, unique_user_fn_scoped: TestUser, tmp_path: Path):
+    user = unique_user_fn_scoped
+    folder = _folder(root, user)
+    _drop(folder, "a.jpg")
+    _drop(folder, "b.png", b"anything: it's taken and refused later")
+    _drop(folder, "fresh.jpg", age=0)  # still being written: not yet waiting
+    _drop(folder, ".hidden.jpg")
+    _drop(folder, "c.jpg.part")
+    card = folder / "card"
+    card.mkdir()
+    _drop(card, "front.jpg")
+    (folder / "empty").mkdir()
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(_jpeg())
+    (folder / "link.jpg").symlink_to(outside)
+    before = _tree(folder)
+
+    assert _scan_twice() == 0  # the group can't read cards: they wait
+    status = _status(user, _readiness(user))
+    assert (status.waiting, status.waiting_reason, status.rejections) == (3, InboxWaitingReason.cannot_read, [])
+    assert _status(user).waiting_reason is None  # no readiness given, no reason
+
+    _configure(user)
+    with session_context() as session:
+        IngestRepos(session, UUID(user.group_id), UUID(user.household_id)).settings.upsert(
+            RecipeIngestionSettingsUpdate(local_only=True)
+        )
+    assert _status(user, _readiness(user)).waiting_reason == InboxWaitingReason.local_only_unavailable
+
+    with session_context() as session:
+        IngestRepos(session, UUID(user.group_id), UUID(user.household_id)).settings.upsert(
+            RecipeIngestionSettingsUpdate(local_only=False)
+        )
+    readable = _status(user, _readiness(user))
+    assert (readable.waiting, readable.waiting_reason) == (3, None)  # the next scan takes them
+    assert _tree(folder) == before  # the status wrote nothing
+
+
+def test_the_status_says_quota_when_the_group_is_at_it(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    folder = _folder(root, reader)
+    _drop(folder, "a.jpg")
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", 0)
+    assert _scan_twice() == 0
+    assert (_status(reader, _readiness(reader)).waiting_reason) == InboxWaitingReason.quota
+
+
+def test_waiting_cards_are_counted_up_to_a_limit(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(inbox, "STATUS_MAX_WAITING", 2)
+    folder = _folder(root, reader)
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        _drop(folder, name)
+    assert _status(reader).waiting == 2
+
+
+def test_the_status_lists_the_newest_refusals_with_their_reasons(root: Path, reader: TestUser, told: list):
+    folder = _folder(root, reader)
+    photo = _jpeg()
+    _drop(folder, "card.jpg", photo)
+    assert _scan_twice() == 1
+    _drop(folder, "card again.jpg", photo)
+    _drop(folder, "notes.txt", b"not an image")
+    assert _scan_twice() == 0
+
+    failed = folder / "failed"
+    old = time.time() - 3600
+    os.utime(failed / "notes.txt.error.txt", (old, old))  # refused an hour before the duplicate
+    status = _status(reader)
+    assert [(item.name, item.reason) for item in status.rejections] == [
+        ("card again.jpg", IngestRejectReason.duplicate),
+        ("notes.txt", IngestRejectReason.unsupported_format),
+    ]
+    assert abs(status.rejections[1].at.timestamp() - old) < 2
+    assert status.rejections[0].at.tzinfo is not None
+
+    # older than the retention: no longer listed
+    ancient = time.time() - 15 * 86400
+    os.utime(failed / "notes.txt.error.txt", (ancient, ancient))
+    os.utime(failed / "notes.txt", (ancient, ancient))
+    assert [item.name for item in _status(reader).rejections] == ["card again.jpg"]
+
+
+def test_a_refusal_without_a_code_is_listed_without_a_reason(root: Path, reader: TestUser, told: list):
+    folder = _folder(root, reader)
+    (folder / "empty").mkdir()
+    _drop(folder / "empty", ".DS_Store", b"junk")  # ignored: the folder has no pages
+    failed = folder / "failed"
+    failed.mkdir()
+    (failed / "odd.jpg").write_bytes(b"x")
+    (failed / "odd.jpg.error.txt").write_text("Not added: a symbolic link, which is never followed.\n")
+    (failed / "made-up.jpg").write_bytes(b"x")
+    (failed / "made-up.jpg.error.txt").write_text("Not added (no_such_reason): who knows.\n")
+    assert {item.name: item.reason for item in _status(reader).rejections} == {"odd.jpg": None, "made-up.jpg": None}
+
+
+def test_at_most_ten_refusals_are_listed_newest_first(root: Path, reader: TestUser):
+    failed = _folder(root, reader) / "failed"
+    failed.mkdir()
+    for number in range(12):
+        (failed / f"{number:02}.jpg").write_bytes(b"x")
+        note = failed / f"{number:02}.jpg.error.txt"
+        note.write_text("Not added (too_large): The file is larger than 30 MB.\n")
+        _age(note, 1000 - number)
+    names = [item.name for item in _status(reader).rejections]
+    assert names == [f"{number:02}.jpg" for number in range(11, 1, -1)]
+
+
+def test_a_failed_folder_that_is_a_link_is_never_followed(root: Path, reader: TestUser, tmp_path: Path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "private.jpg").write_bytes(b"x")
+    (elsewhere / "private.jpg.error.txt").write_text("Not added (duplicate): This card was already scanned.\n")
+    folder = _folder(root, reader)
+    (folder / "failed").symlink_to(elsewhere)
+    _drop(folder, "a.jpg")
+
+    status = _status(reader)
+    assert status.rejections == []
+    assert status.waiting == 1
+
+
+def test_the_status_is_empty_when_the_inbox_is_off_or_the_folder_missing(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    group_slug, household_slug = _slugs(reader)
+    assert inbox.household_status(group_slug, household_slug) == inbox.InboxStatus()  # not created yet
+    assert inbox.household_status("../etc", household_slug) == inbox.InboxStatus()
+
+    _drop(_folder(root, reader), "a.jpg")
+    assert inbox.household_status(group_slug, household_slug).waiting == 1
+    monkeypatch.setattr(inbox, "inbox_root", lambda: None)
+    assert inbox.household_status(group_slug, household_slug) == inbox.InboxStatus()
+
+
+def test_a_burst_of_refusals_reaches_the_households_notifier_once(
+    root: Path,
+    api_client: TestClient,
+    unique_user_fn_scoped: TestUser,
+    apprise_sent: list[Notified],  # noqa: F811
+):
+    user = unique_user_fn_scoped
+    _configure(user)
+    ha = make_notifier(api_client, user, cards_ready=True)
+    folder = _folder(root, user)
+    _drop(folder, "notes.txt", b"not an image")
+    _drop(folder, "menu.pdf", b"%PDF-1.7 a menu")
+
+    assert _scan_twice() == 0
+
+    [sent] = sent_to(apprise_sent, ha, "recipe_ingestion_rejected")
+    assert sent.title == "Recipe cards not added"
+    assert sent.received_document()["count"] == 2
+    assert sent.received_document()["reasons"] == {"unsupported_format": 1, "pdf_not_supported": 1}
+    assert "notes" not in sent.body and "menu" not in sent.body  # no file names

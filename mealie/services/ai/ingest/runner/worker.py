@@ -6,8 +6,12 @@ Running one claimed task (docs/ai/PHASE2.md §3.7), in its own daemon thread and
 3. Apply the job's AI call policy (`local_only`, `job_id`) around the handler: local-only when the job was stored so
    or when its group's "Keep recipe card photos and text on this server" is on now, so switching that on also covers
    cards still queued and later re-reads, re-extracts and retries of older ones (§10: a change never loosens a job).
-4. Call the handler (`tasks.handle_extract` or `tasks.handle_reread`): it opens its own sessions, returns a result and
-   writes nothing to the job row.
+   The policy also re-reads the group's setting before every provider call (`_GroupLocalOnly`, at most every
+   `LOCAL_ONLY_RECHECK`), so switching it on while a card is being read keeps that card's remaining calls (the
+   cross-read, structuring, suggestions) on this server too.
+4. Call the handler (`tasks.handle_extract`, which also rebuilds from an edited transcription or parses chosen lines
+   by its payload's mode, or `tasks.handle_reread`): it opens its own sessions, returns a result and writes nothing
+   to the job row.
 5. Apply the outcome with a write fenced on the lease (`finalize`), in a short session of its own; then, after a first
    extraction, `events.maybe_notify_batch` (§8).
 
@@ -19,16 +23,20 @@ dispatcher releases the lease).
 **A backup restore** (§3.9): when the handler raised `IngestPaused`, or anything while the pause marker is set, or
 finished while it's set, the task writes nothing until the marker clears (polling every `PAUSED_TASK_POLL`, within its
 deadline). Then it releases its lease (`queued`, `attempts - 1`, not claimed for `PAUSED_RELEASE_DELAY`) or applies its
-result, fenced on its token: a restored row carries another token, so the result is then dropped.
+result, fenced on its token: the restore queued the task again, so the result is then dropped, and kept for the card's
+next task instead (`results`), which applies it without calling a provider. A task first looks for such a result (or
+waits for the cut-off task still producing it) before it calls its handler, and marks itself in flight while it runs.
 """
 
 import asyncio
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -45,10 +53,12 @@ from mealie.schema.recipe_ingest import IngestErrorCode, IngestTaskKind
 from mealie.services.ai.policy import AICallPolicy, ai_call_policy
 
 from .. import limits, storage
-from . import finalize
+from . import finalize, results
+from .answers import KeptAnswers
 from .classify import Disposition, classify, safe_trace
 from .finalize import Applied, Finalized
-from .types import ExtractResult, RereadResult, TaskContext
+from .results import Kept, TaskKey
+from .types import ExtractResult, ParseLinesResult, RereadResult, TaskContext
 
 logger = get_logger(__name__)
 
@@ -89,6 +99,13 @@ class _ClaimedJob:
     local_only: bool
     """The job's own `local_only`, or its group's setting as it is now"""
     owner_exists: bool
+    page_hashes: tuple[str, ...]
+    """The job's pages' `page_sha256`, in order, as stored when the task started"""
+
+    @property
+    def key(self) -> TaskKey:
+        """What the task's result is computed from, as a kept result must match (`results`)"""
+        return TaskKey.of(self.id, self.kind, self.payload, self.page_hashes)
 
 
 @dataclass(frozen=True)
@@ -117,6 +134,7 @@ def _load_job(job_id: UUID, token: UUID) -> _ClaimedJob | None:
                 Job.task_payload,
                 Job.locale,
                 Job.local_only,
+                Job.pages,
             ).where(Job.id == job_id, *IngestQueue.fence(token))
         ).one_or_none()
         if row is None:
@@ -136,7 +154,47 @@ def _load_job(job_id: UUID, token: UUID) -> _ClaimedJob | None:
         locale=row.locale or DEFAULT_LOCALE,
         local_only=local_only,
         owner_exists=owner_exists,
+        page_hashes=tuple(str(page.get("page_sha256")) for page in row.pages or [] if isinstance(page, dict)),
     )
+
+
+class _GroupLocalOnly:
+    """
+    The `local_only_check` of a task's AI call policy: whether the job's group keeps cards on this server now. It
+    reads the group's setting in a short session of its own at most every `LOCAL_ONLY_RECHECK` (calls in between get
+    the value last read), and once it's on it stays on for the task: a change never loosens a job (§10). A failed read
+    keeps the last known value, and is logged once. Called on the task's loop and in its worker threads.
+    """
+
+    def __init__(self, job_id: UUID, group_id: UUID, *, now_on: bool) -> None:
+        self.job_id = job_id
+        self.group_id = group_id
+        self._on = now_on
+        self._read_at = time.monotonic()  # the worker has just read it (`_load_job`)
+        self._lock = threading.Lock()
+        self._failure_logged = False
+
+    def __call__(self) -> bool:
+        with self._lock:
+            if self._on or time.monotonic() - self._read_at < limits.LOCAL_ONLY_RECHECK:
+                return self._on
+            self._read_at = time.monotonic()
+            try:
+                with session_context() as session:
+                    on = IngestRepos(session, self.group_id, None).settings.get().local_only
+                    session.commit()
+            except Exception as e:
+                if not self._failure_logged:
+                    self._failure_logged = True
+                    logger.warning(
+                        f"Recipe card job {self.job_id}: couldn't read its group's local-only setting "
+                        f"({type(e).__name__}); keeping the last one read"
+                    )
+                return self._on
+            if on:
+                logger.info(f"Recipe card job {self.job_id}: its group now keeps cards on this server")
+            self._on = bool(on)
+            return self._on
 
 
 class _Progress:
@@ -227,7 +285,7 @@ def _write(job_id: UUID, apply: Callable[[Session], Finalized]) -> Finalized:
 async def _apply(
     job: _ClaimedJob,
     token: UUID,
-    outcome: ExtractResult | RereadResult | _Failure | Exception,
+    outcome: ExtractResult | RereadResult | ParseLinesResult | _Failure | Exception,
     deadline: float,
     cancel_reason: CancelReasonGetter,
 ) -> Finalized:
@@ -260,15 +318,19 @@ async def _apply(
     if isinstance(outcome, ExtractResult):
         extracted = outcome
         return _write(job.id, lambda s: finalize.finalize_extract(s, job.id, token, extracted))
+    if isinstance(outcome, ParseLinesResult):
+        parsed = outcome
+        return _write(job.id, lambda s: finalize.finalize_parse_lines(s, job.id, token, parsed))
     reread = outcome
     return _write(job.id, lambda s: finalize.finalize_reread(s, job.id, token, reread))
 
 
-async def _call_handler(ctx: TaskContext) -> ExtractResult | RereadResult:
+async def _call_handler(ctx: TaskContext) -> ExtractResult | RereadResult | ParseLinesResult:
     # imported here, like every stage-B module the runner calls: some of them import the dispatcher (`wake`)
     from .. import tasks
 
-    with ai_call_policy(AICallPolicy(local_only=ctx.local_only, job_id=ctx.job_id)):
+    group_now = _GroupLocalOnly(ctx.job_id, ctx.group_id, now_on=ctx.local_only)
+    with ai_call_policy(AICallPolicy(local_only=ctx.local_only, job_id=ctx.job_id, local_only_check=group_now)):
         if ctx.kind == IngestTaskKind.reread:
             return await tasks.handle_reread(ctx)
         return await tasks.handle_extract(ctx)
@@ -296,6 +358,7 @@ async def run_task(
     dispatcher cancelled it. Returns what was applied.
     """
     deadline = deadline if deadline is not None else time.monotonic() + limits.TASK_DEADLINE
+    began = time.time()
 
     try:
         job = _load_job(job_id, token)
@@ -306,43 +369,70 @@ async def run_task(
         logger.info(f"Recipe card job {job_id}: its task was taken back before it started")
         return Applied.dropped
 
-    outcome: ExtractResult | RereadResult | _Failure | Exception
-    if not job.owner_exists:
-        outcome = _Failure(IngestErrorCode.owner_missing)
-    else:
-        set_locale_context(get_locale_provider(job.locale), get_locale_config(job.locale))
-        progress = _Progress(job.id, token)
-        ctx = TaskContext(
-            job_id=job.id,
-            group_id=job.group_id,
-            household_id=job.household_id,
-            kind=job.kind,
-            payload=job.payload,
-            token=token,
-            locale=job.locale,
-            local_only=job.local_only,
-            report_progress=progress,
-        )
-        try:
-            outcome = await _call_handler(ctx)
-        except asyncio.CancelledError:
-            _uncancel()
-            reason = cancel_reason() or CancelReason.cancelled
-            if reason in (CancelReason.vanished, CancelReason.shutdown):
-                logger.info(f"Recipe card job {job.id}: its task was stopped ({reason.value})")
-                return Applied.dropped
-            outcome = _Failure(IngestErrorCode(reason.value))
-        except Exception as e:
-            outcome = e
-        finally:
-            progress.close()
+    in_flight: Path | None = None
+    try:
+        outcome: ExtractResult | RereadResult | ParseLinesResult | _Failure | Exception
+        kept: Kept | None = None
+        answers = KeptAnswers()
+        if not job.owner_exists:
+            outcome = _Failure(IngestErrorCode.owner_missing)
+        else:
+            set_locale_context(get_locale_provider(job.locale), get_locale_config(job.locale))
+            progress = _Progress(job.id, token)
+            try:
+                kept = await results.wait_for_kept(
+                    job.key, token, deadline=deadline, stopping=lambda: cancel_reason() is not None
+                )
+                if kept is not None and kept.result is not None:
+                    logger.info(f"Recipe card job {job.id}: applying the reading a backup restore cut off")
+                    outcome = kept.result
+                else:
+                    if kept is not None:
+                        answers = kept.answers
+                        logger.info(f"Recipe card job {job.id}: replaying the answers a backup restore cut off")
+                    in_flight = results.begin(job.id, token)
+                    ctx = TaskContext(
+                        job_id=job.id,
+                        group_id=job.group_id,
+                        household_id=job.household_id,
+                        kind=job.kind,
+                        payload=job.payload,
+                        token=token,
+                        locale=job.locale,
+                        local_only=job.local_only,
+                        report_progress=progress,
+                        answers=answers,
+                    )
+                    outcome = await _call_handler(ctx)
+            except asyncio.CancelledError:
+                _uncancel()
+                reason = cancel_reason() or CancelReason.cancelled
+                if reason in (CancelReason.vanished, CancelReason.shutdown):
+                    logger.info(f"Recipe card job {job.id}: its task was stopped ({reason.value})")
+                    return Applied.dropped
+                outcome = _Failure(IngestErrorCode(reason.value))
+            except Exception as e:
+                outcome = e
+            finally:
+                progress.close()
 
-    finalized = await _apply(job, token, outcome, deadline, cancel_reason)
-    if finalized.applied == Applied.dropped:
-        logger.info(f"Recipe card job {job.id}: its task's outcome was dropped (the lease is no longer its own)")
-    else:
-        logger.debug(f"Recipe card job {job.id}: task finished ({finalized.applied.value})")
+        paused = storage.is_paused()
+        finalized = await _apply(job, token, outcome, deadline, cancel_reason)
+        if finalized.applied == Applied.dropped:
+            logger.info(f"Recipe card job {job.id}: its task's outcome was dropped (the lease is no longer its own)")
+        else:
+            logger.debug(f"Recipe card job {job.id}: task finished ({finalized.applied.value})")
 
-    if finalized.left_processing and finalized.batch_id is not None:
-        _notify(finalized.batch_id)
-    return finalized.applied
+        cut_off = finalized.applied in (Applied.dropped, Applied.released) and (paused or storage.restored_since(began))
+        if cut_off:
+            # a backup restore took the task's lease: its next one uses what it got rather than pay for it again
+            result = outcome if isinstance(outcome, (ExtractResult, RereadResult, ParseLinesResult)) else None
+            results.keep(job.key, result=result, answers=answers)
+        elif kept is not None and finalized.applied != Applied.dropped:
+            results.forget(job.id, job.kind)
+
+        if finalized.left_processing and finalized.batch_id is not None:
+            _notify(finalized.batch_id)
+        return finalized.applied
+    finally:
+        results.end(in_flight)

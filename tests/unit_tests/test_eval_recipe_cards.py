@@ -31,6 +31,7 @@ from mealie.schema.recipe.recipe_step import RecipeStep
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
+    CardDraftNote,
     CardDraftRef,
     CardDraftStep,
     CardFlag,
@@ -595,6 +596,24 @@ def test_blanks_kept_and_blanks_safe():
 
     # the import pipeline has no flags, so safety isn't known
     assert ev.score_recipe(expected, make_recipe(instructions=[filled])).blanks_safe is None
+
+
+def test_a_blank_in_a_note_is_safe_when_its_note_is_flagged():
+    """A note's flags are keyed to its id, as the review page and the flags key them"""
+    expected = ev.ExpectedRecipe(
+        name="Pie", ingredients=[], blanks=[ev.ExpectedBlank(field="notes", text="Freezes for [blank] months")]
+    )
+    filled = CardDraftNote(text="Freezes for 3 months")
+    draft = make_draft(ingredients=[], notes=[CardDraftNote(text="Serve warm"), filled])
+
+    flag = make_flag(CardFlagKind.blank, "notes", filled.id, source=CardFlagSource.cross_read)
+    scores = ev.score_card(expected, make_extraction(draft, [flag]))
+    assert (scores.blanks_kept, scores.blanks_safe) == (0.0, 1.0)
+    assert scores.blanks[0].ref == str(filled.id)
+
+    # another note's flag doesn't make it safe
+    other = make_flag(CardFlagKind.blank, "notes", draft.notes[0].id, source=CardFlagSource.cross_read)
+    assert ev.score_card(expected, make_extraction(draft, [other])).blanks_safe == 0.0
 
 
 def test_a_blank_time_is_kept_when_left_empty():
@@ -1190,7 +1209,7 @@ def fake_orient(turn: int):
 
 
 def test_prepare_card_normalizes_and_orients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)  # orientation needs only Tesseract installed
     monkeypatch.setattr(ev, "orient_page", fake_orient(90))
     [card] = ev.load_cards(CARDS_DIR, ["banana-mug-cake"])
 
@@ -1208,7 +1227,7 @@ def test_prepare_card_normalizes_and_orients(monkeypatch: pytest.MonkeyPatch, tm
 
 
 def test_no_intake_ocr_still_reports_wrong_turns(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)
     monkeypatch.setattr(ev, "orient_page", fake_orient(180))
     [banana] = ev.load_cards(CARDS_DIR, ["banana-mug-cake"])
     upright = ev.Card(id="upright", images=banana.images, fixture=banana.fixture.model_copy(update={"tags": []}))
@@ -1229,7 +1248,7 @@ def test_no_intake_ocr_still_reports_wrong_turns(monkeypatch: pytest.MonkeyPatch
     assert turns is not None and not turns.passed
 
     # without Tesseract there's nothing to report
-    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)
     plain = ev.prepare_card(upright, tmp_path / "plain")
     assert plain.probed_rotations is None
     assert ev.wrong_turns([upright], {"upright": plain}) is None
@@ -1738,7 +1757,8 @@ class FakePipeline:
 def card_pipeline(monkeypatch: pytest.MonkeyPatch) -> FakePipeline:
     fake = FakePipeline()
     monkeypatch.setattr(ev, "extract_card", fake)
-    monkeypatch.setattr(ocr, "is_available", lambda: False)  # no orientation probe
+    monkeypatch.setattr(ocr, "is_available", lambda: False)  # no OCR fallback
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)  # and no orientation probe
     return fake
 
 

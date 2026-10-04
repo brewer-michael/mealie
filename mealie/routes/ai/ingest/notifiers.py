@@ -6,6 +6,9 @@ The permission checks are exactly those of upstream's notifier routes
 (`mealie/routes/households/controller_group_notifications.py`): any member of the household, with the notifier loaded
 through the household-scoped repositories, so another household's notifier is a 404. The toggle lives in the fork's
 `ai_event_notifier_options` side table, never in upstream's notifier options.
+
+The test answers 502 `notification_failed` (with a message) when the notifier didn't get it: Apprise couldn't read
+its URL, or the service it sends to refused or couldn't be reached.
 """
 
 from fastapi import APIRouter, status
@@ -22,6 +25,7 @@ from ._deps import IngestController, ingest_error
 router = APIRouter(prefix="/ai/notifiers", tags=["AI: Recipe Cards"])
 
 NOT_FOUND = "not_found"
+NOTIFICATION_FAILED = "notification_failed"
 
 
 @controller(router)
@@ -56,8 +60,15 @@ class AINotifierEventsController(IngestController):
     def test_notifier_events(self, notifier_id: UUID4) -> None:
         """
         Sends a test "recipe cards ready" notification through this notifier, whether or not it's switched on for
-        it: the same event and data shape, with the household's current counts
+        it: the same event and data shape, with the household's current counts. 502 when it wasn't delivered.
         """
         notifier = self._notifier(notifier_id)
         translator = with_fallback(self.translator)
-        events.send_test_notification(self.session, self.group_id, self.household_id, notifier.apprise_url, translator)
+        target = events.NotifierURL(notifier.id, notifier.name, notifier.apprise_url)
+        if not events.send_test_notification(self.session, self.group_id, self.household_id, target, translator):
+            raise ingest_error(
+                status.HTTP_502_BAD_GATEWAY,
+                NOTIFICATION_FAILED,
+                message_key="recipe-ingest.errors.notification-failed",
+                translator=translator,
+            )

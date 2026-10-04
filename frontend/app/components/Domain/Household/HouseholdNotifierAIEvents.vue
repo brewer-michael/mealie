@@ -44,6 +44,7 @@
 
 <script setup lang="ts">
 import { useUserApi } from "~/composables/api";
+import { errorMessageOf } from "~/composables/use-recipe-ingest";
 import { alert } from "~/composables/use-toast";
 
 /**
@@ -104,7 +105,10 @@ async function sendTest() {
   try {
     const { error } = await api.recipeIngest.testNotifierEvents(props.notifierId);
     if (error) {
-      alert.error(i18n.t("recipe-ingest.notifier.test-failed"));
+      // a notifier that didn't get it (502 `notification_failed`): the API client already showed the server's message
+      if (!errorMessageOf(error)) {
+        alert.error(i18n.t("recipe-ingest.notifier.test-failed"));
+      }
     }
     else {
       alert.success(i18n.t("recipe-ingest.notifier.test-sent"));

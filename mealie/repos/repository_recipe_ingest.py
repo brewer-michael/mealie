@@ -29,29 +29,35 @@ repository factory stays untouched.
 - `cancel_task(session, job_id, *, household_id=None) -> CancelOutcome`: clears a queued task (a `processing` job then
   fails with `cancelled`; a `ready` one stays ready) or asks a running one to stop (`cancel_requested`).
 - `IngestRepos(session, group_id, household_id)`, scoped to the group and household:
-  - `.jobs`: `get`, `page`, `counts`, `find_duplicate`, `next_position`, `create`, `update_job_json`,
-    `enqueue_task`, `cancel_task`, `delete`, and `scope` (the household conditions, for custom queries);
+  - `.jobs`: `get`, `page` (by upload or commit time, optionally committed since a time), `counts`,
+    `find_duplicate`, `same_title` (another waiting card with the same name), `count_processing_by_user` (the
+    per-user quota), `next_position`, `create`, `update_job_json`, `enqueue_task`, `cancel_task`, `delete`, and
+    `scope` (the household conditions, for custom queries);
   - `.batches`: `get`, `create`, `touch` (conditional on not sealed), `seal` (optionally only when idle),
-    `find_open` (the batch an upload auto-joins), `jobs`, `counts`;
+    `find_open` (the batch an upload auto-joins), `latest_locale` (the household's language, for inbox cards),
+    `jobs`, `counts`;
   - `.settings` (group-scoped): `get` (defaults when there's no row), `upsert`;
   - `.notifier_options`: `get`, `set` (for the household's notifiers), `enabled_notifier_ids`;
   - `processing_jobs_in_group()`, for the per-group quota.
-- `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids`, `claim`, `holds`, `heartbeat`,
-  `set_progress`, `expired`, `requeue_expired`, `release`, `release_owned` (every running task of one dispatcher),
-  `requeue_all_running` (after a backup restore), `cancel_requeued`, `update_job_json`.
+- `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids` (fair across groups, with the
+  optional per-group cap), `claim`, `holds`, `heartbeat`, `set_progress`, `expired`, `requeue_expired`, `release`,
+  `release_owned` (every running task of one dispatcher), `requeue_all_running` (after a backup restore),
+  `cancel_requeued`, `waiting_for_limit` and `retry_after_limit` (cards that failed `limit_reached`),
+  `update_job_json`.
 """
 
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult, RowMapping
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from mealie.db.models.household.events import GroupEventNotifierModel
 from mealie.db.models.recipe.recipe import RecipeModel
@@ -69,6 +75,7 @@ from mealie.schema.recipe_ingest import (
     IngestTaskKind,
     IngestTaskState,
     RecipeIngestionJobCounts,
+    RecipeIngestionJobRef,
     RecipeIngestionSettingsUpdate,
 )
 from mealie.services.ai.ingest import limits
@@ -78,6 +85,9 @@ Batch = RecipeIngestionBatch
 
 UPDATE_RETRIES = 3
 """Re-reads after a lost `row_version` race before `JobConflict`"""
+
+GROUP_CLAIM_LOCK = 0x6D414947
+"""The first key of PostgreSQL advisory locks that serialize claims within a group (the second is from its id)"""
 
 VERSIONED_COLUMNS = frozenset(
     {
@@ -111,6 +121,20 @@ def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def naive_utc(value: datetime) -> datetime:
+    """`value` as the naive UTC the columns hold: an aware time converted, a naive one taken as UTC already"""
+    return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+def title_key(title: str) -> str:
+    """A card name as two names are compared: Unicode-normalized, case-folded, its whitespace collapsed"""
+    return " ".join(unicodedata.normalize("NFKC", title).casefold().split())
+
+
+JobOrder = Literal["created", "committed"]
+"""How a page of jobs is sorted, newest first: by upload time, or by commit time (uncommitted cards last)"""
+
+
 class JobConflict(Exception):
     """A job's `row_version` kept changing between the read and the write; nothing was written"""
 
@@ -138,6 +162,19 @@ class ExpiredLease:
     token: UUID
     attempts: int
     status: IngestStatus
+
+
+@dataclass(frozen=True)
+class LimitWait:
+    """A card that failed `limit_reached`, waiting to be read again"""
+
+    job_id: UUID
+    group_id: UUID
+    household_id: UUID
+    local_only: bool
+    """The card's own `local_only` (its group's setting applies on top)"""
+    auto_retry_at: datetime
+    """When it's read again whatever the limits say: the first instant of the next month (UTC)"""
 
 
 def _rowcount(result: sa.Result) -> int:
@@ -291,6 +328,7 @@ def _cancel_queued(session: Session, conditions: Sequence[sa.ColumnElement[bool]
                 "status": IngestStatus.failed.value,
                 "error_code": IngestErrorCode.cancelled.value,
                 "error_params": None,
+                "auto_retry_at": None,  # only a card that failed `limit_reached` waits to be read again
             }
         )
     )
@@ -351,23 +389,31 @@ class IngestJobsRepo:
         *,
         statuses: Iterable[IngestStatus] | None = None,
         batch_id: UUID | None = None,
+        committed_since: datetime | None = None,
+        order: JobOrder = "created",
         page: int = 1,
         per_page: int = 50,
     ) -> tuple[list[RecipeIngestionJob], int]:
-        """A page of the household's jobs, newest first, and how many match in all. `per_page=-1` returns all."""
+        """
+        A page of the household's jobs, newest first, and how many match in all. `per_page=-1` returns all.
+        `committed_since` keeps the cards committed at or after that time (an aware time is converted to UTC);
+        `order="committed"` sorts by commit time, newest first, with cards not committed after the others.
+        """
         conditions = list(self.scope)
         if statuses is not None:
             conditions.append(Job.status.in_([status.value for status in statuses]))
         if batch_id is not None:
             conditions.append(Job.batch_id == batch_id)
+        if committed_since is not None:
+            conditions.append(Job.committed_at >= naive_utc(committed_since))
+
+        newest: tuple[sa.ColumnElement[Any], ...] = (Job.created_at.desc(), Job.position.desc(), Job.id)
+        if order == "committed":
+            # NULLS LAST written out: SQLite and PostgreSQL put NULLs at opposite ends of a descending sort
+            newest = (sa.case((Job.committed_at.is_(None), 1), else_=0), Job.committed_at.desc(), *newest)
 
         total = self.session.execute(sa.select(sa.func.count()).select_from(Job).where(*conditions)).scalar_one()
-        stmt = (
-            sa.select(Job)
-            .where(*conditions)
-            .order_by(Job.created_at.desc(), Job.position.desc(), Job.id)
-            .execution_options(**_FRESH)
-        )
+        stmt = sa.select(Job).where(*conditions).order_by(*newest).execution_options(**_FRESH)
         if per_page > 0:
             stmt = stmt.offset(max(page - 1, 0) * per_page).limit(per_page)
         return list(self.session.execute(stmt).scalars()), total
@@ -393,6 +439,43 @@ class IngestJobsRepo:
             .limit(1)
         )
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def same_title(self, title: str, exclude_id: UUID | None = None) -> RecipeIngestionJobRef | None:
+        """
+        The household's oldest other card, waiting for review or being read (`ready` or `processing`), whose name is
+        `title` once both are normalized (`title_key`: case, Unicode form and spacing don't count); None when there's
+        none or `title` is blank. The same card photographed twice, or two cards of one recipe, before either is added.
+        """
+        key = title_key(title)
+        if not key:
+            return None
+        conditions = [
+            *self.scope,
+            Job.status.in_([IngestStatus.ready.value, IngestStatus.processing.value]),
+            Job.title.is_not(None),
+        ]
+        if exclude_id is not None:
+            conditions.append(Job.id != exclude_id)
+        # compared here rather than in SQL: SQLite's `lower()` folds ASCII only. A household has few cards waiting.
+        stmt = sa.select(Job.id, Job.title).where(*conditions).order_by(Job.created_at, Job.id)
+        match = next((row for row in self.session.execute(stmt) if title_key(row.title) == key), None)
+        return RecipeIngestionJobRef(id=match.id, title=match.title) if match else None
+
+    def count_processing_by_user(self, user_id: UUID) -> int:
+        """
+        How many of the group's cards sent by `user_id` are still `processing` (queued or being read), in every
+        household of the group: the optional per-user quota (`AI_INGEST_MAX_PROCESSING_PER_USER`)
+        """
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(Job)
+            .where(
+                Job.group_id == self.group_id,
+                Job.created_by == user_id,
+                Job.status == IngestStatus.processing.value,
+            )
+        )
+        return self.session.execute(stmt).scalar_one()
 
     def next_position(self, batch_id: UUID) -> int:
         """One past the batch's highest position: arrival order for cards that don't send one"""
@@ -564,6 +647,22 @@ class IngestBatchesRepo:
             Batch.source_key.is_(None) if source_key is None else Batch.source_key == source_key,
         ]
         stmt = sa.select(Batch.id).where(*conditions).order_by(Batch.last_upload_at.desc(), Batch.id).limit(1)
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def latest_locale(self, sources: Iterable[IngestSource]) -> str | None:
+        """
+        The language of the household's most recent batch from `sources` that recorded one (by its last upload, else
+        its creation): what an inbox card, which has no uploader, is written in. None when there's none.
+        """
+        wanted = [source.value for source in sources]
+        if not wanted:
+            return None
+        stmt = (
+            sa.select(Batch.locale)
+            .where(*self.scope, Batch.source.in_(wanted), Batch.locale.is_not(None), Batch.locale != "")
+            .order_by(sa.func.coalesce(Batch.last_upload_at, Batch.created_at).desc(), Batch.id)
+            .limit(1)
+        )
         return self.session.execute(stmt).scalar_one_or_none()
 
     def jobs(self, batch_id: UUID) -> list[RecipeIngestionJob]:
@@ -773,26 +872,101 @@ class IngestQueue:
             Job.cancel_requested.is_(False),
         ]
 
-    def queued_ids(self, now: datetime, limit: int, *, max_priority: int | None = None) -> list[UUID]:
+    @staticmethod
+    def _group_cap(group_cap: int | None) -> int:
+        """The per-group cap on cards read at once: `group_cap`, else `AI_INGEST_GROUP_CONCURRENCY` (0: none)"""
+        if group_cap is not None:
+            return max(group_cap, 0)
+        from mealie.services.ai.ingest.settings import get_ingest_settings
+
+        return get_ingest_settings().GROUP_CONCURRENCY
+
+    @staticmethod
+    def _running_in_group(*, readings_only: bool = False) -> sa.ScalarSelect[int]:
         """
-        Jobs whose task can run now, by priority then age. `max_priority` limits it to the more urgent tasks (e.g.
-        `PRIORITY_REREAD` for the re-read slot).
+        How many tasks of the job's own group are running now (any process), correlated to the outer query's job:
+        every kind, or with `readings_only` the cards being read (not re-reads, which the per-group cap leaves alone)
+        """
+        running = aliased(Job)
+        conditions = [running.group_id == Job.group_id, running.task_state == IngestTaskState.running.value]
+        if readings_only:
+            conditions.append(running.task_priority > limits.PRIORITY_REREAD)
+        return sa.select(sa.func.count()).select_from(running).where(*conditions).correlate(Job).scalar_subquery()
+
+    def queued_ids(
+        self, now: datetime, limit: int, *, max_priority: int | None = None, group_cap: int | None = None
+    ) -> list[UUID]:
+        """
+        Jobs whose task can run now, by priority, then fairly across groups, then age: each group's queued tasks take
+        turns after the ones it has running, so one group's 200-card backlog doesn't hold up another group's card
+        (a group with nothing running goes first; then each group's oldest, then each group's second, ...).
+        `max_priority` limits it to the more urgent tasks (e.g. `PRIORITY_REREAD` for the re-read slot).
+
+        With a per-group cap (`group_cap`, else `AI_INGEST_GROUP_CONCURRENCY`), a group's card readings (not its
+        re-reads, which are short and a reviewer waits for) are listed only while it has fewer running than the cap;
+        `claim` checks the cap again.
         """
         if limit <= 0:
             return []
         conditions = self._claimable(now)
         if max_priority is not None:
             conditions.append(Job.task_priority <= max_priority)
-        stmt = sa.select(Job.id).where(*conditions).order_by(Job.task_priority, Job.created_at, Job.id).limit(limit)
+        cap = self._group_cap(group_cap)
+
+        reread = Job.task_priority <= limits.PRIORITY_REREAD
+        kind_class = sa.case((reread, 0), else_=1)
+        # the task's place in its group's queue (re-reads and card readings each in their own line)
+        place = sa.func.row_number().over(
+            partition_by=(Job.group_id, kind_class), order_by=(Job.task_priority, Job.created_at, Job.id)
+        )
+        queued = (
+            sa.select(
+                Job.id.label("id"),
+                Job.task_priority.label("priority"),
+                Job.created_at.label("created_at"),
+                kind_class.label("kind_class"),
+                (self._running_in_group() + place).label("turn"),
+                (self._running_in_group(readings_only=True) + place).label("reading_turn"),
+            )
+            .where(*conditions)
+            .subquery()
+        )
+        stmt = sa.select(queued.c.id)
+        if cap > 0:
+            stmt = stmt.where(sa.or_(queued.c.kind_class == 0, queued.c.reading_turn <= cap))
+        stmt = stmt.order_by(queued.c.priority, queued.c.turn, queued.c.created_at, queued.c.id).limit(limit)
         ids = list(self.session.execute(stmt).scalars())
         _end_transaction(self.session)
         return ids
 
-    def claim(self, job_id: UUID, *, token: UUID, owner: str, now: datetime) -> bool:
-        """Takes a queued task with a new lease token; whether this caller won it"""
+    def _lock_group(self, job_id: UUID) -> None:
+        """
+        On PostgreSQL, takes the job's group's advisory lock for the rest of the transaction, so two processes
+        claiming cards of one group check its cap one after the other (SQLite runs one writer at a time anyway)
+        """
+        if self.session.get_bind().dialect.name != "postgresql":
+            return
+        group_id = self.session.execute(sa.select(Job.group_id).where(Job.id == job_id)).scalar_one_or_none()
+        if group_id is None:
+            return
+        key = int.from_bytes(UUID(str(group_id)).bytes[:4], "big", signed=True)
+        self.session.execute(sa.select(sa.func.pg_advisory_xact_lock(GROUP_CLAIM_LOCK, key)))
+
+    def claim(self, job_id: UUID, *, token: UUID, owner: str, now: datetime, group_cap: int | None = None) -> bool:
+        """
+        Takes a queued task with a new lease token; whether this caller won it. With a per-group cap (`group_cap`,
+        else `AI_INGEST_GROUP_CONCURRENCY`), a card reading is taken only while its group has fewer running than the
+        cap, checked inside the `UPDATE` (on PostgreSQL under the group's advisory lock).
+        """
+        conditions = [Job.id == job_id, *self._claimable(now)]
+        cap = self._group_cap(group_cap)
+        if cap > 0:
+            self._lock_group(job_id)
+            reread = Job.task_priority <= limits.PRIORITY_REREAD
+            conditions.append(sa.or_(reread, self._running_in_group(readings_only=True) < cap))
         stmt = (
             sa.update(Job)
-            .where(Job.id == job_id, *self._claimable(now))
+            .where(*conditions)
             .values(
                 task_state=IngestTaskState.running.value,
                 lease_token=token,
@@ -802,7 +976,11 @@ class IngestQueue:
                 attempts=Job.attempts + 1,
             )
         )
-        claimed = _execute_update(self.session, stmt) == 1
+        try:
+            claimed = _execute_update(self.session, stmt) == 1
+        except BaseException:
+            self.session.rollback()
+            raise
         _end_transaction(self.session)
         return claimed
 
@@ -965,6 +1143,58 @@ class IngestQueue:
             finally:
                 _end_transaction(self.session)
         return ended
+
+    @staticmethod
+    def _waiting_for_limit() -> list[sa.ColumnElement[bool]]:
+        """A card whose first reading failed because every provider was over its monthly limit, waiting to retry"""
+        return [
+            Job.status == IngestStatus.failed.value,
+            Job.error_code == IngestErrorCode.limit_reached.value,
+            Job.auto_retry_at.is_not(None),
+            Job.task_state.is_(None),
+        ]
+
+    def waiting_for_limit(self) -> list[LimitWait]:
+        """Every card waiting for a monthly limit to reset or be raised (`auto_retry_at`), the soonest retry first"""
+        stmt = (
+            sa.select(Job.id, Job.group_id, Job.household_id, Job.local_only, Job.auto_retry_at)
+            .where(*self._waiting_for_limit())
+            .order_by(Job.auto_retry_at, Job.id)
+        )
+        waiting = [
+            LimitWait(
+                job_id=row.id,
+                group_id=row.group_id,
+                household_id=row.household_id,
+                local_only=bool(row.local_only),
+                auto_retry_at=naive_utc(row.auto_retry_at),
+            )
+            for row in self.session.execute(stmt)
+        ]
+        _end_transaction(self.session)
+        return waiting
+
+    def retry_after_limit(self, job_id: UUID, household_id: UUID) -> bool:
+        """
+        Reads a card that failed `limit_reached` again, as a manual retry does: `processing` with a new extract task,
+        its error and `auto_retry_at` cleared. Conditional on it still waiting (not retried, discarded or changed
+        meanwhile). Whether it was queued; wake the dispatcher afterwards.
+        """
+        return enqueue_task(
+            self.session,
+            job_id,
+            household_id,
+            IngestTaskKind.extract,
+            None,
+            limits.PRIORITY_EXTRACT,
+            where=self._waiting_for_limit(),
+            values={
+                "status": IngestStatus.processing.value,
+                "error_code": None,
+                "error_params": None,
+                "auto_retry_at": None,
+            },
+        )
 
     def update_job_json(
         self, job_id: UUID, mutate: JobMutation, *, where: Sequence[sa.ColumnElement[bool]] = ()

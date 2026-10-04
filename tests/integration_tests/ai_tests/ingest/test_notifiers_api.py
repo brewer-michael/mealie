@@ -1,6 +1,7 @@
 """
 A notifier's "recipe cards ready" toggle and its test notification, `/api/ai/notifiers/{id}/events`
-(docs/ai/PHASE2.md §8, §9): the same permission checks as upstream's notifier routes, the household's notifiers only.
+(docs/ai/PHASE2.md §8, §9): the same permission checks as upstream's notifier routes, the household's notifiers only,
+and a 502 when the test wasn't delivered.
 """
 
 import json
@@ -38,15 +39,17 @@ def create_notifier(user: TestUser, url: str = "jsons://homeassistant.local:8123
 
 @pytest.fixture()
 def published(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, list[str]]]:
+    """What Apprise was asked to deliver (each URL took it; nothing is sent)"""
     sent: list[tuple[Any, list[str]]] = []
 
-    def publish(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
-        sent.append((event, list(notification_urls)))
+    def deliver(event: Any, url: str) -> bool:
+        sent.append((event, [url]))
+        return True
 
     def dispatch(self: EventBusService, *args: Any, **kwargs: Any) -> None:
         raise AssertionError("AI events never go through EventBusService.dispatch")
 
-    monkeypatch.setattr(ApprisePublisher, "publish", publish)
+    monkeypatch.setattr(events, "deliver", deliver)
     monkeypatch.setattr(EventBusService, "dispatch", dispatch)
     return sent
 
@@ -160,3 +163,56 @@ def test_the_test_notification(api_client: TestClient, unique_user_fn_scoped: Te
         "failedCount": 0,
         "reviewUrl": f"http://localhost:8080/g/{slug}/recipes/cards",
     }
+
+
+def test_the_test_notification_that_wasnt_delivered_is_a_502(
+    api_client: TestClient,
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Home Assistant down, a wrong URL, or a notifier that raises: the page says the test failed, and why to look"""
+    user = unique_user_fn_scoped
+    notifier_id = create_notifier(user, "jsons://secret-token@homeassistant.local:8123/api/webhook/mealie_cards")
+    notify_calls: list[str] = []
+
+    def notify(self: apprise.Apprise, *args: Any, **kwargs: Any) -> bool:
+        notify_calls.append(args[0] if args else kwargs.get("body", ""))
+        return False  # what Apprise answers when the service refused it or couldn't be reached
+
+    monkeypatch.setattr(apprise.Apprise, "notify", notify)
+    with caplog.at_level("WARNING"):
+        response = api_client.post(f"{events_url(notifier_id)}/test", headers=user.token)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == {
+        "code": "notification_failed",
+        "message": "The test notification wasn't delivered. "
+        "Check the notifier's URL and that the service it sends to is running.",
+    }
+    assert len(notify_calls) == 1
+    assert str(notifier_id) in caplog.text
+    assert "secret-token" not in caplog.text
+
+    def broken(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
+        raise OSError("jsons://secret-token@homeassistant.local unreachable")
+
+    monkeypatch.setattr(ApprisePublisher, "publish", broken)
+    assert api_client.post(f"{events_url(notifier_id)}/test", headers=user.token).status_code == 502
+
+    # a URL Apprise can't read is never delivered either
+    unreadable = create_notifier(user, "nosuchservice://homeassistant.local/hook")
+    monkeypatch.undo()
+    response = api_client.post(f"{events_url(unreadable)}/test", headers=user.token)
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "notification_failed"
+
+
+def test_the_test_notifications_502_is_in_the_requests_language(api_client: TestClient, unique_user: TestUser):
+    """Only en-US has the fork's texts yet: another language gets the English message, never the key"""
+    notifier_id = create_notifier(unique_user, "nosuchservice://homeassistant.local/hook")
+    response = api_client.post(
+        f"{events_url(notifier_id)}/test", headers={**unique_user.token, "accept-language": "de-DE"}
+    )
+    assert response.status_code == 502
+    assert response.json()["detail"]["message"].startswith("The test notification wasn't delivered.")

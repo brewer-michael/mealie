@@ -64,6 +64,11 @@ function mountItem(value: NeedsALookItem, readonly = false, canReread = true) {
   return wrapper;
 }
 
+/** The line's parts as shown, and whether each is highlighted */
+function segments(wrapper: VueWrapper) {
+  return wrapper.get(".ingest-flag-item__line").findAll("span").map(span => [span.element.textContent, span.classes().includes("ingest-flag-item__mark")]);
+}
+
 function buttonTexts(wrapper: VueWrapper) {
   return wrapper.findAll("button").map(b => b.text());
 }
@@ -207,6 +212,84 @@ describe("IngestFlagItem", () => {
 
     expect(button(wrapper, "Re-read").attributes("disabled")).toBeDefined();
     expect(button(wrapper, "Keep as written").attributes("disabled")).toBeUndefined();
+  });
+
+  test("only the occurrence the flag means is highlighted: the second 2, never the 2 of 1/2", () => {
+    const step = normalizeDraft({ steps: [{ id: "s1", text: "Add 1/2 c. milk. Microwave 2 minutes." }] });
+    const invented = flag({ source: "cross_read", params: { value: "2", start: 27, end: 28 } });
+    const wrapper = mountItem(buildNeedsALook([invented], [invented], new Set(), step, []).items[0]!);
+
+    expect(wrapper.findAll(".ingest-flag-item__mark").map(mark => mark.text())).toEqual(["2"]);
+    expect(segments(wrapper)).toEqual([["Add 1/2 c. milk. Microwave ", false], ["2", true], [" minutes.", false]]);
+  });
+
+  describe("Check this ingredient", () => {
+    const flour = normalizeDraft({
+      ingredients: [
+        { referenceId: "i1", originalText: "2-3 c. flour", quantity: 2, unit: { id: "u1", name: "cup" }, food: { id: "f1", name: "flour" }, note: "to 3" },
+        { referenceId: "i2", originalText: "1 c. sugar, 1 c. flour", quantity: 1, unit: { id: "u1", name: "cup" }, food: { id: null, name: "sugar flour" }, note: "" },
+        { referenceId: "i3", originalText: "pinch of salt", note: "pinch of salt" },
+      ],
+    });
+    const check = (ref: string, params: Record<string, unknown>) => flag({
+      id: `check_parse:ingredients:${ref}`,
+      kind: "check_parse",
+      severity: "warning",
+      source: "parser",
+      field: "ingredients",
+      ref,
+      params,
+    });
+    const itemFor = (f: CardFlag) => buildNeedsALook([f], [f], new Set(), flour, []).items[0]!;
+
+    test("shows what the parser read and what it lost, and can keep the line as text", async () => {
+      const range = check("i1", { value: "2-3", start: 0, end: 3 });
+      const wrapper = mountItem(itemFor(range));
+
+      expect(wrapper.get(".ingest-flag-item__line").text()).toBe("2-3 c. flour");
+      expect(wrapper.get(".ingest-flag-item__mark").text()).toBe("2-3");
+      expect(wrapper.get(".ingest-flag-item__reading").text()).toBe("Read as: 2 cup flour, to 3");
+      expect(wrapper.get(".ingest-flag-item__explanation").text()).toBe("The 3 of 2-3 is kept in the note.");
+      expect(buttonTexts(wrapper)).toEqual(["Re-read", "Looks right", "Keep as text", "Edit"]);
+
+      await button(wrapper, "Keep as text").trigger("click");
+      await button(wrapper, "Looks right").trigger("click");
+      expect(wrapper.emitted("keep-as-text")).toEqual([[range]]);
+      expect(wrapper.emitted("resolve")).toEqual([[range, "dismissed"]]);
+    });
+
+    test("an amount the fields don't hold is named, at the place the flag means", () => {
+      const merged = check("i2", { value: "1", start: 12, end: 13 });
+      const wrapper = mountItem(itemFor(merged));
+
+      expect(wrapper.findAll(".ingest-flag-item__mark")).toHaveLength(1);
+      expect(segments(wrapper)).toEqual([["1 c. sugar, ", false], ["1", true], [" c. flour", false]]);
+      expect(wrapper.get(".ingest-flag-item__reading").text()).toBe("Read as: 1 cup sugar flour");
+      expect(wrapper.get(".ingest-flag-item__explanation").text()).toBe("The 1 isn't in the amount or the note.");
+    });
+
+    test("a low-confidence parse keeps the general explanation", () => {
+      const wrapper = mountItem(itemFor(check("i1", { confidence: 60 })));
+
+      expect(wrapper.get(".ingest-flag-item__reading").text()).toBe("Read as: 2 cup flour, to 3");
+      expect(wrapper.get(".ingest-flag-item__explanation").text()).toBe("This line may not have been split into amount, unit and food correctly.");
+    });
+
+    test("a line already kept as text, or another flag, has nothing to keep", () => {
+      const kept = mountItem(itemFor(check("i3", { value: "1" })));
+      expect(kept.find(".ingest-flag-item__reading").exists()).toBe(false);
+      expect(buttonTexts(kept)).toEqual(["Re-read", "Looks right", "Edit"]);
+
+      const unsure = flag({ id: "unsure:ingredients:i1", kind: "unsure", severity: "warning", source: "model", field: "ingredients", ref: "i1", params: { text: "2-3" } });
+      const other = mountItem(itemFor(unsure));
+      expect(other.find(".ingest-flag-item__reading").exists()).toBe(false);
+      expect(buttonTexts(other)).not.toContain("Keep as text");
+    });
+
+    test("Keep as text is off while the card is read again", () => {
+      const wrapper = mountItem(itemFor(check("i1", { value: "2-3" })), true);
+      expect(button(wrapper, "Keep as text").attributes("disabled")).toBeDefined();
+    });
   });
 
   test("nothing can be changed while the card is read again", () => {

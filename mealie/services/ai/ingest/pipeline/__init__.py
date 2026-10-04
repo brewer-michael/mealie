@@ -5,12 +5,14 @@ production pipeline.
 
 - `decide_orientation` (step 0): whether Tesseract would turn a sideways page upright, with a margin, and its text;
   writes nothing (the runner stages the turn). `orient_page` decides and turns at once, for the eval's copies.
+  `orientation_available` says whether it runs at all (`AI_INGEST_ORIENT`, independent of `OCR_ENABLED`).
 - `extract_card` (steps 1-6): the card compilers, the optional cross-read on the same `ai`, the build and organizer
   steps, ingredient normalization and linking, and the flags. No database writes.
 - `rebuild_from_transcription`: the build steps, ingredients and flags again from an edited transcription, with no
   image read.
 - `parse_lines`: chosen ingredient lines parsed by the AI ingredient parser, in any language.
-- `reread_region`: one region of a page read again, as a proposal.
+- `reread_region`: one region of a page read again, as a proposal; `region_hint`: where on the card a field's text
+  probably is, so the selection to re-read starts there.
 - `options_for_group`: the options from the group's recipe card settings.
 """
 
@@ -41,6 +43,7 @@ from mealie.schema.recipe_ingest import (
 from mealie.services.ai.errors import AIProviderLimitReachedError, AIProviderLocalOnlyError, describe_provider_error
 from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.recipe.import_workflow import RecipeImportWorkflow
+from mealie.services.recipe.import_workflow.context import StepOutcome
 from mealie.services.recipe.import_workflow.exceptions import NoRecipeDataError
 from mealie.services.recipe.import_workflow.recipe_conversion import DEFAULT_RECIPE_NAME, DEFAULT_RECIPE_NAME_KEY
 from mealie.services.recipe.import_workflow.workflow import WorkflowResult
@@ -52,11 +55,12 @@ from .cardtext import canonical_markers, strip_from_prefix
 from .compilers import CapturedError
 from .context import PROGRESS_CROSS_READING, PROGRESS_LINKING_INGREDIENTS, CardWorkflowContext
 from .crossread import read_transcript
-from .flags import compute_flags, ocr_check_lines
+from .flags import ORGANIZERS_STEP, compute_flags, ocr_check_lines, organizers_outcome
 from .ingredients import IngredientLine, normalize_ingredients, parse_lines
 from .llm_schemas import OpenAIRecipeCardTranscription
 from .models import CardExtraction, CardPage, CardPipelineOptions, CardReadPath
-from .orient import OrientDecision, decide_orientation, orient_page, oriented_meta
+from .orient import OrientDecision, decide_orientation, orient_page, orientation_available, oriented_meta
+from .regions import RegionHint, region_hint
 from .reread import reread_region
 from .service import JobAIRuntime, end_transaction
 from .steps import card_rebuild_steps, card_workflow_steps
@@ -68,13 +72,16 @@ __all__ = [
     "CardReadPath",
     "IngredientLine",
     "OrientDecision",
+    "RegionHint",
     "decide_orientation",
     "extract_card",
     "options_for_group",
     "orient_page",
+    "orientation_available",
     "oriented_meta",
     "parse_lines",
     "rebuild_from_transcription",
+    "region_hint",
     "reread_region",
 ]
 
@@ -353,20 +360,27 @@ async def _finish(ctx: CardWorkflowContext, result: WorkflowResult, extraction: 
         recipe, repos=repos, translator=translator, matcher=matcher, language=compiled.language, ai=ai
     )
     units = matcher.unit_names()  # loaded by the parse; for `unit_unclear`
+    linked = matcher.linked_names(ingredients)  # for `linked_fuzzy`
     end_transaction(repos.session)
 
     draft = _draft(recipe, ctx, translator, ingredients, organizers)
     runtime = ai.runtime
+    step_outcomes = {name: outcome.value for name, outcome in result.outcomes.items()}
+    if ctx.organizers_skipped and step_outcomes.get(ORGANIZERS_STEP) == StepOutcome.COMPLETED.value:
+        # no provider could be asked for suggestions: `organizers_skipped` tells the reviewer why
+        step_outcomes[ORGANIZERS_STEP] = organizers_outcome(ctx.organizers_skipped)
     extraction = extraction.model_copy(
         update={
             "language": compiled.language,
             "attribution": ctx.attribution,
-            "step_outcomes": {name: outcome.value for name, outcome in result.outcomes.items()},
+            "step_outcomes": step_outcomes,
             "usage": runtime.usage if isinstance(runtime, JobAIRuntime) else [],
         }
     )
     ocr_lines = ocr_check_lines([page.meta.ocr for page in ctx.pages], extraction.read_path, compiled.content)
-    flags = compute_flags(draft, extraction, {}, transcription=compiled.content, units=units, ocr_lines=ocr_lines)
+    flags = compute_flags(
+        draft, extraction, {}, transcription=compiled.content, units=units, ocr_lines=ocr_lines, linked=linked
+    )
     return CardExtraction(
         draft=draft,
         flags=flags,

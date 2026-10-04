@@ -61,7 +61,7 @@ def _poison(session: Session, lease: ExpiredLease, now: datetime) -> IngestStatu
             IngestStatus.failed,
             sa.update(Job)
             .where(*still_expired, Job.status == IngestStatus.processing.value)
-            .values(**TASK_CLEARED, **error, **bump, status=IngestStatus.failed.value),
+            .values(**TASK_CLEARED, **error, **bump, status=IngestStatus.failed.value, auto_retry_at=None),
         ),
         (
             IngestStatus.ready,

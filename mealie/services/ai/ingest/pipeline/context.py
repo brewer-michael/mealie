@@ -61,6 +61,11 @@ class CardWorkflowContext(WorkflowContext):
     How far the image reader said each page not yet oriented must turn clockwise to be upright (90, 180 or 270), by
     page index; pages it read as upright aren't listed
     """
+    organizers_skipped: str | None = None
+    """
+    Why the organizer step asked no provider, so it suggested nothing without failing: `local_only` or
+    `limit_reached` (`flags.ORGANIZERS_SKIPPED_REASONS`)
+    """
 
     _last_progress: str | None = field(default=None, repr=False)
 

@@ -156,6 +156,22 @@ describe("HouseholdNotifierAIEvents", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
+  test("a notifier that didn't get the test is said once, by the server's message", async () => {
+    // a 502 `notification_failed`: the API client shows its message, so the card adds no second toast
+    const failed = Object.assign(new Error("502"), {
+      response: { status: 502, data: { detail: { code: "notification_failed", message: "The notifier didn't get it." } } },
+    });
+    api.testNotifierEvents.mockResolvedValue({ data: null, error: failed });
+    const wrapper = mountToggle();
+    await flushPromises();
+
+    await button(wrapper, "Send test notification").trigger("click");
+    await flushPromises();
+
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
   test("loads another notifier's switch when it's given one", async () => {
     const wrapper = mountToggle("n1");
     await flushPromises();

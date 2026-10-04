@@ -55,6 +55,8 @@ export const MIN_REGION_SIDE = 0.02;
 export const HIGHLIGHTED_SEVERITIES: readonly CardFlagSeverity[] = ["error", "warning"];
 /** Errors that "Keep as written" resolves (the server's `flag_rules.KEEPABLE_KINDS`); every other error is fixed */
 export const KEEPABLE_KINDS: readonly CardFlagKind[] = ["illegible", "blank"];
+/** Flags about the parser's reading of a line, which the server drops once the line is edited (`flags.PARSE_KINDS`) */
+export const PARSE_KINDS: readonly CardFlagKind[] = ["check_parse", "unit_unclear", "shorthand_read"];
 /** The two markers a card's reading holds (docs/ai/PHASE2.md §4.3) */
 export const MARKERS = { illegible: "[illegible]", blank: "[blank]" } as const;
 
@@ -392,28 +394,109 @@ export function canFillFlag(flag: CardFlag): boolean {
   return (flag.kind === "blank" || flag.kind === "illegible") && flag.field !== "card" && !!flagFragment(flag);
 }
 
-function replaceFirst(text: string, fragment: string, replacement: string): string | null {
-  const index = fragment ? text.indexOf(fragment) : -1;
-  return index < 0 ? null : text.slice(0, index) + replacement + text.slice(index + fragment.length);
+/** A part of a text, as character offsets: `text.slice(start, end)` */
+export interface TextSpan {
+  start: number;
+  end: number;
 }
 
 /**
- * The text with one of a flag's alternatives applied: it replaces the flagged part when the text holds it, else the
- * alternative is the whole new text (a second reading's line, or a reading that has changed since).
+ * Where the flagged part is, as the server found it (`params.start` and `params.end`): offsets into the text the flag
+ * was computed on (a single field's, step's or note's text, an ingredient's card line). None when the flag has none.
  */
-export function applyAlternative(text: string, flag: CardFlag, alternative: string): string {
-  const fragment = flagFragment(flag);
-  return (fragment ? replaceFirst(text, fragment, alternative) : null) ?? alternative;
+export function flagSpan(flag: CardFlag): TextSpan | null {
+  const start = flag.params?.start;
+  const end = flag.params?.end;
+  if (typeof start !== "number" || typeof end !== "number" || !Number.isInteger(start) || !Number.isInteger(end)) {
+    return null;
+  }
+  return start >= 0 && end > start ? { start, end } : null;
 }
 
-/** The text with a typed value in place of the marker (or flagged part); unchanged when the value is empty or the
- * marker is already gone */
-export function fillBlank(text: string, value: string, fragment: string = MARKERS.blank): string {
+const FRACTION_GLYPHS = Object.keys(UNICODE_FRACTIONS).join("");
+const DIGIT = new RegExp(`[\\d${FRACTION_GLYPHS}]`);
+const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+
+/**
+ * Whether a fragment edge joins the character beside it (`outer`, with `beyond` past that) into a bigger token: a
+ * digit edge joins digits ("2" in "12", "1" in "1½") and a separator before another digit ("2" in "1/2" or "1.5");
+ * a letter edge joins letters and digits ("T" in "Tbsp"). A digit before letters still stands alone ("2" in "2T.").
+ */
+function joinsNeighbour(edge: string, outer: string | undefined, beyond: string | undefined): boolean {
+  if (!outer) {
+    return false;
+  }
+  if (DIGIT.test(edge)) {
+    return DIGIT.test(outer) || (/[/.,]/.test(outer) && !!beyond && DIGIT.test(beyond));
+  }
+  return LETTER_OR_DIGIT.test(edge) && LETTER_OR_DIGIT.test(outer);
+}
+
+/** Whether `fragment` at `start` stands on its own in `text`: no number or word runs on from either end */
+function isWholeToken(text: string, fragment: string, start: number): boolean {
+  const end = start + fragment.length;
+  return !joinsNeighbour(fragment[0]!, text[start - 1], text[start - 2])
+    && !joinsNeighbour(fragment[fragment.length - 1]!, text[end], text[end + 1]);
+}
+
+/**
+ * Whether the text at `span` is the fragment; a reading longer than three characters whatever its case, as the server
+ * matches an `unsure` reading ("1/4 t." in "1/4 T. salt"), while "T" and "t" stay different units
+ */
+function fragmentAt(text: string, fragment: string, span: TextSpan): boolean {
+  if (span.end > text.length || span.end - span.start !== fragment.length) {
+    return false;
+  }
+  const there = text.slice(span.start, span.end);
+  return there === fragment || (fragment.length > 3 && there.toLowerCase() === fragment.toLowerCase());
+}
+
+/**
+ * Where the flagged part is in `text`: the server's position (`span`) when the text there still is the fragment
+ * (`fragmentAt`), else the first occurrence that stands on its own, so "2" never matches inside "1/2" or "12".
+ * None when the text doesn't hold it.
+ */
+export function findFragment(text: string, fragment: string | null | undefined, span?: TextSpan | null): TextSpan | null {
+  if (!fragment) {
+    return null;
+  }
+  if (span && fragmentAt(text, fragment, span)) {
+    return { start: span.start, end: span.end };
+  }
+  for (let index = text.indexOf(fragment); index >= 0; index = text.indexOf(fragment, index + 1)) {
+    if (isWholeToken(text, fragment, index)) {
+      return { start: index, end: index + fragment.length };
+    }
+  }
+  return null;
+}
+
+function replaceFragment(text: string, fragment: string, replacement: string, span?: TextSpan | null): string | null {
+  const found = findFragment(text, fragment, span);
+  return found ? text.slice(0, found.start) + replacement + text.slice(found.end) : null;
+}
+
+/**
+ * The text with one of a flag's alternatives applied: it replaces the flagged part when the text holds it (at the
+ * flag's position when that still holds it), else the alternative is the whole new text (a second reading's line, or
+ * a reading that has changed since). `span` is where to look, by default the flag's own position; pass null for text
+ * other than the one the flag was computed on (a parsed line's note).
+ */
+export function applyAlternative(text: string, flag: CardFlag, alternative: string, span: TextSpan | null = flagSpan(flag)): string {
+  const fragment = flagFragment(flag);
+  return (fragment ? replaceFragment(text, fragment, alternative, span) : null) ?? alternative;
+}
+
+/**
+ * The text with a typed value in place of the marker (or flagged part, at `span` when the text still holds it there);
+ * unchanged when the value is empty or the marker is already gone
+ */
+export function fillBlank(text: string, value: string, fragment: string = MARKERS.blank, span: TextSpan | null = null): string {
   const typed = value.trim();
   if (!typed) {
     return text;
   }
-  return replaceFirst(text, fragment, typed) ?? text;
+  return replaceFragment(text, fragment, typed, span) ?? text;
 }
 
 export interface TextSegment {
@@ -421,28 +504,44 @@ export interface TextSegment {
   mark: boolean;
 }
 
-/** The text cut around every occurrence of the flagged part, for highlighting it; a blank shows as "___" */
-export function highlightSegments(text: string, fragment: string | null): TextSegment[] {
+/**
+ * The text cut around the flagged part, for highlighting it: the occurrence at `span` (where the flag says it is) when
+ * the text still holds it there, else the first that stands on its own (`findFragment`). A blank shows as "___".
+ */
+export function highlightSegments(text: string, fragment: string | null, span: TextSpan | null = null): TextSegment[] {
   const show = (part: string) => part.split(MARKERS.blank).join("___");
-  if (!fragment || !text.includes(fragment)) {
+  const found = findFragment(text, fragment, span);
+  if (!found) {
     return text ? [{ text: show(text), mark: false }] : [];
   }
-  const segments: TextSegment[] = [];
-  text.split(fragment).forEach((part, index) => {
-    if (index > 0) {
-      segments.push({ text: show(fragment), mark: true });
+  return [
+    { text: show(text.slice(0, found.start)), mark: false },
+    { text: show(text.slice(found.start, found.end)), mark: true },
+    { text: show(text.slice(found.end)), mark: false },
+  ].filter(segment => segment.text);
+}
+
+/**
+ * Where a part of a parsed line (its note, unit or food name) sits on the card's line, when it covers `span`: the
+ * span within that part. None when the part isn't written on the line around it.
+ */
+function spanInPart(line: string, part: string | null | undefined, span: TextSpan): TextSpan | null {
+  if (!part) {
+    return null;
+  }
+  for (let index = line.indexOf(part); index >= 0; index = line.indexOf(part, index + 1)) {
+    if (index <= span.start && span.end <= index + part.length) {
+      return { start: span.start - index, end: span.end - index };
     }
-    if (part) {
-      segments.push({ text: show(part), mark: false });
-    }
-  });
-  return segments;
+  }
+  return null;
 }
 
 /**
  * An ingredient with a flag's fix applied. A line kept as text changes in its note. A parsed line changes in the
  * part that holds the flagged text (note, amount, unit or food: an edited unit or food is linked again by name at
- * commit); when no part holds it, the fixed line is kept as text.
+ * commit): the part written where the flag points on the card's line, else the first holding it as a whole token.
+ * When no part holds it, the fixed line is kept as text.
  */
 export function fixIngredient(
   ingredient: CardDraftIngredient,
@@ -451,29 +550,108 @@ export function fixIngredient(
   mode: "alternative" | "fill",
 ): CardDraftIngredient {
   const fragment = flagFragment(flag) ?? (mode === "fill" ? MARKERS.blank : null);
-  const fix = (text: string) => (mode === "fill" ? fillBlank(text, replacement, fragment ?? MARKERS.blank) : applyAlternative(text, flag, replacement));
+  const fix = (text: string, span: TextSpan | null) => (mode === "fill"
+    ? fillBlank(text, replacement, fragment ?? MARKERS.blank, span)
+    : applyAlternative(text, flag, replacement, span));
+  const fixName = (named: CardDraftRef, span: TextSpan | null) => ({ id: null, name: fix(named.name ?? "", span).trim() });
 
   if (!isParsedIngredient(ingredient)) {
-    return withDisplay({ ...ingredient, note: fix(ingredient.note || ingredient.originalText || "") });
+    return withDisplay({ ...ingredient, note: fix(ingredient.note || ingredient.originalText || "", flagSpan(flag)) });
   }
   if (fragment) {
-    if (ingredient.note?.includes(fragment)) {
-      return withDisplay({ ...ingredient, note: fix(ingredient.note) });
-    }
     const amount = parseQuantity(fragment);
     const newAmount = parseQuantity(replacement);
-    if (amount !== null && newAmount !== null && amount === ingredient.quantity) {
+    const isAmount = amount !== null && newAmount !== null && amount === ingredient.quantity;
+
+    // where the flag points on the card's line: the part written there, else the amount
+    const line = ingredient.originalText ?? "";
+    const onLine = flagSpan(flag);
+    if (onLine && fragmentAt(line, fragment, onLine)) {
+      const inNote = spanInPart(line, ingredient.note, onLine);
+      if (inNote) {
+        return withDisplay({ ...ingredient, note: fix(ingredient.note ?? "", inNote) });
+      }
+      const inUnit = ingredient.unit ? spanInPart(line, ingredient.unit.name, onLine) : null;
+      if (ingredient.unit && inUnit) {
+        return withDisplay({ ...ingredient, unit: fixName(ingredient.unit, inUnit) });
+      }
+      const inFood = ingredient.food ? spanInPart(line, ingredient.food.name, onLine) : null;
+      if (ingredient.food && inFood) {
+        return withDisplay({ ...ingredient, food: fixName(ingredient.food, inFood) });
+      }
+      if (isAmount) {
+        return withDisplay({ ...ingredient, quantity: newAmount });
+      }
+    }
+
+    // no position to go by: the first part holding it
+    if (ingredient.note && findFragment(ingredient.note, fragment)) {
+      return withDisplay({ ...ingredient, note: fix(ingredient.note, null) });
+    }
+    if (isAmount) {
       return withDisplay({ ...ingredient, quantity: newAmount });
     }
-    if (ingredient.unit?.name?.includes(fragment)) {
-      return withDisplay({ ...ingredient, unit: { id: null, name: fix(ingredient.unit.name).trim() } });
+    if (ingredient.unit && findFragment(ingredient.unit.name ?? "", fragment)) {
+      return withDisplay({ ...ingredient, unit: fixName(ingredient.unit, null) });
     }
-    if (ingredient.food?.name?.includes(fragment)) {
-      return withDisplay({ ...ingredient, food: { id: null, name: fix(ingredient.food.name).trim() } });
+    if (ingredient.food && findFragment(ingredient.food.name ?? "", fragment)) {
+      return withDisplay({ ...ingredient, food: fixName(ingredient.food, null) });
     }
   }
-  const line = fix(ingredient.originalText || ingredientDisplay(ingredient));
+  // the card's line holds the flag's position; a line built from the fields doesn't
+  const line = ingredient.originalText
+    ? fix(ingredient.originalText, flagSpan(flag))
+    : fix(ingredientDisplay(ingredient), null);
   return withDisplay({ ...ingredient, quantity: null, unit: null, food: null, note: line });
+}
+
+/** The line kept as written on the card, with no amount, unit or food: what "Keep as text" makes of it */
+export function ingredientAsText(ingredient: CardDraftIngredient): CardDraftIngredient {
+  const text = ingredient.originalText || ingredientDisplay(ingredient);
+  return withDisplay({ ...ingredient, quantity: null, unit: null, food: null, note: text });
+}
+
+/** What the parser made of a line, as "Check this ingredient" shows it: "2 cup flour, to 3" */
+export function parsedReading(ingredient: CardDraftIngredient): string {
+  const fields = [formatQuantity(ingredient.quantity), ingredient.unit?.name, ingredient.food?.name]
+    .map(part => (part ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+  return [fields, (ingredient.note ?? "").trim()].filter(Boolean).join(", ");
+}
+
+/**
+ * What a `check_parse` flag's `params.value` says the amount, unit and food lost, and whether the note keeps it:
+ * a range's end ("2-3" read as 2: `range`, with `end` "3"), a second amount ("+ 2 T.", the "10 3/4" of "1 can
+ * (10 3/4 oz.) soup", a second ingredient run into the line: `amount`), or a size word read into the unit or food
+ * ("cup scant": `in-name`). `kept`: the note holds it, as parsing keeps it there (a line parsed before that doesn't).
+ */
+export type ParseLoss
+  = | { kind: "range"; value: string; end: string; kept: boolean }
+    | { kind: "amount"; value: string; kept: boolean }
+    | { kind: "in-name"; value: string };
+
+const RANGE_SEPARATOR = /\s*(?:-|–|—|\bto\b)\s*/g;
+
+/** The `ParseLoss` of a `check_parse` flag on this ingredient; none for other flags, or one without a value */
+export function parseLoss(flag: CardFlag, ingredient: CardDraftIngredient | null | undefined): ParseLoss | null {
+  const value = stringParam(flag, "value")?.trim();
+  if (flag.kind !== "check_parse" || !value || !ingredient) {
+    return null;
+  }
+  if (!/\d/.test(value)) {
+    return { kind: "in-name", value };
+  }
+  const note = ingredient.note ?? "";
+  for (const separator of value.matchAll(RANGE_SEPARATOR)) {
+    const start = value.slice(0, separator.index);
+    const end = value.slice(separator.index + separator[0].length);
+    const first = parseQuantity(start);
+    if (first !== null && parseQuantity(end) !== null && first === ingredient.quantity) {
+      return { kind: "range", value, end, kept: !!findFragment(note, end) };
+    }
+  }
+  return { kind: "amount", value, kept: !!findFragment(note, value) };
 }
 
 /**
@@ -488,7 +666,11 @@ export function editFlaggedText(
 ): boolean {
   const field = normalizeField(flag.field);
   const fragment = flagFragment(flag) ?? MARKERS.blank;
-  const fix = (text: string) => (mode === "fill" ? fillBlank(text, replacement, fragment) : applyAlternative(text, flag, replacement));
+  // the flag's position is in the text it was computed on: a field's, step's or note's text, not a note's title
+  const span = flagSpan(flag);
+  const fix = (text: string, at: TextSpan | null = span) => (mode === "fill"
+    ? fillBlank(text, replacement, fragment, at)
+    : applyAlternative(text, flag, replacement, at));
 
   if (field === "ingredients") {
     const index = draft.ingredients.findIndex(item => item.referenceId === flag.ref);
@@ -514,14 +696,14 @@ export function editFlaggedText(
     // the flag's note by its index; without one, the first note holding the flagged part
     const index = noteIndex(flag.ref);
     const note = index === null
-      ? draft.notes.find(item => (item.text ?? "").includes(fragment) || (item.title ?? "").includes(fragment))
+      ? draft.notes.find(item => findFragment(item.text ?? "", fragment) || findFragment(item.title ?? "", fragment))
       : draft.notes[index];
     if (!note) {
       return false;
     }
     // the marker can be in the note's title (the server checks both); otherwise the text changes
-    const part = !(note.text ?? "").includes(fragment) && (note.title ?? "").includes(fragment) ? "title" : "text";
-    const text = fix(note[part] ?? "");
+    const part = !findFragment(note.text ?? "", fragment) && findFragment(note.title ?? "", fragment) ? "title" : "text";
+    const text = fix(note[part] ?? "", part === "text" ? span : null);
     const changed = text !== (note[part] ?? "");
     note[part] = text;
     return changed;
@@ -585,12 +767,33 @@ export interface NeedsALookItem {
   field: string;
   /** The ingredient's or step's position (from 0), for list fields */
   line: number | null;
-  /** The line as it reads now, and the part the flag is about */
+  /** The line as it reads now, the part the flag is about, and where in the line that part is (none when it isn't) */
   text: string;
   fragment: string | null;
+  span: TextSpan | null;
+  /** The ingredient, for a flag on one: what the parser made of the line */
+  ingredient: CardDraftIngredient | null;
   /** Re-read results for this line, shown inside the item */
   proposals: CardProposal[];
   anchor: string;
+}
+
+/**
+ * A flag's position in the text its item shows (`fieldText`): a note's item shows its title above its text, and the
+ * flag's position is in the text
+ */
+function spanInFieldText(draft: CardDraft, field: string, flag: CardFlag): TextSpan | null {
+  const span = flagSpan(flag);
+  if (!span || field !== "notes") {
+    return span;
+  }
+  const index = noteIndex(flag.ref);
+  const note = index === null ? undefined : draft.notes?.[index];
+  if (!note?.text) {
+    return null;
+  }
+  const offset = note.title ? note.title.length + 1 : 0;
+  return { start: span.start + offset, end: span.end + offset };
 }
 
 function sameTarget(target: ProposalTarget | null | undefined, field: string, ref: string | null | undefined) {
@@ -627,13 +830,18 @@ export function buildNeedsALook(
       const index = noteIndex(flag.ref);
       line = index !== null && index < (draft.notes?.length ?? 0) ? index : null;
     }
+    const ingredient = field === "ingredients" && line !== null && line >= 0 ? draft.ingredients![line]! : null;
+    const text = fieldText(draft, field, flag.ref);
+    const fragment = flagFragment(flag);
     return {
       flag,
       state,
       field,
       line: line !== null && line < 0 ? null : line,
-      text: fieldText(draft, field, flag.ref),
-      fragment: flagFragment(flag),
+      text,
+      fragment,
+      span: findFragment(text, fragment, spanInFieldText(draft, field, flag)),
+      ingredient,
       proposals: [],
       anchor: flagAnchorId(flag.id),
     };
@@ -1066,6 +1274,23 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     status.value !== "ready" || task.value?.kind === "extract" || conflict.value || committing.value,
   );
 
+  /**
+   * Whether commit attaches the card's photos to the recipe: the draft's switch, else the household's default
+   * (`cardPhotoDefault`, off where new recipes are public). Turning the switch stores the choice in the draft.
+   */
+  const attachCardPhoto = computed<boolean>({
+    get: () => draft.value.attachCardPhoto ?? job.value?.cardPhotoDefault ?? true,
+    set: (value) => {
+      if (!readOnly.value) {
+        draft.value.attachCardPhoto = value;
+      }
+    },
+  });
+  /** Whether anyone could see the card photo: new recipes here are public, and it's the cover or attached */
+  const cardPhotoPublic = computed(() =>
+    !!job.value?.householdRecipesPublic && (draft.value.useCardAsCover || attachCardPhoto.value),
+  );
+
   function hasPendingChanges() {
     return isDirty.value || pendingResolutions.size > 0 || pendingProposalIds.size > 0 || pendingClearError;
   }
@@ -1457,6 +1682,21 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     if (!readOnly.value && value.trim() && editFlaggedText(draft.value, flag, value, "fill")) {
       markFixed(flag);
     }
+  }
+
+  /**
+   * "Keep as text" on "Check this ingredient": the flagged line is kept as written, with no amount, unit or food.
+   * The parser's flags on the line are done with (the server drops them once the line is edited).
+   */
+  function keepIngredientAsText(flag: CardFlag) {
+    const index = draft.value.ingredients.findIndex(item => item.referenceId === flag.ref);
+    if (readOnly.value || normalizeField(flag.field) !== "ingredients" || index < 0) {
+      return;
+    }
+    draft.value.ingredients.splice(index, 1, ingredientAsText(draft.value.ingredients[index]!));
+    flagsForField(flags.value, "ingredients", flag.ref ?? null)
+      .filter(item => isHighlighted(item) && PARSE_KINDS.includes(item.kind))
+      .forEach(item => markFixed(item));
   }
 
   function settleProposal(proposal: CardProposal) {
@@ -1948,6 +2188,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     task,
     readOnly,
     position,
+    attachCardPhoto,
+    cardPhotoPublic,
     // flags
     needsALook,
     otherProposals,
@@ -1968,6 +2210,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     resolveFlag,
     applyFlagAlternative,
     fillFlagBlank,
+    keepIngredientAsText,
     useProposal,
     dismissProposal,
     dismissError,

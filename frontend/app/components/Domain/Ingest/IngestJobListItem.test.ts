@@ -33,6 +33,7 @@ function job(overrides: Partial<RecipeIngestionJobSummary> = {}): RecipeIngestio
     title: "Banana Mug Cake",
     pageCount: 1,
     thumbUrl: "/api/ai/ingest/jobs/j1/pages/0/thumb?v=abc",
+    draftVersion: 1,
     errorCount: 0,
     warningCount: 0,
     task: null,

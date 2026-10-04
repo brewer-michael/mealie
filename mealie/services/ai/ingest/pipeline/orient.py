@@ -5,20 +5,33 @@ Phones held flat over a table record the wrong EXIF orientation (F7), so intake'
 Tesseract reads the page every way up, and the page turns only when the best reading scores at least
 `ORIENT_MIN_RATIO` times the upright one: handwriting scores low every way, and a wrong turn makes every later read
 worse. The same run's text and confidence are kept (`PageMeta.ocr`) for the OCR fallback, read at the chosen
-rotation, so they match the stored page.
+rotation, so they match the stored page, with the box of each line it found (`PageOCR.lines`), from which a re-read's
+selection starts at the line it's about (`regions.region_hint`).
 
 `decide_orientation` only decides: it writes no file, so the runner can stage the turned files, store their metadata
 and swap them in, and a crash between those steps is recovered (`images.recover_staged`). `orient_page` decides and
 turns the files at once, for callers that work on copies (the eval) or hold no stored metadata.
+
+Orientation has its own switch, `AI_INGEST_ORIENT` (`orientation_available`): it needs only the `tesseract` command,
+so `OCR_ENABLED=false` turns off the OCR fallback reader but not this, and the text read here is still stored.
 """
 
 from dataclasses import dataclass
 
-from mealie.schema.recipe_ingest import PageMeta, PageOCR, PageRotationSource
+from mealie.schema.recipe_ingest import OCRLine, PageMeta, PageOCR, PageRotationSource
 from mealie.services import ocr
 
 from .. import images, limits, storage
+from ..settings import get_ingest_settings
 from .models import CardPage
+
+MAX_OCR_LINES = 300
+"""At most this many of the lines Tesseract found are kept with a page (a card has far fewer)"""
+
+
+def orientation_available() -> bool:
+    """Whether pages are turned upright automatically: `AI_INGEST_ORIENT` is on and Tesseract is installed"""
+    return get_ingest_settings().ORIENT and ocr.binary_available()
 
 
 @dataclass(frozen=True)
@@ -38,25 +51,30 @@ class OrientDecision:
 
 def decide_orientation(page: CardPage) -> OrientDecision:
     """
-    Whether and how far a page must turn to be upright, when Tesseract is available and sure enough
-    (`ORIENT_MIN_RATIO`), and the text it read. Writes nothing. A page already oriented is settled as it is.
-    Blocking (Tesseract); run it in a thread from async code.
+    Whether and how far a page must turn to be upright, when orientation is on (`orientation_available`) and
+    Tesseract is sure enough (`ORIENT_MIN_RATIO`), and the text it read. Writes nothing. A page already oriented is
+    settled as it is. Blocking (Tesseract); run it in a thread from async code.
 
     Raises `FileNotFoundError` when the page is gone.
     """
     if page.meta.oriented:
         return OrientDecision(rotation=0, ocr=page.meta.ocr, settled=True)
-    if not ocr.is_available():
+    if not orientation_available():
         return OrientDecision(rotation=0, ocr=None, settled=False)
     if not page.page_path.is_file():
         raise FileNotFoundError(page.page_path)
 
-    result = ocr.extract_text(page.page_path, min_ratio=limits.ORIENT_MIN_RATIO)
+    # its own switch: read whenever Tesseract is installed, whatever `OCR_ENABLED` says about the OCR fallback
+    result = ocr.extract_text(page.page_path, min_ratio=limits.ORIENT_MIN_RATIO, require_enabled=False)
     if result.failed:
         return OrientDecision(rotation=0, ocr=None, settled=False)
+    lines = [
+        OCRLine(text=line.text, x=line.x, y=line.y, width=line.width, height=line.height)
+        for line in result.lines[:MAX_OCR_LINES]
+    ]
     return OrientDecision(
         rotation=result.rotation % 360,
-        ocr=PageOCR(text=result.text, confidence=result.confidence),
+        ocr=PageOCR(text=result.text, confidence=result.confidence, lines=lines),
         settled=True,
     )
 

@@ -58,6 +58,14 @@ class IngestSettings(BaseSettings):
     """At most this many cards of one group are read at once, across worker processes; 0: no cap"""
     MAX_PROCESSING_PER_USER: int = Field(0, ge=0)
     """At most this many of one user's cards wait to be read; more uploads are refused with 429. 0: no cap"""
+    URL_FETCH: bool = False
+    """Accept image URLs in the upload API's JSON (`{"images": [{"url": ...}]}`), downloaded by the server; off: they
+    are refused `url_not_allowed` and nothing is fetched"""
+    URL_ALLOW_HOSTS: str = ""
+    """Hostnames and addresses (or CIDR ranges), comma-separated, that image URLs may reach although they're on a
+    private network (Home Assistant's, say); on top of `HTTP_ALLOW_LIST`. `HTTP_DISALLOW_LIST` still wins."""
+    URL_TIMEOUT: int = Field(20, ge=1, le=300)
+    """Seconds one image URL's download may take in all, redirects included"""
 
     # an empty variable is unset: Unraid and compose files pass unused ones as `''`
     model_config = SettingsConfigDict(env_prefix="AI_INGEST_", extra="ignore", env_ignore_empty=True)
@@ -86,6 +94,11 @@ class IngestSettings(BaseSettings):
     def inbox_dir_mode(self) -> int:
         """`INBOX_DIR_MODE` as a number"""
         return int(self.INBOX_DIR_MODE, 8)
+
+    @property
+    def url_allow_hosts(self) -> list[str]:
+        """`URL_ALLOW_HOSTS` as a list"""
+        return [host.strip() for host in self.URL_ALLOW_HOSTS.split(",") if host.strip()]
 
 
 @cache

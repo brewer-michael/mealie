@@ -69,6 +69,8 @@ class RecipeIngestionJobSummary(MealieModel):
     page_count: int
     thumb_url: str | None = None
     """The front page's thumbnail"""
+    draft_version: int
+    """What a save or commit of the draft names; a newer one means it changed (409 `version_conflict`)"""
     error_count: int = 0
     warning_count: int = 0
     """Unresolved errors and warnings"""
@@ -119,7 +121,6 @@ class RecipeIngestionJobPermissions(MealieModel):
 
 
 class RecipeIngestionJobOut(RecipeIngestionJobSummary):
-    draft_version: int
     pages: list[PageOut] = Field(default_factory=list)
     transcription: str | None = None
     read: CardReadInfo | None = None

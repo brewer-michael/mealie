@@ -192,6 +192,7 @@ class PhaseCalls:
     commits: list[datetime] = field(default_factory=list)
     inbox: int = 0
     purge: list[datetime] = field(default_factory=list)
+    retries: list[datetime] = field(default_factory=list)
     notified: list[UUID] = field(default_factory=list)
 
 

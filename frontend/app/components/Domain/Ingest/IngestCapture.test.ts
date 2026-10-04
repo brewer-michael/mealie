@@ -4,6 +4,7 @@ import { nextTick } from "vue";
 import IngestCapture from "./IngestCapture.vue";
 import { resetRecipeIngestCounts } from "~/composables/use-recipe-ingest";
 import {
+  BATCH_HEARTBEAT_MS,
   CAPTURE_MODE_STORAGE_KEY,
   resetRecipeIngestUploads,
   useRecipeIngestUploads,
@@ -13,6 +14,7 @@ const api = vi.hoisted(() => ({
   upload: vi.fn(),
   createBatch: vi.fn(),
   sealBatch: vi.fn(),
+  touchBatch: vi.fn(),
   getCounts: vi.fn(),
 }));
 
@@ -104,6 +106,7 @@ beforeEach(() => {
   localStorage.clear();
   api.createBatch.mockResolvedValue({ data: { id: "b1", source: "app" }, error: null });
   api.sealBatch.mockResolvedValue({ data: { id: "b1", source: "app" }, error: null });
+  api.touchBatch.mockResolvedValue({ data: { id: "b1", source: "app" }, error: null });
   api.getCounts.mockResolvedValue({ data: { processing: 1, ready: 0 }, error: null });
   api.upload.mockResolvedValue({
     data: { batchId: "b1", jobs: [{ id: "j1", status: "processing", pageCount: 1, reviewPath: "" }], rejected: [], summary: "" },
@@ -115,6 +118,7 @@ afterEach(() => {
   wrappers.forEach(wrapper => wrapper.unmount());
   wrappers.length = 0;
   resetRecipeIngestUploads();
+  vi.useRealTimers();
 });
 
 describe("IngestCapture", () => {
@@ -234,6 +238,21 @@ describe("IngestCapture", () => {
     await cards()[0]!.get(".draft-join").trigger("click");
     expect(cards()).toHaveLength(2);
     expect(cards()[0]!.find(".draft-join").exists()).toBe(false);
+  });
+
+  test("keeps its open batch open while it's shown, and stops when it closes", async () => {
+    vi.useFakeTimers();
+    const wrapper = mountCapture();
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+
+    await vi.advanceTimersByTimeAsync(BATCH_HEARTBEAT_MS);
+    expect(api.touchBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
+
+    wrapper.unmount();
+    wrappers.length = 0;
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(api.touchBatch).toHaveBeenCalledOnce();
   });
 
   test("Done seals the batch once its cards have uploaded", async () => {

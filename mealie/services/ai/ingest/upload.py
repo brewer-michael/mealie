@@ -15,11 +15,14 @@ Multipart is parsed by Starlette's `MultiPartParser` over the capped stream; its
 directory (never `DATA_DIR`) and go to intake as open file objects, closed when the request ends. A raw image body is
 spooled the same way, and so is a JSON body, which is then decoded in one of the process's intake slots (it takes about
 three times its size in memory): leniently (line breaks, a `data:` prefix, URL-safe letters), each image into a spooled
-file of its own, so cards waiting for intake hold no decoded images in memory. Each card then goes through
-`IntakeService.ingest_async`.
+file of its own, so cards waiting for intake hold no decoded images in memory. A JSON image may instead be a URL
+(`{"url": ...}`, a bare string is always base64): fetched after every check above and the batch's, one after another in
+its place, when `AI_INGEST_URL_FETCH` allows it (`fetch_url`), else refused `url_not_allowed`. Each card then goes
+through `IntakeService.ingest_async`.
 
-The answer is `202 IngestResponse`, whose `summary` is in the request's language for a Shortcut's notification and
-which has nothing named `message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
+The answer is `202 IngestResponse`, whose `summary` is in the request's language for a Shortcut's notification (it
+promises a notification only when a household notifier sends "recipe cards ready") and which has nothing named
+`message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
 Refusals are `UploadRefused`, which the route turns into `{"detail": {"code", "message"?}}`.
 """
 
@@ -54,7 +57,8 @@ from mealie.schema.recipe_ingest import (
 from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.errors import IngestPaused
 
-from . import limits, storage
+from . import events, limits, storage
+from .fetch_url import fetch_image, url_filename
 from .i18n import DEFAULT_LOCALE, FallbackTranslator
 from .images import sanitize_filename
 from .intake import (
@@ -290,10 +294,12 @@ def _content_disposition_filename(value: str | None) -> str | None:
 @dataclass
 class UploadedImage:
     file: BinaryIO | None
-    """None when the image was refused while reading (`rejected`)"""
+    """None when the image was refused while reading (`rejected`), or is still to be fetched (`url`)"""
     filename: str | None
     index: int
     rejected: IngestRejectReason | None = None
+    url: str | None = None
+    """A JSON image given by its URL, fetched after the checks (`fetch_url`)"""
 
 
 @dataclass
@@ -403,11 +409,17 @@ def _decode_json_images(payload: Any, opened: list[Any]) -> list[UploadedImage]:
     decoded: list[UploadedImage] = []
     for index, item in enumerate(items):
         if isinstance(item, str):
-            data: Any = item
+            data: Any = item  # a bare string is always base64, never a URL
             filename = None
         elif isinstance(item, dict):
             data = item.get("data")
             filename = item.get("filename") if isinstance(item.get("filename"), str) else None
+            if "url" in item:
+                url = item["url"]
+                if not isinstance(url, str) or "data" in item:
+                    raise _invalid_body()  # one image is either a URL or data
+                decoded.append(UploadedImage(None, filename or url_filename(url), index, url=url))
+                continue
         else:
             raise _invalid_body()
 
@@ -457,18 +469,42 @@ async def _read_json(request: Request, limit: int, query: Mapping[str, str]) -> 
     return result
 
 
+async def _fetch_urls(body: UploadBody) -> None:
+    """
+    The body's image URLs, fetched one after another in their places (only now: after auth and every check), into
+    spooled files the body closes; a URL that can't be fetched is that image's rejection. Together they may take at
+    most the request's own cap (`AI_INGEST_MAX_UPLOAD_MB`), each at most `MAX_FILE_BYTES`.
+    """
+    remaining = get_ingest_settings().max_upload_bytes
+    for image in body.images:
+        if image.url is None or image.rejected is not None:
+            continue
+        fetched = await fetch_image(image.url, max_bytes=min(limits.MAX_FILE_BYTES, remaining))
+        if isinstance(fetched, IngestRejectReason):
+            image.rejected = fetched
+            continue
+        body._open.append(fetched.file)
+        image.file = fetched.file
+        remaining -= fetched.size
+
+
 # ==================================================================================================================
 # The handler
 
 
-def _summary(translator: Translator, accepted: int, rejected: list[IngestRejected]) -> str:
-    """For a Shortcut's notification: the cards queued, then those already scanned, then those refused for another
-    reason (each counted once, however many photos it had)"""
-    parts = [
-        translator.t("recipe-ingest.upload-summary", count=accepted)
-        if accepted
-        else translator.t("recipe-ingest.upload-summary-none")
-    ]
+def _summary(translator: Translator, accepted: int, rejected: list[IngestRejected], *, notifies: bool = False) -> str:
+    """
+    For a Shortcut's notification: the cards queued, then those already scanned, then those refused for another
+    reason (each counted once, however many photos it had). "You'll be notified when it's ready" only when the
+    household `notifies` (a notifier sends "recipe cards ready"); otherwise the cards wait for review in Mealie.
+    """
+    if not accepted:
+        queued = translator.t("recipe-ingest.upload-summary-none")
+    elif notifies:
+        queued = translator.t("recipe-ingest.upload-summary", count=accepted)
+    else:
+        queued = translator.t("recipe-ingest.upload-summary-in-app", count=accepted)
+    parts = [queued]
     duplicates = sum(1 for item in rejected if item.reason == IngestRejectReason.duplicate)
     if duplicates:
         parts.append(translator.t("recipe-ingest.upload-summary-duplicate", count=duplicates))
@@ -579,6 +615,14 @@ class UploadHandler:
         except _BodyTooLarge as e:
             raise self._too_large(cap) from e
 
+    def _household_notifies(self) -> bool:
+        """Whether a notifier tells the household when its cards are ready (the summary says so only then). Blocking."""
+        try:
+            return events.household_notifies(self.session, self.group_id, self.household_id)
+        finally:
+            if self.session.in_transaction():
+                self.session.commit()
+
     def _check_batch(self, batch_id: UUID | Literal["new"] | None) -> None:
         """An explicit batch must be one of the household's (sealed is fine: it's replaced). Blocking."""
         if not isinstance(batch_id, UUID):
@@ -610,6 +654,7 @@ class UploadHandler:
                     400, LOCAL_ONLY_UNAVAILABLE, message_key="recipe-ingest.errors.local-only-unavailable"
                 )
             await anyio.to_thread.run_sync(self._check_batch, options.batch_id)
+            await _fetch_urls(body)
             return await self._ingest(body, local_only=readiness.group_local_only or options.local_only)
         finally:
             body.close()
@@ -680,11 +725,12 @@ class UploadHandler:
                     )
                 )
 
+        notifies = bool(jobs) and await anyio.to_thread.run_sync(self._household_notifies)
         response = IngestResponse(
             batch_id=batch_id if jobs and isinstance(batch_id, UUID) else None,
             jobs=jobs,
             rejected=rejected,
-            summary=_summary(self.translator, len(jobs), rejected),
+            summary=_summary(self.translator, len(jobs), rejected, notifies=notifies),
         )
         if not jobs:
             raise UploadRefused(400, NOTHING_ACCEPTED, **response.model_dump(mode="json", by_alias=True))

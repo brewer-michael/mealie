@@ -11,10 +11,12 @@ restore pauses ingestion.
 from fastapi import APIRouter, Path, Response, status
 from pydantic import UUID4
 
+from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.routes._base import controller
 from mealie.schema.recipe_ingest import EvalCaseOut, EvalCaseRequest, EvalCaseSummary, EvalCaseUpdate
 from mealie.schema.recipe_ingest.ingest_requests import EVAL_CASE_SLUG_PATTERN
 from mealie.services.ai.ingest import eval_export
+from mealie.services.ai.ingest.review import BUSY, JobActionError, settle_turns
 
 from ._deps import IngestController, ingest_error, require_enabled, require_not_paused, write_section
 
@@ -29,8 +31,8 @@ class RecipeIngestEvalCasesController(IngestController):
     def save_eval_case(self, job_id: UUID4, data: EvalCaseRequest) -> EvalCaseOut:
         """
         Saves a `ready` or `committed` card (until its files are purged) as an eval case: `409` when the slug is
-        taken (`eval_case_exists`), the card has no draft to export (`not_exportable`) or its files are gone
-        (`files_missing`).
+        taken (`eval_case_exists`), the card has no draft to export (`not_exportable`), its files are gone
+        (`files_missing`) or a running task is turning one of its pages (`busy`).
         """
         self.checks.can_manage()
         require_enabled(self.translator)
@@ -43,10 +45,28 @@ class RecipeIngestEvalCasesController(IngestController):
         try:
             # the job's files are read in the write section too, so a restore can't replace them mid-read
             with write_section(self.translator):
+                job = self._settled(job)
                 case = eval_export.build_eval_case(job, data.slug, data.verified, tags=data.tags, notes=data.notes)
                 return eval_export.save_eval_case(job.group_id, case)
         except eval_export.EvalCaseError as e:
             raise ingest_error(status.HTTP_409_CONFLICT, e.code) from e
+
+    def _settled(self, job: RecipeIngestionJob) -> RecipeIngestionJob:
+        """
+        The job once a page turn a stop left half done is settled (`settle_turns`), so its pages are read as their
+        metadata describes them; 409 `busy` while a running task is turning one
+        """
+        try:
+            job, settled = settle_turns(self.ingest_repos, job)
+        except JobActionError as e:
+            raise ingest_error(e.status_code, e.code, **e.params) from e
+        except FileNotFoundError as e:
+            raise eval_export.EvalCaseFilesMissing() from e
+        except TimeoutError as e:
+            raise ingest_error(status.HTTP_409_CONFLICT, BUSY) from e
+        if not settled:
+            raise ingest_error(status.HTTP_409_CONFLICT, BUSY)
+        return job
 
     @router.get("/eval-cases", response_model=list[EvalCaseSummary])
     def list_eval_cases(self) -> list[EvalCaseSummary]:

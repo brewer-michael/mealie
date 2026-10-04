@@ -3,9 +3,10 @@ The card workflow's steps (docs/ai/PHASE2.md §4.1): upstream's import workflow 
 no translation or `finalize_scraped_recipe`.
 """
 
+from mealie.core.root_logger import get_logger
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
 from mealie.schema.openai.recipe import OpenAIRecipe
-from mealie.services.ai.errors import describe_provider_error
+from mealie.services.ai.errors import AIProviderLimitReachedError, AIProviderLocalOnlyError, describe_provider_error
 from mealie.services.recipe.import_workflow.base import WorkflowStep
 from mealie.services.recipe.import_workflow.compilers.base import SourceCompiler
 from mealie.services.recipe.import_workflow.context import WorkflowContext
@@ -16,7 +17,10 @@ from mealie.services.recipe.import_workflow.steps.build_recipe import BUILD_RECI
 from mealie.services.scraper import cleaner
 
 from .compilers import CapturedError, CardImageCompiler, CardOCRCompiler, capture_errors
+from .context import CardWorkflowContext
 from .models import CardPipelineOptions
+
+logger = get_logger(__name__)
 
 CARD_BUILD_RULES_PROMPT = "recipes.card-build-rules"
 
@@ -49,11 +53,20 @@ class CardResolveOrganizersStep(ResolveOrganizersStep):
     Upstream's organizer step (fast slot), configured by the context's `WorkflowOptions` to store the names only.
     It's optional, so the workflow logs a failure with its traceback and moves on; this raises a failure again with
     only its safe description, so no provider response body reaches the log.
+
+    When no provider may be asked (a local-only card whose fast slot has no local provider, or every provider over
+    its monthly limit) it isn't a failure: the reason is kept on the context (`organizers_skipped`), and the step's
+    outcome says so (`flags.organizers_outcome`), so the review page can tell the reviewer.
     """
 
     async def run(self, ctx: WorkflowContext) -> None:
         try:
             await super().run(ctx)
+        except (AIProviderLocalOnlyError, AIProviderLimitReachedError) as e:
+            reason = "local_only" if isinstance(e, AIProviderLocalOnlyError) else "limit_reached"
+            if isinstance(ctx, CardWorkflowContext):
+                ctx.organizers_skipped = reason
+            logger.info(f"Tag suggestions skipped ({describe_provider_error(e)})")
         except Exception as e:
             raise OrganizerSuggestionFailed(describe_provider_error(e)) from None
 

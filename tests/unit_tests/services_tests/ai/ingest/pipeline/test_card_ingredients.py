@@ -1,12 +1,12 @@
 """Card ingredient lines through the shorthand fix, the NLP parser and the matcher (docs/ai/PHASE2.md §5)"""
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from mealie.lang.providers import get_locale_provider
 from mealie.schema.recipe.recipe import Recipe
-from mealie.schema.recipe.recipe_ingredient import RecipeIngredient, SaveIngredientFood
+from mealie.schema.recipe.recipe_ingredient import CreateIngredientFoodAlias, RecipeIngredient, SaveIngredientFood
 from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardFlagKind, CardFlagSeverity, ExtractionMeta
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
@@ -24,16 +24,24 @@ translator = get_locale_provider("en-US")
 
 
 async def _normalize(user: TestUser, lines: list[str], language: str | None = "English"):
+    return (await _normalize_and_link(user, lines, language))[0]
+
+
+async def _normalize_and_link(
+    user: TestUser, lines: list[str], language: str | None = "English"
+) -> tuple[list[CardDraftIngredient], dict[UUID, list[str]]]:
+    """The lines as extraction parses and links them, and the names of what they link (`compute_flags`' `linked`)"""
     with job_session(user) as (session, repos):
+        matcher = IngestMatcher(repos)
         result = await normalize_lines(
             [IngredientLine(text=line) for line in lines],
             repos=repos,
             translator=translator,
-            matcher=IngestMatcher(repos),
+            matcher=matcher,
             language=language,
         )
         assert not session.in_transaction()
-        return result
+        return result, matcher.linked_names(result)
 
 
 @pytest.mark.asyncio
@@ -201,9 +209,12 @@ async def test_an_amount_the_fields_lose_is_kept_in_the_note_and_still_checked(
     }
 
 
-def _highlighted(lines: list[CardDraftIngredient]) -> dict[str, list[tuple[CardFlagKind, dict]]]:
+def _highlighted(
+    lines: list[CardDraftIngredient], linked: dict[UUID, list[str]] | None = None
+) -> dict[str, list[tuple[CardFlagKind, dict]]]:
     """Each line's highlighted flags, by its card text"""
-    flags = compute_flags(CardDraft(name="Card", ingredients=lines), ExtractionMeta(language="English"), {})
+    card = CardDraft(name="Card", ingredients=lines)
+    flags = compute_flags(card, ExtractionMeta(language="English"), {}, linked=linked)
     by_ref: dict[str, list[tuple[CardFlagKind, dict]]] = {str(line.reference_id): [] for line in lines}
     for flag in flags:
         if flag.severity != CardFlagSeverity.info and flag.ref in by_ref:
@@ -234,8 +245,9 @@ async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(uni
     lost = ["2-3 T. milk", "1 to 2 c. water", "2 or 3 eggs"]
     unclear = ["2 pk yeast"]
 
-    parsed = await _normalize(user, banana + fine + lost + unclear)
-    flags = _highlighted(parsed)
+    parsed, linked = await _normalize_and_link(user, banana + fine + lost + unclear)
+    assert linked  # the group's foods and units these lines link: none by a near miss
+    flags = _highlighted(parsed, linked)
 
     assert {line: flags[line] for line in banana + fine} == {line: [] for line in banana + fine}
     assert {line: flags[line] for line in lost} == {
@@ -269,8 +281,8 @@ async def test_mixed_numbers_names_and_second_ingredients_through_the_parser(uni
         "1 stick butter or 1/2 c. oleo": "1/2",
     }
 
-    parsed = await _normalize(user, mixed + named + kept + list(merged))
-    flags = _highlighted(parsed)
+    parsed, linked = await _normalize_and_link(user, mixed + named + kept + list(merged))
+    flags = _highlighted(parsed, linked)
 
     assert [line.quantity for line in parsed[: len(mixed)]] == [2.25, 1.5, 1.5, 1.5, 3.5]
     assert [line.original_text for line in parsed[: len(mixed)]] == mixed
@@ -293,7 +305,7 @@ async def test_an_item_size_is_parsed_out_of_the_food(unique_user_fn_scoped: Tes
         )
     lines = ["1 med onion", "2 med. onions, chopped", "1 med cabbage", "1 med red onion", "1 lg onion", "1 sml onion"]
 
-    parsed = await _normalize(user, lines)
+    parsed, linked = await _normalize_and_link(user, lines)
 
     assert [(line.food and line.food.name, line.food and line.food.id is not None, line.note) for line in parsed] == [
         ("onion", True, "med"),
@@ -304,7 +316,36 @@ async def test_an_item_size_is_parsed_out_of_the_food(unique_user_fn_scoped: Tes
         ("onion", True, "sml"),
     ]
     assert [line.original_text for line in parsed] == lines
-    assert _highlighted(parsed) == {line: [] for line in lines}
+    assert _highlighted(parsed, linked) == {line: [] for line in lines}  # no `linked_fuzzy` either
+
+
+@pytest.mark.asyncio
+async def test_a_food_linked_by_a_near_miss_name_is_flagged(unique_user_fn_scoped: TestUser):
+    """
+    The matcher links "rd onions" to the group's "red onion" fuzzily: the line is flagged with the food it linked.
+    Links by name, plural or alias, and lines whose size word was taken out, aren't.
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    group_id = user.repos.group_id
+    for name, plural in [("onion", "onions"), ("red onion", "red onions")]:
+        user.repos.ingredient_foods.create(SaveIngredientFood(name=name, plural_name=plural, group_id=group_id))
+    user.repos.ingredient_foods.create(
+        SaveIngredientFood(name="green onion", group_id=group_id, aliases=[CreateIngredientFoodAlias(name="scallion")])
+    )
+    lines = ["2 rd onions", "2 red onions", "3 scallions, sliced", "1 med onion", "1 T. coconut oil", "2 eggs"]
+
+    parsed, linked = await _normalize_and_link(user, lines)
+
+    rd = parsed[0]
+    assert rd.food is not None and rd.food.id is not None and rd.food.name == "red onion"  # the fuzzy link
+    assert all(line.food is not None and line.food.id is not None for line in parsed)
+    flags = _highlighted(parsed, linked)
+    # (the parser isn't sure of that line either: `check_parse` with its confidence)
+    assert [params for kind, params in flags["2 rd onions"] if kind == CardFlagKind.linked_fuzzy] == [
+        {"name": "red onion", "kind": "food", "start": 2, "end": 11}
+    ]
+    assert {line: flags[line] for line in lines[1:]} == {line: [] for line in lines[1:]}
 
 
 @pytest.mark.asyncio

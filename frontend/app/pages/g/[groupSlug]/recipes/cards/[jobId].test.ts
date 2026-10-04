@@ -139,7 +139,7 @@ const stubs = {
       </div>
     `,
   },
-  RecipeOrganizerSelector: { props: ["modelValue", "selectorType", "showAdd"], template: "<div class=\"organizers\" :data-type=\"selectorType\" :data-show-add=\"showAdd\" />" },
+  IngestOrganizerSelector: { props: ["modelValue", "selectorType", "readonly", "canCreate"], template: "<div class=\"organizers\" :data-type=\"selectorType\" :data-can-create=\"canCreate\" />" },
   RecipeNotes: { props: ["modelValue", "edit"], template: "<div class=\"notes\" />" },
   RecipeImageLightbox: { props: ["modelValue", "imageUrl"], template: "<div />" },
   VContainer: slot(),
@@ -185,8 +185,9 @@ const stubs = {
   VTextarea: input("textarea"),
   VCombobox: input("combobox"),
   VSwitch: {
-    props: ["modelValue", "label"],
-    template: "<label class=\"switch\"><input type=\"checkbox\" :checked=\"modelValue\">{{ label }}</label>",
+    props: ["modelValue", "label", "disabled"],
+    emits: ["update:modelValue"],
+    template: "<label class=\"switch\"><input type=\"checkbox\" :checked=\"modelValue\" :disabled=\"disabled\" @change=\"$emit('update:modelValue', $event.target.checked)\">{{ label }}</label>",
   },
   VSelect: slot(),
   VCheckbox: slot(),
@@ -286,15 +287,62 @@ describe("the recipe card review page", () => {
     expect(wrapper.get(".ingest-needs-a-look h3").text()).toBe("Needs a look (2)");
     expect(wrapper.findAll("[data-flag]").map(item => item.attributes("data-flag"))).toEqual(["unsure:ingredients:i1", "blank:steps:s2"]);
     expect(wrapper.get(".ingest-review__duplicate").text()).toContain("A recipe called \"Banana Mug Cake\" already exists.");
-    expect(wrapper.get(".ingest-review__public").text()).toContain("New recipes in this household are public");
+    expect(wrapper.get(".ingest-review__public").text()).toBe("Recipes in this household are public: the card photo will be visible to anyone.");
     // a member who can't add foods sees the food kept as text
     expect(wrapper.get(".ingest-ingredient__new-food").text()).toBe("Kept as text");
-    expect(wrapper.findAll(".organizers").map(o => [o.attributes("data-type"), o.attributes("data-show-add")]))
+    // a member who can't organize can't add new tags either
+    expect(wrapper.findAll(".organizers").map(o => [o.attributes("data-type"), o.attributes("data-can-create")]))
       .toEqual([["tags", "false"], ["categories", "false"], ["tools", "false"]]);
     expect(primary(wrapper).text()).toBe("1 to fix");
     // phones get the strip and the pinned bar
     expect(wrapper.find(".ingest-card-strip").exists()).toBe(true);
     expect(wrapper.find(".ingest-review-bar--fixed").exists()).toBe(true);
+  });
+
+  test("the card photo switch starts at the household's default; the warning shows while the photo would be public", async () => {
+    const draft = { ...job().draft!, useCardAsCover: false };
+    api.getJob.mockResolvedValue(ok(job({ draft, householdRecipesPublic: true, cardPhotoDefault: false })));
+    const wrapper = await mountPage();
+    const attach = () => wrapper.findAll(".switch").find(s => s.text() === "Attach the card photo to the recipe")!;
+    const cover = () => wrapper.findAll(".switch").find(s => s.text() === "Use the card photo as the recipe image")!;
+
+    // a public household: off unless the reviewer turns it on, and nothing is public while both are off
+    expect((attach().get("input").element as HTMLInputElement).checked).toBe(false);
+    expect((cover().get("input").element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.find(".ingest-review__public").exists()).toBe(false);
+
+    await attach().get("input").setValue(true);
+    expect(wrapper.get(".ingest-review__public").text()).toBe("Recipes in this household are public: the card photo will be visible to anyone.");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft).toMatchObject({ attachCardPhoto: true, useCardAsCover: false });
+
+    await attach().get("input").setValue(false);
+    expect(wrapper.find(".ingest-review__public").exists()).toBe(false);
+    // the cover is the recipe's image: public too
+    await cover().get("input").setValue(true);
+    expect(wrapper.find(".ingest-review__public").exists()).toBe(true);
+  });
+
+  test("a choice the draft holds wins over the default, and a private household gets no warning", async () => {
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...job().draft!, attachCardPhoto: true }, householdRecipesPublic: false, cardPhotoDefault: true })));
+    const wrapper = await mountPage();
+    const attach = wrapper.findAll(".switch").find(s => s.text() === "Attach the card photo to the recipe")!;
+
+    expect((attach.get("input").element as HTMLInputElement).checked).toBe(true);
+    expect(wrapper.find(".ingest-review__public").exists()).toBe(false);
+
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...job().draft!, attachCardPhoto: false }, householdRecipesPublic: false, cardPhotoDefault: true })));
+    const other = await mountPage();
+    const off = other.findAll(".switch").find(s => s.text() === "Attach the card photo to the recipe")!;
+    expect((off.get("input").element as HTMLInputElement).checked).toBe(false);
+  });
+
+  test("someone who may organize can add new tags, categories and tools", async () => {
+    api.getJob.mockResolvedValue(ok(job({ permissions: { canCreateFoods: true, canDiscard: true, canExportEval: true, canCreateOrganizers: true } })));
+    const wrapper = await mountPage();
+
+    expect(wrapper.findAll(".organizers").map(o => o.attributes("data-can-create"))).toEqual(["true", "true", "true"]);
   });
 
   test("infos about the whole card show quietly, and aren't counted", async () => {
@@ -307,6 +355,21 @@ describe("the recipe card review page", () => {
       "Ingredients kept as text: This card isn't in English, and its ingredient lines couldn't be split into amount, unit and food, so they're kept as written.",
     ]);
     expect(wrapper.get(".ingest-needs-a-look h3").text()).toBe("Needs a look (1)");
+  });
+
+  test("Check this ingredient shows the parser's reading, and Keep as text saves the line as written", async () => {
+    const check: CardFlag = { id: "check_parse:ingredients:i1", kind: "check_parse", severity: "warning", source: "parser", field: "ingredients", ref: "i1", params: { confidence: 60 } };
+    api.getJob.mockResolvedValue(ok(job({ flags: [blank, check] })));
+    const wrapper = await mountPage();
+
+    const item = wrapper.get("[data-flag=\"check_parse:ingredients:i1\"]");
+    expect(item.get(".ingest-flag-item__reading").text()).toBe("Read as: 1/4 teaspoon salt");
+    await button(wrapper, "Keep as text").trigger("click");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+
+    expect(api.updateJob.mock.calls[0]![1].draft.ingredients[0]).toMatchObject({ quantity: null, unit: null, food: null, note: "1/4 t. salt" });
+    expect(wrapper.get("[data-flag=\"check_parse:ingredients:i1\"]").classes()).toContain("ingest-flag-item--fixed");
   });
 
   test("1 to fix scrolls to the error instead of committing", async () => {

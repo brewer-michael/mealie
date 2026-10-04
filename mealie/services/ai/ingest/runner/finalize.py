@@ -15,8 +15,16 @@ between the read and the write makes it read again, so neither is lost.
   replacing an older one still pending (the job keeps one reading, the newest, which accepting a proposal checks it
   against), stores the new transcription and extraction, and recomputes the kept draft's flags against them.
 - A **re-read** adds its proposal.
+- **Parse with AI** (`parse_lines`) writes the parsed fields into the lines it parsed, on a `ready` job, for each line
+  that still reads as it did when it was sent (a line the reviewer changed meanwhile keeps their change); the draft's
+  flags are recomputed as a save computes them, with the stored resolutions (a parsed line's parse flags are its new
+  reading's), and `draft_version` goes up, so an open editor's next save gets 409 and reloads.
+- A **rebuild** from the edited transcription is applied as a re-extract is, its proposal marked as a rebuild.
 - A **failure** stores its code: a `processing` job becomes `failed`, a `ready` one stays ready with the code as a
-  banner (a re-read the reviewer cancelled leaves no banner).
+  banner (a re-read the reviewer cancelled leaves no banner). A card whose first reading failed because every
+  provider was over its monthly limit (`limit_reached`) is read again automatically: `auto_retry_at` is set to the
+  first instant of next month (UTC), when the limits reset (`runner/retries.py` also reads it sooner once the limit no
+  longer applies). Any other failure clears it.
 """
 
 from dataclasses import dataclass
@@ -30,12 +38,14 @@ from sqlalchemy.engine import CursorResult, RowMapping
 from sqlalchemy.orm import Session
 
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, update_job_json
+from mealie.repos.repository_ai_routing import month_range
+from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, naive_utc, update_job_json, utcnow
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardFlag,
     CardProposal,
     CardProposalKind,
+    ExtractionMeta,
     IngestErrorCode,
     IngestStatus,
     IngestTaskState,
@@ -43,9 +53,9 @@ from mealie.schema.recipe_ingest import (
 
 from .. import limits
 from ..flag_rules import count_unresolved
-from ..pipeline.flags import compute_flags
+from ..pipeline.flags import PARSE_KINDS, compute_flags, ingredient_line
 from .classify import rate_limit_delay
-from .types import ExtractResult, RereadResult
+from .types import ExtractResult, ParseLinesResult, RereadResult
 
 Job = RecipeIngestionJob
 
@@ -65,6 +75,8 @@ class Applied(StrEnum):
     """Rate limited: back in the queue after a backoff"""
     released = "released"
     """Given back without using up an attempt (a pause, or shutdown)"""
+    unchanged = "unchanged"
+    """The task ended with nothing to change: every line it parsed was changed by the reviewer meanwhile"""
     dropped = "dropped"
     """Nothing written: the lease is no longer this task's"""
 
@@ -121,6 +133,7 @@ def finalize_extract(session: Session, job_id: UUID, token: UUID, result: Extrac
         common = {
             **TASK_CLEARED,
             **_NO_ERROR,
+            "auto_retry_at": None,  # read: no longer waiting for a monthly limit
             "transcription": result.transcription,
             "extraction": result.extraction,
             "pages": result.pages,
@@ -153,7 +166,7 @@ def finalize_extract(session: Session, job_id: UUID, token: UUID, result: Extrac
         flags = compute_flags(
             draft, result.extraction, resolutions, transcription=result.transcription, previous=stored_flags
         )
-        proposal = CardProposal(kind=CardProposalKind.full, draft=result.draft)
+        proposal = CardProposal(kind=CardProposalKind.full, draft=result.draft, origin=result.origin)
         # an older whole-card proposal is a stale reading of the same card: the job's transcription and extraction are
         # now this one's, so only this one can be accepted with its own flags (a save using the older one gets 409)
         kept = [p for p in row["proposals"] or [] if not _is_full_proposal(p)]
@@ -184,13 +197,88 @@ def finalize_reread(session: Session, job_id: UUID, token: UUID, result: RereadR
     return Finalized(Applied.proposal, batch_id=write.before["batch_id"])
 
 
+def next_limit_reset(now: datetime | None = None) -> datetime:
+    """When monthly token limits next reset: the first instant of the next UTC calendar month, as naive UTC"""
+    _, end = month_range(now or utcnow())
+    return naive_utc(end)
+
+
+_PARSED_FIELDS = ("quantity", "unit", "food", "note", "display", "parse_confidence", "extracted_hash")
+"""What "Parse with AI" sets on a line; its id, section title and the card's reading of it stay"""
+
+
+def finalize_parse_lines(session: Session, job_id: UUID, token: UUID, result: ParseLinesResult) -> Finalized:
+    """
+    Chosen lines parsed by the AI ingredient parser: their parsed fields replace the draft's for each line still as
+    it was sent; the flags are recomputed against the stored transcription, extraction and resolutions (as a save
+    does), and `draft_version` goes up. A parsed line's parse flags are those of its new reading, judged as
+    extraction judges them (the group's units, the linked names): the ones stored, and their resolutions, were about
+    the reading it replaced. Lines changed or removed meanwhile are skipped; nothing changed when none is left. Only a
+    `ready` job's draft is changed.
+    """
+    parsed = {str(ingredient.reference_id): ingredient for ingredient in result.ingredients}
+    applied: list[Applied] = []
+
+    def mutate(row: RowMapping) -> dict[str, Any]:
+        applied.clear()
+        if row["status"] != IngestStatus.ready or row["draft"] is None:
+            applied.append(Applied.dropped)
+            return dict(TASK_CLEARED)
+
+        draft = CardDraft.model_validate(row["draft"])
+        lines = []
+        changed: set[str] = set()
+        for line in draft.ingredients:
+            ref = str(line.reference_id)
+            if ref in parsed and result.sent.get(ref) == ingredient_line(line):
+                line = line.model_copy(update={name: getattr(parsed[ref], name) for name in _PARSED_FIELDS})
+                changed.add(ref)
+            lines.append(line)
+        applied.append(Applied.draft if changed else Applied.unchanged)
+        if not changed:
+            return {**TASK_CLEARED, **_NO_ERROR}
+
+        updated = draft.model_copy(update={"ingredients": lines})
+        stored_flags = [
+            flag
+            for flag in (CardFlag.model_validate(flag) for flag in row["flags"] or [])
+            if not (flag.kind in PARSE_KINDS and flag.ref in changed)
+        ]
+        resolutions = {flag.id: flag.resolution for flag in stored_flags if flag.resolution is not None}
+        extraction = ExtractionMeta.model_validate(row["extraction"]) if row["extraction"] else None
+        flags = compute_flags(
+            updated,
+            extraction,
+            resolutions,
+            transcription=row["transcription"],
+            previous=stored_flags,
+            units=result.units,
+            linked=result.linked,
+        )
+        return {
+            **TASK_CLEARED,
+            **_NO_ERROR,
+            **_counts(flags),
+            "draft": updated,
+            "flags": flags,
+            "title": _title(updated),
+            "draft_version": row["draft_version"] + 1,
+        }
+
+    write = update_job_json(session, job_id, mutate, where=IngestQueue.fence(token))
+    if write is None or applied[0] == Applied.dropped:
+        return DROPPED
+    return Finalized(applied[0], batch_id=write.before["batch_id"])
+
+
 def finalize_failure(
     session: Session, job_id: UUID, token: UUID, code: IngestErrorCode, params: dict[str, Any] | None = None
 ) -> Finalized:
     """
     A task that ended without a result (§3.6): a `processing` job becomes `failed` with the code; a `ready` job keeps
     its draft and shows the code as a banner, except for a cancellation the reviewer asked for, which leaves no
-    banner (as cancelling a queued task doesn't).
+    banner (as cancelling a queued task doesn't). A failed card that hit the monthly limits (`limit_reached`) waits
+    to be read again from the next reset (`auto_retry_at`); any other failure clears that.
     """
     outcome: list[Applied] = []
 
@@ -199,7 +287,8 @@ def finalize_failure(
         error = {"error_code": code.value, "error_params": params or None}
         if row["status"] == IngestStatus.processing:
             outcome.append(Applied.failed)
-            return {**TASK_CLEARED, **error, "status": IngestStatus.failed.value}
+            retry = next_limit_reset() if code == IngestErrorCode.limit_reached else None
+            return {**TASK_CLEARED, **error, "status": IngestStatus.failed.value, "auto_retry_at": retry}
         outcome.append(Applied.error)
         if code == IngestErrorCode.cancelled:
             return dict(TASK_CLEARED)

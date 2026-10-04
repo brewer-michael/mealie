@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from mealie.db.db_setup import session_context
 from mealie.repos.repository_recipe_ingest import ExpiredLease, IngestQueue
 from mealie.services.ai.ingest import commit, events, inbox, limits, retention, storage, tasks
+from mealie.services.ai.ingest.runner import retries
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from tests.utils.fixture_schemas import TestUser
 
@@ -79,7 +80,13 @@ def phases(monkeypatch: pytest.MonkeyPatch) -> PhaseCalls:
     monkeypatch.setattr(events, "maybe_notify_batch", maybe_notify_batch)
     monkeypatch.setattr(commit, "resume_stale_commits", resume_stale_commits)
     monkeypatch.setattr(inbox, "scan_once", scan_once)
+
+    def retry_waiting(now: datetime) -> int:
+        calls.retries.append(now)
+        return 0
+
     monkeypatch.setattr(retention, "purge_once", calls.purge.append)
+    monkeypatch.setattr(retries, "retry_waiting", retry_waiting)
     return calls
 
 

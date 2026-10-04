@@ -21,6 +21,9 @@ NEW_VARIABLES = (
     "LOCK_DIR",
     "GROUP_CONCURRENCY",
     "MAX_PROCESSING_PER_USER",
+    "URL_FETCH",
+    "URL_ALLOW_HOSTS",
+    "URL_TIMEOUT",
 )
 
 
@@ -39,6 +42,9 @@ def test_the_defaults():
     assert settings.LOCK_DIR is None
     assert settings.GROUP_CONCURRENCY == 0
     assert settings.MAX_PROCESSING_PER_USER == 0
+    assert settings.URL_FETCH is False  # image URLs are refused unless switched on
+    assert settings.url_allow_hosts == []
+    assert settings.URL_TIMEOUT == 20
 
 
 def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -48,6 +54,9 @@ def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv("AI_INGEST_LOCK_DIR", str(tmp_path))
     monkeypatch.setenv("AI_INGEST_GROUP_CONCURRENCY", "2")
     monkeypatch.setenv("AI_INGEST_MAX_PROCESSING_PER_USER", "25")
+    monkeypatch.setenv("AI_INGEST_URL_FETCH", "true")
+    monkeypatch.setenv("AI_INGEST_URL_ALLOW_HOSTS", " homeassistant.local, 192.168.1.0/24 ,,")
+    monkeypatch.setenv("AI_INGEST_URL_TIMEOUT", "45")
     settings = IngestSettings()
     assert settings.ORIENT is False
     assert settings.INBOX_PROCESSED_DAYS == 30
@@ -55,6 +64,9 @@ def test_the_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch,
     assert settings.LOCK_DIR == tmp_path
     assert settings.GROUP_CONCURRENCY == 2
     assert settings.MAX_PROCESSING_PER_USER == 25
+    assert settings.URL_FETCH is True
+    assert settings.url_allow_hosts == ["homeassistant.local", "192.168.1.0/24"]
+    assert settings.URL_TIMEOUT == 45
 
 
 @pytest.mark.parametrize("name", ["INBOX_DIR", *NEW_VARIABLES, "CONCURRENCY", "RETENTION_DAYS"])
@@ -76,6 +88,8 @@ def test_a_blank_value_is_unset(name: str):
         {"INBOX_PROCESSED_DAYS": -3},
         {"GROUP_CONCURRENCY": -1},
         {"MAX_PROCESSING_PER_USER": -1},
+        {"URL_TIMEOUT": 0},
+        {"URL_TIMEOUT": 301},
     ],
 )
 def test_numbers_below_their_minimum_are_refused(values: dict):

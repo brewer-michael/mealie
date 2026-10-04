@@ -12,14 +12,26 @@ included) is simply not found. Refusals are raised as `JobActionError`, which th
 and the write only makes the save re-read and retry, while a stale `draftVersion` is a 409. New tasks go through
 `enqueue_task`, conditional on the job having none. Rotate and discard run inside the ingest write lock, which their
 callers hold.
+
+**Turning a page is crash-safe (§4.4).** `rotate` stages the turned files beside the page's (`images.stage_rotation`),
+stores the new metadata, then swaps the staged files in (`images.apply_staged`); a refused write discards them. A stop
+in between leaves the stored metadata naming either the files in place or the staged ones, and whatever reads the
+page's files next settles it first (`settle_turns`): its image, another turn, a commit and an eval export. All of
+that holds the page's turn lock (`page_turn_lock`), so settling never discards a turn that's still being stored, and
+two turns of one page both land.
 """
 
 import asyncio
+import errno
+import fcntl
 import math
 import os
-from collections.abc import Iterable, Mapping, Sequence
+import threading
+import time
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -69,7 +81,8 @@ from mealie.schema.recipe_ingest import (
     RereadRequest,
 )
 from mealie.schema.user.user import PrivateUser
-from mealie.services.ai.ingest import flag_rules, images, limits, storage
+from mealie.services.ai.errors import IngestPaused
+from mealie.services.ai.ingest import flag_rules, images, limits, retention, storage
 from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
 from mealie.services.ai.ingest.i18n import translator_for
 from mealie.services.ai.ingest.intake import source_sha256
@@ -78,7 +91,6 @@ from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.pipeline.cardtext import markers_in
 from mealie.services.ai.ingest.pipeline.ingredients import IngredientLine, normalize_lines
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
-from mealie.services.ai.ingest.settings import get_ingest_settings
 
 logger = get_logger(__name__)
 
@@ -239,6 +251,7 @@ def resolve_flags(
     *,
     transcription: str | None = None,
     previous: Sequence[CardFlag] | None = None,
+    linked: Mapping[UUID, Collection[str]] | None = None,
 ) -> list[CardFlag]:
     """
     The draft's flags with the reviewer's resolutions applied (§4.6), as stored and returned on every save. Only
@@ -247,9 +260,13 @@ def resolve_flags(
 
     `transcription` and `previous` are the job's stored transcription and flags, as `compute_flags` takes them on a
     save: the checks against what the card says (`not_on_card`, `marker_dropped`) are made again, and reading flags
-    are kept only where they were raised before, so the reviewer's own edits never raise one.
+    are kept only where they were raised before, so the reviewer's own edits never raise one. `linked` is every name
+    of the foods and units the draft links (`IngestMatcher.linked_names`), so a line parsed on the save, or taken
+    from a proposal, is checked for a link that isn't an exact name match (`linked_fuzzy`) like an extracted one.
     """
-    flags = card_flags.compute_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
+    flags = card_flags.compute_flags(
+        draft, extraction, resolutions, transcription=transcription, previous=previous, linked=linked
+    )
     resolved: list[CardFlag] = []
     for flag in flags:
         resolution = flag.resolution or resolutions.get(flag.id)
@@ -278,19 +295,21 @@ def _adopted_reading_flags(
     group's `units` (`IngestMatcher.unit_names`). A save that accepts the proposal passes them as `previous`, so the
     new reading's reading flags (Tesseract's check of a printed card's numbers, a lost unit that is one of the group's
     own, included) are raised on the draft it became (its ingredient and step ids are new, so none of the stored flags
-    matches them). Accepting keeps the proposal's ingredient and step ids; a dismissed one shares none with the draft.
+    matches them). Accepting keeps the proposal's ingredient, step and note ids; a dismissed one shares none with the
+    draft.
     """
     flags: list[CardFlag] = []
     units = list(units)
     read_path = extraction.read_path if extraction else None
     ocr_lines = card_flags.ocr_check_lines([page.ocr for page in pages], read_path, transcription)
     ids = {ingredient.reference_id for ingredient in draft.ingredients} | {step.id for step in draft.steps}
+    ids |= {note.id for note in draft.notes}
     for proposal in proposals:
         proposed = proposal.draft
         if proposal.kind != CardProposalKind.full or proposed is None:
             continue
         proposed_ids = {ingredient.reference_id for ingredient in proposed.ingredients}
-        proposed_ids |= {step.id for step in proposed.steps}
+        proposed_ids |= {step.id for step in proposed.steps} | {note.id for note in proposed.notes}
         if ids & proposed_ids or (not proposed_ids and proposed == draft):
             flags.extend(
                 card_flags.compute_flags(
@@ -395,6 +414,140 @@ def attaches_card_photo(draft: CardDraft, household: HouseholdInDB | None) -> bo
 
 
 # ==========================================
+# A page's turn lock, and settling a turn a stop left staged (§4.4)
+
+
+TURN_LOCK_FILE = ".turn.lock"
+"""The empty file in a page's directory whose `flock` is the page's turn lock; it stays once made"""
+TURN_LOCK_WAIT = 30.0
+"""Seconds to wait for another turn of the same page to end (a turn takes a second or two)"""
+_TURN_LOCK_POLL = 0.02
+
+_UNSUPPORTED_LOCK_ERRORS = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS})
+"""What `flock` raises where the filesystem has no locks (as `storage` treats them)"""
+
+_turn_gates: dict[str, tuple[threading.Lock, int]] = {}
+"""This process's lock for each page being turned or settled, by directory, and how many threads want it"""
+_turn_gates_guard = threading.Lock()
+_turn_lock_warned = False
+
+
+@contextmanager
+def _page_gate(key: str) -> Iterator[threading.Lock]:
+    """The page's lock in this process, kept while any of its threads waits for it or holds it"""
+    with _turn_gates_guard:
+        entry = _turn_gates.get(key)
+        gate = entry[0] if entry else threading.Lock()
+        _turn_gates[key] = (gate, (entry[1] if entry else 0) + 1)
+    try:
+        yield gate
+    finally:
+        with _turn_gates_guard:
+            held, users = _turn_gates[key]
+            if users > 1:
+                _turn_gates[key] = (held, users - 1)
+            else:
+                del _turn_gates[key]
+
+
+def _warn_turn_lock_unsupported(error: OSError) -> None:
+    global _turn_lock_warned
+    with _turn_gates_guard:
+        if _turn_lock_warned:
+            return
+        _turn_lock_warned = True
+    logger.warning(
+        f"File locks aren't supported for recipe card pages ({errno.errorcode.get(error.errno or 0, error.errno)}): "
+        "turning a page is kept to one at a time within each worker process only"
+    )
+
+
+def _flock(fd: int, deadline: float) -> None:
+    """An exclusive `flock` on `fd` by `deadline`, else `TimeoutError`; nothing where the filesystem has no locks"""
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Another turn of this page is still in progress") from None
+            time.sleep(_TURN_LOCK_POLL)
+        except OSError as e:
+            if e.errno not in _UNSUPPORTED_LOCK_ERRORS:
+                raise
+            _warn_turn_lock_unsupported(e)
+            return
+
+
+@contextmanager
+def page_turn_lock(page_dir: Path, *, wait: float = TURN_LOCK_WAIT) -> Iterator[None]:
+    """
+    Holds a page's turn lock, so one turn of a page runs at a time across threads and worker processes. A turn holds it
+    from settling what an earlier one left (`images.stage_rotation` does that first) through staging, storing the
+    metadata and swapping the files in or discarding them; `settle_turns` holds it too, so it never discards the staged
+    files of a turn whose metadata is still being stored.
+
+    The lock is an exclusive `flock` on the page's `TURN_LOCK_FILE`, opened for writing (NFS emulates `flock` with
+    write locks), behind the page's lock in this process, for platforms whose `flock` belongs to the process. Where the
+    filesystem has no locks, the process's lock alone (one warning is logged).
+
+    Waits up to `wait` seconds, then raises `TimeoutError`; `FileNotFoundError` when the page's directory is gone.
+    Callers hold `storage.ingest_write()`: the lock file is made under `groups/`.
+    """
+    deadline = time.monotonic() + wait
+    with _page_gate(os.path.abspath(page_dir)) as gate:
+        if not gate.acquire(timeout=max(deadline - time.monotonic(), 0)):
+            raise TimeoutError("Another turn of this page is still in progress")
+        try:
+            fd = os.open(page_dir / TURN_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            try:
+                _flock(fd, deadline)
+                yield
+            finally:
+                os.close(fd)  # which releases the flock
+        finally:
+            gate.release()
+
+
+def settle_turns(
+    repos: IngestRepos, job: RecipeIngestionJob, indexes: Collection[int] | None = None
+) -> tuple[RecipeIngestionJob, bool]:
+    """
+    Settles what a stop left between staging a page's turn and swapping it in (`images.recover_staged`), for the
+    job's pages with staged files (only `indexes`, when given): the swap is finished when the stored metadata names
+    the staged page, and the staged files are discarded when it doesn't. Each page is settled under its turn lock,
+    against its metadata read again there, and not while a task runs: the runner owns a running task's pages (it
+    settles them when the task starts, and may be turning one now).
+
+    Returns the job as last read (`job` itself when nothing was staged) and whether none of the pages asked about is
+    left staged. Raises `JobActionError` `not_found` when the job is gone, `FileNotFoundError` when a page's directory
+    is, and `TimeoutError` when a turn holds a page past `TURN_LOCK_WAIT`. Callers hold `storage.ingest_write()`.
+    """
+    staged = [
+        page.index
+        for page in parse_pages(job.pages)
+        if (indexes is None or page.index in indexes)
+        and images.has_staged(storage.page_dir(job.group_id, job.id, page.index))
+    ]
+    settled = True
+    for index in staged:
+        page_dir = storage.page_dir(job.group_id, job.id, index)
+        with page_turn_lock(page_dir):
+            current = repos.jobs.get(job.id)
+            if current is None:
+                raise not_found()
+            job = current
+            stored = next((page for page in parse_pages(job.pages) if page.index == index), None)
+            if stored is None or job.task_state == IngestTaskState.running.value:
+                settled = settled and not images.has_staged(page_dir)
+                continue
+            outcome = images.recover_staged(page_dir, stored)
+            if outcome != "none":
+                logger.info(f"Recipe card job {job.id}: the staged turn of page {index} a stop left was {outcome}")
+    return job, settled
+
+
+# ==========================================
 # Page images
 
 
@@ -413,6 +566,11 @@ class PageImage:
     """The `?v=` the page's URLs carry"""
     stat: Any
     """`os.stat_result` of the file, read before responding"""
+    settled: bool = True
+    """
+    False when a turn of the page may still be swapping in (a running task is turning it, or a backup restore pauses
+    writes): the file is served as it is, and never cached
+    """
 
 
 # ==========================================
@@ -479,6 +637,7 @@ class ReviewService:
             "title": job.title,
             "page_count": len(pages),
             "thumb_url": thumb_url,
+            "draft_version": job.draft_version,
             "error_count": job.error_count,
             "warning_count": job.warning_count,
             "task": _task(job),
@@ -489,19 +648,9 @@ class ReviewService:
             "created_at": job.created_at,
             "committed_at": job.committed_at,
             "auto_retry_at": job.auto_retry_at if job.status == IngestStatus.failed.value else None,
-            "expires_at": self._expires_at(job),
+            # when the retention purge removes a failed card (§16), by the purge's own rule
+            "expires_at": retention.failed_card_expires_at(job),
         }
-
-    @staticmethod
-    def _expires_at(job: RecipeIngestionJob) -> datetime | None:
-        """
-        When the retention purge removes a failed card (§16): `AI_INGEST_RETENTION_DAYS` after its last change, or
-        after its automatic retry for one waiting for a monthly limit to reset (the purge's own cutoff)
-        """
-        if job.status != IngestStatus.failed.value:
-            return None
-        since = job.auto_retry_at or job.update_at or job.created_at
-        return since + timedelta(days=get_ingest_settings().RETENTION_DAYS) if since else None
 
     def _local_only(self, job: RecipeIngestionJob) -> bool:
         """
@@ -641,7 +790,6 @@ class ReviewService:
         recipes = self._recipe_refs([job.recipe_id] if job.recipe_id else [])
         out = RecipeIngestionJobOut(
             **self._summary_fields(job, recipes),
-            draft_version=job.draft_version,
             pages=[] if is_slimmed(job) else [PageOut.from_meta(job.id, page) for page in parse_pages(job.pages)],
             transcription=job.transcription,
             read=extraction.read_info() if extraction else None,
@@ -701,6 +849,7 @@ class ReviewService:
         draft = self._parse_text_lines(job_id, _with_unique_ids(update.draft), update.draft_version)
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
         units = self._unit_names() if resolved_proposals else []
+        linked = self._linked_names(draft)
 
         def mutate(row: RowMapping) -> dict[str, Any] | None:
             # compared as read, so a draft stored by an older schema version (notes without ids) isn't "changed" by
@@ -728,7 +877,9 @@ class ReviewService:
             pages = parse_pages(row["pages"]) if adopted else []
             adopted_flags = _adopted_reading_flags(draft, adopted, extraction, transcription, pages=pages, units=units)
             previous = [*stored_flags, *adopted_flags]
-            flags = resolve_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
+            flags = resolve_flags(
+                draft, extraction, resolutions, transcription=transcription, previous=previous, linked=linked
+            )
             errors, warnings = flag_rules.count_unresolved(flags)
             values: dict[str, Any] = {
                 "draft": draft,
@@ -772,6 +923,17 @@ class ReviewService:
         if self.session.in_transaction():
             self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
         return units
+
+    def _linked_names(self, draft: CardDraft) -> dict[UUID, list[str]]:
+        """
+        Every name of the group's foods and units the draft links, for `linked_fuzzy` (`IngestMatcher.linked_names`,
+        only the linked rows), read before a draft's write
+        """
+        repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
+        linked = IngestMatcher(repos).linked_names(draft.ingredients)
+        if self.session.in_transaction():
+            self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
+        return linked
 
     def _parse_text_lines(self, job_id: UUID, draft: CardDraft, draft_version: int) -> CardDraft:
         """
@@ -964,10 +1126,30 @@ class ReviewService:
 
     def rotate(self, job_id: UUID, index: int, degrees: int) -> PageOut:
         """
-        Turns one page clockwise (§4.4): rewrites its files, then stores its new metadata conditional on the job still
-        having no task. 409 `busy` while a task is active. The caller holds the ingest write lock.
+        Turns one page clockwise (§4.4), crash-safe: the turned files are staged beside the page's
+        (`images.stage_rotation`, which first settles a turn a stop left), the new metadata is stored conditional on
+        the job still having no task and the page still being the one turned, then the staged files are swapped in
+        (`images.apply_staged`). A refused write discards them, leaving the page byte for byte as stored. An error
+        while the metadata is written leaves them, as whether it was stored isn't known: the next look at the page
+        settles them against what was (`settle_turns`). It all holds the page's turn lock, and reads the job again
+        once it has it.
+
+        409 `busy` while a task is active, the page changed meanwhile, or another turn of it takes too long. The
+        caller holds the ingest write lock.
         """
-        job = self.job(job_id)
+        self._check_rotate(self.job(job_id), index)
+        page_dir = storage.page_dir(self.group_id, job_id, index)
+        try:
+            with page_turn_lock(page_dir):
+                return self._turn_page(job_id, index, degrees, page_dir)
+        except FileNotFoundError as e:
+            raise not_found() from e
+        except TimeoutError as e:
+            raise busy() from e
+
+    @staticmethod
+    def _check_rotate(job: RecipeIngestionJob, index: int) -> PageMeta:
+        """The page to turn, or why it can't be"""
         pages = {page.index: page for page in parse_pages(job.pages)}
         if index not in pages:
             raise not_found()
@@ -975,18 +1157,20 @@ class ReviewService:
             raise busy()
         if job.status not in (IngestStatus.ready.value, IngestStatus.failed.value):
             raise invalid_status(job.status)
+        return pages[index]
 
-        before = pages[index]
-        page_dir = storage.page_dir(self.group_id, job_id, index)
-        try:
-            turned = images.rotate_page_files(page_dir, before, degrees, PageRotationSource.user)
-        except FileNotFoundError as e:
-            raise not_found() from e
+    def _turn_page(self, job_id: UUID, index: int, degrees: int, page_dir: Path) -> PageOut:
+        """`rotate`, holding the page's turn lock"""
+        job = self.job(job_id)  # again: another turn of the page may have landed while this one waited
+        before = self._check_rotate(job, index)
+        turned = images.stage_rotation(page_dir, before, degrees, PageRotationSource.user)
 
         def mutate(row: RowMapping) -> dict[str, Any] | None:
             stored = [dict(page) for page in row["pages"] or []]
             for position, page in enumerate(stored):
                 if page.get("index") == index:
+                    if page.get("page_sha256") != before.page_sha256:
+                        return None  # the page changed since it was read
                     stored[position] = turned.model_dump(mode="json")
                     return {"pages": stored}
             return None
@@ -1001,13 +1185,11 @@ class ReviewService:
             written = None
 
         if written is None:
-            # a task started (or the job went) while the files were being turned: turn them back
-            try:
-                images.rotate_page_files(page_dir, turned, (360 - degrees) % 360, before.rotation_source)
-            except FileNotFoundError:
-                raise not_found() from None
+            # a task started, the page changed or the job went while the turn was staged: the page stays as stored
+            images.discard_staged(page_dir)
             raise self._refuse_enqueue(job_id, IngestStatus(job.status))
 
+        images.apply_staged(page_dir)
         return PageOut.from_meta(job_id, turned)
 
     def discard(self, job_id: UUID) -> None:
@@ -1139,14 +1321,27 @@ class ReviewService:
                 logger.error("Couldn't move a merged card's page back; the card may be missing a page")
 
     def page_image(self, job_id: UUID, index: int, kind: str) -> PageImage:
-        """One of a page's images, after the household check (§9)"""
+        """
+        One of a page's images, after the household check (§9). A turn a stop left staged is settled first
+        (`settle_turns`), so the file served is the one the page's metadata, and so its ETag, describes; while that
+        can't be done (a running task is turning the page, or a backup restore pauses writes) the file is served as
+        it is, with `settled` false.
+        """
         job = self.job(job_id)
         pages = {page.index: page for page in parse_pages(job.pages)}
         if index not in pages or kind not in PAGE_MEDIA_TYPES or is_slimmed(job):
             raise not_found()
 
+        page_dir = storage.page_dir(self.group_id, job_id, index)
+        settled = True
+        if images.has_staged(page_dir):
+            job, settled = self._settle_to_read(job, index)
+            pages = {page.index: page for page in parse_pages(job.pages)}
+            if index not in pages:
+                raise not_found()
+
         page = pages[index]
-        path = images.page_file(storage.page_dir(self.group_id, job_id, index), kind)
+        path = images.page_file(page_dir, kind)
         try:
             stat = path.stat()
         except FileNotFoundError as e:
@@ -1159,4 +1354,17 @@ class ReviewService:
             etag=f'"{page.page_sha256[:20]}-r{page.rotation}-{kind}"',
             version=version,
             stat=stat,
+            settled=settled,
         )
+
+    def _settle_to_read(self, job: RecipeIngestionJob, index: int) -> tuple[RecipeIngestionJob, bool]:
+        """`settle_turns` for one page about to be read, in a write section of its own; unsettled while paused"""
+        try:
+            with storage.ingest_write():
+                return settle_turns(self.repos, job, [index])
+        except IngestPaused:
+            return job, False  # a restore is replacing the files anyway
+        except TimeoutError:
+            return job, False
+        except FileNotFoundError as e:
+            raise not_found() from e

@@ -1,13 +1,16 @@
 """
-Orientation inside a task (docs/ai/PHASE2.md §3.7, §4.4): a page Tesseract turns has its files and its stored
-metadata changed as one step. A task stopped during orientation (shutdown, the reviewer's cancel), a later page that
-fails, or a lease lost meanwhile never leaves a turned page described as it was before it turned.
+Orientation inside a task (docs/ai/PHASE2.md §3.7, §4.4): a page Tesseract turns, or one the image reader says is
+sideways, has its files and its stored metadata changed as one step. A task stopped during orientation (shutdown, the
+reviewer's cancel), a later page that fails, a lease lost meanwhile or a killed process never leaves a turned page
+described as it was before it turned: the turn is staged, stored, then swapped in, and the next task settles a turn
+cut short.
 """
 
 import asyncio
 import hashlib
 import io
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,8 @@ from sqlalchemy.orm import Session
 
 from mealie.repos.repository_recipe_ingest import CancelOutcome, IngestQueue, cancel_task, utcnow
 from mealie.schema.recipe_ingest import (
+    CardDraft,
+    ExtractionMeta,
     IngestErrorCode,
     IngestStatus,
     IngestTaskKind,
@@ -29,6 +34,7 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services import ocr
 from mealie.services.ai.ingest import images, limits, storage, tasks
+from mealie.services.ai.ingest.pipeline import CardExtraction
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from mealie.services.ai.ingest.runner.types import TaskContext, TaskFailed
 
@@ -51,7 +57,7 @@ class SlowOCR:
         self.pages: list[int] = []
         self.before_answer: Any = None
 
-    def __call__(self, path: Path, *, min_ratio: float = 1.0) -> ocr.OCRResult:
+    def __call__(self, path: Path, *, min_ratio: float = 1.0, **kwargs: Any) -> ocr.OCRResult:
         index = int(path.parent.name)
         self.pages.append(index)
         self.entered.set()
@@ -68,6 +74,7 @@ class SlowOCR:
 def reader(monkeypatch: pytest.MonkeyPatch) -> SlowOCR:
     fake = SlowOCR()
     monkeypatch.setattr(ocr, "is_available", lambda: True)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)  # orientation's own check (Tesseract isn't in CI)
     monkeypatch.setattr(ocr, "extract_text", fake)
     return fake
 
@@ -257,3 +264,250 @@ def test_a_task_whose_lease_is_already_gone_doesnt_read_or_turn_the_page(
     assert failed.value.code == IngestErrorCode.interrupted
     assert reader.pages == []
     assert _files(jobs, job_id) == files_before
+
+
+# ==========================================
+# A turn is staged: a killed process never splits a page's files from its stored metadata
+
+
+class Killed(BaseException):
+    """The process dying at that point: nothing after it runs, no `except Exception` sees it"""
+
+
+class ReadingStarted(Exception):
+    """The task got past its pages (orientation and recovery) to reading the card"""
+
+
+def _staged(jobs: Jobs, job_id: UUID, index: int = 0) -> list[str]:
+    page_dir = storage.page_dir(jobs.repos.group_id, job_id, index)
+    return sorted(name for name in images.STAGED_FILES.values() if (page_dir / name).exists())
+
+
+def _next_task(jobs: Jobs, job_id: UUID, token: UUID, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs the job's next task up to reading the card: everything it does with the pages first"""
+
+    async def extract_card(*args: Any, **kwargs: Any) -> Any:
+        raise ReadingStarted()
+
+    monkeypatch.setattr(tasks, "extract_card", extract_card)
+    with pytest.raises(ReadingStarted):
+        run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+
+def test_a_kill_after_the_turn_is_stored_is_finished_by_the_next_task(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    job_id = card_job()
+    token = _claim(db, job_id)
+    reader.release.set()
+    apply_staged = images.apply_staged
+
+    def killed_before_the_swap(page_dir: Path) -> None:
+        raise Killed()
+
+    monkeypatch.setattr(images, "apply_staged", killed_before_the_swap)
+    with pytest.raises(Killed):
+        run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    # the metadata naming the turned page is stored; the turned files wait beside the old ones
+    stored = PageMeta.model_validate(jobs.row(job_id)["pages"][0])
+    assert (stored.rotation, stored.rotation_source, stored.oriented) == (90, PageRotationSource.ocr, True)
+    assert stored.ocr is not None and stored.ocr.text == "Banana Mug Cake"  # read at the new rotation, kept
+    assert _staged(jobs, job_id) == sorted(images.STAGED_FILES.values())
+    page_dir = storage.page_dir(jobs.repos.group_id, job_id, 0)
+    assert hashlib.sha256((page_dir / images.PAGE_FILE).read_bytes()).hexdigest() != stored.page_sha256
+
+    monkeypatch.setattr(images, "apply_staged", apply_staged)
+    _next_task(jobs, job_id, token, monkeypatch)
+
+    assert _staged(jobs, job_id) == []
+    meta = _stored_matches_disk(jobs, job_id)  # the swap was finished: the files are the ones the row names
+    assert (meta.rotation, meta.width, meta.height) == (90, SIDEWAYS[1], SIDEWAYS[0])
+    assert reader.pages == [0]  # the page wasn't read or turned again
+
+
+def test_a_kill_before_the_turn_is_stored_is_undone_by_the_next_task(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    job_id = card_job()
+    token = _claim(db, job_id)
+    reader.release.set()
+    files_before = _files(jobs, job_id)
+    pages_before = jobs.row(job_id)["pages"]
+    store_page = tasks._store_page
+
+    def killed_before_the_write(*args: Any, **kwargs: Any) -> bool:
+        raise Killed()
+
+    monkeypatch.setattr(tasks, "_store_page", killed_before_the_write)
+    with pytest.raises(Killed):
+        run(tasks.handle_extract(_context(jobs, job_id, token)))
+    assert _staged(jobs, job_id) == sorted(images.STAGED_FILES.values())
+    assert jobs.row(job_id)["pages"] == pages_before
+
+    # the next task finds the staged files, which nothing stored names: they go, and the page is as stored
+    monkeypatch.setattr(tasks, "_store_page", store_page)
+    reader.readings[0] = 0  # read upright this time, so the page isn't turned again
+    _next_task(jobs, job_id, token, monkeypatch)
+
+    assert _staged(jobs, job_id) == []
+    assert _files(jobs, job_id) == files_before  # byte for byte
+    meta = _stored_matches_disk(jobs, job_id)
+    assert (meta.rotation, meta.rotation_source, meta.oriented) == (0, PageRotationSource.none, True)
+
+
+def test_a_lease_lost_while_the_turn_is_staged_leaves_no_staged_files(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    job_id = card_job()
+    token = _claim(db, job_id)
+    reader.release.set()
+    files_before = _files(jobs, job_id)
+    pages_before = jobs.row(job_id)["pages"]
+    stage_rotation = images.stage_rotation
+
+    def swept_meanwhile(*args: Any, **kwargs: Any) -> PageMeta:
+        staged = stage_rotation(*args, **kwargs)
+        jobs.update(job_id, lease_token=uuid4())  # swept and claimed by another process
+        return staged
+
+    monkeypatch.setattr(images, "stage_rotation", swept_meanwhile)
+    with pytest.raises(TaskFailed) as failed:
+        run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    assert failed.value.code == IngestErrorCode.interrupted
+    assert _staged(jobs, job_id) == []
+    assert jobs.row(job_id)["pages"] == pages_before
+    assert _files(jobs, job_id) == files_before
+    _stored_matches_disk(jobs, job_id)
+
+
+def test_an_error_while_storing_the_turn_settles_the_staged_files_at_once(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    """A database error (not a kill) while the metadata is written: the staged files follow what the row says"""
+    job_id = card_job()
+    token = _claim(db, job_id)
+    reader.release.set()
+    files_before = _files(jobs, job_id)
+
+    def database_gone(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("connection lost")
+
+    monkeypatch.setattr(tasks, "_store_page", database_gone)
+    with pytest.raises(RuntimeError, match="connection lost"):
+        run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    assert _staged(jobs, job_id) == []
+    assert _files(jobs, job_id) == files_before
+    _stored_matches_disk(jobs, job_id)
+
+
+# ==========================================
+# A turn the image reader reports
+
+
+def _reader_says(monkeypatch: pytest.MonkeyPatch, rotations: dict[int, int]) -> None:
+    """`extract_card` as the pipeline answers when the image reader said how far each page must turn"""
+
+    async def extract_card(pages: list[Any], **kwargs: Any) -> CardExtraction:
+        return CardExtraction(
+            draft=CardDraft(name="Banana Mug Cake"),
+            flags=[],
+            transcription="Banana Mug Cake",
+            extraction=ExtractionMeta(),
+            rotations=rotations,
+        )
+
+    monkeypatch.setattr(tasks, "extract_card", extract_card)
+
+
+def test_a_page_the_image_reader_says_is_sideways_is_turned_without_tesseract(
+    db: Session, jobs: Jobs, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)
+    _reader_says(monkeypatch, {0: 90})
+    job_id = card_job(pages=2)
+    token = _claim(db, job_id)
+    back_before = _files(jobs, job_id, 1)
+
+    result = run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    front = _stored_matches_disk(jobs, job_id, 0)
+    assert (front.rotation, front.rotation_source, front.oriented) == (90, PageRotationSource.model, True)
+    assert (front.width, front.height) == (SIDEWAYS[1], SIDEWAYS[0])
+    assert result.pages[0] == front  # the result carries the turned page, as finalize stores it
+    back = _stored_matches_disk(jobs, job_id, 1)
+    assert (back.rotation, back.oriented) == (0, False)  # read as upright: left for Rotate
+    assert _files(jobs, job_id, 1) == back_before
+    assert _staged(jobs, job_id) == []
+
+
+def test_a_page_tesseract_or_the_reviewer_oriented_ignores_the_image_reader(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    _reader_says(monkeypatch, {0: 90, 1: 180})
+    reader.readings[0] = 0  # Tesseract reads the front upright: settled as it is
+    reader.release.set()
+    job_id = card_job(pages=2)
+    pages = jobs.row(job_id)["pages"]
+    pages[1] = {**pages[1], "oriented": True, "rotation_source": PageRotationSource.user.value}  # turned by hand
+    jobs.update(job_id, pages=pages)
+    token = _claim(db, job_id)
+    files_before = [_files(jobs, job_id, 0), _files(jobs, job_id, 1)]
+
+    run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    front = _stored_matches_disk(jobs, job_id, 0)
+    assert (front.rotation, front.rotation_source, front.oriented) == (0, PageRotationSource.none, True)
+    back = _stored_matches_disk(jobs, job_id, 1)
+    assert (back.rotation, back.rotation_source) == (0, PageRotationSource.user)
+    assert [_files(jobs, job_id, 0), _files(jobs, job_id, 1)] == files_before
+
+
+def test_a_manual_rotate_in_progress_and_the_tasks_turn_never_mix_their_staged_files(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A rotate that checked for a task just before this one was claimed stages its turn, is refused (the job has a task
+    now) and discards its staged files. The task's turn waits for the page's turn lock meanwhile, so the rotate never
+    discards the task's staged files, and the page ends turned as the task stored it.
+    """
+    from mealie.services.ai.ingest.review import page_turn_lock
+
+    job_id = card_job()
+    token = _claim(db, job_id)
+    page_dir = storage.page_dir(jobs.repos.group_id, job_id, 0)
+    stored = PageMeta.model_validate(jobs.row(job_id)["pages"][0])
+    holding, done = threading.Event(), threading.Event()
+    order: list[str] = []
+    stage_rotation = images.stage_rotation
+
+    def recorded(page_dir: Path, meta: PageMeta, degrees: int, source: PageRotationSource) -> PageMeta:
+        order.append(f"stage {source.value}")
+        return stage_rotation(page_dir, meta, degrees, source)
+
+    monkeypatch.setattr(images, "stage_rotation", recorded)
+
+    def rotate_refused() -> None:
+        with storage.ingest_write(), page_turn_lock(page_dir):
+            images.stage_rotation(page_dir, stored, 180, PageRotationSource.user)
+            holding.set()
+            time.sleep(0.3)  # the task's turn reaches the lock meanwhile
+            images.discard_staged(page_dir)  # its write was refused
+            order.append("rotate discarded")
+        done.set()
+
+    rotating = threading.Thread(target=rotate_refused, daemon=True)
+    rotating.start()
+    assert holding.wait(5)
+    reader.release.set()
+    _next_task(jobs, job_id, token, monkeypatch)
+    rotating.join(5)
+
+    assert done.is_set()
+    assert order == ["stage user", "rotate discarded", "stage ocr"]  # the task's turn waited for the rotate's
+    assert _staged(jobs, job_id) == []
+    meta = _stored_matches_disk(jobs, job_id)
+    assert (meta.rotation, meta.rotation_source) == (90, PageRotationSource.ocr)

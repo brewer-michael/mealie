@@ -9,7 +9,7 @@ are shared with the other job, review and commit tests in this folder.
 import io
 import re
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -126,12 +126,13 @@ def fake_compute_flags(
     previous: Sequence[CardFlag] | None = None,
     units: Iterable[str] = (),
     ocr_lines: Sequence[str] | None = None,
+    linked: Mapping[UUID, Collection[str]] | None = None,
 ) -> list[CardFlag]:
     """
     A small stand-in for B1's flag rules, so these tests don't depend on them: markers are errors, a missing name is
     an error, a low parse confidence is a warning and an unlinked food is an info. Resolutions are applied by id; the
-    transcription, the previous flags, the group's units and Tesseract's lines aren't used (`test_review_flags.py`
-    runs the real rules).
+    transcription, the previous flags, the group's units, Tesseract's lines and the linked names aren't used
+    (`test_review_flags.py` runs the real rules).
     """
     flags: list[CardFlag] = []
     if not draft.name.strip():

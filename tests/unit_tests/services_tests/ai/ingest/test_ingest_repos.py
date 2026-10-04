@@ -4,7 +4,7 @@ conditional updates, batches, settings and notifier options. Runs on SQLite and 
 """
 
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -203,6 +203,103 @@ def test_a_committed_card_whose_recipe_was_deleted_is_no_duplicate(db: Session, 
         assert repos.jobs.find_duplicate(f"{status.value:f<64}"[:64]) == other
 
 
+def test_cards_committed_lately_come_by_commit_time(db: Session, unique_user_fn_scoped: TestUser):
+    """A card uploaded 8 days ago and added today is among the cards added this week, newest addition first"""
+    repos = _repos(db, unique_user_fn_scoped)
+    now = utcnow()
+    old_upload = _job(
+        repos,
+        status=IngestStatus.committed.value,
+        created_at=now - timedelta(days=8),
+        committed_at=now - timedelta(minutes=5),
+    )
+    this_week = _job(
+        repos,
+        status=IngestStatus.committed.value,
+        created_at=now - timedelta(days=4),
+        committed_at=now - timedelta(days=3),
+    )
+    _job(
+        repos,
+        status=IngestStatus.committed.value,
+        created_at=now - timedelta(days=12),
+        committed_at=now - timedelta(days=9),
+    )
+    waiting = _job(repos, status=IngestStatus.ready.value, created_at=now)
+
+    added, total = repos.jobs.page(committed_since=now - timedelta(days=7), order="committed")
+    assert [job.id for job in added] == [old_upload, this_week]
+    assert total == 2
+
+    # an aware time is read as the moment it names
+    aware = (now - timedelta(days=7)).replace(tzinfo=UTC).astimezone(timezone(timedelta(hours=-5)))
+    assert [job.id for job in repos.jobs.page(committed_since=aware, order="committed")[0]] == [old_upload, this_week]
+
+    # by commit time without the filter, cards not committed come after the others; by upload time, newest upload first
+    by_commit = [job.id for job in repos.jobs.page(order="committed", per_page=-1)[0]]
+    assert by_commit[:2] == [old_upload, this_week] and by_commit[-1] == waiting
+    assert repos.jobs.page(per_page=-1)[0][0].id == waiting
+
+
+def test_another_waiting_card_with_the_same_name(db: Session, unique_user_fn_scoped: TestUser, g2_user: TestUser):
+    repos = _repos(db, unique_user_fn_scoped)
+    now = utcnow()
+    this = _job(repos, status=IngestStatus.ready.value, title="Banana Bread", created_at=now)
+    older = _job(repos, status=IngestStatus.ready.value, title="  banana   BREAD ", created_at=now - timedelta(hours=2))
+    reading = _job(
+        repos, status=IngestStatus.processing.value, title="Banana Bread", created_at=now - timedelta(hours=1)
+    )
+    for status in (IngestStatus.committed, IngestStatus.failed, IngestStatus.committing):
+        _job(repos, status=status.value, title="Banana Bread", created_at=now - timedelta(days=1))
+    _job(_repos(db, g2_user), status=IngestStatus.ready.value, title="Banana Bread", created_at=now - timedelta(days=2))
+
+    match = repos.jobs.same_title("BANANA bread", exclude_id=this)
+    assert match is not None and (match.id, match.title) == (older, "  banana   BREAD ")
+    assert repos.jobs.same_title("Banana Bread", exclude_id=older).id == reading  # type: ignore[union-attr]
+    assert repos.jobs.same_title("Banana Bread").id == older  # type: ignore[union-attr]
+    assert repos.jobs.same_title("Ｂａｎａｎａ Bread", exclude_id=this).id == older  # type: ignore[union-attr]
+    assert repos.jobs.same_title("Banana Muffins", exclude_id=this) is None
+    assert repos.jobs.same_title("   ", exclude_id=this) is None
+
+
+def test_cards_being_read_count_per_user_across_the_group(db: Session, unique_user: TestUser, h2_user: TestUser):
+    user_id, someone_else = uuid4(), uuid4()
+    mine, other_household = _repos(db, unique_user), _repos(db, h2_user)
+    _job(mine, created_by=user_id)
+    _job(mine, created_by=user_id)
+    _job(other_household, created_by=user_id)  # the same group: the quota is the group's
+    _job(mine, created_by=user_id, status=IngestStatus.ready.value)
+    _job(mine, created_by=someone_else)
+    _job(mine, created_by=None)
+
+    assert mine.jobs.count_processing_by_user(user_id) == 3
+    assert other_household.jobs.count_processing_by_user(user_id) == 3
+    assert mine.jobs.count_processing_by_user(someone_else) == 1
+    assert mine.jobs.count_processing_by_user(uuid4()) == 0
+
+
+def test_the_households_latest_language(db: Session, unique_user_fn_scoped: TestUser, g2_user: TestUser):
+    repos = _repos(db, unique_user_fn_scoped)
+    now = utcnow()
+    app, api = (IngestSource.app, IngestSource.api)
+    assert repos.batches.latest_locale((app, api)) is None
+
+    german = repos.batches.create(source=app, created_by=None, locale="de-DE", now=now - timedelta(days=3))
+    assert repos.batches.latest_locale((app, api)) == "de-DE"
+
+    repos.batches.create(source=api, created_by=None, locale="fr-FR", now=now - timedelta(days=2))
+    repos.batches.create(source=app, created_by=None, locale=None, now=now - timedelta(days=1))  # recorded none
+    repos.batches.create(source=IngestSource.inbox, created_by=None, locale="it-IT", now=now)
+    _repos(db, g2_user).batches.create(source=app, created_by=None, locale="nl-NL", now=now)
+    assert repos.batches.latest_locale((app, api)) == "fr-FR"
+    assert repos.batches.latest_locale((app,)) == "de-DE"
+    assert repos.batches.latest_locale(()) is None
+
+    # a later upload into an older batch makes it the latest
+    assert repos.batches.touch(german, now)
+    assert repos.batches.latest_locale((app, api)) == "de-DE"
+
+
 # ==========================================
 # update_job_json
 
@@ -384,6 +481,57 @@ def test_cancelling(db: Session, unique_user: TestUser):
     assert _row(db, running)["cancel_requested"] is True
 
     assert repos.jobs.cancel_task(ready) == CancelOutcome.idle
+
+
+def test_a_cancelled_retry_no_longer_waits_for_the_monthly_limit(db: Session, unique_user: TestUser):
+    """A card retried by hand while waiting for the limit, then cancelled, fails `cancelled`: it isn't retried later"""
+    repos = _repos(db, unique_user)
+    job_id = _job(repos, auto_retry_at=utcnow() + timedelta(days=3))
+    repos.jobs.enqueue_task(job_id, IngestTaskKind.extract, None, limits.PRIORITY_EXTRACT)
+    assert repos.jobs.cancel_task(job_id) == CancelOutcome.cancelled
+    row = _row(db, job_id)
+    assert (row["status"], row["error_code"], row["auto_retry_at"]) == ("failed", "cancelled", None)
+
+
+def test_cards_waiting_for_the_monthly_limit_are_read_again_once(db: Session, unique_user_fn_scoped: TestUser):
+    repos = _repos(db, unique_user_fn_scoped)
+    queue = IngestQueue(db)
+    now = utcnow()
+    limit = IngestErrorCode.limit_reached.value
+    soon = _job(repos, status="failed", error_code=limit, auto_retry_at=now + timedelta(days=1), local_only=True)
+    later = _job(repos, status="failed", error_code=limit, auto_retry_at=now + timedelta(days=9))
+    not_waiting = [
+        _job(repos, status="failed", error_code=limit),  # failed before automatic retries existed
+        _job(repos, status="failed", error_code="provider_failed", auto_retry_at=now),
+        _job(repos, status="ready", error_code=limit, auto_retry_at=now),  # a re-extract's banner
+        _job(repos, status="failed", error_code=limit, auto_retry_at=now, task_state="queued"),  # retried by hand
+    ]
+
+    waiting = [wait for wait in queue.waiting_for_limit() if wait.job_id in {soon, later, *not_waiting}]
+    assert [wait.job_id for wait in waiting] == [soon, later]
+    assert (waiting[0].group_id, waiting[0].household_id) == (repos.group_id, repos.household_id)
+    assert waiting[0].local_only and not waiting[1].local_only
+    assert abs(waiting[0].auto_retry_at - (now + timedelta(days=1))) < timedelta(seconds=1)
+
+    assert queue.retry_after_limit(soon, repos.household_id)  # type: ignore[arg-type]
+    row = _row(db, soon)
+    assert (row["status"], row["error_code"], row["error_params"], row["auto_retry_at"]) == (
+        "processing",
+        None,
+        None,
+        None,
+    )
+    assert (row["task_kind"], row["task_state"], row["task_priority"], row["attempts"]) == (
+        "extract",
+        "queued",
+        limits.PRIORITY_EXTRACT,
+        0,
+    )
+    assert not queue.retry_after_limit(soon, repos.household_id)  # type: ignore[arg-type]
+    assert not queue.retry_after_limit(later, uuid4())  # another household's id matches nothing
+    for job_id in not_waiting:
+        assert not queue.retry_after_limit(job_id, repos.household_id)  # type: ignore[arg-type]
+    assert soon not in [wait.job_id for wait in queue.waiting_for_limit()]
 
 
 # ==========================================

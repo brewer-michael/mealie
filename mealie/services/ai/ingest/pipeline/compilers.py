@@ -21,6 +21,7 @@ from typing import Any
 from uuid import UUID
 
 from mealie.core import exceptions
+from mealie.core.config import get_app_settings
 from mealie.core.root_logger import get_logger
 from mealie.schema.group.ai_providers import AIProviderOut
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
@@ -314,12 +315,13 @@ class CardOCRCompiler(OCRImageCompiler):
 
     It doesn't run after the image compiler was rate limited: that card waits and is read properly (§3.6). A
     monthly limit, a missing image provider or a local-only refusal still fall back here, since the default slot may
-    have other providers.
+    have other providers. `OCR_ENABLED=false` turns it off, even when orientation (`AI_INGEST_ORIENT`, which needs
+    only Tesseract) stored the pages' text.
     """
 
     def can_compile(self) -> bool:
         ctx = self.ctx
-        if not ctx.input.images or ctx.ai.default_provider is None:
+        if not ctx.input.images or ctx.ai.default_provider is None or not get_app_settings().OCR_ENABLED:
             return False
 
         if isinstance(ctx, CardWorkflowContext):

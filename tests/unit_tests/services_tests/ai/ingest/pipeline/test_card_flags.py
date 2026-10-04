@@ -1,5 +1,7 @@
 """`compute_flags` (docs/ai/PHASE2.md §4.6): every kind, stable ids, resolutions, edits and the reading flags on save"""
 
+import hashlib
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -23,12 +25,14 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services.ai.ingest.flag_rules import count_unresolved, is_clean
 from mealie.services.ai.ingest.pipeline.flags import (
+    ORGANIZERS_STEP,
     compute_flags,
     flag_id,
     ingredient_hash,
     ingredient_line,
     ocr_check_lines,
 )
+from mealie.services.recipe.import_workflow.steps import ResolveOrganizersStep
 
 
 def ingredient(
@@ -115,6 +119,13 @@ def test_every_kind_is_raised():
     raised: set[CardFlagKind] = set()
     for card, extraction, transcription in scenarios():
         raised |= kinds(compute_flags(card, extraction, {}, transcription=transcription))
+    # a food linked by a near-miss name, judged by the names of the group's foods
+    onions = ingredient("2 rd onions", quantity=2, food="red onion")
+    assert onions.food is not None and onions.food.id is not None
+    raised |= kinds(compute_flags(draft(ingredients=[onions]), None, {}, linked={onions.food.id: ["red onion"]}))
+    # tag suggestions that failed
+    failed = ExtractionMeta(step_outcomes={"build-recipe": "completed", "resolve-organizers": "failed"})
+    raised |= kinds(compute_flags(draft(), failed, {}))
 
     assert raised == set(CardFlagKind)
 
@@ -185,6 +196,44 @@ def test_each_kind_says_what_it_found():
         (CardFlagKind.empty_section, "steps"),
     }
     assert only(compute_flags(*scenarios()[2][:2], {}), CardFlagKind.not_parsed).field == "card"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [
+        ("failed", "failed"),
+        ("skipped:local_only", "local_only"),
+        ("skipped:limit_reached", "limit_reached"),
+        ("completed", None),
+        (None, None),  # the group has no organizers: none were asked for
+        ("skipped", None),  # suggestions turned off
+    ],
+)
+def test_skipped_tag_suggestions_are_said(outcome: str | None, reason: str | None):
+    outcomes = {"compile-source": "completed", "build-recipe": "completed"}
+    if outcome is not None:
+        outcomes["resolve-organizers"] = outcome
+    extraction = ExtractionMeta(step_outcomes=outcomes)
+
+    flags = [flag for flag in compute_flags(draft(), extraction, {}) if flag.kind == CardFlagKind.organizers_skipped]
+
+    if reason is None:
+        assert flags == []
+    else:
+        (flag,) = flags
+        assert (flag.id, flag.field, flag.ref) == ("organizers_skipped:card:", "card", None)
+        assert (flag.severity, flag.source, flag.params) == (
+            CardFlagSeverity.info,
+            CardFlagSource.model,
+            {"reason": reason},
+        )
+        assert is_clean(flags)  # shown quietly: nothing to fix
+        # it says so on every save, whatever the reviewer does
+        assert compute_flags(draft(), extraction, {}, previous=flags)[0] == flag
+
+
+def test_the_organizer_step_is_named_as_upstream_names_it():
+    assert ORGANIZERS_STEP == ResolveOrganizersStep.name
 
 
 def test_flags_come_in_reading_order():
@@ -552,6 +601,120 @@ def test_parse_flags_drop_off_an_edited_line():
     assert ingredient_line(line) == "2 sq chocolate"
 
 
+# ==========================================
+# Links that aren't an exact name match
+
+
+def _names(line: CardDraftIngredient, *, food: list[str] | None = None, unit: list[str] | None = None) -> dict:
+    """`compute_flags`' `linked` for a line: the names its linked food and unit go by in the group"""
+    linked = {}
+    if food is not None and line.food and line.food.id:
+        linked[line.food.id] = food
+    if unit is not None and line.unit and line.unit.id:
+        linked[line.unit.id] = unit
+    return linked
+
+
+TABLESPOON = ["tablespoon", "tablespoons", "tbsp"]
+CUP = ["cup", "cups", "c"]
+
+
+@pytest.mark.parametrize(
+    ("line", "food", "unit"),
+    [
+        (ingredient("2 red onions", quantity=2, food="red onion"), ["red onion", "red onions"], None),
+        (ingredient("2 red onions", quantity=2, food="red onion"), ["red onion"], None),  # no plural in the group
+        (ingredient("3 scallions, sliced", quantity=3, food="green onion"), ["green onion", "scallion"], None),
+        (ingredient("1 T. sugar", quantity=1, unit="tablespoon", food="sugar"), ["sugar"], TABLESPOON),
+        (ingredient("1/3 C. almond flour", quantity=1 / 3, unit="cup", food="almond flour"), ["almond flour"], CUP),
+        (ingredient("1 lb. ground beef", quantity=1, unit="pound", food="ground beef"), None, ["pound", "lb"]),
+        (ingredient("1 c. confectioners' sugar", quantity=1, unit="cup", food="confectioners sugar"), [], CUP),
+        (ingredient("2 c. all-purpose flour", quantity=2, unit="cup", food="all purpose flour"), [], CUP),
+        (ingredient("1 Jalapeño, minced", quantity=1, food="jalapeno"), ["jalapeno"], None),
+        (ingredient("2 c. cherries", quantity=2, unit="cup", food="cherry"), ["cherry"], CUP),
+        (ingredient("2 bay leaves", quantity=2, food="bay leaf"), ["bay leaf"], None),
+        (ingredient("1 doz. eggs", quantity=1, unit="dozen", food="egg"), ["egg"], ["dozen"]),
+        # a size word the parser took out doesn't hide the food's name
+        (ingredient("1 med onion", quantity=1, food="onion", note="med"), ["onion"], None),
+        (ingredient("1 c. sugar (scant)", quantity=1, unit="cup", food="sugar", note="scant"), ["sugar"], CUP),
+    ],
+)
+def test_an_exact_or_alias_link_is_not_flagged(
+    line: CardDraftIngredient, food: list[str] | None, unit: list[str] | None
+):
+    linked = _names(line, food=food, unit=unit)
+    assert linked
+    flags = compute_flags(draft(ingredients=[line]), ExtractionMeta(language="English"), {}, linked=linked)
+    assert CardFlagKind.linked_fuzzy not in kinds(flags)
+
+
+def test_a_food_or_unit_linked_by_a_near_miss_name_is_flagged():
+    onions = ingredient("2 rd onions", quantity=2, food="red onion")
+    ref = str(onions.reference_id)
+
+    flags = compute_flags(
+        draft(ingredients=[onions]), None, {}, linked=_names(onions, food=["red onion", "red onions"])
+    )
+
+    flag = only(flags, CardFlagKind.linked_fuzzy)
+    assert (flag.id, flag.field, flag.ref) == (f"linked_fuzzy:ingredients:{ref}", "ingredients", ref)
+    assert (flag.severity, flag.source) == (CardFlagSeverity.warning, CardFlagSource.parser)
+    # the linked name, and where the words it was matched from are
+    assert flag.params == {"name": "red onion", "kind": "food", "start": 2, "end": 11}
+    assert count_unresolved(flags) == (0, 1)
+
+    # a food and a unit on one line: two flags, the unit's with an id of its own
+    both = ingredient("2 cps rd onions", quantity=2, unit="cup", food="red onion")
+    flags = compute_flags(draft(ingredients=[both]), None, {}, linked=_names(both, food=["red onion"], unit=CUP))
+    by_kind = {flag.params["kind"]: flag for flag in flags if flag.kind == CardFlagKind.linked_fuzzy}
+    ref = str(both.reference_id)
+    assert by_kind["food"].id == f"linked_fuzzy:ingredients:{ref}"
+    assert by_kind["unit"].id == f"linked_fuzzy:ingredients:{ref}#unit"
+    assert by_kind["unit"].ref == ref and by_kind["unit"].params["name"] == "cup"
+
+
+def test_a_fuzzy_link_follows_the_line():
+    """Computed on every save from the linked names: dismissable, gone once the reviewer picks another food"""
+    onions = ingredient("2 rd onions", quantity=2, food="red onion")
+    assert onions.food is not None and onions.food.id is not None
+    card = draft(ingredients=[onions])
+    linked = _names(onions, food=["red onion"])
+    extracted = compute_flags(card, None, {}, linked=linked)
+    flag = only(extracted, CardFlagKind.linked_fuzzy)
+
+    # "Looks right"
+    dismissed = compute_flags(card, None, {flag.id: FlagResolution.dismissed}, previous=extracted, linked=linked)
+    assert only(dismissed, CardFlagKind.linked_fuzzy).resolution == FlagResolution.dismissed
+    assert is_clean(dismissed)
+
+    # a save without the linked names keeps it while the line is as parsed
+    assert only(compute_flags(card, None, {}, previous=extracted), CardFlagKind.linked_fuzzy) == flag
+    # a food that isn't the group's (any more) isn't judged
+    assert CardFlagKind.linked_fuzzy not in kinds(compute_flags(card, None, {}, linked={}))
+
+    # the reviewer picks another food: the line is theirs now
+    onions.food = CardDraftRef(id=uuid4(), name="yellow onion")
+    for flags in (
+        compute_flags(card, None, {}, previous=extracted),
+        compute_flags(card, None, {}, previous=extracted, linked={onions.food.id: ["yellow onion"]}),
+    ):
+        assert CardFlagKind.linked_fuzzy not in kinds(flags)
+
+    # a line that wasn't parsed has no link of the parser's to check
+    text = ingredient("2 rd onions", food="red onion", confidence=None)
+    assert text.food is not None and text.food.id is not None
+    flags = compute_flags(draft(ingredients=[text]), None, {}, linked={text.food.id: ["red onion"]})
+    assert CardFlagKind.linked_fuzzy not in kinds(flags)
+
+
+def test_a_fuzzy_link_on_a_card_in_another_language_is_judged_as_written():
+    """Shorthand is written out only on English cards; elsewhere the names are looked for in the line as it is"""
+    line = ingredient("1 c. sucre", quantity=1, unit="cup", food="sugar")
+    linked = _names(line, food=["sugar"], unit=CUP)
+    flags = compute_flags(draft(ingredients=[line]), ExtractionMeta(language="fr"), {}, linked=linked)
+    assert [flag.params["kind"] for flag in flags if flag.kind == CardFlagKind.linked_fuzzy] == ["food"]
+
+
 def test_a_line_typed_in_full_reads_from_its_fields():
     line = CardDraftIngredient(
         quantity=1.5, unit=CardDraftRef(name="cup"), food=CardDraftRef(name="flour"), note="sifted"
@@ -628,63 +791,121 @@ def test_notes_and_single_fields_are_keyed_without_an_index_of_their_own():
         notes=[CardDraftNote(text="fine"), CardDraftNote(title="[illegible]", text="Serve warm")],
         attribution="From [illegible]",
     )
+    note = str(card.notes[1].id)
     flags = compute_flags(card, None, {})
-    assert [(flag.id.split("#")[0], flag.field, flag.ref) for flag in flags] == [
+    assert [(flag.id, flag.field, flag.ref) for flag in flags] == [
         ("illegible:description:", "description", None),
         ("blank:totalTime:", "totalTime", None),
-        ("illegible:notes:1", "notes", "1"),  # the note's position, and a digest of what it says
+        (f"illegible:notes:{note}", "notes", note),  # the note's id, like a step's
         ("illegible:attribution:", "attribution", None),
     ]
-    assert flags[2].id.startswith("illegible:notes:1#")
 
 
-def _note_flag(flags: list[CardFlag], ref: str) -> CardFlag:
-    (flag,) = [flag for flag in flags if flag.field == "notes" and flag.ref == ref]
+def _note_flag(flags: list[CardFlag], note: CardDraftNote) -> CardFlag:
+    (flag,) = [flag for flag in flags if flag.field == "notes" and flag.ref == str(note.id)]
     return flag
 
 
 def test_a_kept_note_flag_stays_with_its_note():
-    """A note has no id of its own; keeping one note's blank never keeps another's when notes move"""
-    card = draft(notes=[CardDraftNote(text="Bake [blank] min"), CardDraftNote(text="Serve with [blank]")])
-    first = _note_flag(compute_flags(card, None, {}), "0")
+    """A note's resolution is stored by its id: it follows the note when it's edited or moved, never another note"""
+    bake, serve = CardDraftNote(text="Bake [blank] min"), CardDraftNote(text="Serve with [blank]")
+    card = draft(notes=[bake, serve])
+    first = _note_flag(compute_flags(card, None, {}), bake)
+    assert first.id == f"blank:notes:{bake.id}"
     resolutions = {first.id: FlagResolution.kept}
 
     flags = compute_flags(card, None, resolutions)
-    assert _note_flag(flags, "0").resolution == FlagResolution.kept
+    assert _note_flag(flags, bake).resolution == FlagResolution.kept
     assert count_unresolved(flags) == (1, 0)  # the second note's blank
     assert compute_flags(card, None, resolutions) == flags  # stable from save to save
 
-    # the reviewer deletes the first note: the second moves up, and its blank still needs a look
-    del card.notes[0]
+    # the reviewer edits the kept note's text around its blank: still kept
+    bake.text = "Bake [blank] minutes, until golden"
+    assert _note_flag(compute_flags(card, None, resolutions), bake).resolution == FlagResolution.kept
+
+    # the notes are reordered: each keeps its own
+    card.notes = [serve, bake]
     flags = compute_flags(card, None, resolutions)
-    assert _note_flag(flags, "0").resolution is None
+    assert (_note_flag(flags, bake).resolution, _note_flag(flags, serve).resolution) == (FlagResolution.kept, None)
     assert count_unresolved(flags) == (1, 0)
 
-    # likewise when notes are reordered
-    card.notes = [CardDraftNote(text="Serve with [blank]"), CardDraftNote(text="Bake [blank] min")]
-    assert count_unresolved(compute_flags(card, None, resolutions)) == (2, 0)
+    # another note is deleted: the kept one isn't reopened
+    card.notes = [bake]
+    flags = compute_flags(card, None, resolutions)
+    assert _note_flag(flags, bake).resolution == FlagResolution.kept
+    assert count_unresolved(flags) == (0, 0)
+
+    # a new note saying what the deleted one said is a new note
+    card.notes = [CardDraftNote(text="Serve with [blank]"), bake]
+    assert count_unresolved(compute_flags(card, None, resolutions)) == (1, 0)
 
 
-def test_a_note_keeps_its_unsure_flag_when_a_note_above_it_is_deleted():
-    """A note's reading flags are found again by what it says, wherever it moved; a resolution stays with its id"""
-    card = draft(notes=[CardDraftNote(text="Double for a 9x13 pan"), CardDraftNote(text="Freezes for 3 months")])
+def test_a_note_keeps_its_unsure_flag_and_resolution_when_notes_change():
+    """A note's reading flags and their resolutions stay with its id, wherever it moves and whatever is deleted"""
+    double, freezes = CardDraftNote(text="Double for a 9x13 pan"), CardDraftNote(text="Freezes for 3 months")
+    card = draft(notes=[double, freezes])
     extraction = ExtractionMeta(unsure=[ExtractionUnsure(text="3 months", alternatives=["8 months"], reason="faded")])
     extracted = compute_flags(card, extraction, {})
     unsure = only(extracted, CardFlagKind.unsure)
-    assert (unsure.field, unsure.ref, unsure.alternatives) == ("notes", "1", ["8 months"])
+    assert (unsure.field, unsure.ref, unsure.alternatives) == ("notes", str(freezes.id), ["8 months"])
     assert only(compute_flags(card, extraction, {}, previous=extracted), CardFlagKind.unsure) == unsure
 
-    # the reviewer deletes the first note: the second moves up, and its warning still needs a look
+    # "Looks right"; then the reviewer deletes the first note: the second moves up, still dismissed
+    resolutions = {unsure.id: FlagResolution.dismissed}
     del card.notes[0]
-    saved = compute_flags(card, extraction, {unsure.id: FlagResolution.dismissed}, previous=extracted)
+    saved = compute_flags(card, extraction, resolutions, previous=extracted)
     moved = only(saved, CardFlagKind.unsure)
-    assert (moved.field, moved.ref, moved.alternatives, moved.resolution) == ("notes", "0", ["8 months"], None)
-    assert count_unresolved(saved) == (0, 1)
-    assert compute_flags(card, extraction, {}, previous=saved) == saved  # and on the next save
+    assert (moved.id, moved.ref, moved.resolution) == (unsure.id, str(freezes.id), FlagResolution.dismissed)
+    assert count_unresolved(saved) == (0, 0)
+    assert compute_flags(card, extraction, resolutions, previous=saved) == saved  # and on the next save
 
-    # an edited note says what the reviewer typed
-    card.notes[0].text = "Freezes for 8 months"
-    assert CardFlagKind.unsure not in kinds(compute_flags(card, extraction, {}, previous=saved))
+    # moved back below a new note, then its text edited around the words: still the same flag, still dismissed
+    card.notes = [CardDraftNote(text="Serve warm"), freezes]
+    freezes.text = "Freezes well for 3 months"
+    edited = compute_flags(card, extraction, resolutions, previous=saved)
+    assert (only(edited, CardFlagKind.unsure).id, only(edited, CardFlagKind.unsure).resolution) == (
+        unsure.id,
+        FlagResolution.dismissed,
+    )
+
+    # the uncertain words gone: the reading flag no longer holds
+    freezes.text = "Freezes well"
+    assert CardFlagKind.unsure not in kinds(compute_flags(card, extraction, resolutions, previous=edited))
+
+
+def test_note_flags_stored_before_notes_had_ids_still_apply():
+    """
+    A job's flags stored before notes had ids are keyed `"<kind>:notes:<position>#<digest>"`: on the first save their
+    resolutions apply to the note still at that position saying that, and their reading flags find the note saying it
+    """
+    bake, freezes = CardDraftNote(text="Bake [blank] min"), CardDraftNote(text="Freezes for 3 months")
+    card = draft(notes=[bake, freezes])
+    extraction = ExtractionMeta(unsure=[ExtractionUnsure(text="3 months", alternatives=["8 months"], reason="faded")])
+
+    def legacy(flag: CardFlag, index: int, note: CardDraftNote) -> CardFlag:
+        digest = hashlib.sha256(json.dumps([note.title, note.text]).encode()).hexdigest()[:8]
+        ref = f"{index}#{digest}"
+        return flag.model_copy(update={"id": flag_id(flag.kind, "notes", ref), "ref": str(index)})
+
+    current = compute_flags(card, extraction, {})
+    blank = legacy(_note_flag(current, bake), 0, bake)
+    unsure = legacy(only(current, CardFlagKind.unsure), 1, freezes)
+    stored = [blank.model_copy(update={"resolution": FlagResolution.kept}), unsure]
+    resolutions = {blank.id: FlagResolution.kept}
+
+    # the first save after the upgrade: keyed to the notes' ids, the blank still kept, the unsure flag still raised
+    saved = compute_flags(card, extraction, resolutions, previous=stored)
+    assert (_note_flag(saved, bake).id, _note_flag(saved, bake).resolution) == (
+        f"blank:notes:{bake.id}",
+        FlagResolution.kept,
+    )
+    assert only(saved, CardFlagKind.unsure).id == f"unsure:notes:{freezes.id}"
+
+    # a reading flag finds its note wherever it moved, and an old resolution never lands on another note
+    card.notes = [freezes, CardDraftNote(text="Bake [blank] min")]
+    moved = compute_flags(card, extraction, resolutions, previous=stored)
+    assert only(moved, CardFlagKind.unsure).ref == str(freezes.id)
+    assert count_unresolved(moved) == (1, 1)
 
 
 def test_a_steps_own_list_number_is_never_not_on_card():

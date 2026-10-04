@@ -1,7 +1,8 @@
 """
 "Recipe cards ready" notifications (docs/ai/PHASE2.md §8, §18 Events): only notifiers that opted in, the Apprise URL
 params, one notification when two cards finish together, auto-seal, failed-only batches, the 24-hour cutoff, counts
-and a link only, and never through `EventBusService.dispatch`.
+and a link only, and never through `EventBusService.dispatch`. Delivery is checked per notifier and retried after the
+claim's lease: at least once per notifier, given up on after `NOTIFY_ATTEMPTS`.
 """
 
 import json
@@ -35,6 +36,7 @@ CARD_TITLE = "Grandma Jo's Secret Fudge"
 class Published:
     event: events.AIEvent
     urls: list[str]
+    """The URLs that took it"""
     thread: threading.Thread
 
     @property
@@ -43,20 +45,57 @@ class Published:
         return self.event.document_data
 
 
-@pytest.fixture()
-def published(monkeypatch: pytest.MonkeyPatch) -> list[Published]:
-    """What Apprise was asked to send (nothing is sent); `EventBusService.dispatch` must never be used"""
-    sent: list[Published] = []
+class Outbox(list[Published]):
+    """
+    What Apprise was asked to deliver (nothing is sent): one entry per event, with the URLs that took it. A URL that
+    holds one of the strings in `down` doesn't take it; `tries` has every URL tried, delivered or not.
+    """
 
-    def publish(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
-        sent.append(Published(event, list(notification_urls), threading.current_thread()))
+    def __init__(self) -> None:
+        super().__init__()
+        self.down: set[str] = set()
+        self.tries: list[tuple[events.AIEvent, str]] = []
+        self._lock = threading.Lock()
+
+    def deliver(self, event: events.AIEvent, url: str) -> bool:
+        with self._lock:
+            self.tries.append((event, url))
+            if any(part in url for part in self.down):
+                return False
+            for published in self:
+                if published.event.event_id == event.event_id:
+                    published.urls.append(url)
+                    break
+            else:
+                self.append(Published(event, [url], threading.current_thread()))
+            return True
+
+    def delivered_to(self, batch_id: UUID, host: str) -> int:
+        """How many times the batch's notification reached the URLs with `host`"""
+        return sum(1 for p in for_batch(self, batch_id) for url in p.urls if host in url)
+
+    def tried(self, batch_id: UUID, host: str) -> int:
+        """How many times the batch's notification was sent to the URLs with `host`, delivered or not"""
+        return sum(
+            1
+            for event, url in self.tries
+            if isinstance(event.document_data, events.EventIngestionReadyData)
+            and event.document_data.batch_id == batch_id
+            and host in url
+        )
+
+
+@pytest.fixture()
+def published(monkeypatch: pytest.MonkeyPatch) -> Outbox:
+    """What Apprise was asked to deliver, one notifier at a time; `EventBusService.dispatch` must never be used"""
+    outbox = Outbox()
 
     def dispatch(self: EventBusService, *args: Any, **kwargs: Any) -> None:
         raise AssertionError("AI events never go through EventBusService.dispatch")
 
-    monkeypatch.setattr(ApprisePublisher, "publish", publish)
+    monkeypatch.setattr(events, "deliver", outbox.deliver)
     monkeypatch.setattr(EventBusService, "dispatch", dispatch)
-    return sent
+    return outbox
 
 
 def for_batch(sent: list[Published], batch_id: UUID) -> list[Published]:
@@ -68,10 +107,10 @@ def for_batch(sent: list[Published], batch_id: UUID) -> list[Published]:
     ]
 
 
-def notifier(user: TestUser, url: str, *, ready: bool = True, enabled: bool = True) -> UUID:
+def notifier(user: TestUser, url: str, *, ready: bool = True, enabled: bool = True, name: str | None = None) -> UUID:
     saved = user.repos.group_event_notifier.create(
         GroupEventNotifierSave(
-            name=random_string(),
+            name=name or random_string(),
             apprise_url=url,
             enabled=enabled,
             group_id=user.group_id,
@@ -136,6 +175,20 @@ def batch_row(batch_id: UUID) -> dict[str, Any]:
             sa.select(RecipeIngestionBatch.sealed_at, RecipeIngestionBatch.notified_at).where(
                 RecipeIngestionBatch.id == batch_id
             )
+        ).one()
+        return dict(row._mapping)
+
+
+def notify_state(batch_id: UUID) -> dict[str, Any]:
+    """The batch's notification columns"""
+    with session_context() as session:
+        row = session.execute(
+            sa.select(
+                RecipeIngestionBatch.notified_at,
+                RecipeIngestionBatch.notify_claimed_at,
+                RecipeIngestionBatch.notify_attempts,
+                RecipeIngestionBatch.notify_delivered,
+            ).where(RecipeIngestionBatch.id == batch_id)
         ).one()
         return dict(row._mapping)
 
@@ -274,7 +327,7 @@ def test_sent_once_the_batch_is_sealed_and_nothing_is_processing(
 
     set_status(batch_id, IngestStatus.ready)
     assert events.maybe_notify_batch(batch_id) is True
-    assert events.maybe_notify_batch(batch_id) is False  # at most once
+    assert events.maybe_notify_batch(batch_id) is False  # once
     assert len(published) == 1
     assert batch_row(batch_id)["notified_at"] is not None
 
@@ -442,29 +495,314 @@ def test_housekeeping_seals_idle_batches_and_sends_what_became_due(
 
 
 def test_housekeeping_carries_on_past_a_failing_notifier(
-    unique_user_fn_scoped: TestUser, published: list[Published], monkeypatch: pytest.MonkeyPatch
+    unique_user_fn_scoped: TestUser,
+    published: Outbox,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ):
-    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    notifier(unique_user_fn_scoped, "json://secret-token@ha.local/hook")
     first = make_batch(unique_user_fn_scoped, "ready")
     second = make_batch(unique_user_fn_scoped, "ready")
-    send = ApprisePublisher.publish
 
-    def publish(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
+    def deliver(event: events.AIEvent, url: str) -> bool:
+        assert isinstance(event.document_data, events.EventIngestionReadyData)
         if event.document_data.batch_id == first:
-            raise RuntimeError("json://secret@ha.local is down")
-        send(self, event, notification_urls)
+            raise RuntimeError(f"{url} is down")
+        return published.deliver(event, url)
 
-    monkeypatch.setattr(ApprisePublisher, "publish", publish)
-    events.housekeeping(utcnow())
+    monkeypatch.setattr(events, "deliver", deliver)
+    with caplog.at_level("WARNING"):
+        events.housekeeping(utcnow())
 
-    assert batch_row(first)["notified_at"] is not None  # at most once: it isn't retried
     assert len(for_batch(published, second)) == 1
+    assert batch_row(first)["notified_at"] is None  # tried again once the lease has passed
+    assert f"Recipe card batch {first}" in caplog.text and "RuntimeError" in caplog.text
+    assert "secret-token" not in caplog.text
+
+    monkeypatch.setattr(events, "deliver", published.deliver)
+    events.housekeeping(utcnow() + LEASE)
+    assert len(for_batch(published, first)) == 1
+    assert batch_row(first)["notified_at"] is not None
+
+
+# ==================================================================================================================
+# Delivery: checked per notifier, retried after the lease, at least once each
+
+LEASE = timedelta(seconds=limits.NOTIFY_LEASE + 1)
+"""Long enough for a claim's lease to have passed"""
+
+
+def test_a_notifier_that_didnt_get_it_gets_it_after_the_lease(
+    unique_user_fn_scoped: TestUser, published: Outbox, caplog: pytest.LogCaptureFixture
+):
+    user = unique_user_fn_scoped
+    ha_id = notifier(user, "jsons://secret-token@ha.local/api/webhook/cards", name="Kitchen HA")
+    notifier(user, "pover://user@token")
+    batch_id = make_batch(user, "ready", "failed")
+    published.down.add("ha.local")  # Home Assistant is down
+
+    with caplog.at_level("WARNING"):
+        assert events.maybe_notify_batch(batch_id) is False
+
+    assert published.delivered_to(batch_id, "pover://") == 1
+    assert published.delivered_to(batch_id, "ha.local") == 0
+    state = notify_state(batch_id)
+    assert state["notified_at"] is None and state["notify_attempts"] == 1
+    assert len(state["notify_delivered"]) == 1  # Pushover's hash, no URL
+    assert all(len(key) == 64 and "pover" not in key for key in state["notify_delivered"])
+    # the failure names the batch and the notifier, never its URL
+    assert f"Recipe card batch {batch_id}" in caplog.text
+    assert "'Kitchen HA'" in caplog.text and str(ha_id) in caplog.text
+    assert "secret-token" not in caplog.text and "ha.local" not in caplog.text
+
+    # nothing is tried again while the claim's lease lasts, by a card's task or by housekeeping
+    assert events.maybe_notify_batch(batch_id) is False
+    events.housekeeping(utcnow())
+    assert published.tried(batch_id, "ha.local") == 1
+
+    published.down.clear()  # it's back
+    events.housekeeping(utcnow() + LEASE)
+    assert published.delivered_to(batch_id, "ha.local") == 1
+    assert published.delivered_to(batch_id, "pover://") == 1  # only the one that missed it is sent to again
+    state = notify_state(batch_id)
+    assert state["notified_at"] is not None and state["notify_attempts"] == 2
+    assert len(state["notify_delivered"]) == 2
+
+    events.housekeeping(utcnow() + LEASE * 2)
+    assert published.tried(batch_id, "ha.local") == 2 and published.tried(batch_id, "pover://") == 1
+
+
+def test_an_error_after_the_claim_is_tried_again_after_the_lease(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """A crash (or an error) between claiming the notification and sending it no longer loses it"""
+    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    batch_id = make_batch(unique_user_fn_scoped, "ready")
+    ready_event = events._ready_event
+
+    def crash(*args: Any) -> None:
+        raise RuntimeError("the process died here")
+
+    monkeypatch.setattr(events, "_ready_event", crash)
+    with pytest.raises(RuntimeError):
+        events.maybe_notify_batch(batch_id)
+    assert notify_state(batch_id)["notify_claimed_at"] is not None
+    assert notify_state(batch_id)["notified_at"] is None
+
+    monkeypatch.setattr(events, "_ready_event", ready_event)
+    events.housekeeping(utcnow())
+    assert for_batch(published, batch_id) == []  # its lease still holds
+
+    events.housekeeping(utcnow() + LEASE)
+    [sent] = for_batch(published, batch_id)
+    assert sent.urls[0].startswith("json://ha.local/hook?")
+    assert notify_state(batch_id)["notified_at"] is not None
+
+
+def test_apprise_failing_then_succeeding_delivers_once_per_notifier(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """Through the real `deliver`: Apprise's own answer decides, and a notifier that took it isn't sent it again"""
+    import apprise
+
+    user = unique_user_fn_scoped
+    first, second = (f"{random_string().lower()}.local" for _ in range(2))
+    notifier(user, f"json://{first}/hook")
+    notifier(user, f"json://{second}/hook")
+    batch_id = make_batch(user, "ready")
+    up = {first}
+    notified: list[str] = []
+
+    def notify(self: apprise.Apprise, *args: Any, **kwargs: Any) -> bool:
+        [server] = list(self)  # one notifier at a time
+        if server.host not in up:
+            return False
+        notified.append(server.host)
+        return True
+
+    monkeypatch.setattr(apprise.Apprise, "notify", notify)
+    assert events.maybe_notify_batch(batch_id) is False
+    assert notified == [first]
+
+    up.add(second)
+    events.housekeeping(utcnow() + LEASE)
+    assert notified == [first, second]
+    assert notify_state(batch_id)["notified_at"] is not None
+
+
+def test_two_processes_send_once_per_notifier(unique_user_fn_scoped: TestUser, published: Outbox):
+    """
+    While one process sends the notification, another (finishing a card, or its housekeeping) finds it taken; once
+    the first has recorded each notifier, nothing is sent twice
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://first.local/hook")
+    notifier(user, "json://second.local/hook")
+    batch_id = make_batch(user, "ready")
+
+    sending = threading.Event()
+    go_on = threading.Event()
+    deliver = published.deliver
+
+    def slow(event: events.AIEvent, url: str) -> bool:
+        sending.set()
+        assert go_on.wait(10)
+        return deliver(event, url)
+
+    results: list[bool] = []
+    first = threading.Thread(target=lambda: results.append(events.maybe_notify_batch(batch_id)))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(events, "deliver", slow)
+        first.start()
+        assert sending.wait(10)
+        # the other process, while the first is sending
+        assert events.maybe_notify_batch(batch_id) is False
+        events.housekeeping(utcnow())
+        go_on.set()
+        first.join(10)
+
+    assert results == [True]
+    assert published.tried(batch_id, "first.local") == 1
+    assert published.tried(batch_id, "second.local") == 1
+    events.housekeeping(utcnow() + LEASE)
+    assert published.tried(batch_id, "first.local") + published.tried(batch_id, "second.local") == 2
+
+
+def test_an_attempt_that_outlives_its_lease_stops_when_another_takes_over(
+    unique_user_fn_scoped: TestUser, published: Outbox
+):
+    """
+    A process stuck sending past the lease: housekeeping elsewhere takes the notification over and sends it; the
+    stuck one records nothing more and sends to no other notifier
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://first.local/hook")
+    notifier(user, "json://second.local/hook")
+    batch_id = make_batch(user, "ready")
+
+    stuck = threading.Event()
+    go_on = threading.Event()
+    deliver = published.deliver
+
+    def deliver_stuck_once(event: events.AIEvent, url: str) -> bool:
+        if threading.current_thread() is not threading.main_thread() and not stuck.is_set():
+            stuck.set()
+            assert go_on.wait(10)
+        return deliver(event, url)
+
+    results: list[bool] = []
+    slow = threading.Thread(target=lambda: results.append(events.maybe_notify_batch(batch_id)))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(events, "deliver", deliver_stuck_once)
+        slow.start()
+        assert stuck.wait(10)
+        events.housekeeping(utcnow() + LEASE)  # takes over: attempt 2 sends to both
+        go_on.set()
+        slow.join(10)
+
+    assert results == [False]
+    assert notify_state(batch_id)["notify_attempts"] == 2
+    assert notify_state(batch_id)["notified_at"] is not None
+    # the stuck attempt finished its one send (which a crash at that moment would also double), then stopped
+    tried = [published.tried(batch_id, host) for host in ("first.local", "second.local")]
+    assert sorted(tried) == [1, 2]
+
+
+def test_given_up_after_the_last_attempt(
+    unique_user_fn_scoped: TestUser, published: Outbox, caplog: pytest.LogCaptureFixture
+):
+    user = unique_user_fn_scoped
+    notifier(user, "json://secret-token@ha.local/hook", name="Kitchen HA")
+    batch_id = make_batch(user, "ready")
+    published.down.add("ha.local")
+
+    with caplog.at_level("WARNING"):
+        events.maybe_notify_batch(batch_id)
+        for attempt in range(1, limits.NOTIFY_ATTEMPTS):
+            assert notify_state(batch_id)["notified_at"] is None
+            events.housekeeping(utcnow() + LEASE * attempt)
+
+    assert published.tried(batch_id, "ha.local") == limits.NOTIFY_ATTEMPTS
+    state = notify_state(batch_id)
+    assert state["notified_at"] is not None and state["notify_attempts"] == limits.NOTIFY_ATTEMPTS
+    [given_up] = [r for r in caplog.records if r.levelname == "ERROR" and str(batch_id) in r.message]
+    assert f"Recipe card batch {batch_id}" in given_up.message and "'Kitchen HA'" in given_up.message
+    assert "secret-token" not in caplog.text
+
+    published.down.clear()
+    events.housekeeping(utcnow() + LEASE * limits.NOTIFY_ATTEMPTS)
+    assert published.tried(batch_id, "ha.local") == limits.NOTIFY_ATTEMPTS
+
+
+def test_a_last_attempt_that_never_finished_is_given_up_after_its_lease(
+    unique_user_fn_scoped: TestUser, published: Outbox, caplog: pytest.LogCaptureFixture
+):
+    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    batch_id = make_batch(unique_user_fn_scoped, "ready")
+    now = utcnow()
+    with session_context() as session:  # the last attempt was claimed, and its process died
+        session.execute(
+            sa.update(RecipeIngestionBatch)
+            .where(RecipeIngestionBatch.id == batch_id)
+            .values(notify_attempts=limits.NOTIFY_ATTEMPTS, notify_claimed_at=now)
+        )
+        session.commit()
+
+    events.housekeeping(now)
+    assert notify_state(batch_id)["notified_at"] is None  # its lease still holds
+    with caplog.at_level("ERROR"):
+        events.housekeeping(now + LEASE)
+
+    assert notify_state(batch_id)["notified_at"] is not None
+    assert f"Recipe card batch {batch_id}: gave up" in caplog.text
+    assert for_batch(published, batch_id) == []
+
+
+def test_deliver_reports_what_apprise_answered(monkeypatch: pytest.MonkeyPatch):
+    """Upstream's `ApprisePublisher.publish` drops `Apprise.notify`'s answer; `deliver` doesn't"""
+    import apprise
+
+    event = events.AIEvent(
+        message=events.EventBusMessage(title="Recipe cards ready", body="1 card is ready to review."),
+        event_type=events.AIEventTypes.recipe_ingestion_ready,
+        integration_id=events.INTERNAL_INTEGRATION_ID,
+        document_data=events.EventIngestionReadyData(
+            batch_id=uuid4(),
+            job_ids=[],
+            ready_count=1,
+            needs_attention_count=0,
+            failed_count=0,
+            review_url="http://mealie.local/g/home/recipes/cards",
+        ),
+    )
+    # a URL Apprise can't read: nothing to send to (Apprise's own `notify`, which answers None)
+    assert events.deliver(event, "nosuchservice://ha.local/hook") is False
+
+    answers = [True, False]
+    sent_to: list[list[str]] = []
+
+    def notify(self: apprise.Apprise, *args: Any, **kwargs: Any) -> bool:
+        sent_to.append([server.host for server in self])
+        return answers.pop(0)
+
+    monkeypatch.setattr(apprise.Apprise, "notify", notify)
+    assert events.deliver(event, "json://ha.local/hook") is True
+    assert events.deliver(event, "json://other.local/hook") is False
+    assert sent_to == [["ha.local"], ["other.local"]]  # each URL on its own
+
+    def broken(self: apprise.Apprise, *args: Any, **kwargs: Any) -> bool:
+        raise OSError("json://secret@ha.local unreachable")
+
+    monkeypatch.setattr(apprise.Apprise, "notify", broken)
+    with pytest.raises(OSError):
+        events.deliver(event, "json://ha.local/hook")
 
 
 def test_apprise_reads_the_event_data_and_the_notifiers_own_fields_back():
     """
     Home Assistant parses `document_data` with `from_json` (§8): its JSON must reach Apprise intact, and the user's own
-    `:field` and `+header` values (a literal `+` included) must arrive as written
+    `:field` and `+header` values (a literal `+` included) must arrive as written. The fork's listener uses upstream's
+    `update_urls_with_event_data`, which encodes this way since its fork hook (UH-01).
     """
     import apprise
 
@@ -584,11 +922,29 @@ def test_inbox_rejections_without_a_notifier_send_nothing(unique_user_fn_scoped:
     assert published == []
 
 
+def test_inbox_rejections_go_to_each_notifier_on_its_own(
+    unique_user_fn_scoped: TestUser, published: Outbox, caplog: pytest.LogCaptureFixture
+):
+    """A notifier that's down doesn't keep the others from getting it, and it's logged by name"""
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook", name="Kitchen HA")
+    notifier(user, "pover://user@token")
+    published.down.add("ha.local")
+
+    with caplog.at_level("WARNING"):
+        sent = events.notify_inbox_rejections(UUID(user.group_id), UUID(user.household_id), [None])
+
+    assert sent is True
+    [delivered] = published
+    assert delivered.urls == ["pover://user@token"]
+    assert "'Kitchen HA'" in caplog.text and "not added" in caplog.text
+
+
 def test_inbox_rejections_never_raise_when_sending_fails(
     unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     user = unique_user_fn_scoped
-    notifier(user, "json://secret-token@ha.local/hook")
+    notifier_id = notifier(user, "json://secret-token@ha.local/hook", name="Kitchen HA")
 
     def publish(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
         raise RuntimeError("json://secret-token@ha.local is down")
@@ -600,7 +956,8 @@ def test_inbox_rejections_never_raise_when_sending_fails(
         )
 
     assert sent is False
-    assert "not added" in caplog.text
+    assert "not added" in caplog.text and "RuntimeError" in caplog.text
+    assert "'Kitchen HA'" in caplog.text and str(notifier_id) in caplog.text  # which notifier, never its URL
     assert "secret-token" not in caplog.text
 
 

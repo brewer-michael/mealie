@@ -7,16 +7,20 @@ marker and the `flock` are the real ones, in this test process's own DATA_DIR (`
 The restore writes its marker and waits for the intake. Meanwhile new cards are refused, the dispatcher claims
 nothing, and a task whose card was read waits to store it. Then the restore replaces the database and the files with
 no dispatcher query in between, and removes its marker. The dispatcher carries on with nothing logged as an error and
-no traceback: the tasks it was running are dropped (their rows came back without a lease), the restored rows are read
-again from the queue, and a row the backup held as running is queued again by the restore itself, its attempt given
-back. The files match the restored rows: the backup's job directories, and none for the card the restore wiped.
+no traceback: the results of the tasks it was running are refused by the restored rows (they came back without a
+lease) and kept, a task still waiting for its provider carries on, and the restored rows' next tasks apply those
+readings without calling the provider again. A row the backup held as running is queued again by the restore itself,
+its attempt given back. The files match the restored rows: the backup's job directories, and none for the card the
+restore wiped.
 
 A backup taken while a task ran holds that task's live lease token: the restore queues every running row again, so
-that task's result is refused by the fence rather than written to the restored row.
+that task's result is refused by the fence rather than written to the restored row, and the card's next task applies
+it (the provider is asked once). A reading of pages the restore changed (a backup from before the page was turned) is
+not applied: the card is read again.
 
 A second run has one provider answer land just after the restore dropped the tables (a read takes about 25 s, so in
-production one often does): the task still waits for the restore and its result is still dropped, and its usage-log
-and progress writes are skipped while paused, so nothing is logged as an error then either.
+production one often does): the task still waits for the restore and its result is still refused and kept, and its
+usage-log and progress writes are skipped while paused, so nothing is logged as an error then either.
 """
 
 import asyncio
@@ -46,7 +50,7 @@ from mealie.services import ocr
 from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import commit, events, inbox, limits, retention, storage
 from mealie.services.ai.ingest.intake import IntakeAccepted, IntakeCard, IntakeOptions, IntakePage, IntakeService
-from mealie.services.ai.ingest.runner import finalize
+from mealie.services.ai.ingest.runner import finalize, retries
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from mealie.services.ai.policy import current_policy
 from mealie.services.backups_v2.alchemy_exporter import AlchemyExporter
@@ -132,18 +136,37 @@ class ProviderGates:
 
 
 class SlowUpload(io.BytesIO):
-    """An upload still arriving: intake's first read of it waits until the test lets the rest of the body in"""
+    """
+    An upload still being written: the intake in the thread named `intake` stops inside its write section, once its
+    job directory exists, until the test lets it go on (`slow_intake`)
+    """
 
     def __init__(self, data: bytes) -> None:
         super().__init__(data)
         self.arriving = threading.Event()
         self.arrived = threading.Event()
 
-    def read(self, size: int | None = -1, /) -> bytes:
-        if not self.arrived.is_set():
-            self.arriving.set()
-            self.arrived.wait(TIMEOUT)
-        return super().read(size)
+
+def slow_intake(monkeypatch: pytest.MonkeyPatch, upload: SlowUpload) -> None:
+    """The intake in the thread named `intake` waits for `upload.arrived` right after it creates its job directory"""
+    create_job_dir = storage.create_job_dir
+
+    def created_then_waits(group_id: UUID, job_id: UUID, page_count: int) -> Path:
+        path = create_job_dir(group_id, job_id, page_count)
+        if threading.current_thread().name == "intake" and not upload.arrived.is_set():
+            upload.arriving.set()
+            upload.arrived.wait(TIMEOUT)
+        return path
+
+    monkeypatch.setattr(storage, "create_job_dir", created_then_waits)
+
+
+def _kept_files(*job_ids: UUID) -> list[str]:
+    """What the results folder holds for these jobs: kept readings and tasks marked in flight"""
+    folder = storage.results_dir()
+    if not folder.is_dir():
+        return []
+    return sorted(path.name for path in folder.iterdir() if path.name.split(".")[0] in {str(job) for job in job_ids})
 
 
 def _intake(user: TestUser, number: int, upload: io.BytesIO | None = None) -> IntakeAccepted:
@@ -276,6 +299,7 @@ def recorded_phases(monkeypatch: pytest.MonkeyPatch, timeline: Timeline) -> None
     monkeypatch.setattr(commit, "resume_stale_commits", recorder("stale commits"))
     monkeypatch.setattr(inbox, "scan_once", recorder("inbox"))
     monkeypatch.setattr(retention, "purge_once", recorder("purge"))
+    monkeypatch.setattr(retries, "retry_waiting", recorder("limit retries"))
 
 
 @pytest.fixture(autouse=True)
@@ -391,6 +415,7 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
 
     dispatcher = IngestDispatcher(concurrency=2, instance="restore")
     upload = SlowUpload(card_image(lines=("Banana Mug Cake", "card 5")))
+    slow_intake(monkeypatch, upload)
     intake_outcome: list[IntakeAccepted | BaseException] = []
     restore_errors: list[BaseException] = []
     j5_dir: list[str] = []
@@ -451,25 +476,31 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
             assert restore_errors == []
 
             # the old tasks end without writing: the first's result (and, if it answered mid-restore, the second's)
-            # is refused by the restored row's fence; the second, still waiting for its provider, is stopped once its
-            # lease is found gone
+            # is refused by the restored row's fence, and kept; the second, still waiting for its provider, carries on
             await _wait_for(
                 lambda: _logged(caplog, f"Recipe card job {j1}: its task's outcome was dropped"),
                 "the first card's old result to be dropped",
             )
-            second = "its task's outcome was dropped" if answer_mid_restore else "its task was stopped (vanished)"
+            second = (
+                "its task's outcome was dropped" if answer_mid_restore else "a backup restore took its task's lease"
+            )
             await _wait_for(
-                lambda: _logged(caplog, f"Recipe card job {j2}: {second}"), "the second card's old task to end"
+                lambda: _logged(caplog, f"Recipe card job {j2}: {second}"), "the second card's old task to be cut off"
             )
 
-            # every restored card is read again, once; the fourth too, which the restore queued again with its attempt
-            # given back (the backup held it running)
+            # every restored card is ready: the first two with the readings their old tasks got (the second's next
+            # task waits for its provider's answer; when that answer met the dropped tables instead, the next task
+            # replays it), the third read once, and the fourth, which the restore queued again with its attempt given
+            # back (the backup held it running), read from the queue
             visible.add(j4)
             gates.release(j2)
             await _wait_for(
                 lambda: all((_row(job) or {}).get("status") == IngestStatus.ready for job in (j1, j2, j3, j4)),
-                "every card to be read again",
+                "every card to be ready",
             )
+            assert _logged(caplog, f"Recipe card job {j1}: applying the reading a backup restore cut off")
+            second_next = "replaying the answers" if answer_mid_restore else "applying the reading"
+            assert _logged(caplog, f"Recipe card job {j2}: {second_next} a backup restore cut off")
             assert dispatcher.running
         finally:
             upload.arrived.set()
@@ -519,8 +550,9 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
     assert restore_steps["files"] == seeded
     assert _files(root) == seeded
 
-    # each card read again exactly once after the restore: one claim each from the queue (the fourth's earlier claim,
-    # which the backup held, given back by the restore)
+    # one claim each from the restored queue (the fourth's earlier claim, which the backup held, given back by the
+    # restore), and each card read by the provider exactly once: the readings the restore cut off were applied, not
+    # asked for again
     for job, claims in ((j1, 1), (j2, 1), (j3, 1), (j4, 1)):
         row = _row(job)
         assert row is not None
@@ -532,7 +564,8 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
             None,
         )
         assert row["draft"]["name"] == "Banana Mug Cake"
-    assert {job: gates.started(job) for job in (j1, j2, j3, j4)} == {j1: 2, j2: 2, j3: 1, j4: 1}
+    assert {job: gates.started(job) for job in (j1, j2, j3, j4)} == {j1: 1, j2: 1, j3: 1, j4: 1}
+    assert _kept_files(j1, j2, j3, j4) == []  # applied readings are removed, and no task is left marked in flight
     assert _logged(caplog, "Recipe card ingestion is paused while a backup is restored")
     assert _logged(caplog, "Recipe card ingestion resumed after the backup restore")
 
@@ -599,8 +632,9 @@ def test_a_task_in_flight_when_its_backup_was_taken_doesnt_write_to_the_restored
     visible: set[UUID],
 ):
     """
-    The dispatcher's task holds the same token as the restored row (the backup was taken while it ran). Its result
-    is dropped, and the card is read again from the queue, once, with its attempt given back.
+    The dispatcher's task holds the same token as the restored row (the backup was taken while it ran). Its result is
+    refused by the fence, and the card's next task, claimed from the queue with the attempt given back, waits for it
+    and applies it: the provider is asked once in all.
     """
     caplog.set_level(logging.INFO)
     user = unique_user_fn_scoped
@@ -638,15 +672,17 @@ def test_a_task_in_flight_when_its_backup_was_taken_doesnt_write_to_the_restored
             assert (restored["task_state"], restored["lease_token"]) == (IngestTaskState.queued, None)
             assert token is not None
 
+            await _wait_for(
+                lambda: _logged(caplog, f"Recipe card job {job_id}: a backup restore took its task's lease"),
+                "the old task to be cut off",
+            )
             gates.release(job_id)  # the old read answers now
             await _wait_for(
-                lambda: (
-                    _logged(caplog, f"Recipe card job {job_id}: its task's outcome was dropped")
-                    or _logged(caplog, f"Recipe card job {job_id}: its task was stopped (vanished)")
-                ),
+                lambda: _logged(caplog, f"Recipe card job {job_id}: its task's outcome was dropped"),
                 "the old task to end without writing",
             )
-            await _wait_for(lambda: (_row(job_id) or {}).get("status") == IngestStatus.ready, "the card read again")
+            await _wait_for(lambda: (_row(job_id) or {}).get("status") == IngestStatus.ready, "the card to be ready")
+            assert _logged(caplog, f"Recipe card job {job_id}: applying the reading a backup restore cut off")
             return path
         finally:
             gates.release_all()
@@ -665,4 +701,91 @@ def test_a_task_in_flight_when_its_backup_was_taken_doesnt_write_to_the_restored
         1,
         None,
     )
-    assert gates.started(job_id) == 2
+    assert row["draft"]["name"] == "Banana Mug Cake"
+    assert gates.started(job_id) == 1  # the restore didn't cost a second reading
+    assert _kept_files(job_id) == []
+
+
+def test_a_reading_of_pages_the_restore_changed_is_not_applied(
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    visible: set[UUID],
+):
+    """
+    The backup was taken before the card's task turned its page upright, so the restore brings the page back as it
+    was. The reading the restore cut off describes the turned page: it isn't applied, and the card is turned and read
+    again, its files matching its row.
+    """
+    caplog.set_level(logging.INFO)
+    user = unique_user_fn_scoped
+    configure(user, image=create_provider(user, "Vision"), default=create_provider(user, "Text"))
+    gates = ProviderGates()
+    FakeCardAI(banana_answers(OpenAIRecipeCardTranscription=gates.read)).install(monkeypatch)
+    # Tesseract (faked) finds the card a quarter turn out, and the task turns it before reading it
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)
+    monkeypatch.setattr(
+        ocr, "extract_text", lambda path, **kwargs: ocr.OCRResult(text="Banana Mug Cake", confidence=80, rotation=90)
+    )
+    job_id = _intake(user, 1).job_id
+    visible.add(job_id)
+    job_root = storage.ingest_root(UUID(user.group_id)) / str(job_id)
+    as_uploaded = _files(job_root)
+
+    user.repos.session.commit()
+    backup_v2 = BackupV2(get_app_settings().DB_URL)
+    backup_path = backup_v2.backup()  # before the task turned the page
+    dispatcher = IngestDispatcher(concurrency=2, instance="changed-pages")
+    restore_errors: list[BaseException] = []
+
+    def restore_in_thread() -> None:
+        try:
+            backup_v2.restore(backup_path)
+        except BaseException as e:
+            restore_errors.append(e)
+
+    async def scenario() -> None:
+        await dispatcher.start()
+        try:
+            await _wait_for(lambda: gates.started(job_id) == 1, "the card's read")
+            turned = _row(job_id)
+            assert turned is not None and turned["pages"][0]["rotation"] == 90
+            assert _files(job_root) != as_uploaded
+
+            restore = threading.Thread(target=restore_in_thread, name="restore", daemon=True)
+            restore.start()
+            await _join(restore, "the restore")
+            assert restore_errors == []
+            restored = _row(job_id)
+            assert restored is not None and restored["pages"][0]["rotation"] == 0
+            assert _files(job_root) == as_uploaded
+
+            await _wait_for(
+                lambda: _logged(caplog, f"Recipe card job {job_id}: a backup restore took its task's lease"),
+                "the old task to be cut off",
+            )
+            gates.release(job_id)  # the old reading answers: it's kept, but for the page as it was turned
+            await _wait_for(
+                lambda: _logged(caplog, f"Recipe card job {job_id}: its kept reading is for other pages"),
+                "the kept reading to be refused",
+            )
+            await _wait_for(lambda: (_row(job_id) or {}).get("status") == IngestStatus.ready, "the card read again")
+        finally:
+            gates.release_all()
+            await dispatcher.stop()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        backup_v2.db_exporter.engine.dispose()
+        backup_path.unlink(missing_ok=True)
+
+    assert gates.started(job_id) == 2  # the restored page had to be read again
+    assert not _logged(caplog, f"Recipe card job {job_id}: applying the reading a backup restore cut off")
+    row = _row(job_id)
+    assert row is not None
+    page = row["pages"][0]
+    assert (page["rotation"], page["oriented"]) == (90, True)  # turned again, and its files are the turned ones
+    files = _files(job_root)
+    assert files["pages/0/page.jpg"] == page["page_sha256"]
+    assert _kept_files(job_id) == []

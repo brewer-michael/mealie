@@ -1459,7 +1459,32 @@
       "source-api": "Uploaded",
       "source-inbox": "From the inbox",
       "local-only": "Local only",
-      "batch-summary": "Batch done: {added} added, {left} left to review",
+      "batch-done": "Batch done: {summary}",
+      "summary-added": "{count} added",
+      "summary-left": "{count} left to review",
+      "summary-reading": "{count} still being read",
+      "summary-failed": "{count} failed",
+      "add-clean": "Add {count} clean card | Add {count} clean cards",
+      "add-clean-title": "Add {count} card as a recipe? | Add {count} cards as recipes?",
+      "add-clean-confirm": "Nothing is highlighted on these cards. They're added as they were read:",
+      "add-clean-failed": "Couldn't add the cards",
+      "added-clean": "Added {count} card | Added {count} cards",
+      "added-clean-none": "No cards were added",
+      "clean-left": "{count} was left to review: | {count} were left to review:",
+      "clean-skipped": "{title}: {reason}",
+      "clean-skip": {
+        "not_clean": "has something to check now",
+        "unresolved_flags": "has something to check now",
+        "version_conflict": "changed after this list loaded",
+        "invalid_status": "isn't ready to add any more",
+        "not_found": "no longer exists",
+        "commit_invalid": "couldn't be added; open it to check its fields",
+        "commit_interrupted": "was interrupted; try again",
+        "paused_for_restore": "wasn't added while a backup is restored",
+        "internal_error": "couldn't be added"
+      },
+      "clean-none": "No cards in this batch are clean any more.",
+      "clean-check-failed": "Couldn't check the cards. Try again.",
       "load-failed": "Couldn't load the cards",
       "status-failed": "Failed",
       "cancel": "Cancel",
@@ -1548,7 +1573,7 @@
       "read-only-while-reading": "The card is being read again; you can edit it when that's done.",
       "possible-duplicate": "A recipe called \"{name}\" already exists. Adding this card makes \"{name} (1)\".",
       "view-duplicate": "View it",
-      "public-photo": "New recipes in this household are public, so the card photo will show on the public recipe.",
+      "public-photo": "Recipes in this household are public: the card photo will be visible to anyone.",
       "local-only": "Local only",
       "reread-title": "Re-read an area",
       "reread-hint": "Drag over the part of the card to read again.",
@@ -1576,7 +1601,10 @@
       "unsaved-text": "Your last changes aren't saved. Leave anyway?",
       "leave": "Leave",
       "stay": "Stay",
-      "read-again-short": "Read again"
+      "read-again-short": "Read again",
+      "attach-card-photo": "Attach the card photo to the recipe",
+      "create-organizer": "Create \"{name}\"",
+      "new-organizer": "{name} (new)"
     },
     "flag": {
       "actions": {
@@ -1623,7 +1651,14 @@
       "check_parse": {
         "title": "Check this ingredient",
         "explanation": "This line may not have been split into amount, unit and food correctly.",
-        "action": "Looks right"
+        "action": "Looks right",
+        "read-as": "Read as: {reading}",
+        "range-kept": "The {end} of {value} is kept in the note.",
+        "range-lost": "The {end} of {value} isn't in the amount or the note.",
+        "amount-kept": "The {value} is kept in the note.",
+        "amount-lost": "The {value} isn't in the amount or the note.",
+        "in-name": "\"{value}\" was read into the unit or food.",
+        "keep-as-text": "Keep as text"
       },
       "unit_unclear": {
         "title": "Unit unclear",
@@ -1726,6 +1761,7 @@
       "purged": "This card's photos and draft were removed after a while, so it can't go back to review.",
       "recipe_edited": "The recipe was changed after this card was added. Going back to review would delete those changes.",
       "not_clean": "This card has a highlighted problem to check, so it wasn't added.",
+      "notification_failed": "The test notification wasn't delivered.",
       "unknown": "Something went wrong ({code})."
     },
     "commit-warning": {
@@ -1735,8 +1771,8 @@
     },
     "reject": {
       "too_large": "This photo is too large.",
-      "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF or TIFF.",
-      "pdf_not_supported": "PDFs can't be scanned. Upload a photo of the card instead.",
+      "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF.",
+      "pdf_not_supported": "This PDF can't be opened. It may need a password or be damaged.",
       "too_many_pixels": "This photo has too many pixels.",
       "unreadable_image": "This image couldn't be read. It may be damaged or incomplete.",
       "too_many_pages": "Too many photos for one card.",
@@ -1827,6 +1863,17 @@
       "delete": "Delete",
       "delete-confirm": "Delete the eval case \"{slug}\"?",
       "deleted": "Eval case deleted",
+      "delete-failed": "Couldn't delete the eval case",
+      "save-failed": "Couldn't save the eval case",
+      "download": "Download",
+      "download-failed": "Couldn't download the eval case",
+      "gone": "This eval case no longer exists",
+      "tag-handwritten": "Handwritten",
+      "tag-printed": "Printed",
+      "tag-faded": "Faded",
+      "tag-sideways": "Sideways",
+      "tag-two-sided": "Two-sided",
+      "tag-blank": "Has blanks",
       "pages": "{count} page | {count} pages",
       "verified-chip": "Verified",
       "load-failed": "Couldn't load the eval cases"

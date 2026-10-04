@@ -14,6 +14,7 @@ from mealie.schema.recipe.recipe_ingredient import (
     SaveIngredientFood,
     SaveIngredientUnit,
 )
+from mealie.schema.recipe_ingest import CardDraftIngredient, CardDraftRef
 from mealie.services.ai.ingest.matching import IngestMatcher
 from tests.utils.fixture_schemas import TestUser
 
@@ -156,3 +157,46 @@ def test_the_units_names_for_the_flags(unique_user_fn_scoped: TestUser):
         names = set(matcher.unit_names())
 
     assert {"tablespoon", "tablespoons", "tbsp", "tbs", "package", "pkg"} <= names
+
+
+def test_the_linked_names_for_the_flags(unique_user_fn_scoped: TestUser, unique_user: TestUser):
+    """
+    Every name of the foods and units a draft links, by id: what `compute_flags` takes as `linked`. A save reads only
+    those (no matter how many foods the group has); ids that aren't the group's are left out.
+    """
+    user = unique_user_fn_scoped
+    _seed(user)
+    their_egg = unique_user.repos.ingredient_foods.create(
+        SaveIngredientFood(name=f"egg {uuid4()}", group_id=unique_user.repos.group_id)
+    )
+    for i in range(20):
+        user.repos.ingredient_foods.create(SaveIngredientFood(name=f"food {i}", group_id=user.repos.group_id))
+    loaded = IngestMatcher(user.repos)
+    oil, tablespoon = loaded.exact_food("coconut oil"), loaded.exact_unit("tbsp")
+    assert oil and tablespoon
+    lines = [
+        CardDraftIngredient(
+            original_text="1 T. coconut oil",
+            unit=CardDraftRef(id=tablespoon.id, name="tablespoon"),
+            food=CardDraftRef(id=oil.id, name="coconut oil"),
+        ),
+        CardDraftIngredient(original_text="1 egg", food=CardDraftRef(id=their_egg.id, name="egg")),
+        CardDraftIngredient(original_text="1 c. milk", unit=CardDraftRef(name="cup"), food=CardDraftRef(name="milk")),
+    ]
+    expected = {
+        oil.id: ["coconut oil", "virgin coconut oil"],
+        tablespoon.id: ["tablespoon", "tablespoons", "tbsp", "tbs"],
+    }
+
+    with session_context() as session:
+        matcher = IngestMatcher(get_repositories(session, group_id=user.repos.group_id, household_id=None))
+        with _counting_queries(session) as statements:
+            names = matcher.linked_names(lines)
+        assert names == expected
+        # the linked food and unit by id, with their aliases, not the group's 22 foods
+        assert len(statements) <= 10
+        assert all(statement.lstrip().upper().startswith("SELECT") and " IN (" in statement for statement in statements)
+
+    # parsing loaded them all already: no more queries
+    assert loaded.linked_names(lines) == expected
+    assert loaded.linked_names([]) == {}

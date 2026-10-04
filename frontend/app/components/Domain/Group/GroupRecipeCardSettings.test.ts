@@ -9,6 +9,8 @@ const api = vi.hoisted(() => ({
   getSettings: vi.fn(),
   updateSettings: vi.fn(),
   getEvalCases: vi.fn(),
+  updateEvalCase: vi.fn(),
+  downloadEvalCase: vi.fn(),
   deleteEvalCase: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
@@ -59,9 +61,16 @@ const banana: EvalCaseSummary = {
   name: "Banana Mug Cake",
   pageCount: 1,
   verified: true,
+  tags: ["handwritten", "sideways"],
+  notes: "Grandma's card",
   createdAt: "2026-10-03T12:00:00",
 };
-const fudge: EvalCaseSummary = { slug: "fudge", name: null, pageCount: 2, verified: false, createdAt: null };
+const fudge: EvalCaseSummary = { slug: "fudge", name: null, pageCount: 2, verified: false, tags: ["two-sided"], notes: "", createdAt: null };
+
+/** A failed request as the API client answers it */
+function failure(status: number | null, detail: Record<string, unknown> = {}) {
+  return { data: null, error: status === null ? new Error("Network Error") : { response: { status, data: { detail } } } };
+}
 
 const slot = (tag = "div", className = "") => ({ template: `<${tag} class="${className}"><slot /></${tag}>` });
 const wrappers: VueWrapper[] = [];
@@ -119,7 +128,54 @@ async function mountSettings() {
         VListItem: { template: "<li class=\"list-item\"><slot /><slot name=\"append\" /></li>" },
         VListItemTitle: slot("div", "item-title"),
         VListItemSubtitle: slot("div", "item-subtitle"),
-        VChip: slot("span", "chip"),
+        VChip: {
+          props: ["value"],
+          inject: { chipGroup: { default: null } },
+          computed: {
+            selected() {
+              const group = (this as unknown as { chipGroup: { modelValue: string[] } | null }).chipGroup;
+              return !!group && group.modelValue.includes((this as unknown as { value: string }).value);
+            },
+          },
+          methods: {
+            toggle() {
+              const self = this as unknown as { value: string; chipGroup: { modelValue: string[]; disabled: boolean; $emit: (e: string, v: unknown) => void } | null };
+              const group = self.chipGroup;
+              if (!group || group.disabled) {
+                return;
+              }
+              const next = group.modelValue.includes(self.value)
+                ? group.modelValue.filter(value => value !== self.value)
+                : [...group.modelValue, self.value];
+              group.$emit("update:modelValue", next);
+            },
+          },
+          template: "<span class=\"chip\" :aria-pressed=\"value === undefined ? undefined : String(selected)\" @click=\"toggle\"><slot /></span>",
+        },
+        // a chip group of toggles: each chip is a button that adds or removes its value
+        VChipGroup: {
+          props: ["modelValue", "disabled"],
+          emits: ["update:modelValue"],
+          provide() {
+            return { chipGroup: this };
+          },
+          template: "<div class=\"chip-group\" :data-disabled=\"disabled\"><slot /></div>",
+        },
+        VCheckbox: {
+          props: ["modelValue", "label", "disabled"],
+          emits: ["update:modelValue"],
+          template: `
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                :checked="modelValue"
+                :disabled="disabled"
+                @change="$emit('update:modelValue', $event.target.checked)"
+              >
+              <span class="label">{{ label }}</span>
+            </label>
+          `,
+        },
       },
     },
   });
@@ -282,16 +338,137 @@ describe("GroupRecipeCardSettings", () => {
     expect(notAdvanced.get(".notifications").text()).not.toBe("");
   });
 
-  test("lists the group's eval cases", async () => {
+  test("lists the group's eval cases with their tags, notes and whether they're verified", async () => {
     const wrapper = await mountSettings();
 
     const items = wrapper.findAll(".eval-case");
     expect(items.map(item => item.get(".item-title").text())).toEqual(["Banana Mug Cake", "fudge"]);
     expect(items[0]!.get(".item-subtitle").text()).toContain("banana-mug-cake");
     expect(items[0]!.get(".item-subtitle").text()).toContain("1 page");
-    expect(items[0]!.get(".verified").text()).toBe("Verified");
     expect(items[1]!.get(".item-subtitle").text()).toContain("2 pages");
-    expect(items[1]!.find(".verified").exists()).toBe(false);
+
+    // the reviewer's tags are toggles; the ones found from the card are only shown
+    const tags = (item: (typeof items)[number]) => item.findAll(".eval-tag").map(tag => `${tag.text()}:${tag.attributes("aria-pressed")}`);
+    expect(tags(items[0]!)).toEqual(["Handwritten:true", "Printed:false", "Faded:false"]);
+    expect(items[0]!.findAll(".found-tag").map(tag => tag.text())).toEqual(["Sideways"]);
+    expect(items[1]!.findAll(".found-tag").map(tag => tag.text())).toEqual(["Two-sided"]);
+    expect(items[0]!.get(".eval-case-notes").text()).toBe("Grandma's card");
+    expect(items[1]!.find(".eval-case-notes").exists()).toBe(false);
+
+    const verified = (item: (typeof items)[number]) => (item.get(".eval-verified input").element as HTMLInputElement).checked;
+    expect(items[0]!.get(".eval-verified .label").text()).toBe("Verified");
+    expect(verified(items[0]!)).toBe(true);
+    expect(verified(items[1]!)).toBe(false);
+  });
+
+  test("ticking \"verified\" saves it at once", async () => {
+    api.updateEvalCase.mockResolvedValue({ data: { ...fudge, verified: true }, error: null });
+    const wrapper = await mountSettings();
+
+    await wrapper.findAll(".eval-case")[1]!.get(".eval-verified input").setValue(true);
+    await flushPromises();
+
+    expect(api.updateEvalCase).toHaveBeenCalledExactlyOnceWith("fudge", { verified: true });
+    expect((wrapper.findAll(".eval-case")[1]!.get(".eval-verified input").element as HTMLInputElement).checked).toBe(true);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("a tag chip adds or removes the tag; the tags found from the card stay", async () => {
+    api.updateEvalCase.mockImplementation(async (_slug: string, update: { tags: string[] }) => ({
+      data: { ...banana, tags: [...update.tags, "sideways"] },
+      error: null,
+    }));
+    const wrapper = await mountSettings();
+    const first = () => wrapper.findAll(".eval-case")[0]!;
+
+    await first().get(".eval-tag-faded").trigger("click");
+    await flushPromises();
+    expect(api.updateEvalCase).toHaveBeenLastCalledWith("banana-mug-cake", { tags: ["handwritten", "faded"] });
+    expect(first().get(".eval-tag-faded").attributes("aria-pressed")).toBe("true");
+    expect(first().findAll(".found-tag").map(tag => tag.text())).toEqual(["Sideways"]);
+
+    await first().get(".eval-tag-handwritten").trigger("click");
+    await flushPromises();
+    expect(api.updateEvalCase).toHaveBeenLastCalledWith("banana-mug-cake", { tags: ["faded"] });
+    expect(first().get(".eval-tag-handwritten").attributes("aria-pressed")).toBe("false");
+  });
+
+  test("a change that can't be saved is undone, and says so", async () => {
+    api.updateEvalCase.mockResolvedValue(failure(500));
+    const wrapper = await mountSettings();
+    const first = () => wrapper.findAll(".eval-case")[0]!;
+
+    await first().get(".eval-tag-printed").trigger("click");
+    await flushPromises();
+    expect(first().get(".eval-tag-printed").attributes("aria-pressed")).toBe("false");
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("Couldn't save the eval case");
+
+    toast.error.mockClear();
+    await first().get(".eval-verified input").setValue(false);
+    await flushPromises();
+    expect((first().get(".eval-verified input").element as HTMLInputElement).checked).toBe(true);
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("Couldn't save the eval case");
+  });
+
+  test("a case deleted elsewhere leaves the list when it's changed", async () => {
+    api.updateEvalCase.mockResolvedValue(failure(404, { code: "not_found" }));
+    const wrapper = await mountSettings();
+    api.getEvalCases.mockResolvedValue({ data: [fudge], error: null });
+
+    await wrapper.findAll(".eval-case")[0]!.get(".eval-tag-printed").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("This eval case no longer exists");
+    expect(wrapper.findAll(".eval-case").map(item => item.get(".item-title").text())).toEqual(["fudge"]);
+  });
+
+  test("a refusal the API client already showed (a restore running) isn't shown twice", async () => {
+    api.updateEvalCase.mockResolvedValue(failure(503, { code: "paused_for_restore", message: "Recipe cards are paused" }));
+    const wrapper = await mountSettings();
+
+    await wrapper.findAll(".eval-case")[0]!.get(".eval-tag-printed").trigger("click");
+    await flushPromises();
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(wrapper.findAll(".eval-case")[0]!.get(".eval-tag-printed").attributes("aria-pressed")).toBe("false");
+  });
+
+  test("Download saves the case's zip", async () => {
+    const zip = new Blob(["PK"], { type: "application/zip" });
+    api.downloadEvalCase.mockResolvedValue({ data: zip, error: null });
+    const createObjectURL = vi.fn(() => "blob:eval-case");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }));
+    const saved: { href: string; download: string }[] = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push({ href: this.href, download: this.download });
+    });
+    try {
+      const wrapper = await mountSettings();
+      await button(wrapper, "Download", ".eval-case").trigger("click");
+      await flushPromises();
+
+      expect(api.downloadEvalCase).toHaveBeenCalledExactlyOnceWith("banana-mug-cake");
+      expect(createObjectURL).toHaveBeenCalledExactlyOnceWith(zip);
+      expect(saved).toEqual([{ href: "blob:eval-case", download: "banana-mug-cake.zip" }]);
+      expect(toast.error).not.toHaveBeenCalled();
+    }
+    finally {
+      click.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("a failed download says why", async () => {
+    api.downloadEvalCase.mockResolvedValueOnce(failure(503));
+    const wrapper = await mountSettings();
+
+    await button(wrapper, "Download", ".eval-case").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenLastCalledWith("Recipe cards are paused while a backup is restored. Try again in a minute.");
+
+    api.downloadEvalCase.mockResolvedValueOnce(failure(null));
+    await button(wrapper, "Download", ".eval-case").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenLastCalledWith("Couldn't download the eval case");
   });
 
   test("says when there are no eval cases", async () => {
@@ -317,8 +494,8 @@ describe("GroupRecipeCardSettings", () => {
     expect(toast.success).toHaveBeenCalledExactlyOnceWith("Eval case deleted");
   });
 
-  test("a failed delete shows the list as it is now", async () => {
-    api.deleteEvalCase.mockResolvedValue({ data: null, error: new Error("404") });
+  test("deleting a case that's already gone shows the list as it is now", async () => {
+    api.deleteEvalCase.mockResolvedValue(failure(404, { code: "not_found" }));
     const wrapper = await mountSettings();
     api.getEvalCases.mockResolvedValue({ data: [fudge], error: null });
 
@@ -329,6 +506,35 @@ describe("GroupRecipeCardSettings", () => {
     expect(api.getEvalCases).toHaveBeenCalledTimes(2);
     expect(wrapper.findAll(".eval-case").map(item => item.get(".item-title").text())).toEqual(["fudge"]);
     expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("a delete refused while a restore runs: the API client's message, and the list as it is now", async () => {
+    api.deleteEvalCase.mockResolvedValue(failure(503, { code: "paused_for_restore", message: "Recipe cards are paused" }));
+    const wrapper = await mountSettings();
+
+    await button(wrapper, "Delete", ".eval-case").trigger("click");
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.getEvalCases).toHaveBeenCalledTimes(2);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("a delete that fails otherwise says so, and keeps the case", async () => {
+    for (const result of [failure(500), failure(403, {}), failure(null)]) {
+      toast.error.mockClear();
+      api.deleteEvalCase.mockResolvedValueOnce(result);
+      const wrapper = await mountSettings();
+
+      await button(wrapper, "Delete", ".eval-case").trigger("click");
+      await wrapper.get(".dialog-confirm").trigger("click");
+      await flushPromises();
+
+      expect(toast.error).toHaveBeenCalledExactlyOnceWith("Couldn't delete the eval case");
+      expect(wrapper.findAll(".eval-case").map(item => item.get(".item-title").text())).toEqual(["Banana Mug Cake", "fudge"]);
+      expect(toast.success).not.toHaveBeenCalled();
+    }
   });
 
   test("a member who can't manage the group only reads the settings", async () => {

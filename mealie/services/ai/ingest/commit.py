@@ -10,9 +10,10 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    cancels a pending re-read or re-extract. Every check of step 1 is repeated in its `WHERE`.
 3. **A recipe with that id exists?** Skip to step 6: `create_one` commits more than once, so a partial create leaves a
    row, and creating it again would only clash.
-4. **Files** into `recipes/<id>/`: each `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is
-   attached (`attaches_card_photo`: the draft's switch, else not in a household whose recipes are public), and the
-   front's `view.jpg` as the cover when the draft asks for it, a portrait card letterboxed to 4:3 (`cover_image`).
+4. **Files** into `recipes/<id>/`, once a page turn a stop left half done is settled (`review.settle_turns`): each
+   `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is attached (`attaches_card_photo`: the
+   draft's switch, else not in a household whose recipes are public), and the front's `view.jpg` as the cover when the
+   draft asks for it, a portrait card letterboxed to 4:3 (`cover_image`).
 5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): ingredients re-linked through a fresh
    `IngestMatcher` (§5), organizers looked up in the group by id (or created by name, for a committer who can
    organize), the kept markers converted, the attribution as a
@@ -130,6 +131,7 @@ from mealie.services.ai.ingest.review import (
     not_found,
     parse_flags,
     parse_pages,
+    settle_turns,
     version_conflict,
 )
 from mealie.services.event_bus_service.event_bus_service import EventBusService
@@ -1004,6 +1006,9 @@ def _run(
                 unreadable=_job_translator(job).t("recipe-ingest.unreadable"),
             )
             build(draft, settings=settings, linker=None)  # validates before anything is written or created
+            # a turn a stop left half done is settled first, so the files copied are the ones the pages describe (a
+            # committing job has no task, so every page is settled)
+            settle_turns(IngestRepos(session, job.group_id, job.household_id), job)
             _write_files(job, draft, pages, token, attach)
             lease = _renew_lease(session, job, lease)
             linker = IngredientLinker(repos, job.group_id, can_create_foods=bool(user.can_organize))

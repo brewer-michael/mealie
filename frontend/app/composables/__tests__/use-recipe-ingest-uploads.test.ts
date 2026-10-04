@@ -1,6 +1,7 @@
 import { flushPromises } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
+  BATCH_HEARTBEAT_MS,
   CANNOT_SHRINK,
   CAPTURE_MODE_STORAGE_KEY,
   DATA_SAVER_MAX_SIDE,
@@ -38,6 +39,7 @@ const api = vi.hoisted(() => ({
   upload: vi.fn(),
   createBatch: vi.fn(),
   sealBatch: vi.fn(),
+  touchBatch: vi.fn(),
   getCounts: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn() }));
@@ -114,6 +116,7 @@ beforeEach(() => {
   localStorage.clear();
   api.createBatch.mockImplementation(() => ok({ id: "b1", source: "app" }));
   api.sealBatch.mockImplementation((id: string) => ok({ id, source: "app" }));
+  api.touchBatch.mockImplementation((id: string) => ok({ id, source: "app" }));
   api.getCounts.mockImplementation(() => ok({ processing: 1, ready: 0, needsAttention: 0, failed: 0 }));
   api.upload.mockImplementation(() => ok(accepted()));
 });
@@ -1410,5 +1413,196 @@ describe("Scan again", () => {
     expect(uploadOptions(1)).toEqual({ batchId: "b1", position: 0, localOnly: false, allowDuplicate: true });
     expect(queue.cards.value[0]).toMatchObject({ status: "done", duplicateOf: null });
     expect(queue.uploadedCount.value).toBe(1);
+  });
+});
+
+describe("an open batch while the capture page is open", () => {
+  function setVisibility(state: "visible" | "hidden") {
+    Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  function touched() {
+    return api.touchBatch.mock.calls.map(call => call[0] as string);
+  }
+
+  let stops: (() => void)[] = [];
+
+  beforeEach(() => {
+    setVisibility("visible");
+    stops = [];
+  });
+
+  afterEach(() => {
+    stops.forEach(stop => stop());
+    setVisibility("visible");
+  });
+
+  /** The capture page mounts: what it does with `keepBatchOpen` */
+  function openCapturePage(queue: ReturnType<typeof useRecipeIngestUploads>) {
+    const stop = queue.keepBatchOpen();
+    stops.push(stop);
+    return stop;
+  }
+
+  test("is touched every 3 minutes, quietly, so a pause in the stack doesn't end it", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    openCapturePage(queue);
+    await vi.advanceTimersByTimeAsync(BATCH_HEARTBEAT_MS);
+    // no batch yet: nothing to keep open
+    expect(api.touchBatch).not.toHaveBeenCalled();
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(BATCH_HEARTBEAT_MS - 1);
+    expect(api.touchBatch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(api.touchBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
+
+    // a 12-minute pause (the server ends an app batch after 10 idle minutes): touched all along
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1", "b1", "b1", "b1", "b1"]);
+    expect(BATCH_HEARTBEAT_MS).toBe(3 * 60_000);
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect(uploadOptions(1).batchId).toBe("b1");
+    expect(api.createBatch).toHaveBeenCalledOnce();
+  });
+
+  test("not once the page is closed, nor after Done", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    const close = openCapturePage(queue);
+    queue.takePhoto(photo());
+    await flushPromises();
+
+    close();
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(api.touchBatch).not.toHaveBeenCalled();
+
+    openCapturePage(queue);
+    expect(touched()).toEqual(["b1"]);
+    queue.done();
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1"]);
+  });
+
+  test("not while the page is hidden; at once when it's back", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    // a capture page opened with a batch already open touches it at once
+    openCapturePage(queue);
+    expect(touched()).toEqual(["b1"]);
+
+    setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1"]);
+
+    setVisibility("visible");
+    await flushPromises();
+    expect(touched()).toEqual(["b1", "b1"]);
+    await vi.advanceTimersByTimeAsync(BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1", "b1", "b1"]);
+  });
+
+  test("ended anyway (409): the next photo starts a new batch, without a word; Done seals that one", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    // the page was away for longer than 10 minutes: the server sealed the batch
+    api.touchBatch.mockImplementation(() => failed(409, { code: "batch_sealed" }));
+    api.createBatch.mockImplementation(() => ok({ id: "b2", source: "app" }));
+    api.upload.mockImplementation(() => ok(accepted("b2", "j2")));
+    openCapturePage(queue);
+    await flushPromises();
+
+    // a sealed batch isn't touched again
+    await vi.advanceTimersByTimeAsync(2 * BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1"]);
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect(api.createBatch).toHaveBeenCalledTimes(2);
+    expect(uploadOptions(1)).toMatchObject({ batchId: "b2", position: 1 });
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+
+    api.touchBatch.mockImplementation((id: string) => ok({ id, source: "app" }));
+    await vi.advanceTimersByTimeAsync(BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1", "b2"]);
+
+    queue.done();
+    await flushPromises();
+    expect(api.sealBatch.mock.calls.map(call => call[0])).toEqual(["b2"]);
+  });
+
+  test("a batch gone from the server (404) is treated the same", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    api.touchBatch.mockImplementation(() => failed(404, { code: "not_found" }));
+    api.createBatch.mockImplementation(() => ok({ id: "b2", source: "app" }));
+    openCapturePage(queue);
+    await flushPromises();
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect(uploadOptions(1).batchId).toBe("b2");
+  });
+
+  test("a touch that fails otherwise (offline, a restore) keeps the batch and tries again at the next beat", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    api.touchBatch
+      .mockImplementationOnce(() => failed(null))
+      .mockImplementationOnce(() => failed(503, { code: "paused_for_restore" }));
+    openCapturePage(queue);
+    await vi.advanceTimersByTimeAsync(2 * BATCH_HEARTBEAT_MS);
+    expect(touched()).toEqual(["b1", "b1", "b1"]);
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect(uploadOptions(1).batchId).toBe("b1");
+    expect(api.createBatch).toHaveBeenCalledOnce();
+  });
+
+  test("an open batch that comes back after a reload is touched at once by the page already shown", async () => {
+    const storage = memoryUploadStorage();
+    const first = useRecipeIngestUploads();
+    await first.connect("u1", () => storage);
+    first.takePhoto(photo());
+    await flushPromises();
+    expect(first.openBatch.value?.serverId).toBe("b1");
+
+    // a reload: the page is shown before the stored queue has been read back
+    resetRecipeIngestUploads();
+    const queue = useRecipeIngestUploads();
+    openCapturePage(queue);
+    expect(api.touchBatch).not.toHaveBeenCalled();
+    await queue.connect("u1", () => storage);
+    await flushPromises();
+    expect(touched()).toEqual(["b1"]);
+  });
+
+  test("a logout stops the beat", async () => {
+    vi.useFakeTimers();
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    openCapturePage(queue);
+    api.touchBatch.mockClear();
+
+    resetRecipeIngestUploads();
+    await vi.advanceTimersByTimeAsync(4 * BATCH_HEARTBEAT_MS);
+    expect(api.touchBatch).not.toHaveBeenCalled();
   });
 });

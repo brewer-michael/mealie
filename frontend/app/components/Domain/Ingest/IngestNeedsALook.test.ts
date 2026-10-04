@@ -78,6 +78,14 @@ describe("IngestNeedsALook", () => {
     expect(wrapper.emitted("resolve")).toEqual([[unsure, "dismissed"], [blank, "kept"]]);
   });
 
+  test("passes Keep as text on Check this ingredient up to the page", async () => {
+    const check: CardFlag = { id: "check_parse:ingredients:i1", kind: "check_parse", severity: "warning", source: "parser", field: "ingredients", ref: "i1", params: { confidence: 60 } };
+    const wrapper = mountPanel([check], [check]);
+
+    await wrapper.findAll("button").find(b => b.text() === "Keep as text")!.trigger("click");
+    expect(wrapper.emitted("keep-as-text")).toEqual([[check]]);
+  });
+
   test("once everything is resolved or fixed it says there's nothing left", () => {
     const wrapper = mountPanel([blank, unsure], [{ ...unsure, resolution: "dismissed" }], []);
 

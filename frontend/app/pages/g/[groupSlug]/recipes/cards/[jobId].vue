@@ -314,6 +314,7 @@
                 @fill="(flag, value) => review.fillFlagBlank(flag, value)"
                 @reread="flag => openReread(flag.field, flag.ref)"
                 @edit="flag => revealField(flag.field, flag.ref, true)"
+                @keep-as-text="flag => review.keepIngredientAsText(flag)"
                 @resolve="(flag, resolution) => review.resolveFlag(flag, resolution)"
                 @use-proposal="(proposal, mode) => review.useProposal(proposal, mode)"
                 @dismiss-proposal="proposal => review.dismissProposal(proposal)"
@@ -383,16 +384,19 @@
                       v-model="review.draft.value.tags"
                       selector-type="tags"
                       :readonly="review.readOnly.value"
+                      :can-create="!!job.permissions?.canCreateOrganizers"
                     />
                     <IngestOrganizerSelector
                       v-model="review.draft.value.categories"
                       selector-type="categories"
                       :readonly="review.readOnly.value"
+                      :can-create="!!job.permissions?.canCreateOrganizers"
                     />
                     <IngestOrganizerSelector
                       v-model="review.draft.value.tools"
                       selector-type="tools"
                       :readonly="review.readOnly.value"
+                      :can-create="!!job.permissions?.canCreateOrganizers"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -415,10 +419,24 @@
                 :disabled="review.readOnly.value"
                 :label="$t('recipe-ingest.review.use-card-as-cover')"
               />
-              <p v-if="job.householdRecipesPublic" class="text-caption text-medium-emphasis mt-1 ingest-review__public">
-                <v-icon size="x-small" :icon="$globals.icons.informationOutline" />
+              <!-- the card's photos as the recipe's assets; off by default where new recipes are public -->
+              <v-switch
+                v-model="review.attachCardPhoto.value"
+                class="ingest-review__attach"
+                color="primary"
+                hide-details
+                :disabled="review.readOnly.value"
+                :label="$t('recipe-ingest.review.attach-card-photo')"
+              />
+              <v-alert
+                v-if="review.cardPhotoPublic.value"
+                type="warning"
+                variant="tonal"
+                density="compact"
+                class="mt-1 ingest-review__public"
+              >
                 {{ $t("recipe-ingest.review.public-photo") }}
-              </p>
+              </v-alert>
             </template>
           </div>
 

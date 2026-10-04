@@ -4,26 +4,34 @@ notifiers that opted in, never through `EventBusService.dispatch` (its listeners
 The same notifiers get "Recipe cards not added" (`recipe_ingestion_rejected`): one per inbox scan burst that refused
 files.
 
-**Once per batch, at most once.** `maybe_notify_batch` claims the batch's notification with one conditional
-`UPDATE ... SET notified_at` (sealed, not yet notified, no card still processing, a card written in the last 24 hours)
-and publishes only when that update matched the row. Two processes finishing the last two cards at the same moment
-can't both win, and `notified_at` is written before anything is sent, so a crash loses a notification rather than
-doubling it. The 24 hours count from the cards' last activity, not the batch's creation: a batch read over days still
-notifies, while a batch whose cards were last written over 24 hours ago (a restored backup's) never does, and
-housekeeping settles it so a later edit doesn't either.
+**Once per batch, at least once per notifier.** A batch's notification is due once it's sealed, none of its cards is
+still processing and one was written in the last 24 hours. `maybe_notify_batch` claims it with one conditional
+`UPDATE` that takes a 5-minute lease (`notify_claimed_at`) and counts the attempt (`notify_attempts`), so two
+processes finishing the last two cards at the same moment can't both send it. It then sends to each notifier on its
+own, checks Apprise's answer, and records each notifier that got it (a hash in `notify_delivered`) before the next
+send; `notified_at` is set once every notifier has it. A notifier that failed, or a process that died part way, is
+tried again by housekeeping once the lease has passed, skipping the notifiers that already have it; after 5 attempts
+the batch is given up on (`notified_at` set, an error logged). A notifier gets it twice only if the process dies
+between sending to it and recording that. The 24 hours count from the cards' last activity, not the batch's creation:
+a batch read over days still notifies, while a batch whose cards were last written over 24 hours ago (a restored
+backup's) never does, and housekeeping settles it so a later edit doesn't either.
 
-**Counts and a link only:** no card names or text, since notifications leave the server.
+**Counts and a link only:** no card names or text, since notifications leave the server. Logs name a notifier by its
+id and name, never by its URL, which holds its secrets.
 
 Apprise blocks: everything here runs in the caller's thread (a task thread, the dispatcher's thread limiter, or a
 route's threadpool), never on the event loop, and no database transaction stays open while Apprise sends.
 """
 
+import hashlib
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from urllib.parse import parse_qsl, quote, unquote_plus, urlencode, urlsplit, urlunsplit
+from typing import Any, NamedTuple
+from urllib.parse import quote
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -49,6 +57,7 @@ from mealie.services.event_bus_service.event_types import (
     EventDocumentType,
     EventOperation,
 )
+from mealie.services.event_bus_service.publisher import ApprisePublisher
 
 from . import limits
 from .batches import seal_idle_batches
@@ -105,10 +114,65 @@ class EventIngestionRejectedData(EventDocumentDataBase):
     """`BASE_URL/g/<group-slug>/recipes/cards`: the cards page"""
 
 
+class NotifierURL(NamedTuple):
+    """A household notifier that the fork's events go to"""
+
+    notifier_id: UUID
+    name: str
+    url: str
+    """Its Apprise URL as the user wrote it. It holds the notifier's secrets, so it's never logged."""
+
+    @property
+    def label(self) -> str:
+        """How logs name it"""
+        return f"{self.name!r} ({self.notifier_id})"
+
+    @property
+    def delivery_key(self) -> str:
+        """
+        What a batch's `notify_delivered` records once the notifier has its notification: a hash, so the row holds no
+        URL. A notifier whose URL was changed since counts as a new one.
+        """
+        return hashlib.sha256(f"apprise:{self.notifier_id}:{self.url}".encode()).hexdigest()
+
+
+class _AnsweringApprise:
+    """
+    An `ApprisePublisher`'s `Apprise` object that remembers what `notify` answered: upstream's `publish` drops it, so a
+    notifier that was down, or a URL Apprise couldn't read, went unnoticed
+    """
+
+    def __init__(self, apprise: Any) -> None:
+        self._apprise = apprise
+        self.answer: bool | None = None
+        """True once every URL took the notification; False when one didn't; None when there was no URL to send to"""
+
+    def add(self, *args: Any, **kwargs: Any) -> bool:
+        return bool(self._apprise.add(*args, **kwargs))
+
+    def notify(self, *args: Any, **kwargs: Any) -> bool | None:
+        self.answer = self._apprise.notify(*args, **kwargs)
+        return self.answer
+
+
+def deliver(event: Event, url: str) -> bool:
+    """
+    Sends `event` to one Apprise URL (with the event's data already in it) through upstream's `ApprisePublisher`;
+    whether it was delivered: Apprise could read the URL and its service took the notification. Raises what Apprise
+    raises. Blocking.
+    """
+    publisher = ApprisePublisher()
+    answering = _AnsweringApprise(publisher.apprise)
+    publisher.apprise = answering
+    publisher.publish(event, [url])  # upstream's: adds the URL, tagged with the event's id, then notifies that tag
+    return answering.answer is True
+
+
 class AIEventAppriseListener(AppriseEventListener):
     """
-    Sends AI events to the household's enabled Apprise notifiers whose fork option for the event is on, with the
-    event's data added to the URLs that take custom values (`json://`, `form://`, `xml://`) as upstream does.
+    Sends AI events to the household's enabled Apprise notifiers whose fork option for the event is on, one notifier
+    at a time so each one's delivery is known. Upstream's `update_urls_with_event_data` adds the event's data to the
+    URLs that take custom values (`json://`, `form://`, `xml://`).
     """
 
     def __init__(self, group_id: UUID4, household_id: UUID4, session: Session | None = None) -> None:
@@ -116,50 +180,37 @@ class AIEventAppriseListener(AppriseEventListener):
         self._session = session
 
     def get_subscribers(self, event: Event) -> list[str]:
+        """Upstream's interface: the notifiers' URLs, with the event's data"""
+        return self.update_urls_with_event_data([target.url for target in self.targets(event)], event)
+
+    def targets(self, event: Event) -> list[NotifierURL]:
+        """The notifiers that get `event`. With a session of the caller's, its transaction is ended."""
         # both events go to the notifiers with the recipe cards option on
         if not isinstance(event, AIEvent):
             return []
 
         with self.ensure_session() as session:
-            notifier_ids = IngestRepos(
-                session, self.group_id, self.household_id
-            ).notifier_options.enabled_notifier_ids()
-            urls = notifier_urls(session, self.group_id, self.household_id, notifier_ids)
+            targets = household_targets(session, self.group_id, self.household_id)
             if session.in_transaction():
                 session.commit()  # Apprise may take a while; no transaction stays open meanwhile
+        return targets
 
-        return self.update_urls_with_event_data(urls, event)
-
-    @staticmethod
-    def update_urls_with_event_data(urls: list[str], event: Event) -> list[str]:
+    def send(self, event: Event, target: NotifierURL) -> str | None:
         """
-        Upstream's, with the event's fields percent-encoded and the notifier's own query left as the user wrote it.
-        Upstream's `urlencode` writes a space as `+`, which Apprise doesn't read back (it decodes `:key` values with
-        `unquote`), so Home Assistant got a `document_data` with `+` between its JSON tokens, which `from_json` can't
-        parse (§8). Re-encoding the whole query instead would turn a literal `+` in the user's own values into a space.
+        Sends `event` to one notifier, with the event's data in its URL. None once it's delivered, else why not (never
+        the URL). Never raises. Blocking (Apprise).
         """
-        updated: list[str] = []
-        for url, merged in zip(urls, AppriseEventListener.update_urls_with_event_data(urls, event), strict=True):
-            if not AppriseEventListener.is_custom_url(url):
-                updated.append(url)
-                continue
-
-            # upstream wrote the event's fields with `quote_plus`, so reading `+` as a space here is right
-            fields = [(k, v) for k, v in parse_qsl(urlsplit(merged).query, keep_blank_values=True) if k in _EVENT_KEYS]
-            parts = urlsplit(url)
-            own = [
-                part
-                for part in parts.query.split("&")
-                if part and unquote_plus(part.split("=", 1)[0]) not in _EVENT_KEYS
-            ]
-            query = "&".join([*own, urlencode(fields, quote_via=quote)])
-            updated.append(urlunsplit(parts._replace(query=query)))
-
-        return updated
+        [url] = self.update_urls_with_event_data([target.url], event)
+        try:
+            return None if deliver(event, url) else "Apprise couldn't deliver it"
+        except Exception as e:
+            return type(e).__qualname__  # its message could hold the URL
 
 
-_EVENT_KEYS = {":event_type", ":integration_id", ":document_data", ":event_id", ":timestamp"}
-"""The fields upstream's `AppriseEventListener.update_urls_with_event_data` adds to a custom (form, json, xml) URL"""
+def household_targets(session: Session, group_id: UUID, household_id: UUID) -> list[NotifierURL]:
+    """The household's enabled notifiers, with a URL, that send its recipe card events"""
+    notifier_ids = IngestRepos(session, group_id, household_id).notifier_options.enabled_notifier_ids()
+    return notifier_urls(session, group_id, household_id, notifier_ids)
 
 
 def household_notifies(session: Session, group_id: UUID, household_id: UUID) -> bool:
@@ -167,17 +218,16 @@ def household_notifies(session: Session, group_id: UUID, household_id: UUID) -> 
     Whether the household hears about its recipe cards: it has an enabled notifier, with a URL, that sends "recipe
     cards ready"
     """
-    notifier_ids = IngestRepos(session, group_id, household_id).notifier_options.enabled_notifier_ids()
-    return bool(notifier_urls(session, group_id, household_id, notifier_ids))
+    return bool(household_targets(session, group_id, household_id))
 
 
-def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier_ids: list[UUID]) -> list[str]:
-    """The Apprise URLs of the household's notifiers among `notifier_ids`"""
+def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier_ids: list[UUID]) -> list[NotifierURL]:
+    """The household's notifiers among `notifier_ids` that have a URL"""
     if not notifier_ids:
         return []
 
     stmt = (
-        sa.select(GroupEventNotifierModel.apprise_url)
+        sa.select(GroupEventNotifierModel.id, GroupEventNotifierModel.name, GroupEventNotifierModel.apprise_url)
         .where(
             GroupEventNotifierModel.id.in_(notifier_ids),
             GroupEventNotifierModel.group_id == group_id,
@@ -185,7 +235,7 @@ def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier
         )
         .order_by(GroupEventNotifierModel.id)
     )
-    return [url for url in session.execute(stmt).scalars() if url]
+    return [NotifierURL(row.id, row.name, row.apprise_url) for row in session.execute(stmt) if row.apprise_url]
 
 
 # ==================================================================================================================
@@ -276,17 +326,74 @@ def _due(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bool]]:
     return [*_finished(batch_id), _recently_active(now)]
 
 
-def _claim(session: Session, batch_id: UUID, now: datetime) -> bool:
-    """Marks the batch notified if its notification is due; whether this call did (and so must send it)"""
-    stmt = sa.update(Batch).where(*_due(batch_id, now)).values(notified_at=now)
+def _lease_free(now: datetime) -> sa.ColumnElement[bool]:
+    """No process holds the batch's notification: it was never claimed, or its lease has passed"""
+    expired = now - timedelta(seconds=limits.NOTIFY_LEASE)
+    return sa.or_(Batch.notify_claimed_at.is_(None), Batch.notify_claimed_at <= expired)
+
+
+def _claimable(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bool]]:
+    """Due, held by no process, and with attempts left"""
+    return [*_due(batch_id, now), _lease_free(now), Batch.notify_attempts < limits.NOTIFY_ATTEMPTS]
+
+
+@dataclass(frozen=True)
+class _Claim:
+    attempt: int
+    """The batch's `notify_attempts` after this claim: only this attempt's writes match it"""
+    delivered: frozenset[str]
+    """The notifiers earlier attempts reached (`NotifierURL.delivery_key`)"""
+
+
+def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
+    """
+    Takes the batch's notification for `limits.NOTIFY_LEASE` seconds if it's due, free and has attempts left, in one
+    conditional update that no two processes can both win; this attempt, or None
+    """
+    stmt = (
+        sa.update(Batch)
+        .where(*_claimable(batch_id, now))
+        .values(notify_claimed_at=now, notify_attempts=Batch.notify_attempts + 1)
+    )
     try:
         result = session.execute(stmt, execution_options={"synchronize_session": False})
-        claimed = isinstance(result, CursorResult) and result.rowcount == 1
+        claim = None
+        if isinstance(result, CursorResult) and result.rowcount == 1:
+            # read before the commit: until then the row is this transaction's
+            attempt, delivered = session.execute(
+                sa.select(Batch.notify_attempts, Batch.notify_delivered).where(Batch.id == batch_id)
+            ).one()
+            claim = _Claim(attempt, frozenset(delivered or ()))
         session.commit()
     except BaseException:
         session.rollback()
         raise
-    return claimed
+    return claim
+
+
+def _record(
+    session: Session, batch_id: UUID, attempt: int, delivered: Iterable[str], *, notified_at: datetime | None = None
+) -> bool:
+    """
+    Records the notifiers that have the batch's notification and, with `notified_at`, that it's done, if `attempt`
+    still holds it (no later attempt took it over, nothing settled it); whether it did
+    """
+    values: dict[str, Any] = {"notify_delivered": sorted(delivered)}
+    if notified_at is not None:
+        values["notified_at"] = notified_at
+    stmt = (
+        sa.update(Batch)
+        .where(Batch.id == batch_id, Batch.notified_at.is_(None), Batch.notify_attempts == attempt)
+        .values(**values)
+    )
+    try:
+        result = session.execute(stmt, execution_options={"synchronize_session": False})
+        recorded = isinstance(result, CursorResult) and result.rowcount == 1
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return recorded
 
 
 def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
@@ -318,31 +425,66 @@ def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
 
 def maybe_notify_batch(batch_id: UUID) -> bool:
     """
-    Sends the batch's notification if it's due: sealed, not yet notified, none of its cards still processing, and one
-    written in the last 24 hours. The conditional `notified_at` update decides, so it's sent at most once across
-    processes. Whether this call sent it (to every notifier that opted in, if any): False when it wasn't due, or when
-    the finished batch has nothing to look at (every card committed or discarded already). Blocking (Apprise).
+    Sends the batch's notification if it's due (sealed, not yet notified, none of its cards still processing, and one
+    written in the last 24 hours) and no other process is sending it. Whether this call finished it: every notifier
+    that opted in has it (or there's none). False when it wasn't due or was being sent elsewhere, when a notifier
+    didn't get it (housekeeping tries again), and when the finished batch has nothing to look at (every card
+    committed or discarded already). Blocking (Apprise).
     """
+    return _notify_batch(batch_id, utcnow())
+
+
+def _notify_batch(batch_id: UUID, now: datetime) -> bool:
+    """`maybe_notify_batch` at `now`"""
     with session_context() as session:
-        if not _claim(session, batch_id, utcnow()):
+        claim = _claim(session, batch_id, now)
+        if claim is None:
             return False
 
+        # anything raised from here leaves the claim: housekeeping tries again once its lease has passed
         batch = session.get(Batch, batch_id)
-        event = _ready_event(session, batch) if batch is not None else None
-        if batch is None or event is None:
+        if batch is None:
+            return False
+        event = _ready_event(session, batch)
+        if event is None:
+            _record(session, batch_id, claim.attempt, claim.delivered, notified_at=utcnow())
             return False
 
         listener = AIEventAppriseListener(batch.group_id, batch.household_id, session)
-        urls = listener.get_subscribers(event)  # ends the session's transaction before anything is sent
+        targets = listener.targets(event)  # ends the session's transaction before anything is sent
+        delivered = set(claim.delivered)
+        missed: list[NotifierURL] = []
+        for target in targets:
+            if target.delivery_key in delivered:
+                continue  # an earlier attempt reached it
+            if (reason := listener.send(event, target)) is not None:
+                last = claim.attempt >= limits.NOTIFY_ATTEMPTS
+                again = "" if last else f", tried again in {limits.NOTIFY_LEASE // 60} minutes"
+                logger.warning(
+                    f"Recipe card batch {batch_id}: notifier {target.label} didn't get the ready notification "
+                    f"({reason}; attempt {claim.attempt} of {limits.NOTIFY_ATTEMPTS}{again})"
+                )
+                missed.append(target)
+                continue
+            delivered.add(target.delivery_key)
+            if not _record(session, batch_id, claim.attempt, delivered):
+                return False  # this attempt outlived its lease and another took over, or the batch was settled
 
-    if urls:
-        listener.publish_to_subscribers(event, urls)
-    return True
+        if not missed:
+            return _record(session, batch_id, claim.attempt, delivered, notified_at=utcnow())
+        if claim.attempt >= limits.NOTIFY_ATTEMPTS and _record(
+            session, batch_id, claim.attempt, delivered, notified_at=utcnow()
+        ):
+            logger.error(
+                f"Recipe card batch {batch_id}: gave up on the ready notification after {claim.attempt} attempts; "
+                f"never delivered to {', '.join(target.label for target in missed)}"
+            )
+        return False
 
 
 def due_batches(session: Session, now: datetime) -> list[UUID]:
-    """Every household's batches whose notification is due, oldest first"""
-    stmt = sa.select(Batch.id).where(*_due(None, now)).order_by(Batch.created_at, Batch.id)
+    """Every household's batches whose notification is due and free to send, oldest first"""
+    stmt = sa.select(Batch.id).where(*_claimable(None, now)).order_by(Batch.created_at, Batch.id)
     due = list(session.execute(stmt).scalars())
     if session.in_transaction():
         session.commit()
@@ -368,22 +510,51 @@ def settle_stale_batches(session: Session, now: datetime) -> int:
     return settled
 
 
+def give_up_batches(session: Session, now: datetime) -> list[UUID]:
+    """
+    Marks as notified the batches whose last attempt didn't finish (its process died part way) once its lease has
+    passed: no attempt is left to finish them. The batches it gave up on.
+    """
+    conditions = [Batch.notified_at.is_(None), Batch.notify_attempts >= limits.NOTIFY_ATTEMPTS, _lease_free(now)]
+    given_up: list[UUID] = []
+    try:
+        for batch_id in list(session.execute(sa.select(Batch.id).where(*conditions)).scalars()):
+            stmt = sa.update(Batch).where(Batch.id == batch_id, *conditions).values(notified_at=now)
+            result = session.execute(stmt, execution_options={"synchronize_session": False})
+            if isinstance(result, CursorResult) and result.rowcount == 1:
+                given_up.append(batch_id)
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    for batch_id in given_up:
+        logger.error(
+            f"Recipe card batch {batch_id}: gave up on the ready notification after {limits.NOTIFY_ATTEMPTS} attempts; "
+            "the last one never finished"
+        )
+    return given_up
+
+
 def housekeeping(now: datetime) -> None:
     """
-    Seals idle batches, settles stale ones and sends the notifications that became due (the dispatcher, every
-    minute)
+    Seals idle batches, settles stale ones, gives up on those out of attempts, and sends the notifications that
+    became due or whose last attempt's lease has passed (the dispatcher, every minute)
     """
     with session_context() as session:
         seal_idle_batches(session, now)
         settle_stale_batches(session, now)
+        give_up_batches(session, now)
         due = due_batches(session, now)
 
     for batch_id in due:
         try:
-            maybe_notify_batch(batch_id)
+            _notify_batch(batch_id, now)
         except Exception as e:
-            # one notifier's failure doesn't hold up the other batches; its message could hold an Apprise URL
-            logger.error(f"Recipe card batch {batch_id}: its ready notification failed ({type(e).__qualname__})")
+            # one batch's failure doesn't hold up the others; its message could hold an Apprise URL
+            logger.error(
+                f"Recipe card batch {batch_id}: its ready notification failed ({type(e).__qualname__}); "
+                "tried again once its lease has passed"
+            )
 
 
 def notify_inbox_rejections(
@@ -400,9 +571,10 @@ def notify_inbox_rejections(
     code), in `locale` (the language the inbox's cards take; en-US for a text it doesn't have). Counts and a link only:
     no file names, which can be card text too.
 
-    Sent to the household's notifiers with the recipe cards option on; whether it went to any. Never raises: the
-    refused files are in `failed/` with a note either way, and a failing notifier is logged without its URL. With
-    `session`, its transaction is ended before anything is sent. Blocking (Apprise).
+    Sent to each of the household's notifiers with the recipe cards option on; whether any of them got it. Never
+    raises: the refused files are in `failed/` with a note either way, and a notifier that didn't get it is logged
+    (by id and name, never its URL). With `session`, its transaction is ended before anything is sent. Blocking
+    (Apprise).
     """
     counts = Counter(str(reason) if reason else OTHER_REASON for reason in reasons)
     if not counts:
@@ -420,12 +592,18 @@ def notify_inbox_rejections(
                 ),
             )
             listener = AIEventAppriseListener(group_id, household_id, db)
-            urls = listener.get_subscribers(event)  # ends the session's transaction before anything is sent
+            targets = listener.targets(event)  # ends the session's transaction before anything is sent
 
-        if not urls:
-            return False
-        listener.publish_to_subscribers(event, urls)
-        return True
+        delivered = False
+        for target in targets:
+            if (reason := listener.send(event, target)) is None:
+                delivered = True
+            else:
+                logger.warning(
+                    f"Recipe card inbox of household {household_id}: notifier {target.label} didn't get the "
+                    f"'not added' notification ({reason})"
+                )
+        return delivered
     except Exception as e:
         if session is not None and session.in_transaction():
             session.rollback()
@@ -438,11 +616,12 @@ def notify_inbox_rejections(
 
 
 def send_test_notification(
-    session: Session, group_id: UUID, household_id: UUID, apprise_url: str, translator: Translator
-) -> None:
+    session: Session, group_id: UUID, household_id: UUID, notifier: NotifierURL, translator: Translator
+) -> bool:
     """
     A test of the "recipe cards ready" event through one notifier, whatever its toggle says: the same event type and
     data shape (with no batch, and the household's current counts), so a Home Assistant automation can be tried out.
+    Whether it was delivered; a failure is logged (by the notifier's id and name, never its URL). Blocking (Apprise).
     """
     counts = IngestRepos(session, group_id, household_id).jobs.counts()
     slug = group_slug(session, group_id)
@@ -465,5 +644,7 @@ def send_test_notification(
             review_url=cards_url(slug),
         ),
     )
-    listener = AIEventAppriseListener(group_id, household_id, session)
-    listener.publish_to_subscribers(event, listener.update_urls_with_event_data([apprise_url], event))
+    reason = AIEventAppriseListener(group_id, household_id, session).send(event, notifier)
+    if reason is not None:
+        logger.warning(f"Notifier {notifier.label} didn't get the test recipe card notification ({reason})")
+    return reason is None

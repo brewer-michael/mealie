@@ -13,14 +13,18 @@ tick runs these phases; each one survives its own errors, logging once and backi
   reader runs (`storage.dispatcher_seen_at`).
 - **Pause check:** while a backup restore's marker is set, nothing below runs (§3.9).
 - **Heartbeat** (every `HEARTBEAT_INTERVAL`): renews this process's leases; a task whose token is gone (commit,
-  discard, sweep, restore) or that was asked to stop is cancelled through its own loop.
+  discard, sweep) or that was asked to stop is cancelled through its own loop. One whose token a backup restore took
+  (a restore ended after it was claimed) carries on instead: its result is kept for the card's next task
+  (`results`), so the reading already paid for isn't asked for again.
 - **Sweep** (every tick): expired leases of other processes' tasks are requeued or given up (`sweep.py`). Held back
   for two heartbeats after a pause, so every live process renews its leases first.
 - **Claims** (every tick, and at once on `wake()`): `AI_INGEST_CONCURRENCY` task threads for any task plus
-  `REREAD_SLOTS` that only re-reads use, so a reviewer's re-read starts at once while a batch is being read.
-- **Housekeeping and stale commits** (every `HOUSEKEEPING_INTERVAL`), **the inbox** (every
-  `AI_INGEST_INBOX_POLL_SECONDS`) and **the purge** (daily, first `PURGE_FIRST_DELAY` after start) run in the
-  background, so a slow scan or notification never delays a claim or a heartbeat.
+  `REREAD_SLOTS` that only re-reads use, so a reviewer's re-read starts at once while a batch is being read. Groups
+  take turns (`IngestQueue.queued_ids`), and `AI_INGEST_GROUP_CONCURRENCY` caps one group's cards read at once across
+  every process.
+- **Housekeeping, stale commits and cards waiting for a monthly limit** (every `HOUSEKEEPING_INTERVAL`; `retries`),
+  **the inbox** (every `AI_INGEST_INBOX_POLL_SECONDS`) and **the purge** (daily, first `PURGE_FIRST_DELAY` after start)
+  run in the background, so a slow scan or notification never delays a claim or a heartbeat.
 
 Each task runs in a **daemon thread with its own event loop** (`worker.run_task`), registered as (loop, task, token,
 deadline): not a thread pool, whose threads are joined at exit and would hold a container stop behind a provider
@@ -80,6 +84,7 @@ class Phase(StrEnum):
     claim = "claims"
     housekeeping = "housekeeping"
     commits = "stale commits"
+    retries = "limit retries"
     inbox = "inbox scan"
     purge = "purge"
 
@@ -112,8 +117,9 @@ def claim_tasks(
 ) -> ClaimBatch:
     """
     Claims up to `reread_slots` queued re-reads (priority `PRIORITY_REREAD`) for the re-read slot, then up to
-    `general_slots` queued tasks of any kind, by priority then age (§3.2). Each claim is a conditional `UPDATE` with a
-    new lease token, kept only when it changed one row, so two processes never claim the same task. Once `stop` is set
+    `general_slots` queued tasks of any kind, by priority, then taking turns across groups, then age (§3.2, §3.4).
+    Each claim is a conditional `UPDATE` with a new lease token, kept only when it changed one row, so two processes
+    never claim the same task (nor more of a group's cards than `AI_INGEST_GROUP_CONCURRENCY`). Once `stop` is set
     (shutdown), no further task is claimed.
     """
     queue = IngestQueue(session)
@@ -186,8 +192,11 @@ class _RunningTask:
         self.token = claim.token
         self.reread_slot = claim.reread_slot
         self.deadline = deadline
+        self.claimed_at = time.time()
+        """When it was claimed (a Unix time), to tell whether a restore took its lease since"""
         self.done = threading.Event()
         self.stuck_logged = False
+        self.cut_off_logged = False
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -455,6 +464,7 @@ class IngestDispatcher:
         intervals: dict[Phase, tuple[Callable[[], Awaitable[None]], float]] = {
             Phase.housekeeping: (self._housekeeping, limits.HOUSEKEEPING_INTERVAL),
             Phase.commits: (self._resume_commits, limits.HOUSEKEEPING_INTERVAL),
+            Phase.retries: (self._retry_after_limits, limits.HOUSEKEEPING_INTERVAL),
             Phase.inbox: (self._scan_inbox, get_ingest_settings().INBOX_POLL_SECONDS),
             Phase.purge: (self._purge, limits.PURGE_INTERVAL),
         }
@@ -529,8 +539,18 @@ class IngestDispatcher:
         if not held:
             return
         alive = await self._call(_with_session, lambda session: IngestQueue(session).heartbeat(list(held), utcnow()))
+        restored_at = await self._call(storage.restored_at) if set(held) - set(alive) else None
         for token, handle in held.items():
             if token not in alive:
+                if restored_at is not None and restored_at >= handle.claimed_at:
+                    # a backup restore queued its job again: it finishes, and its result is kept for the next task
+                    if not handle.cut_off_logged:
+                        handle.cut_off_logged = True
+                        logger.info(
+                            f"Recipe card job {handle.job_id}: a backup restore took its task's lease; it finishes, "
+                            "and its reading is kept for the card's next task"
+                        )
+                    continue
                 # usually the task's own finalize, just before its thread ends; else a commit, discard or sweep
                 if handle.cancel(CancelReason.vanished):
                     logger.debug(f"Recipe card job {handle.job_id}: its lease is gone; stopping its task")
@@ -608,6 +628,12 @@ class IngestDispatcher:
         from .. import commit
 
         await self._call(commit.resume_stale_commits, utcnow(), abandon_on_cancel=True)
+
+    async def _retry_after_limits(self) -> None:
+        from . import retries
+
+        if await self._call(retries.retry_waiting, utcnow(), abandon_on_cancel=True):
+            self.wake()
 
     async def _scan_inbox(self) -> None:
         from .. import inbox

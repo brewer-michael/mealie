@@ -8,8 +8,10 @@ import {
   INGEST_API_ERROR_CODES,
   INGEST_ERROR_CODES,
   INGEST_REJECT_REASONS,
+  cardTitle,
   commitWarningText,
   errorCodeOf,
+  errorMessageOf,
   errorStatusOf,
   flagText,
   ingestErrorText,
@@ -221,6 +223,54 @@ describe("the recipe card API client", () => {
     expect(client.pageImageUrl("j1", 0, "thumb")).toBe("/api/ai/ingest/jobs/j1/pages/0/thumb");
   });
 
+  test("batch, commit, merge, rebuild and eval routes send their bodies", async () => {
+    const requests = fakeRequests();
+    const client = new RecipeIngestAPI(requests as unknown as ApiRequestInstance);
+
+    await client.touchBatch("b1", { suppressAlert: true });
+    await client.commitClean("b1", { jobIds: ["j1", "j2"], draftVersions: { j1: 3, j2: 1 } });
+    await client.readWithCloud("j1");
+    await client.merge("j2", { intoJobId: "j1" });
+    await client.rebuild("j1", { transcription: "Banana Mug Cake\n1 banana" });
+    await client.parseLines("j1", { refs: ["i1", "i3"] });
+    await client.uncommit("j1");
+    await client.uncommit("j1", { force: true });
+    await client.updateEvalCase("banana-mug-cake", { verified: true, tags: ["handwritten", "faded"] });
+    await client.regionHint("j1", { field: "ingredients", ref: "i2" });
+    await client.regionHint("j1", { field: "name", ref: null });
+
+    const posts = requests.post.mock.calls.map(call => [call[0], call[1]]);
+    expect(posts).toEqual([
+      ["/api/ai/ingest/batches/b1/touch", {}],
+      ["/api/ai/ingest/batches/b1/commit-clean", { jobIds: ["j1", "j2"], draftVersions: { j1: 3, j2: 1 } }],
+      ["/api/ai/ingest/jobs/j1/read-with-cloud", {}],
+      ["/api/ai/ingest/jobs/j2/merge", { intoJobId: "j1" }],
+      ["/api/ai/ingest/jobs/j1/rebuild", { transcription: "Banana Mug Cake\n1 banana" }],
+      ["/api/ai/ingest/jobs/j1/parse-lines", { refs: ["i1", "i3"] }],
+      ["/api/ai/ingest/jobs/j1/uncommit", {}],
+      ["/api/ai/ingest/jobs/j1/uncommit", { force: true }],
+    ]);
+    // the heartbeat is quiet: a sealed batch or a paused server isn't news to the person scanning
+    expect(requests.post.mock.calls[0]![2]).toMatchObject({ suppressAlert: true });
+    expect(requests.put.mock.calls).toEqual([
+      ["/api/ai/ingest/eval-cases/banana-mug-cake", { verified: true, tags: ["handwritten", "faded"] }],
+    ]);
+    // a region hint's 404 means "no hint", never an error to show
+    expect(requests.get.mock.calls.map(call => call[0])).toEqual([
+      "/api/ai/ingest/jobs/j1/region-hint?field=ingredients&ref=i2",
+      "/api/ai/ingest/jobs/j1/region-hint?field=name",
+    ]);
+    expect(requests.get.mock.calls[0]![2]).toMatchObject({ suppressAlert: true });
+
+    // an eval case's zip comes as a Blob, quietly: the settings card says what went wrong
+    await client.downloadEvalCase("banana-mug-cake");
+    expect(requests.get.mock.calls[2]).toEqual([
+      "/api/ai/ingest/eval-cases/banana-mug-cake/download",
+      undefined,
+      { responseType: "blob", suppressAlert: true },
+    ]);
+  });
+
   test("job filters repeat the status parameter, as FastAPI reads a list", async () => {
     const requests = fakeRequests();
     const client = new RecipeIngestAPI(requests as unknown as ApiRequestInstance);
@@ -232,6 +282,19 @@ describe("the recipe card API client", () => {
       "/api/ai/ingest/jobs?status=ready&status=failed&batchId=b1&page=2&perPage=25",
     );
     expect(requests.get.mock.calls[1]![0]).toBe("/api/ai/ingest/jobs");
+  });
+
+  test("committed cards can be listed by commit time since a date", async () => {
+    const requests = fakeRequests();
+    const client = new RecipeIngestAPI(requests as unknown as ApiRequestInstance);
+
+    await client.getJobs({ status: "committed", committedSince: new Date("2026-09-27T10:00:00Z"), orderBy: "committedAt", perPage: 50 });
+    await client.getJobs({ committedSince: "2026-09-27T10:00:00.000Z" });
+
+    expect(requests.get.mock.calls[0]![0]).toBe(
+      "/api/ai/ingest/jobs?status=committed&committedSince=2026-09-27T10%3A00%3A00.000Z&orderBy=committedAt&perPage=50",
+    );
+    expect(requests.get.mock.calls[1]![0]).toBe("/api/ai/ingest/jobs?committedSince=2026-09-27T10%3A00%3A00.000Z");
   });
 });
 
@@ -355,6 +418,22 @@ describe("text", () => {
     expect(errorCodeOf({ response: { status: 422, data: { detail: [{ msg: "bad" }] } } })).toBeNull();
     expect(errorCodeOf(null)).toBeNull();
     expect(errorStatusOf(new Error("network"))).toBeNull();
+  });
+
+  test("a card's name in lists: its title, else its file (inbox, API), else its place in the batch", () => {
+    const card = { title: null, source: "app", sourceName: "upload/IMG_1.jpg", status: "processing", position: 2 } as const;
+    expect(cardTitle({ ...card, title: "Scones" }, t)).toBe("Scones");
+    expect(cardTitle(card, t)).toBe("Card 3");
+    expect(cardTitle({ ...card, source: "inbox", sourceName: "inbox/home/kitchen/scan.jpg" }, t)).toBe("scan.jpg");
+    expect(cardTitle({ ...card, status: "ready" }, t)).toBe("Untitled card");
+  });
+
+  test("an error's message is the one the API client already showed", () => {
+    expect(errorMessageOf({ response: { status: 503, data: { detail: { code: "paused_for_restore", message: "Paused" } } } }))
+      .toBe("Paused");
+    expect(errorMessageOf({ response: { status: 404, data: { detail: { code: "not_found" } } } })).toBeNull();
+    expect(errorMessageOf({ response: { status: 403, data: { detail: "Forbidden" } } })).toBeNull();
+    expect(errorMessageOf(new Error("network"))).toBeNull();
   });
 });
 

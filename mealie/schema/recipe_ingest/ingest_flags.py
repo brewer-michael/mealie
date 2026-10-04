@@ -32,7 +32,7 @@ class CardFlag(MealieModel):
     field: str
     """The draft field: `name`, `description`, `ingredients`, `steps`, `notes`, a time or yield field, or `card`"""
     ref: str | None = None
-    """The ingredient's `reference_id` or the step's `id`, for list fields"""
+    """The ingredient's `reference_id`, or the step's or note's `id`, for list fields"""
     params: dict[str, Any] = Field(default_factory=dict)
     """Values the flag's text shows, e.g. `value`, `token`, `suggestion`, `confidence`"""
     alternatives: list[str] = Field(default_factory=list)
@@ -48,7 +48,7 @@ class ProposalTarget(MealieModel):
     field: str
     """`name`, `description`, `ingredients`, `steps`, `notes`, `attribution`, or a time or yield field"""
     ref: str | None = None
-    """The ingredient's `reference_id` or the step's `id`, for list fields"""
+    """The ingredient's `reference_id`, or the step's or note's `id`, for list fields"""
 
     model_config = ConfigDict(extra="ignore")
 
