@@ -5,11 +5,15 @@ commits and refusals. Crash recovery is in `test_commit_recovery.py`. Runs on SQ
 """
 
 import fcntl
+import io
 import os
+import threading
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from PIL import ExifTags, Image
 from test_jobs_api import (
@@ -20,11 +24,13 @@ from test_jobs_api import (
     job_row,
     job_url,
     seed_job,
+    set_columns,
     use_fake_flags,
 )
 
-from mealie.core.config import get_app_dirs
+from mealie.core.config import get_app_dirs, get_app_settings
 from mealie.db.db_setup import session_context
+from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.lang.providers import get_locale_provider
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
@@ -43,6 +49,7 @@ from mealie.schema.recipe_ingest import (
 from mealie.schema.response.pagination import PaginationQuery
 from mealie.services.ai.ingest import commit as card_commit
 from mealie.services.ai.ingest import storage
+from mealie.services.backups_v2.backup_v2 import BackupV2
 from mealie.services.event_bus_service.event_bus_service import EventBusService
 from mealie.services.event_bus_service.event_types import EventTypes
 from tests.utils import api_routes
@@ -84,8 +91,8 @@ def kept(flags: list[CardFlag]) -> list[CardFlag]:
 
 
 def ready_to_commit(user: TestUser, **kwargs: Any) -> UUID:
-    """A ready job whose errors were all kept as written"""
-    draft = kwargs.pop("draft", None) or banana_draft()
+    """A ready job whose errors were all kept as written; unless `draft` says otherwise, the card photo is attached"""
+    draft = kwargs.pop("draft", None) or banana_draft(attach_card_photo=True)
     return seed_job(user, draft=draft, flags=kept(fake_compute_flags(draft, None, {})), **kwargs)
 
 
@@ -249,7 +256,8 @@ def test_settings_come_from_the_household_with_assets_shown(api_client: TestClie
 
 def test_no_cover_when_the_draft_says_so(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
-    out = commit(api_client, user, ready_to_commit(user, draft=banana_draft(use_card_as_cover=False))).json()
+    draft = banana_draft(use_card_as_cover=False, attach_card_photo=True)
+    out = commit(api_client, user, ready_to_commit(user, draft=draft)).json()
     recipe = recipe_of(api_client, user, out["slug"])
     assert recipe["image"] is None
     assert not (recipe_dir(out["recipeId"]) / "images" / "original.webp").exists()
@@ -281,7 +289,7 @@ def test_a_language_without_the_forks_texts_gets_them_in_english(
 ):
     """Only en-US carries the fork's texts: a commit in another language writes them in English, never their keys"""
     user = unique_user_fn_scoped
-    draft = banana_draft(steps=[CardDraftStep(text="Bake at [illegible] degrees.")])
+    draft = banana_draft(steps=[CardDraftStep(text="Bake at [illegible] degrees.")], attach_card_photo=True)
     job_id = ready_to_commit(user, draft=draft, locale=locale)
 
     response = api_client.post(
@@ -345,13 +353,13 @@ def test_foreign_and_unknown_ids_are_dropped(
             CardDraftIngredient(original_text="1 pinch", quantity=1, food=CardDraftRef(id=uuid4(), name="")),
         ],
         tags=[CardDraftRef(id=foreign_tag.id, name="Dessert"), CardDraftRef(id=our_tag.id, name="Quick")],
-        categories=[CardDraftRef(name="No id")],
         tools=[CardDraftRef(id=uuid4(), name="Mug")],
     )
     response = commit(api_client, user, ready_to_commit(user, draft=draft))
     assert response.status_code == 201, response.text
     out = response.json()
-    assert sorted(out["warnings"]) == ["category_dropped:No id", "tag_dropped:Dessert", "tool_dropped:Mug"]
+    # an id that isn't one of the group's is dropped, whatever its name
+    assert sorted(out["warnings"]) == ["tag_dropped:Dessert", "tool_dropped:Mug"]
 
     recipe = recipe_of(api_client, user, out["slug"])
     oil, banana, half, pinch = recipe["recipeIngredient"]
@@ -652,3 +660,367 @@ def test_missing_card_files_return_the_job_to_ready(
     assert not recipe_dir(row["commit_recipe_id"]).exists()
     assert published == []
     assert api_client.get(api_routes.recipes, headers=user.token).json()["items"] == []
+
+
+# ==================================================================================================================
+# The cover (a portrait card is letterboxed) and the card photo switch
+
+
+def _set_recipes_public(api_client: TestClient, user: TestUser, public: bool) -> None:
+    """The household's new recipes seen without a login or not, with their assets hidden by default"""
+    preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
+    preferences.update({"privateHousehold": not public, "recipePublic": public, "recipeShowAssets": False})
+    assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
+
+
+def _dark(pixel: Any) -> bool:
+    return sum(pixel[:3]) < 3 * 80
+
+
+def _light(pixel: Any) -> bool:
+    return all(channel > 200 for channel in pixel[:3])
+
+
+def test_a_portrait_card_is_letterboxed_as_the_cover(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """The recipe header crops its image to a landscape box: the whole card, title included, stays in view"""
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user)  # 480 x 640 pages, a dark block in the top-left corner
+    out = commit(api_client, user, job_id).json()
+    recipe = recipe_of(api_client, user, out["slug"])
+    assert recipe["image"]
+
+    with Image.open(recipe_dir(out["recipeId"]) / "images" / "original.webp") as cover:
+        rgb = cover.convert("RGB")
+    width, height = rgb.size
+    assert abs(width / height - 4 / 3) < 0.01
+    page_width = height * 480 / 640
+    left = (width - page_width) / 2
+    # the page's top row is in the cover (its dark corner block), centred on the page's own border colour
+    assert _dark(rgb.getpixel((round(left + page_width * 0.1), round(height * 0.05))))
+    assert _light(rgb.getpixel((round(left / 2), round(height * 0.05))))
+    assert _light(rgb.getpixel((round(width - left / 2), round(height * 0.95))))
+    assert _light(rgb.getpixel((round(left + page_width * 0.9), round(height * 0.9))))
+
+    # the asset is still the whole page, as it was
+    token = job_row(job_id)["commit_asset_token"]
+    with Image.open(recipe_dir(out["recipeId"]) / "assets" / f"recipe-card-{token}-1.jpg") as asset:
+        assert asset.size == (480, 640)
+
+
+def test_a_landscape_card_is_the_cover_as_it_is(tmp_path: Any):
+    landscape, portrait = tmp_path / "landscape.jpg", tmp_path / "portrait.jpg"
+    Image.new("RGB", (640, 480), (250, 245, 230)).save(landscape, "JPEG")
+    page = Image.new("RGB", (300, 600), (30, 90, 200))
+    page.paste((250, 250, 250), (20, 20, 280, 580))
+    page.save(portrait, "JPEG")
+
+    assert card_commit.cover_image(landscape) == landscape
+    cover_bytes = card_commit.cover_image(portrait)
+    assert isinstance(cover_bytes, bytes)
+    with Image.open(io.BytesIO(cover_bytes)) as cover:
+        assert cover.format == "JPEG"
+        assert cover.size == (800, 600)
+        # the letterbox takes the page's border colour, not the paper's
+        red, green, blue = cover.convert("RGB").getpixel((50, 300))
+        assert abs(red - 30) < 12 and abs(green - 90) < 12 and abs(blue - 200) < 12
+
+
+def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """Assets are served without a login, so in a household whose recipes are public the card photo is off unless
+    the reviewer turns it on; elsewhere it's on unless they turn it off"""
+    user = unique_user_fn_scoped
+
+    def committed(draft: Any) -> tuple[dict[str, Any], list[str]]:
+        job_id = ready_to_commit(user, draft=draft)
+        out = commit(api_client, user, job_id).json()
+        recipe = recipe_of(api_client, user, out["slug"])
+        assets = recipe_dir(out["recipeId"]) / "assets"
+        files = sorted(path.name for path in assets.glob("recipe-card-*")) if assets.exists() else []
+        return recipe, files
+
+    # a new install: a private household whose recipes are "public" by default keeps the card (set here: a test
+    # user's registration picks the household's privacy at random)
+    preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
+    preferences.update({"privateHousehold": True, "recipePublic": True})
+    assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
+    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"]) == (False, True)
+
+    _set_recipes_public(api_client, user, True)
+    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["draft"]["attachCardPhoto"]) == (
+        True,
+        False,
+        None,
+    )
+
+    recipe, files = committed(banana_draft(name="Public default"))
+    assert (recipe["assets"], files) == ([], [])
+    assert recipe["settings"]["showAssets"] is False  # the household's own default
+    assert recipe["image"]  # the cover is its own switch
+
+    recipe, files = committed(banana_draft(name="Public attached", attach_card_photo=True))
+    assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
+    assert len(files) == 1
+    assert recipe["settings"]["showAssets"] is True
+
+    _set_recipes_public(api_client, user, False)
+    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"]) == (False, True)
+
+    recipe, files = committed(banana_draft(name="Private default"))
+    assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
+    assert len(files) == 1
+
+    recipe, files = committed(banana_draft(name="Private detached", attach_card_photo=False))
+    assert (recipe["assets"], files) == ([], [])
+
+
+def test_a_resumed_commit_that_no_longer_attaches_removes_the_written_assets(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user, draft=banana_draft(attach_card_photo=False))
+    set_columns(job_id, commit_recipe_id=uuid4(), commit_asset_token="tok")
+    row = job_row(job_id)
+    stale = recipe_dir(row["commit_recipe_id"]) / "assets" / "recipe-card-tok-1.jpg"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"an earlier attempt's asset")
+
+    out = commit(api_client, user, job_id).json()
+    assert out["recipeId"] == str(row["commit_recipe_id"])
+    assert not stale.exists()
+
+
+# ==================================================================================================================
+# Upstream's provenance bit
+
+
+def _is_ocr_recipe(recipe_id: Any) -> Any:
+    with session_context() as session:
+        stmt = sa.select(RecipeModel.is_ocr_recipe).where(RecipeModel.id == UUID(str(recipe_id)))
+        return session.execute(stmt).scalar_one()
+
+
+def test_a_card_recipe_is_marked_as_one_and_others_arent(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    out = commit(api_client, user, ready_to_commit(user)).json()
+    assert _is_ocr_recipe(out["recipeId"]) is True
+
+    # a recipe made in the editor isn't
+    response = api_client.post(api_routes.recipes, json={"name": "Typed in"}, headers=user.token)
+    assert response.status_code == 201
+    typed = recipe_of(api_client, user, response.json())
+    assert not _is_ocr_recipe(typed["id"])
+
+
+def test_the_mark_survives_a_backup(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    out = commit(api_client, user, ready_to_commit(user)).json()
+
+    backup_v2 = BackupV2(get_app_settings().DB_URL)
+    try:
+        backup_v2.restore(backup_v2.backup())
+    finally:
+        backup_v2.db_exporter.engine.dispose()
+
+    assert _is_ocr_recipe(out["recipeId"]) is True
+    assert not storage.is_paused()
+
+
+# ==================================================================================================================
+# recipe_created, at least once
+
+
+def test_a_commit_sends_recipe_created_once_and_records_it(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, published: list
+):
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user)
+    assert commit(api_client, user, job_id).status_code == 201
+
+    row = job_row(job_id)
+    assert len(published) == 1
+    assert row["recipe_event_claimed_at"] is not None
+    assert row["recipe_event_sent_at"] is not None
+
+    # housekeeping has nothing to send for it, however late it runs
+    later = utcnow() + card_commit.RECIPE_EVENT_LEASE + timedelta(minutes=1)
+    assert card_commit.resend_recipe_events(later) == 0
+    assert len(published) == 1
+
+
+def test_a_failed_send_is_sent_again_by_housekeeping(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    sent: list[str] = []
+
+    def dispatch(self: EventBusService, *args: Any, **kwargs: Any) -> None:
+        if kwargs["event_type"] != EventTypes.recipe_created:
+            return
+        if not sent and not getattr(dispatch, "failed", False):
+            dispatch.failed = True  # type: ignore[attr-defined]
+            raise RuntimeError("the notifier's server is down")
+        sent.append(kwargs["document_data"].recipe_slug)
+
+    monkeypatch.setattr(EventBusService, "dispatch", dispatch)
+    job_id = ready_to_commit(user)
+    assert commit(api_client, user, job_id).status_code == 201
+    assert sent == []
+    assert job_row(job_id)["recipe_event_sent_at"] is None
+
+    # the committer's claim holds for a while, then housekeeping sends it, once
+    assert card_commit.resend_recipe_events(utcnow() + timedelta(minutes=2)) == 0
+    later = utcnow() + card_commit.RECIPE_EVENT_LEASE + timedelta(seconds=5)
+    assert card_commit.resend_recipe_events(later) == 1
+    assert sent == ["banana-mug-cake"]
+    assert job_row(job_id)["recipe_event_sent_at"] is not None
+    assert card_commit.resend_recipe_events(later + timedelta(minutes=10)) == 0
+    assert sent == ["banana-mug-cake"]
+
+
+def test_two_housekeepers_send_a_late_event_once(unique_user_fn_scoped: TestUser, published: list, api_client):
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user)
+    assert commit(api_client, user, job_id).status_code == 201
+    published.clear()
+    # as if the process had stopped between the finish and the send, six minutes ago
+    set_columns(
+        job_id,
+        recipe_event_sent_at=None,
+        recipe_event_claimed_at=utcnow() - timedelta(minutes=6),
+        committed_at=utcnow() - timedelta(minutes=6),
+    )
+
+    barrier = threading.Barrier(2)
+    counts: list[int] = []
+
+    def housekeeping() -> None:
+        barrier.wait()
+        counts.append(card_commit.resend_recipe_events(utcnow()))
+
+    threads = [threading.Thread(target=housekeeping) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert sorted(counts) == [0, 1]
+    assert len(published) == 1
+
+
+def test_late_events_skip_old_commits_and_deleted_recipes(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, published: list
+):
+    user = unique_user_fn_scoped
+    old_job, deleted_job = ready_to_commit(user), ready_to_commit(user, draft=banana_draft(name="Gone"))
+    old = commit(api_client, user, old_job).json()
+    gone = commit(api_client, user, deleted_job).json()
+    published.clear()
+    set_columns(
+        old_job, recipe_event_sent_at=None, recipe_event_claimed_at=None, committed_at=utcnow() - timedelta(hours=25)
+    )
+    set_columns(deleted_job, recipe_event_sent_at=None, recipe_event_claimed_at=None)
+    assert api_client.delete(api_routes.recipes_slug(gone["slug"]), headers=user.token).status_code == 200
+
+    later = utcnow() + timedelta(minutes=2)
+    assert card_commit.resend_recipe_events(later) == 0
+    assert published == []
+    assert job_row(old_job)["recipe_event_sent_at"] is None  # a restored backup never replays old events
+    assert job_row(deleted_job)["recipe_event_sent_at"] is not None  # nothing to announce
+    assert old["slug"] == "banana-mug-cake"
+
+
+# ==================================================================================================================
+# Organizers named in review are created at commit
+
+
+def _organizer_names(user: TestUser, kind: str) -> list[str]:
+    with session_context() as session:
+        repos = get_repositories(session, group_id=UUID(user.group_id), household_id=None)
+        return sorted(item.name for item in getattr(repos, kind).page_all(_all()).items)
+
+
+def test_new_organizers_are_created_for_a_committer_who_can_organize(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    with session_context() as session:
+        existing = get_repositories(session, group_id=UUID(user.group_id), household_id=None).tags.create(
+            TagSave(name="Quick", group_id=user.group_id)
+        )
+    job_id = ready_to_commit(
+        user,
+        draft=banana_draft(
+            attach_card_photo=True,
+            tags=[CardDraftRef(name="Weeknight"), CardDraftRef(name="quick")],  # "quick" is the group's "Quick"
+            categories=[CardDraftRef(name="Dessert")],
+            tools=[CardDraftRef(name="Mug"), CardDraftRef(name="[illegible] pan")],
+        ),
+    )
+    assert api_client.get(job_url(job_id), headers=user.token).json()["permissions"]["canCreateOrganizers"] is True
+
+    out = commit(api_client, user, job_id).json()
+    recipe = recipe_of(api_client, user, out["slug"])
+    tags = {tag["name"]: tag["id"] for tag in recipe["tags"]}
+    assert sorted(tags) == ["Quick", "Weeknight"]
+    assert tags["Quick"] == str(existing.id)
+    assert [category["name"] for category in recipe["recipeCategory"]] == ["Dessert"]
+    assert [tool["name"] for tool in recipe["tools"]] == ["Mug"]
+    assert out["warnings"] == ["tool_dropped:[illegible] pan"]  # a name with a marker is never made an organizer
+    assert _organizer_names(user, "tags") == ["Quick", "Weeknight"]
+    assert _organizer_names(user, "categories") == ["Dessert"]
+    assert _organizer_names(user, "tools") == ["Mug"]
+
+
+def test_a_committer_who_cant_organize_drops_new_organizers(
+    api_client: TestClient, admin_token: dict, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    member = household_member(api_client, admin_token, user)
+    job_id = ready_to_commit(user, draft=banana_draft(tags=[CardDraftRef(name="Weeknight")]))
+    assert api_client.get(job_url(job_id), headers=member.token).json()["permissions"]["canCreateOrganizers"] is False
+
+    out = commit(api_client, member, job_id).json()
+    assert out["warnings"] == ["tag_dropped:Weeknight"]
+    assert recipe_of(api_client, user, out["slug"])["tags"] == []
+    assert _organizer_names(user, "tags") == []
+
+
+def test_an_organizer_another_commit_creates_meanwhile_is_used_once(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """The lookup misses it, the insert then clashes with the one another commit just made: that one is used"""
+    user = unique_user_fn_scoped
+    with session_context() as session:
+        theirs = get_repositories(session, group_id=UUID(user.group_id), household_id=None).tags.create(
+            TagSave(name="Weeknight", group_id=user.group_id)
+        )
+    real = card_commit.OrganizerMaker._find_or_create
+
+    class Late:
+        """The tags repository, seen before the other commit's insert"""
+
+        def __init__(self, repo: Any) -> None:
+            self.repo, self.looked = repo, False
+
+        def get_one(self, *args: Any) -> Any:
+            if not self.looked:
+                self.looked = True
+                return None
+            return self.repo.get_one(*args)
+
+        def create(self, data: Any) -> Any:
+            return self.repo.create(data)
+
+    monkeypatch.setattr(
+        card_commit.OrganizerMaker, "_find_or_create", lambda self, repo, save, name: real(self, Late(repo), save, name)
+    )
+    out = commit(api_client, user, ready_to_commit(user, draft=banana_draft(tags=[CardDraftRef(name="Weeknight")])))
+    assert out.status_code == 201, out.text
+    recipe = recipe_of(api_client, user, out.json()["slug"])
+    assert [tag["id"] for tag in recipe["tags"]] == [str(theirs.id)]
+    assert _organizer_names(user, "tags") == ["Weeknight"]

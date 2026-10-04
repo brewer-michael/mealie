@@ -1,7 +1,7 @@
 """
 Who can do what to a recipe card (docs/ai/PHASE2.md §9): every job route and page image is household-scoped, so
 another household's card is a 404, in the same group or another; and discarding is for the uploader, anyone for an
-inbox card, otherwise the household's managers. Runs on SQLite and PostgreSQL.
+inbox card or one sent with an API token, otherwise the household's managers. Runs on SQLite and PostgreSQL.
 """
 
 from typing import Any
@@ -79,20 +79,30 @@ def test_who_can_discard(api_client: TestClient, admin_token: dict, unique_user_
     other_member = household_member(api_client, admin_token, manager)
 
     managers_card = seed_job(manager)
+    others_app_card = seed_job(manager, source=IngestSource.app, created_by=other_member.user_id)
     members_card = seed_job(member, created_by=member.user_id)
     inbox_card = seed_job(manager, source=IngestSource.inbox, created_by=None)
+    # sent by Home Assistant or a Shortcut with another user's API token (often one shared "kitchen" user)
     api_card = seed_job(manager, source=IngestSource.api, created_by=other_member.user_id)
 
+    # someone else's card from the app: its uploader or a manager
     assert_code(api_client.delete(job_url(managers_card), headers=member.token), 403, "forbidden")
-    assert_code(api_client.delete(job_url(api_card), headers=member.token), 403, "forbidden")
+    assert_code(api_client.delete(job_url(others_app_card), headers=member.token), 403, "forbidden")
+    listed = api_client.get(JOBS, params={"perPage": -1}, headers=member.token).json()["items"]
+    can_discard = {item["id"]: item["canDiscard"] for item in listed}
+    assert can_discard[str(others_app_card)] is False
+    assert can_discard[str(api_card)] is True
+    assert can_discard[str(inbox_card)] is True
+    assert api_client.get(job_url(api_card), headers=member.token).json()["permissions"]["canDiscard"] is True
     assert job_row(managers_card)["status"] == "ready"
     assert storage.job_dir(UUID(manager.group_id), managers_card).is_dir()
 
     assert api_client.delete(job_url(members_card), headers=member.token).status_code == 204  # the uploader
     assert api_client.delete(job_url(inbox_card), headers=member.token).status_code == 204  # anyone
-    assert api_client.delete(job_url(api_card), headers=manager.token).status_code == 204  # a manager
+    assert api_client.delete(job_url(api_card), headers=member.token).status_code == 204  # anyone
+    assert api_client.delete(job_url(others_app_card), headers=other_member.token).status_code == 204  # the uploader
     assert api_client.delete(job_url(managers_card), headers=manager.token).status_code == 204
-    for job_id in (members_card, inbox_card, api_card, managers_card):
+    for job_id in (members_card, inbox_card, api_card, others_app_card, managers_card):
         assert job_row(job_id) == {}
         assert not storage.job_dir(UUID(manager.group_id), job_id).exists()
 

@@ -11,6 +11,7 @@ from mealie.core.root_logger import get_logger
 from mealie.core.settings.settings import ScraperProxyMode
 
 from . import flaresolverr
+from .redirects import acheck_redirect
 from .transport import AsyncSafeTransport
 
 SCRAPER_TIMEOUT = 15
@@ -180,7 +181,8 @@ async def _attempt(
       rotating won't fix, and the caller should stop.
     """
     transport = _build_transport(impersonation, proxy)
-    async with AsyncClient(transport=transport) as client:
+    # fork hook: no redirect off http(s), or from https to http (redirects.py)
+    async with AsyncClient(transport=transport, event_hooks={"response": [acheck_redirect]}) as client:
         async with client.stream(method, url, timeout=timeout, follow_redirects=True) as resp:
             status_code = resp.status_code
             retry_after = resp.headers.get("Retry-After")

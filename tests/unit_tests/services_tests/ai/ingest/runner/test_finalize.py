@@ -200,6 +200,33 @@ def test_a_save_landing_during_a_reextract_makes_it_a_proposal(
     assert [proposal["draft"]["name"] for proposal in row["proposals"]] == ["Banana Bread"]
 
 
+def test_a_newer_reextract_replaces_the_older_whole_card_proposal(db: Session, jobs: Jobs):
+    """
+    Two re-extracts of an edited draft: the job keeps only the newest reading (its transcription and extraction), so
+    only the newest whole-card proposal stays to be accepted. A region re-read's proposal stays as it was.
+    """
+    region = reread_result("1/2 tsp vanilla").proposal
+    job_id = jobs.ready(draft_version=2, proposals=[region])
+
+    names = []
+    for name in ("Banana Bread", "Banana Muffins"):
+        jobs.update(job_id, task_kind=IngestTaskKind.extract.value, task_state=IngestTaskState.queued.value)
+        token = _claim(db, job_id)
+        result = extract_result(name)
+        assert finalize.finalize_extract(db, job_id, token, result).applied == Applied.proposal
+        names.append(name)
+
+        row = jobs.row(job_id)
+        full = [proposal for proposal in row["proposals"] if proposal["kind"] == CardProposalKind.full]
+        assert [proposal["draft"]["name"] for proposal in full] == [name]
+        assert row["transcription"] == result.transcription
+
+    row = jobs.row(job_id)
+    assert [proposal["kind"] for proposal in row["proposals"]] == [CardProposalKind.region, CardProposalKind.full]
+    assert row["proposals"][0]["id"] == str(region.id)
+    assert row["draft"]["name"] == "Banana Mug Cake"  # the reviewer's draft is kept
+
+
 def test_a_reread_adds_its_proposal(db: Session, jobs: Jobs):
     earlier = reread_result("1/2 tsp vanilla").proposal
     job_id = jobs.ready(

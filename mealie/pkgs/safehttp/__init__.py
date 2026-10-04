@@ -6,6 +6,7 @@ from .fetch import (
     ResponseTooLargeError,
     resilient_fetch,
 )
+from .redirects import UnsafeRedirectError, acheck_redirect, check_redirect  # fork
 from .transport import (
     AsyncSafeTransport,
     ForcedTimeoutException,
@@ -28,4 +29,7 @@ __all__ = [
     "ForceTimeoutException",
     "ResponseTooLargeError",
     "resilient_fetch",
+    "UnsafeRedirectError",
+    "acheck_redirect",
+    "check_redirect",
 ]

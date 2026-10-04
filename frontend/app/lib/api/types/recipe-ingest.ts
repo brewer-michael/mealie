@@ -23,12 +23,17 @@ export type CardFlagKind =
   | "shorthand_read"
   | "not_parsed"
   | "new_food"
-  | "new_unit";
+  | "new_unit"
+  | "linked_fuzzy"
+  | "organizers_skipped";
 export type CardFlagSeverity = "error" | "warning" | "info";
 export type CardFlagSource = "marker" | "model" | "validator" | "parser" | "ocr" | "cross_read";
 export type FlagResolution = "kept" | "dismissed";
 export type CardProposalKind = "region" | "full";
+export type CardProposalOrigin = "reextract" | "rebuild";
 export type IngestReadPath = "image" | "ocr";
+export type EvalCaseTag = "handwritten" | "printed" | "faded";
+export type InboxWaitingReason = "cannot_read" | "local_only_unavailable" | "quota";
 export type IngestRejectReason =
   | "too_large"
   | "unsupported_format"
@@ -36,9 +41,11 @@ export type IngestRejectReason =
   | "too_many_pixels"
   | "unreadable_image"
   | "too_many_pages"
-  | "duplicate";
+  | "duplicate"
+  | "url_not_allowed"
+  | "url_fetch_failed";
 export type IngestStatus = "processing" | "ready" | "failed" | "committing" | "committed";
-export type PageRotationSource = "none" | "ocr" | "user";
+export type PageRotationSource = "none" | "ocr" | "user" | "model";
 export type IngestSource = "app" | "api" | "inbox";
 export type IngestErrorCode =
   | "ai_not_enabled"
@@ -57,12 +64,33 @@ export type IngestErrorCode =
   | "commit_interrupted";
 export type IngestTaskKind = "extract" | "reread";
 export type IngestTaskState = "queued" | "running";
+export type IngestLimitedFeature = "suggestions" | "cross_read";
+export type RegionHintSource = "ocr" | "position";
 
 export interface AINotifierEventsOut {
   recipeIngestionReady?: boolean;
 }
 export interface AINotifierEventsUpdate {
   recipeIngestionReady?: boolean;
+}
+export interface BulkCommitOut {
+  committed?: BulkCommitted[];
+  skipped?: BulkCommitSkipped[];
+}
+export interface BulkCommitted {
+  jobId: string;
+  recipeId: string;
+  slug: string;
+}
+export interface BulkCommitSkipped {
+  jobId: string;
+  code: string;
+}
+export interface BulkCommitRequest {
+  jobIds: string[];
+  draftVersions?: {
+    [k: string]: number;
+  };
 }
 export interface CardDraft {
   schemaVersion?: number;
@@ -76,6 +104,7 @@ export interface CardDraft {
   totalTime?: string | null;
   attribution?: string | null;
   useCardAsCover?: boolean;
+  attachCardPhoto?: boolean | null;
   ingredients?: CardDraftIngredient[];
   steps?: CardDraftStep[];
   notes?: CardDraftNote[];
@@ -105,6 +134,7 @@ export interface CardDraftStep {
   text?: string;
 }
 export interface CardDraftNote {
+  id?: string;
   title?: string;
   text?: string;
 }
@@ -113,6 +143,10 @@ export interface CardDraftSaved {
   flags?: CardFlag[];
   errorCount?: number;
   warningCount?: number;
+  ingredients?: CardDraftIngredient[] | null;
+  duplicateOf?: RecipeIngestionRecipeRef | null;
+  duplicateJob?: RecipeIngestionJobRef | null;
+  duplicateName?: string | null;
 }
 export interface CardFlag {
   id: string;
@@ -126,6 +160,15 @@ export interface CardFlag {
   };
   alternatives?: string[];
   resolution?: FlagResolution | null;
+}
+export interface RecipeIngestionRecipeRef {
+  id: string;
+  slug?: string | null;
+  name?: string | null;
+}
+export interface RecipeIngestionJobRef {
+  id: string;
+  title?: string | null;
 }
 export interface CardDraftUpdate {
   draftVersion: number;
@@ -145,6 +188,7 @@ export interface CardProposal {
   alternatives?: string[];
   viaOcr?: boolean;
   draft?: CardDraft | null;
+  origin?: CardProposalOrigin;
   createdAt?: string;
 }
 export interface ProposalTarget {
@@ -176,13 +220,22 @@ export interface EvalCaseOut {
 export interface EvalCaseRequest {
   slug: string;
   verified?: boolean;
+  tags?: EvalCaseTag[];
+  notes?: string;
 }
 export interface EvalCaseSummary {
   slug: string;
   name?: string | null;
   pageCount?: number;
   verified?: boolean;
+  tags?: string[];
+  notes?: string;
   createdAt?: string | null;
+}
+export interface EvalCaseUpdate {
+  verified?: boolean | null;
+  tags?: EvalCaseTag[] | null;
+  notes?: string | null;
 }
 export interface ExtractionCompilerError {
   compiler: string;
@@ -235,10 +288,19 @@ export interface IngestAboutFeature {
   maxImagesPerRequest: number;
   maxPagesPerCard: number;
   inbox: boolean;
+  worker?: boolean;
 }
 export interface IngestInboxInfo {
   enabled?: boolean;
   folder?: string | null;
+  waiting?: number;
+  waitingReason?: InboxWaitingReason | null;
+  rejections?: IngestInboxRejection[];
+}
+export interface IngestInboxRejection {
+  name: string;
+  reason?: IngestRejectReason | null;
+  at?: string | null;
 }
 export interface IngestLimits {
   maxUploadBytes: number;
@@ -246,6 +308,7 @@ export interface IngestLimits {
   maxImagesPerRequest: number;
   maxPagesPerCard: number;
   maxPixels: number;
+  maxJpegPixels: number;
 }
 export interface IngestRejected {
   index: number;
@@ -271,6 +334,16 @@ export interface LocalReadiness {
   fast?: string[];
   notPrivate?: string[];
 }
+export interface MergeRequest {
+  intoJobId: string;
+}
+export interface OCRLine {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 export interface PageMeta {
   index: number;
   width: number;
@@ -290,6 +363,7 @@ export interface PageMeta {
 export interface PageOCR {
   text?: string;
   confidence?: number;
+  lines?: OCRLine[];
 }
 export interface PageOut {
   index: number;
@@ -305,10 +379,16 @@ export interface PageOut {
   viewUrl: string;
   thumbUrl: string;
 }
+export interface ParseLinesRequest {
+  refs: string[];
+}
 export interface ReaderInfo {
   name: string;
   local: boolean;
   viaOcr?: boolean;
+}
+export interface RebuildRequest {
+  transcription: string;
 }
 export interface RecipeIngestionBatchJob {
   id: string;
@@ -357,6 +437,9 @@ export interface RecipeIngestionJobOut {
   localOnly?: boolean;
   canDiscard?: boolean;
   createdAt?: string | null;
+  committedAt?: string | null;
+  autoRetryAt?: string | null;
+  expiresAt?: string | null;
   draftVersion: number;
   pages?: PageOut[];
   transcription?: string | null;
@@ -366,7 +449,10 @@ export interface RecipeIngestionJobOut {
   proposals?: CardProposal[];
   permissions?: RecipeIngestionJobPermissions;
   duplicateOf?: RecipeIngestionRecipeRef | null;
+  duplicateJob?: RecipeIngestionJobRef | null;
+  duplicateName?: string | null;
   householdRecipesPublic?: boolean;
+  cardPhotoDefault?: boolean;
 }
 export interface RecipeIngestionJobTask {
   kind: IngestTaskKind;
@@ -374,15 +460,14 @@ export interface RecipeIngestionJobTask {
   progressKey?: string | null;
   cancelRequested?: boolean;
 }
-export interface RecipeIngestionRecipeRef {
-  id: string;
-  slug?: string | null;
-  name?: string | null;
-}
 export interface RecipeIngestionJobPermissions {
   canCreateFoods?: boolean;
+  canCreateOrganizers?: boolean;
   canDiscard?: boolean;
   canExportEval?: boolean;
+  canReadWithCloud?: boolean;
+  canUncommit?: boolean;
+  canMerge?: boolean;
 }
 export interface RecipeIngestionJobState {
   draftVersion: number;
@@ -409,6 +494,9 @@ export interface RecipeIngestionJobSummary {
   localOnly?: boolean;
   canDiscard?: boolean;
   createdAt?: string | null;
+  committedAt?: string | null;
+  autoRetryAt?: string | null;
+  expiresAt?: string | null;
 }
 export interface RecipeIngestionSettingsOut {
   enabled?: boolean;
@@ -416,6 +504,9 @@ export interface RecipeIngestionSettingsOut {
   crossRead?: boolean;
   canReadCards?: boolean;
   limitReached?: boolean;
+  limitedFeatures?: IngestLimitedFeature[];
+  baseUrlSet?: boolean;
+  readerRunning?: boolean;
   ocrAvailable?: boolean;
   reader?: ReaderInfo | null;
   localOnlyAvailable?: boolean;
@@ -427,6 +518,14 @@ export interface RecipeIngestionSettingsUpdate {
   localOnly?: boolean;
   crossRead?: boolean;
 }
+export interface RegionHintOut {
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  source: RegionHintSource;
+}
 export interface RereadRequest {
   page: number;
   x: number;
@@ -437,6 +536,9 @@ export interface RereadRequest {
 }
 export interface RotateRequest {
   degrees: 90 | 180 | 270;
+}
+export interface UncommitRequest {
+  force?: boolean;
 }
 export interface UnresolvedFlagsDetail {
   code?: "unresolved_flags";

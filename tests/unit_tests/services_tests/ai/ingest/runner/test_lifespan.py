@@ -5,8 +5,13 @@ logged once without stopping the loop, and shutdown through the lifespan.
 """
 
 import asyncio
+import json
 import logging
+import os
+import subprocess
+import sys
 import threading
+import time
 from uuid import UUID, uuid4
 
 import pytest
@@ -14,6 +19,7 @@ from ingest_runner_testing import FakeHandlers, Jobs, PhaseCalls, blocking, run,
 
 import mealie.app as mealie_app
 from mealie.app import app
+from mealie.core.config import get_app_settings
 from mealie.db import init_db
 from mealie.repos.repository_recipe_ingest import IngestQueue
 from mealie.schema.recipe_ingest import IngestStatus, IngestTaskState
@@ -251,3 +257,103 @@ def test_one_dispatcher_runs_per_lifespan(
 
     assert run(scenario()) == []
     assert len(lock_checks) == 1
+
+
+# ==========================================
+# Telling whether a card reader runs
+
+
+def test_a_process_whose_worker_is_off_warns_that_it_reads_no_cards(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setattr(get_app_settings(), "TESTING", False)  # under TESTING the worker is off by default, quietly
+    monkeypatch.setattr(get_ingest_settings(), "WORKER", False)
+    instance = IngestDispatcher(concurrency=1)
+
+    async def scenario() -> None:
+        async with instance.lifespan(app):
+            assert not instance.running
+
+    with caplog.at_level(logging.WARNING):
+        run(scenario())
+    warnings = [record for record in caplog.records if "reads no cards" in record.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "run the worker in another process" in warnings[0].getMessage()
+
+    caplog.clear()
+    monkeypatch.setattr(get_ingest_settings(), "ENABLED", False)  # ingestion off: nothing to warn about
+    run(scenario())
+    assert not any("reads no cards" in record.getMessage() for record in caplog.records)
+
+
+def test_a_running_dispatcher_marks_itself_seen_at_most_once_an_interval(
+    jobs: Jobs, handlers: FakeHandlers, monkeypatch: pytest.MonkeyPatch
+):
+    storage.dispatcher_seen_path().unlink(missing_ok=True)
+    assert storage.dispatcher_seen_at() is None
+    instance = IngestDispatcher(concurrency=1)
+
+    before = time.time()
+    run(instance.run_once())
+    seen = storage.dispatcher_seen_at()
+    assert seen is not None and before - 1 <= seen <= time.time() + 1
+
+    old = time.time() - 30
+    os.utime(storage.dispatcher_seen_path(), (old, old))
+    run(instance.run_once())  # within the interval: not written again
+    assert storage.dispatcher_seen_at() == pytest.approx(old)
+
+    monkeypatch.setattr(limits, "DISPATCHER_SEEN_INTERVAL", 0)
+    instance = IngestDispatcher(concurrency=1)
+    run(instance.run_once())
+    seen = storage.dispatcher_seen_at()
+    assert seen is not None and seen > old + 20
+
+
+def test_a_paused_dispatcher_still_marks_itself_seen(jobs: Jobs, handlers: FakeHandlers):
+    storage.dispatcher_seen_path().unlink(missing_ok=True)
+    storage.pause_marker_path().write_text(f"{time.time():.3f}")
+    job_id = jobs.create()
+
+    run(IngestDispatcher(concurrency=1).run_once())
+    assert storage.dispatcher_seen_at() is not None
+    assert handlers.calls == [] and jobs.row(job_id)["task_state"] == IngestTaskState.queued
+
+
+def test_the_dispatcher_clears_a_crashed_restores_marker_when_it_starts(
+    dispatcher: IngestDispatcher, lock_checks: list[int], caplog: pytest.LogCaptureFixture
+):
+    """A container stopped mid-restore left its marker: the restarted process carries on at once"""
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(30)
+    marker = storage.pause_marker_path()
+    marker.write_text(
+        json.dumps(
+            {
+                "time": time.time(),
+                "pid": gone.pid,
+                "host": storage._host_identity(),
+                "started": None,
+                "lock": str(storage.restore_lock_path()),  # nobody holds it now
+            }
+        )
+    )
+    cleared: list[bool] = []
+    clear_stale_pause = storage.clear_stale_pause
+
+    def recorded() -> bool:
+        cleared.append(clear_stale_pause())
+        return cleared[-1]
+
+    async def scenario() -> bool:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(storage, "clear_stale_pause", recorded)
+            await dispatcher.start()
+        exists = marker.exists()
+        await dispatcher.stop()
+        return exists
+
+    with caplog.at_level(logging.INFO):
+        assert run(scenario()) is False
+    assert cleared == [True]
+    assert any("no longer running" in record.getMessage() for record in caplog.records)

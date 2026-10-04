@@ -1,6 +1,8 @@
 """
 Retention (docs/ai/PHASE2.md §16): the daily purge of committed and failed cards' files, empty batches and orphan
-job directories. Ready and committing jobs, eval cases and `recipes/` are never touched.
+job directories. Ready and committing jobs, eval cases and `recipes/` are never touched. Empty batches go a day after
+their last upload (`EMPTY_BATCH_AGE`), sealed or not: an upload whose only card was refused as a duplicate, or one the
+app abandoned, leaves a batch nobody seals.
 
 `purge_once` is idempotent, so every worker process running it once a day is harmless. Each job's file work runs inside
 the ingest write lock (§3.9), and every row change is conditional on the state that made it purgeable, so a job retried
@@ -109,7 +111,11 @@ def _purge_failed(session: Session, cutoff: datetime) -> int:
 
 
 def _purge_empty_batches(session: Session, cutoff: datetime) -> int:
-    """Batches with no cards left whose last upload is past retention"""
+    """
+    Batches with no cards whose last upload (or creation, if none came) is before `cutoff`, sealed or not. An upload
+    into one meanwhile touches it first (§1.4), so the `WHERE` no longer matches it; one that comes after the delete
+    gets "batch not found", and the app starts another batch.
+    """
     no_jobs = ~sa.exists().where(Job.batch_id == Batch.id)
     delete = sa.delete(Batch).where(sa.func.coalesce(Batch.last_upload_at, Batch.created_at) < cutoff, no_jobs)
     return _execute(session, delete)
@@ -180,7 +186,7 @@ def purge_once(now: datetime) -> None:
         try:
             committed = _purge_committed(session, cutoff)
             failed = _purge_failed(session, cutoff)
-            batches = _purge_empty_batches(session, cutoff)
+            batches = _purge_empty_batches(session, now - timedelta(seconds=limits.EMPTY_BATCH_AGE))
             orphans = _purge_orphan_dirs(session, now)
         except IngestPaused:
             logger.info("The recipe card purge stopped: a backup restore is pausing ingestion")

@@ -1,12 +1,13 @@
 """
 Upgrades and downgrades cc5357be7e71 (recipe card ingestion's tables, `ai_providers.runs_locally` and
-`ai_usage_log.job_id`) on a scratch database of the engine the suite runs on: a SQLite file, or a PostgreSQL database
-created for the test.
+`ai_usage_log.job_id`) and 0c2bef734816 (notification delivery, automatic retry and `recipe_created` columns) on a
+scratch database of the engine the suite runs on: a SQLite file, or a PostgreSQL database created for the test.
 """
 
 import os
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -23,6 +24,7 @@ from mealie.db.models._model_utils.guid import GUID
 
 REVISION = "cc5357be7e71"
 DOWN_REVISION = "970cf50b85f4"
+DELIVERY_REVISION = "0c2bef734816"
 TABLES = {
     "recipe_ingestion_batches",
     "recipe_ingestion_jobs",
@@ -124,8 +126,15 @@ def _seed(url: str) -> None:
         )
 
 
-def _insert_job(conn: sa.Connection) -> None:
-    batch_id, job_id = uuid4(), uuid4()
+def _insert_job(
+    conn: sa.Connection,
+    *,
+    status: str = "processing",
+    committed_at: datetime | None = None,
+    job_id: UUID | None = None,
+    with_settings: bool = True,
+) -> None:
+    batch_id, job_id = uuid4(), job_id or uuid4()
     values = {
         "batch": _guid(conn, batch_id),
         "job": _guid(conn, job_id),
@@ -144,12 +153,20 @@ def _insert_job(conn: sa.Connection) -> None:
         sa.text(
             "INSERT INTO recipe_ingestion_jobs (id, group_id, household_id, batch_id, position, source, local_only, "
             "status, draft_version, extracted_version, row_version, error_count, warning_count, task_priority, "
-            "attempts, rate_limit_retries, cancel_requested, pages, source_sha256, draft) "
-            "VALUES (:job, :group, :household, :batch, 0, 'app', :false, 'processing', 0, 0, 0, 0, 0, 10, 0, 0, "
-            ":false, '[]', :sha, :draft)"
+            "attempts, rate_limit_retries, cancel_requested, pages, source_sha256, draft, committed_at) "
+            "VALUES (:job, :group, :household, :batch, 0, 'app', :false, :status, 0, 0, 0, 0, 0, 10, 0, 0, "
+            ":false, '[]', :sha, :draft, :committed_at)"
         ),
-        {**values, "sha": "a" * 64, "draft": '{"name": "Banana Mug Cake"}'},
+        {
+            **values,
+            "status": status,
+            "committed_at": committed_at,
+            "sha": "a" * 64,
+            "draft": '{"name": "Banana Mug Cake"}',
+        },
     )
+    if not with_settings:
+        return
     conn.execute(
         sa.text(
             "INSERT INTO recipe_ingestion_settings (id, group_id, local_only, cross_read) "
@@ -251,3 +268,81 @@ def test_downgrade_removes_them_and_keeps_everything_else(db_url: str):
     with _connect(db_url) as conn:
         assert TABLES <= set(sa.inspect(conn).get_table_names())
         assert conn.execute(sa.text("SELECT count(*) FROM recipe_ingestion_jobs")).scalar_one() == 0
+
+
+# ==================================================================================================================
+# 0c2bef734816: notification delivery, automatic retry and recipe_created
+
+
+COMMITTED_ID, READY_ID = uuid4(), uuid4()
+COMMITTED_AT = datetime(2026, 10, 3, 18, 30, tzinfo=UTC).replace(tzinfo=None)  # stored naive, in UTC
+
+
+def _job_columns(conn: sa.Connection, job_id: UUID) -> dict[str, Any]:
+    row = conn.execute(
+        sa.text(
+            "SELECT status, auto_retry_at, recipe_event_claimed_at, recipe_event_sent_at FROM recipe_ingestion_jobs "
+            "WHERE id = :id"
+        ),
+        {"id": _guid(conn, job_id)},
+    ).mappings()
+    return dict(row.one())
+
+
+def test_delivery_columns_upgrade_backfills_and_downgrades(db_url: str):
+    cfg = _alembic_cfg()
+    command.upgrade(cfg, REVISION)
+    with _connect(db_url) as conn:
+        _insert_job(conn, status="committed", committed_at=COMMITTED_AT, job_id=COMMITTED_ID)
+        _insert_job(conn, status="ready", job_id=READY_ID, with_settings=False)
+
+    command.upgrade(cfg, DELIVERY_REVISION)
+
+    with _connect(db_url) as conn:
+        inspector = sa.inspect(conn)
+        batch_columns = {column["name"]: column for column in inspector.get_columns("recipe_ingestion_batches")}
+        assert {"notify_claimed_at", "notify_attempts", "notify_delivered"} <= set(batch_columns)
+        assert not batch_columns["notify_attempts"]["nullable"]
+        job_columns = {column["name"] for column in inspector.get_columns("recipe_ingestion_jobs")}
+        assert {"auto_retry_at", "recipe_event_claimed_at", "recipe_event_sent_at"} <= job_columns
+        job_indexes = {index["name"]: index["column_names"] for index in inspector.get_indexes("recipe_ingestion_jobs")}
+        assert job_indexes["ix_recipe_ingestion_jobs_status_auto_retry"] == ["status", "auto_retry_at"]
+        assert job_indexes["ix_recipe_ingestion_jobs_status_event_sent"] == ["status", "recipe_event_sent_at"]
+
+        # existing batches start with no attempts; cards committed before the upgrade don't send recipe_created again
+        assert conn.execute(sa.text("SELECT notify_attempts FROM recipe_ingestion_batches")).scalars().all() == [0, 0]
+        committed = _job_columns(conn, COMMITTED_ID)
+        assert committed["recipe_event_sent_at"] is not None
+        assert str(committed["recipe_event_sent_at"]).startswith("2026-10-03 18:30")
+        ready = _job_columns(conn, READY_ID)
+        assert ready["recipe_event_sent_at"] is None
+        assert ready["auto_retry_at"] is None and ready["recipe_event_claimed_at"] is None
+
+        # a batch inserted without the new columns gets the default
+        conn.execute(
+            sa.text(
+                "INSERT INTO recipe_ingestion_batches (id, group_id, household_id, source) "
+                "VALUES (:id, :group, :household, 'inbox')"
+            ),
+            {"id": _guid(conn, uuid4()), "group": _guid(conn, GROUP_ID), "household": _guid(conn, HOUSEHOLD_ID)},
+        )
+        assert conn.execute(sa.text("SELECT max(notify_attempts) FROM recipe_ingestion_batches")).scalar_one() == 0
+
+    command.downgrade(cfg, REVISION)
+
+    with _connect(db_url) as conn:
+        inspector = sa.inspect(conn)
+        assert not {"notify_claimed_at", "notify_attempts", "notify_delivered"} & {
+            column["name"] for column in inspector.get_columns("recipe_ingestion_batches")
+        }
+        assert not {"auto_retry_at", "recipe_event_claimed_at", "recipe_event_sent_at"} & {
+            column["name"] for column in inspector.get_columns("recipe_ingestion_jobs")
+        }
+        assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == REVISION
+        assert conn.execute(sa.text("SELECT count(*) FROM recipe_ingestion_jobs")).scalar_one() == 2
+        assert conn.execute(sa.text("SELECT count(*) FROM recipe_ingestion_batches")).scalar_one() == 3
+
+    # and back again
+    command.upgrade(cfg, DELIVERY_REVISION)
+    with _connect(db_url) as conn:
+        assert _job_columns(conn, COMMITTED_ID)["recipe_event_sent_at"] is not None

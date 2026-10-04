@@ -86,6 +86,8 @@ class NumberMatch:
     parts: tuple[Fraction, ...]
     """Every number it consists of: the value, a mixed number's parts and a range's ends"""
     span: tuple[int, int]
+    end_text: str | None = None
+    """A range's second number as written"""
 
 
 def find_numbers(text: str | None) -> list[NumberMatch]:
@@ -107,6 +109,7 @@ def find_numbers(text: str | None) -> list[NumberMatch]:
                 text=text[match.start() : match.end()].strip(),
                 parts=tuple(parts),
                 span=match.span(),
+                end_text=text[match.start("second") : match.end("second")].strip() if second else None,
             )
         )
     return found
@@ -162,24 +165,48 @@ A token the cross-read compares: `("number", "1/4")`, `("range", "2", "3")`, `("
 """
 
 
-def salient_tokens(text: str | None) -> list[SalientToken]:
+def salient_token_spans(text: str | None) -> list[tuple[SalientToken, tuple[int, int]]]:
     """
-    The tokens of a line that a second reading has to agree on (§4.5): numbers (as rationals; ranges kept whole;
-    temperatures are their numbers), the case-sensitive shorthand units right after a number, and the markers.
+    The tokens of a line that a second reading has to agree on (§4.5), in order, each with where it's written: numbers
+    (as rationals; ranges kept whole; temperatures are their numbers), the case-sensitive shorthand units right after
+    a number, and the markers. A marker stands where a number would, so the unit after it is a unit too: "[blank] c.
+    sugar" says cups, as "2 c. sugar" does, and only the number is missing from it.
+
     A unit is compared by what it means (`shorthand.UNITS`): "C." and "c." are both cups and "t" and "tsp" both
     teaspoons, while "T" and "t" stay apart.
     """
     text = text or ""
-    tokens: list[SalientToken] = []
+    positions: list[tuple[int, SalientToken, tuple[int, int]]] = []
     for number in find_numbers(text):
         if number.end is not None:
-            tokens.append(("range", str(number.value), str(number.end)))
+            token: SalientToken = ("range", str(number.value), str(number.end))
+            positions.append((number.span[0], token, stripped_span(text, number.span)))
         else:
-            tokens.append(("number", str(number.value)))
-        if unit := _UNIT_AFTER_NUMBER_RE.match(text, number.span[1]):
-            tokens.append(("unit", UNITS[unit.group("unit")]))
-    tokens.extend(("marker", marker) for marker in markers_in(text))
+            positions.append((number.span[0], ("number", str(number.value)), stripped_span(text, number.span)))
+    for marker in MARKER_RE.finditer(text):
+        positions.append((marker.start(), ("marker", marker.group(1).lower()), marker.span()))
+
+    tokens: list[tuple[SalientToken, tuple[int, int]]] = []
+    for _, token, span in sorted(positions, key=lambda position: position[0]):
+        tokens.append((token, span))
+        if unit := _UNIT_AFTER_NUMBER_RE.match(text, span[1]):
+            tokens.append((("unit", UNITS[unit.group("unit")]), unit.span("unit")))
     return tokens
+
+
+def salient_tokens(text: str | None) -> list[SalientToken]:
+    """The tokens of `salient_token_spans`, without where they're written"""
+    return [token for token, _ in salient_token_spans(text)]
+
+
+def stripped_span(text: str, span: tuple[int, int]) -> tuple[int, int]:
+    """`span` without the white space at its ends"""
+    start, end = span
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
 
 
 def describe_token(token: SalientToken) -> str:
@@ -194,3 +221,28 @@ def describe_token(token: SalientToken) -> str:
         case (_, value, *_):
             return value
     return ""
+
+
+_FROM_TITLE_WORD = "from"
+
+
+def strip_from_prefix(text: str, title: str = "From") -> str:
+    """
+    An attribution without its own leading "From" (or the title's word, as the note it becomes is titled), with or
+    without a colon: the review page's field is labelled "From" and commit makes it a note titled "From", so "From
+    Grandma Jo" is kept as "Grandma Jo", never shown as "From: From Grandma Jo"
+    """
+    words = sorted({_FROM_TITLE_WORD, title.strip().lower()} - {""}, key=len, reverse=True)
+    leading = re.compile(rf"^(?:{'|'.join(map(re.escape, words))})(?:\s*:\s*|\s+|$)", re.IGNORECASE)
+    return leading.sub("", text.strip(), count=1).strip()
+
+
+def without_list_marker(text: str) -> tuple[str, int]:
+    """
+    A step's text without the list number at its start ("3. Bake 20 minutes" is "Bake 20 minutes"), and how many
+    characters were taken off its start
+    """
+    match = LIST_MARKER_RE.match(text)
+    if not match:
+        return text, 0
+    return text[match.end() :], match.end()

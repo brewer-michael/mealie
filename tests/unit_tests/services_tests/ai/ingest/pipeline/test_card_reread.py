@@ -168,3 +168,40 @@ async def test_unreadable_and_unavailable(
     monkeypatch.setattr(ocr, "is_available", lambda: False)
     with job_session(user) as (_, repos), pytest.raises(OpenAINotEnabledException):
         await reread_region(page, REGION, ProposalTarget(field="name"), "Banana", ai=JobOpenAIService(repos))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "read", "alternatives", "text", "kept"),
+    [
+        # a step's own list number isn't part of it (it would be held against the card as a number)
+        ("steps", "4. Cool on a rack.", ["4) Cool on the rack."], "Cool on a rack.", ["Cool on the rack."]),
+        ("steps", "Bake 20 minutes.", [], "Bake 20 minutes.", []),
+        # the attribution field is labelled "From"
+        ("attribution", "From Grandma Jo", ["From: Grandma Joe"], "Grandma Jo", ["Grandma Joe"]),
+        ("attribution", "Aunt May's", [], "Aunt May's", []),
+        # an ingredient's amount stays
+        ("ingredients", "2. c. sugar", [], "2. c. sugar", []),
+    ],
+)
+async def test_a_reading_is_kept_as_its_field_holds_it(
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    read: str,
+    alternatives: list[str],
+    text: str,
+    kept: list[str],
+):
+    user = unique_user_fn_scoped
+    configure(user, image=create_provider(user, "Vision"), default=create_provider(user, "Text"))
+    answer = {"readable": True, "text": read, "alternatives": alternatives}
+    FakeCardAI(banana_answers(OpenAIRecipeCardRegion=answer)).install(monkeypatch)
+    (page,) = make_pages(tmp_path)
+    target = ProposalTarget(field=field, ref="ref-1" if field in ("steps", "ingredients") else None)
+
+    with job_session(user) as (_, repos):
+        proposal = await reread_region(page, REGION, target, None, ai=JobOpenAIService(repos))
+
+    assert (proposal.text, proposal.alternatives) == (text, kept)

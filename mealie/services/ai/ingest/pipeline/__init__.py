@@ -3,14 +3,19 @@ The recipe card extraction pipeline (docs/ai/PHASE2.md §4, §5): everything bet
 draft, flags and transcription. The worker and the eval (§11) call exactly these functions, so the eval scores the
 production pipeline.
 
-- `orient_page` (step 0): Tesseract turns a sideways page upright, with a margin, and keeps its text.
+- `decide_orientation` (step 0): whether Tesseract would turn a sideways page upright, with a margin, and its text;
+  writes nothing (the runner stages the turn). `orient_page` decides and turns at once, for the eval's copies.
 - `extract_card` (steps 1-6): the card compilers, the optional cross-read on the same `ai`, the build and organizer
   steps, ingredient normalization and linking, and the flags. No database writes.
+- `rebuild_from_transcription`: the build steps, ingredients and flags again from an edited transcription, with no
+  image read.
+- `parse_lines`: chosen ingredient lines parsed by the AI ingredient parser, in any language.
 - `reread_region`: one region of a page read again, as a proposal.
 - `options_for_group`: the options from the group's recipe card settings.
 """
 
 import asyncio
+import re
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -38,31 +43,38 @@ from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.recipe.import_workflow import RecipeImportWorkflow
 from mealie.services.recipe.import_workflow.exceptions import NoRecipeDataError
 from mealie.services.recipe.import_workflow.recipe_conversion import DEFAULT_RECIPE_NAME, DEFAULT_RECIPE_NAME_KEY
+from mealie.services.recipe.import_workflow.workflow import WorkflowResult
 from mealie.services.recipe.organizer_resolver import OrganizerResolver
 
 from ..matching import IngestMatcher
 from ..runner.types import ProgressCallback
-from .cardtext import canonical_markers
+from .cardtext import canonical_markers, strip_from_prefix
 from .compilers import CapturedError
 from .context import PROGRESS_CROSS_READING, PROGRESS_LINKING_INGREDIENTS, CardWorkflowContext
 from .crossread import read_transcript
-from .flags import compute_flags
-from .ingredients import normalize_ingredients
+from .flags import compute_flags, ocr_check_lines
+from .ingredients import IngredientLine, normalize_ingredients, parse_lines
 from .llm_schemas import OpenAIRecipeCardTranscription
 from .models import CardExtraction, CardPage, CardPipelineOptions, CardReadPath
-from .orient import orient_page
+from .orient import OrientDecision, decide_orientation, orient_page, oriented_meta
 from .reread import reread_region
 from .service import JobAIRuntime, end_transaction
-from .steps import card_workflow_steps
+from .steps import card_rebuild_steps, card_workflow_steps
 
 __all__ = [
     "CardExtraction",
     "CardPage",
     "CardPipelineOptions",
     "CardReadPath",
+    "IngredientLine",
+    "OrientDecision",
+    "decide_orientation",
     "extract_card",
     "options_for_group",
     "orient_page",
+    "oriented_meta",
+    "parse_lines",
+    "rebuild_from_transcription",
     "reread_region",
 ]
 
@@ -128,6 +140,30 @@ def _suggestions(repos: AllRepositories, names: OpenAIOrganizers | None) -> Sugg
         end_transaction(repos.session)
 
 
+def _comparable(text: str) -> str:
+    """Text as an attribution is compared: its words, lowercased, without punctuation or a leading "From" """
+    return " ".join(re.findall(r"[^\W_]+", strip_from_prefix(text).lower()))
+
+
+def _description(description: str, attribution: str | None) -> str:
+    """
+    The description without the attribution the build step may have copied into it, despite its rules (the reader
+    keeps "From Grandma Jo" in the transcription): dropped when it says only that, ignoring case, punctuation and a
+    leading "From"; a first or last sentence that says only that is taken off
+    """
+    key = _comparable(attribution or "")
+    if not key or not description.strip():
+        return description
+    if _comparable(description) == key:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", description.strip())
+    if sentences and _comparable(sentences[-1]) == key:
+        sentences.pop()
+    if sentences and _comparable(sentences[0]) == key:
+        sentences.pop(0)
+    return " ".join(sentences)
+
+
 def _draft(
     recipe: Recipe,
     ctx: CardWorkflowContext,
@@ -142,7 +178,7 @@ def _draft(
     tags, categories, tools = organizers
     return CardDraft(
         name=name,
-        description=canonical_markers(recipe.description or ""),
+        description=_description(canonical_markers(recipe.description or ""), ctx.attribution),
         recipe_yield=canonical_markers(recipe.recipe_yield) if recipe.recipe_yield else None,
         recipe_yield_quantity=recipe.recipe_yield_quantity or None,
         recipe_servings=recipe.recipe_servings or None,
@@ -228,11 +264,6 @@ async def extract_card(
             cross_read.cancel()
         raise
 
-    recipe = result.recipe
-    compiled = ctx.compiled_source
-    assert compiled is not None  # the compile step either set it or raised
-    organizers = _suggestions(repos, ctx.organizer_names)
-
     cross_read_lines: list[str] | None = None
     cross_read_failed = False
     if cross_read is not None:
@@ -244,17 +275,9 @@ async def extract_card(
             cross_read_failed = True
             logger.warning(f"The second reading of a card failed ({describe_provider_error(e)}); fewer checks ran")
 
-    await ctx.report_progress(PROGRESS_LINKING_INGREDIENTS)
-    ingredients = await normalize_ingredients(
-        recipe, repos=repos, translator=translator, matcher=IngestMatcher(repos), language=compiled.language
-    )
-
-    draft = _draft(recipe, ctx, translator, ingredients, organizers)
     provider, model = _reader(ai, ctx.read_path)
-    runtime = ai.runtime
     extraction = ExtractionMeta(
         read_path=ctx.read_path,
-        language=compiled.language,
         attribution=ctx.attribution,
         unsure=ctx.unsure,
         cross_read_lines=cross_read_lines,
@@ -262,11 +285,92 @@ async def extract_card(
         ocr_confidence=ctx.ocr_confidence,
         provider=provider,
         model=model,
-        step_outcomes={name: outcome.value for name, outcome in result.outcomes.items()},
         compiler_errors=[
             ExtractionCompilerError(compiler=captured.compiler, error=captured.description) for captured in errors
         ],
-        usage=runtime.usage if isinstance(runtime, JobAIRuntime) else [],
     )
-    flags = compute_flags(draft, extraction, {}, transcription=compiled.content)
-    return CardExtraction(draft=draft, flags=flags, transcription=compiled.content, extraction=extraction)
+    return await _finish(ctx, result, extraction)
+
+
+async def rebuild_from_transcription(
+    pages: list[CardPage],
+    transcription: str,
+    *,
+    ai: OpenAIService,
+    repos: AllRepositories,
+    translator: Translator,
+    options: CardPipelineOptions,
+    previous: ExtractionMeta | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> CardExtraction:
+    """
+    Builds the card's draft again from an edited transcription (the review page's "Rebuild from this text"): only the
+    build and organizer steps on `transcription` (default and fast slots; no image is read), then ingredient
+    normalization and the flags, computed against that transcription. Makes no database writes.
+
+    The card was still read as `previous` says (the job's extraction): its reader, attribution, `unsure` list and
+    second reading are kept; the step outcomes say the draft came from the transcription (`"transcription"` in place
+    of `"compile-source"`). Raises `NoRecipeDataError` when the text holds no recipe, and the provider's error.
+    """
+    ctx = CardWorkflowContext.for_card(
+        pages,
+        ai=ai,
+        repos=repos,
+        translator=translator,
+        options=options,
+        errors=[],
+        on_progress=on_progress,
+    )
+    before = previous or ExtractionMeta()
+    language = before.language
+    ctx.read_path, ctx.attribution, ctx.unsure = before.read_path, before.attribution, list(before.unsure)
+    ctx.ocr_confidence = before.ocr_confidence
+
+    result = await RecipeImportWorkflow(card_rebuild_steps(options, transcription, language)).run(ctx)
+    extraction = before.model_copy(
+        update={"compiler_errors": [], "usage": [], "step_outcomes": {}},
+        deep=True,
+    )
+    return await _finish(ctx, result, extraction)
+
+
+async def _finish(ctx: CardWorkflowContext, result: WorkflowResult, extraction: ExtractionMeta) -> CardExtraction:
+    """
+    What `extract_card` and `rebuild_from_transcription` share once the recipe is built: the organizer suggestions,
+    the ingredient lines (an English card's through the NLP parser, others' through the AI parser on the same `ai`),
+    the draft, and the flags against the transcription (and, for a printed card the image provider read, Tesseract's
+    reading of its numbers)
+    """
+    repos, translator, ai = ctx.repos, ctx.translator, ctx.ai
+    recipe = result.recipe
+    compiled = ctx.compiled_source
+    assert compiled is not None  # the compile step either set it or raised
+    organizers = _suggestions(repos, ctx.organizer_names)
+
+    await ctx.report_progress(PROGRESS_LINKING_INGREDIENTS)
+    matcher = IngestMatcher(repos)
+    ingredients = await normalize_ingredients(
+        recipe, repos=repos, translator=translator, matcher=matcher, language=compiled.language, ai=ai
+    )
+    units = matcher.unit_names()  # loaded by the parse; for `unit_unclear`
+    end_transaction(repos.session)
+
+    draft = _draft(recipe, ctx, translator, ingredients, organizers)
+    runtime = ai.runtime
+    extraction = extraction.model_copy(
+        update={
+            "language": compiled.language,
+            "attribution": ctx.attribution,
+            "step_outcomes": {name: outcome.value for name, outcome in result.outcomes.items()},
+            "usage": runtime.usage if isinstance(runtime, JobAIRuntime) else [],
+        }
+    )
+    ocr_lines = ocr_check_lines([page.meta.ocr for page in ctx.pages], extraction.read_path, compiled.content)
+    flags = compute_flags(draft, extraction, {}, transcription=compiled.content, units=units, ocr_lines=ocr_lines)
+    return CardExtraction(
+        draft=draft,
+        flags=flags,
+        transcription=compiled.content,
+        extraction=extraction,
+        rotations=dict(ctx.rotations),
+    )

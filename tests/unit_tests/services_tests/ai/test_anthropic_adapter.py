@@ -90,7 +90,8 @@ class FakeClaude:
         class MockedClient(anthropic.AsyncAnthropic):
             # The adapter's own client and settings, minus retries and the network
             def __init__(self, **kwargs: Any) -> None:
-                super().__init__(**kwargs, max_retries=0, http_client=httpx2.AsyncClient(transport=transport))
+                kwargs["http_client"] = httpx2.AsyncClient(transport=transport)
+                super().__init__(**kwargs, max_retries=0)
 
         monkeypatch.setattr(anthropic, "AsyncAnthropic", MockedClient)
 

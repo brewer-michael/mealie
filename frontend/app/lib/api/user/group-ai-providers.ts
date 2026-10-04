@@ -51,7 +51,7 @@ export class AIProvidersAPI extends BaseAPI {
   }
 
   async testSavedOne(id: string, overrides?: AIProviderUpdate & { apiKey?: string }) {
-    return await this.requests.post<AIProviderTestResult, typeof overrides>(routes.providersIdTest(id), overrides);
+    return await this.requests.post<AIProviderTestResult>(routes.providersIdTest(id), overrides);
   }
 
   async listModels(payload: AIProviderModelsQuery & { apiKey: string }) {

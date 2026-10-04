@@ -85,8 +85,10 @@ def activity(monkeypatch: pytest.MonkeyPatch) -> Activity:
     handle_extract = tasks.handle_extract
     maybe_notify_batch = events.maybe_notify_batch
 
-    def recording_claims(session: Session, *, owner: str, general_slots: int, reread_slots: int) -> ClaimBatch:
-        batch = claim_tasks(session, owner=owner, general_slots=general_slots, reread_slots=reread_slots)
+    def recording_claims(
+        session: Session, *, owner: str, general_slots: int, reread_slots: int, stop: threading.Event | None = None
+    ) -> ClaimBatch:
+        batch = claim_tasks(session, owner=owner, general_slots=general_slots, reread_slots=reread_slots, stop=stop)
         instance = owner.rsplit(":", 1)[-1]
         with seen.lock:
             seen.claims.extend((instance, claim.job_id, claim.token) for claim in batch.claims)

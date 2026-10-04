@@ -22,13 +22,18 @@ const settings: AIProviderSettingsOut = {
 
 const slotStub = { template: "<div><slot /></div>" };
 
-function mountEditor(routes?: AIProviderRoutes, extraProps: Record<string, unknown> = {}) {
+type EditorProps = InstanceType<typeof GroupAIProviderSettingsEditor>["$props"];
+
+function mountEditor(routes?: AIProviderRoutes, extraProps: Partial<EditorProps> = {}) {
   // Without routes, like the admin's group page, which doesn't bind them
-  const props: Record<string, unknown> = { modelValue: settings, ...extraProps };
-  if (routes) {
-    props.routes = routes;
-    props["onUpdate:routes"] = (value: AIProviderRoutes) => wrapper.setProps({ routes: value });
-  }
+  const props: EditorProps = routes
+    ? {
+        "modelValue": settings,
+        ...extraProps,
+        routes,
+        "onUpdate:routes": (value: AIProviderRoutes | null) => wrapper.setProps({ routes: value ?? undefined }),
+      }
+    : { modelValue: settings, ...extraProps };
 
   const wrapper = mount(GroupAIProviderSettingsEditor, {
     props,

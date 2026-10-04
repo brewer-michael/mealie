@@ -1,6 +1,6 @@
 """Fork: a recipe card's normalized pages (docs/ai/PHASE2.md §2)"""
 
-from pydantic import UUID4, ConfigDict
+from pydantic import UUID4, ConfigDict, Field
 
 from mealie.schema._mealie import MealieModel
 
@@ -10,12 +10,28 @@ PAGE_IMAGE_KINDS = ("page", "view", "thumb")
 """The files of a page: `page.jpg` (long side at most 4096), `view.jpg` (2048) and `thumb.webp` (480)"""
 
 
+class OCRLine(MealieModel):
+    """A line of text Tesseract found on a page, with its box in fractions of the upright page's width and height"""
+
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class PageOCR(MealieModel):
     """What Tesseract read on a page while orienting it"""
 
     text: str = ""
     confidence: float = 0.0
     """Mean word confidence, from 0 to 100"""
+    lines: list[OCRLine] = Field(default_factory=list)
+    """The lines it found, top to bottom (at most 300)"""
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class PageMeta(MealieModel):

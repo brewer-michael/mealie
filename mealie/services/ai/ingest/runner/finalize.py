@@ -11,8 +11,9 @@ between the read and the write makes it read again, so neither is lost.
 - A **first extraction** (the job is `processing`) writes the draft, flags, title, counts, transcription, extraction
   and pages, and makes the job `ready`.
 - A **re-extract** replaces a draft nobody edited (`draft_version = extracted_version`; both become `draft_version + 1`,
-  so an open editor's next save gets 409). On an edited draft it adds the new draft as a whole-card proposal instead,
-  stores the new transcription and extraction, and recomputes the kept draft's flags against them.
+  so an open editor's next save gets 409). On an edited draft it makes the new draft the whole-card proposal instead,
+  replacing an older one still pending (the job keeps one reading, the newest, which accepting a proposal checks it
+  against), stores the new transcription and extraction, and recomputes the kept draft's flags against them.
 - A **re-read** adds its proposal.
 - A **failure** stores its code: a `processing` job becomes `failed`, a `ready` one stays ready with the code as a
   banner (a re-read the reviewer cancelled leaves no banner).
@@ -100,6 +101,11 @@ def _counts(flags: list[CardFlag]) -> dict[str, int]:
 _NO_ERROR: dict[str, Any] = {"error_code": None, "error_params": None}
 
 
+def _is_full_proposal(stored: Any) -> bool:
+    """Whether a stored proposal (as read from the JSON column) is a whole-card one"""
+    return isinstance(stored, dict) and stored.get("kind") == CardProposalKind.full.value
+
+
 def finalize_extract(session: Session, job_id: UUID, token: UUID, result: ExtractResult) -> Finalized:
     """A finished first extraction, retry or re-extract (§3.3)"""
     applied: list[Applied] = []
@@ -148,12 +154,15 @@ def finalize_extract(session: Session, job_id: UUID, token: UUID, result: Extrac
             draft, result.extraction, resolutions, transcription=result.transcription, previous=stored_flags
         )
         proposal = CardProposal(kind=CardProposalKind.full, draft=result.draft)
+        # an older whole-card proposal is a stale reading of the same card: the job's transcription and extraction are
+        # now this one's, so only this one can be accepted with its own flags (a save using the older one gets 409)
+        kept = [p for p in row["proposals"] or [] if not _is_full_proposal(p)]
         applied.append(Applied.proposal)
         return {
             **common,
             **_counts(flags),
             "flags": flags,
-            "proposals": [*(row["proposals"] or []), proposal],
+            "proposals": [*kept, proposal],
         }
 
     write = update_job_json(session, job_id, mutate, where=IngestQueue.fence(token))

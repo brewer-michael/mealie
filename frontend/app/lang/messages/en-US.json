@@ -1383,7 +1383,9 @@
       "recipe-cards-count": "Recipe cards ({count})",
       "scan-recipe-cards": "Scan recipe cards",
       "scan-recipe-cards-subtitle": "Photograph a stack of recipe cards",
-      "scan-a-stack": "Have a stack of cards? Scan them in a batch"
+      "scan-a-stack": "Have a stack of cards? Scan them in a batch",
+      "upload-failed": "{count} card couldn't be uploaded. | {count} cards couldn't be uploaded.",
+      "open-recipe-cards": "Open recipe cards"
     },
     "capture": {
       "title": "Scan recipe cards",
@@ -1422,7 +1424,14 @@
       "rejected": "Not used: {reason}",
       "cards-queued": "No cards queued | {count} card queued | {count} cards queued",
       "cannot-read": "AI isn't set up to read recipe cards. A group manager can set it up in the group settings.",
-      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. They're kept: retry them once the limit resets or a group manager raises it."
+      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. They're kept: retry them once the limit resets or a group manager raises it.",
+      "choose-photos-short": "Choose",
+      "data-saver": "Data saver",
+      "data-saver-hint": "Sends smaller photos, no larger than the server keeps them.",
+      "storage-failed": "Photos can't be kept on this device, so keep this page open until they're uploaded.",
+      "scan-again": "Scan again",
+      "logout-pending": "{count} photo hasn't been uploaded. Log out anyway? | {count} photos haven't been uploaded. Log out anyway?",
+      "local-only-blocked": "Your group keeps cards on this server, but no AI provider on your network can read them. Ask a group manager to add one."
     },
     "queue": {
       "title": "Cards",
@@ -1451,7 +1460,10 @@
       "source-inbox": "From the inbox",
       "local-only": "Local only",
       "batch-summary": "Batch done: {added} added, {left} left to review",
-      "load-failed": "Couldn't load the cards"
+      "load-failed": "Couldn't load the cards",
+      "status-failed": "Failed",
+      "cancel": "Cancel",
+      "batch-unavailable": "That batch isn't available any more."
     },
     "review": {
       "card-of": "Card {number} of {total}",
@@ -1543,7 +1555,28 @@
       "reread-for": "Read it for",
       "reread-send": "Read this area",
       "region-too-small": "Select a larger area",
-      "reread-queued": "Re-read queued"
+      "reread-queued": "Re-read queued",
+      "region-selection": "Selected area",
+      "region-keys": "Arrow keys move the selected area. Shift and arrow keys resize it.",
+      "region-position": "{left}% from the left, {top}% from the top, {width}% wide, {height}% high",
+      "load-failed": "Couldn't load this card.",
+      "try-again": "Try again",
+      "move-up": "Move up",
+      "move-down": "Move down",
+      "drag-to-move": "Drag to move",
+      "stopping": "Stopping…",
+      "read-cancelled": "Reading stopped",
+      "next-batch": "Next batch",
+      "still-reading": "{count} card is still being read | {count} cards are still being read",
+      "save-refused-added": "This card was already added. Your last changes weren't saved.",
+      "save-refused-changed": "This card changed somewhere else. Your last changes weren't saved.",
+      "save-rejected": "Couldn't save your last change. Check what you just typed.",
+      "commit-unsaved": "Your last changes aren't saved yet, so the card wasn't added.",
+      "unsaved-title": "Changes not saved",
+      "unsaved-text": "Your last changes aren't saved. Leave anyway?",
+      "leave": "Leave",
+      "stay": "Stay",
+      "read-again-short": "Read again"
     },
     "flag": {
       "actions": {
@@ -1584,6 +1617,7 @@
       "read_disagreement": {
         "title": "Two readings disagree",
         "explanation": "A second reading of the card says \"{text}\" here.",
+        "explanation-ocr": "Text recognition read \"{read}\" here. Check the number against the card.",
         "action": "Looks right"
       },
       "check_parse": {
@@ -1628,7 +1662,7 @@
       },
       "not_parsed": {
         "title": "Ingredients kept as text",
-        "explanation": "This card isn't in English, so its ingredient lines are kept as written."
+        "explanation": "This card isn't in English, and its ingredient lines couldn't be split into amount, unit and food, so they're kept as written."
       },
       "new_food": {
         "title": "New food",
@@ -1638,6 +1672,17 @@
       "new_unit": {
         "title": "New unit",
         "explanation": "\"{name}\" isn't one of your units yet. It's added when you commit the card."
+      },
+      "linked_fuzzy": {
+        "title": "Check the link",
+        "explanation": "Linked to \"{name}\": check it's the same thing.",
+        "action": "Looks right"
+      },
+      "organizers_skipped": {
+        "title": "No tags suggested",
+        "explanation": "Tags, categories and tools couldn't be suggested for this card. Add them yourself if you want.",
+        "explanation-local_only": "Tags, categories and tools weren't suggested: this card stays on this server, and no AI provider on your network can suggest them.",
+        "explanation-limit_reached": "Tags, categories and tools weren't suggested: the AI provider for suggestions has reached its monthly token limit."
       }
     },
     "error": {
@@ -1667,7 +1712,7 @@
       "authorization_required": "Sign in again to upload recipe cards.",
       "not_found": "This card no longer exists.",
       "invalid_status": "This card has changed since this page loaded. Reload it and try again.",
-      "forbidden": "Only the person who scanned this card, or a household manager, can discard it.",
+      "forbidden": "You don't have permission to do this with this card.",
       "unknown_page": "This card doesn't have that page.",
       "unknown_target": "That line is no longer on the card. Choose another one and read the area again.",
       "invalid_body": "The upload couldn't be read. Try sending the card again.",
@@ -1675,6 +1720,12 @@
       "not_exportable": "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
       "eval_case_exists": "An eval case with this name already exists",
       "eval_case_error": "This card couldn't be saved as an eval case.",
+      "group_local_only": "This group keeps every card on this server, so cards can't be read with a cloud provider.",
+      "too_many_pages": "A card can have at most {max} photos.",
+      "same_card": "A card can't be added to itself.",
+      "purged": "This card's photos and draft were removed after a while, so it can't go back to review.",
+      "recipe_edited": "The recipe was changed after this card was added. Going back to review would delete those changes.",
+      "not_clean": "This card has a highlighted problem to check, so it wasn't added.",
       "unknown": "Something went wrong ({code})."
     },
     "commit-warning": {
@@ -1689,7 +1740,10 @@
       "too_many_pixels": "This photo has too many pixels.",
       "unreadable_image": "This image couldn't be read. It may be damaged or incomplete.",
       "too_many_pages": "Too many photos for one card.",
-      "duplicate": "Already scanned"
+      "duplicate": "Already scanned",
+      "cannot-shrink": "This photo is too large, and this browser can't make it smaller. Take it again or upload it from the phone.",
+      "url_not_allowed": "Images can't be fetched from this address on this server.",
+      "url_fetch_failed": "The image couldn't be downloaded from its address."
     },
     "progress": {
       "queued": "Waiting to be read",
@@ -1710,14 +1764,17 @@
       "local-reader": "Read by {name} on your network",
       "group-local": "Your group keeps recipe cards on this server.",
       "keep-local": "Keep these cards on this server",
-      "keep-local-hint": "Only AI providers on your network read the cards sent from now on.",
+      "keep-local-hint": "Only AI providers on your network read the cards sent from now on. Remembered on this device.",
       "already-sent": "{count} card already sent isn't affected. | {count} cards already sent aren't affected.",
       "local-unavailable": "No AI provider on your network can read cards.",
-      "no-reader": "AI isn't set up to read recipe cards."
+      "no-reader": "AI isn't set up to read recipe cards.",
+      "local-blocked": "Kept on this server, but nothing here can read it",
+      "keep-local-unavailable": "No AI provider on your network can read cards now, so cards sent with this on fail.",
+      "finished-batch": "The cards already sent finish as their own batch; the next photo starts a new one."
     },
     "notifier": {
       "recipe-cards-ready": "Recipe cards ready to review",
-      "recipe-cards-ready-hint": "One notification when a batch of cards has been read, with a link to review them.",
+      "recipe-cards-ready-hint": "One notification when a batch of cards has been read, with a link to review them, and one when photos put in the inbox couldn't be added.",
       "send-test": "Send test notification",
       "test-sent": "Test notification sent",
       "test-failed": "Couldn't send the test notification",

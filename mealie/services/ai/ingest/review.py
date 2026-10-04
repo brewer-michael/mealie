@@ -16,8 +16,10 @@ callers hold.
 
 import asyncio
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -33,7 +35,8 @@ from mealie.core.root_logger import get_logger
 from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.repos.all_repositories import get_repositories
-from mealie.repos.repository_recipe_ingest import IngestRepos, JobConflict
+from mealie.repos.repository_recipe_ingest import IngestRepos, JobConflict, enqueue_task
+from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.recipe.recipe import create_recipe_slug
 from mealie.schema.recipe_ingest import (
     CardDraft,
@@ -69,11 +72,13 @@ from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.ingest import flag_rules, images, limits, storage
 from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
 from mealie.services.ai.ingest.i18n import translator_for
+from mealie.services.ai.ingest.intake import source_sha256
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.pipeline.cardtext import markers_in
 from mealie.services.ai.ingest.pipeline.ingredients import IngredientLine, normalize_lines
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
+from mealie.services.ai.ingest.settings import get_ingest_settings
 
 logger = get_logger(__name__)
 
@@ -97,10 +102,29 @@ COMMIT_INVALID = "commit_invalid"
 """422 with `fields`: the draft no longer validates into a recipe"""
 FORBIDDEN = "forbidden"
 """403: e.g. discarding someone else's card without `can_manage_household`"""
+FILES_MISSING = IngestErrorCode.files_missing.value
+"""409: the card's photos are missing on disk"""
 UNKNOWN_PAGE = "unknown_page"
 """422: a re-read names a page the card doesn't have"""
 UNKNOWN_TARGET = "unknown_target"
 """422: a re-read targets an ingredient or step `ref` the draft doesn't have"""
+GROUP_LOCAL_ONLY = "group_local_only"
+"""409: the group keeps every card on this server, so none can be read with a cloud provider"""
+TOO_MANY_PAGES = "too_many_pages"
+"""409 with `max`: merging would give the card more pages than a card may have"""
+SAME_CARD = "same_card"
+"""422: a card can't be added to itself"""
+PURGED = "purged"
+"""409: the card's photos and draft were removed after the retention period, so it can't go back to review"""
+RECIPE_EDITED = "recipe_edited"
+"""409: the recipe was edited after the card was added; undoing the commit would lose that (send `force`)"""
+NOT_CLEAN = "not_clean"
+"""A bulk commit left the card for review: it has a highlighted problem nobody resolved"""
+PAUSED_FOR_RESTORE = "paused_for_restore"
+"""A bulk commit stopped: a backup restore paused recipe cards"""
+
+UNCOMMIT_GRACE = timedelta(seconds=5)
+"""A recipe updated later than this after its commit was edited (the commit's own cover update is within it)"""
 
 
 class JobActionError(Exception):
@@ -244,15 +268,22 @@ def _adopted_reading_flags(
     proposals: Iterable[CardProposal],
     extraction: ExtractionMeta | None,
     transcription: str | None,
+    *,
+    pages: Sequence[PageMeta] = (),
+    units: Iterable[str] = (),
 ) -> list[CardFlag]:
     """
     The flags of each whole-card proposal (a re-extract of an edited draft) that `draft` took up, computed as the
-    re-extract computed them: against the job's transcription and extraction, which are that reading's. A save that
-    accepts the proposal passes them as `previous`, so the new reading's reading flags are raised on the draft it
-    became (its ingredient and step ids are new, so none of the stored flags matches them). Accepting keeps the
-    proposal's ingredient and step ids; a dismissed one shares none with the draft.
+    re-extract computed them: against the job's transcription, extraction and pages, which are that reading's, and the
+    group's `units` (`IngestMatcher.unit_names`). A save that accepts the proposal passes them as `previous`, so the
+    new reading's reading flags (Tesseract's check of a printed card's numbers, a lost unit that is one of the group's
+    own, included) are raised on the draft it became (its ingredient and step ids are new, so none of the stored flags
+    matches them). Accepting keeps the proposal's ingredient and step ids; a dismissed one shares none with the draft.
     """
     flags: list[CardFlag] = []
+    units = list(units)
+    read_path = extraction.read_path if extraction else None
+    ocr_lines = card_flags.ocr_check_lines([page.ocr for page in pages], read_path, transcription)
     ids = {ingredient.reference_id for ingredient in draft.ingredients} | {step.id for step in draft.steps}
     for proposal in proposals:
         proposed = proposal.draft
@@ -261,7 +292,11 @@ def _adopted_reading_flags(
         proposed_ids = {ingredient.reference_id for ingredient in proposed.ingredients}
         proposed_ids |= {step.id for step in proposed.steps}
         if ids & proposed_ids or (not proposed_ids and proposed == draft):
-            flags.extend(card_flags.compute_flags(proposed, extraction, {}, transcription=transcription))
+            flags.extend(
+                card_flags.compute_flags(
+                    proposed, extraction, {}, transcription=transcription, units=units, ocr_lines=ocr_lines
+                )
+            )
     return flags
 
 
@@ -296,8 +331,9 @@ def _stored_form(draft: CardDraft) -> Any:
 
 def _with_unique_ids(draft: CardDraft) -> CardDraft:
     """
-    Flags are keyed to ingredient `reference_id`s and step ids, so a draft holding a duplicate (a pasted row) gets a
-    fresh id for each repeat
+    Flags are keyed to ingredient `reference_id`s, step ids and note ids, so a draft holding a duplicate (a pasted row)
+    gets a fresh id for each repeat. A note sent without an id already has one (`CardDraft` gives it `note_id_for` its
+    place and text), and keeps it while it's saved unchanged.
     """
     seen: set[UUID] = set()
     ingredients = []
@@ -314,9 +350,16 @@ def _with_unique_ids(draft: CardDraft) -> CardDraft:
         seen.add(step.id)
         steps.append(step)
 
-    if ingredients == draft.ingredients and steps == draft.steps:
+    notes = []
+    for note in draft.notes:
+        if note.id in seen:
+            note = note.model_copy(update={"id": _fresh_id(seen)})
+        seen.add(note.id)
+        notes.append(note)
+
+    if ingredients == draft.ingredients and steps == draft.steps and notes == draft.notes:
         return draft
-    return draft.model_copy(update={"ingredients": ingredients, "steps": steps})
+    return draft.model_copy(update={"ingredients": ingredients, "steps": steps, "notes": notes})
 
 
 def _fresh_id(taken: set[UUID]) -> UUID:
@@ -329,6 +372,26 @@ def _fresh_id(taken: set[UUID]) -> UUID:
 def _title(draft: CardDraft) -> str | None:
     name = draft.name.strip()
     return name[:255] if name else None
+
+
+def recipes_public(household: HouseholdInDB | None) -> bool:
+    """
+    New recipes in the household can be seen without a login, so a card photo on one could be too: upstream's explore
+    routes need both a household that isn't private and recipes that are public by default. A new install has a private
+    household whose recipes are "public", so the card is attached there.
+    """
+    preferences = household.preferences if household else None
+    return bool(preferences and not preferences.private_household and preferences.recipe_public)
+
+
+def attaches_card_photo(draft: CardDraft, household: HouseholdInDB | None) -> bool:
+    """
+    Whether commit attaches the card's photos to the recipe: the draft's switch, else the household's default, which
+    keeps them off recipes that are public when created (assets are served without a login)
+    """
+    if draft.attach_card_photo is not None:
+        return draft.attach_card_photo
+    return not recipes_public(household)
 
 
 # ==========================================
@@ -424,7 +487,21 @@ class ReviewService:
             "local_only": self._local_only(job),
             "can_discard": self.can_discard(job),
             "created_at": job.created_at,
+            "committed_at": job.committed_at,
+            "auto_retry_at": job.auto_retry_at if job.status == IngestStatus.failed.value else None,
+            "expires_at": self._expires_at(job),
         }
+
+    @staticmethod
+    def _expires_at(job: RecipeIngestionJob) -> datetime | None:
+        """
+        When the retention purge removes a failed card (§16): `AI_INGEST_RETENTION_DAYS` after its last change, or
+        after its automatic retry for one waiting for a monthly limit to reset (the purge's own cutoff)
+        """
+        if job.status != IngestStatus.failed.value:
+            return None
+        since = job.auto_retry_at or job.update_at or job.created_at
+        return since + timedelta(days=get_ingest_settings().RETENTION_DAYS) if since else None
 
     def _local_only(self, job: RecipeIngestionJob) -> bool:
         """
@@ -462,9 +539,60 @@ class ReviewService:
     def _permissions(self, job: RecipeIngestionJob) -> RecipeIngestionJobPermissions:
         return RecipeIngestionJobPermissions(
             can_create_foods=bool(self.user.can_organize),
+            can_create_organizers=bool(self.user.can_organize),
             can_discard=self.can_discard(job),
             can_export_eval=bool(self.user.can_manage) and self.exportable(job),
+            can_read_with_cloud=self.can_read_with_cloud(job),
+            can_uncommit=self.can_uncommit(job),
+            can_merge=self.can_merge(job),
         )
+
+    def _uploaded(self, job: RecipeIngestionJob) -> bool:
+        return job.created_by is not None and job.created_by == self.user.id
+
+    def can_read_with_cloud(self, job: RecipeIngestionJob) -> bool:
+        """
+        A card that failed because it had to stay local and nothing local could read it, sent so (its own
+        `local_only`) while its group doesn't keep cards local: its uploader or a household manager may have it read by
+        any of the group's providers
+        """
+        return (self._uploaded(job) or bool(self.user.can_manage_household)) and self._cloud_readable(job)
+
+    def _cloud_readable(self, job: RecipeIngestionJob) -> bool:
+        return (
+            job.status == IngestStatus.failed.value
+            and job.error_code == IngestErrorCode.local_only_unavailable.value
+            and bool(job.local_only)
+            and not self._group_local_only
+        )
+
+    def can_merge(self, job: RecipeIngestionJob) -> bool:
+        """A card being reviewed or failed, with no task, that the user uploaded or manages can become another's back"""
+        return (
+            (self._uploaded(job) or bool(self.user.can_manage_household))
+            and job.status in (IngestStatus.ready.value, IngestStatus.failed.value)
+            and job.task_state is None
+        )
+
+    def can_uncommit(self, job: RecipeIngestionJob) -> bool:
+        """
+        A committed card, its files and draft still kept, can go back to review for its committer or a household
+        manager, who may also delete its recipe as upstream allows (its owner, or an admin), unless it's gone already
+        """
+        if job.status != IngestStatus.committed.value or is_slimmed(job):
+            return False
+        if job.committed_by != self.user.id and not self.user.can_manage_household:
+            return False
+        recipe = self._recipe_row(job.recipe_id)
+        return recipe is None or bool(self.user.admin) or recipe.user_id == self.user.id
+
+    def _recipe_row(self, recipe_id: UUID | None) -> Any:
+        if recipe_id is None:
+            return None
+        stmt = sa.select(RecipeModel.id, RecipeModel.slug, RecipeModel.name, RecipeModel.user_id).where(
+            RecipeModel.id == recipe_id, RecipeModel.group_id == self.group_id
+        )
+        return self.session.execute(stmt).one_or_none()
 
     @staticmethod
     def exportable(job: RecipeIngestionJob) -> bool:
@@ -475,10 +603,13 @@ class ReviewService:
         return job.status in EXPORTABLE_STATUSES and bool(job.draft) and bool(job.pages) and not is_slimmed(job)
 
     def can_discard(self, job: RecipeIngestionJob) -> bool:
-        """§9: the uploader; anyone for inbox cards; otherwise the household's managers"""
-        if job.created_by is not None and job.created_by == self.user.id:
+        """
+        §9: the uploader; any household member for a card from the inbox or sent with an API token (Home Assistant or
+        a Shortcut, often under one shared user); otherwise the household's managers
+        """
+        if self._uploaded(job):
             return True
-        if job.source == IngestSource.inbox.value:
+        if job.source in (IngestSource.inbox.value, IngestSource.api.value):
             return True
         return bool(self.user.can_manage_household)
 
@@ -497,10 +628,10 @@ class ReviewService:
             return None
         return RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name)
 
+    @cached_property
     def _household_recipes_public(self) -> bool:
         repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
-        household = repos.households.get_one(self.household_id)
-        return bool(household and household.preferences and household.preferences.recipe_public)
+        return recipes_public(repos.households.get_one(self.household_id))
 
     def get_job(self, job_id: UUID) -> RecipeIngestionJobOut:
         """The whole job for the review page, with its permissions and the possible duplicate"""
@@ -519,7 +650,8 @@ class ReviewService:
             proposals=_parse_proposals(job.proposals),
             permissions=self._permissions(job),
             duplicate_of=self._duplicate_of(job, draft),
-            household_recipes_public=self._household_recipes_public(),
+            household_recipes_public=self._household_recipes_public,
+            card_photo_default=not self._household_recipes_public,
         )
         return out
 
@@ -568,9 +700,13 @@ class ReviewService:
         """
         draft = self._parse_text_lines(job_id, _with_unique_ids(update.draft), update.draft_version)
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
+        units = self._unit_names() if resolved_proposals else []
 
         def mutate(row: RowMapping) -> dict[str, Any] | None:
-            changed = _stored_form(draft) != row["draft"]
+            # compared as read, so a draft stored by an older schema version (notes without ids) isn't "changed" by
+            # the ids and version reading it gives it; the save writes it in the current form either way
+            stored = _parse_draft(row["draft"])
+            changed = stored is None or _stored_form(draft) != _stored_form(stored)
             if changed and resolved_proposals - {str(p.get("id")) for p in row["proposals"] or []}:
                 # it uses a proposal another device already settled, which kept `draft_version`: that proposal (and
                 # with it a whole-card reading's flags) is gone, so this is a 409 and the client reloads
@@ -589,7 +725,9 @@ class ReviewService:
             extraction = _parse_extraction(row["extraction"])
             transcription = row["transcription"]
             adopted = [p for p in _parse_proposals(row["proposals"]) if str(p.id) in resolved_proposals]
-            previous = [*stored_flags, *_adopted_reading_flags(draft, adopted, extraction, transcription)]
+            pages = parse_pages(row["pages"]) if adopted else []
+            adopted_flags = _adopted_reading_flags(draft, adopted, extraction, transcription, pages=pages, units=units)
+            previous = [*stored_flags, *adopted_flags]
             flags = resolve_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
             errors, warnings = flag_rules.count_unresolved(flags)
             values: dict[str, Any] = {
@@ -626,6 +764,14 @@ class ReviewService:
             error_count=written.values["error_count"],
             warning_count=written.values["warning_count"],
         )
+
+    def _unit_names(self) -> list[str]:
+        """The group's unit names for `unit_unclear` (`IngestMatcher.unit_names`), read before a draft's write"""
+        repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
+        units = IngestMatcher(repos).unit_names()
+        if self.session.in_transaction():
+            self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
+        return units
 
     def _parse_text_lines(self, job_id: UUID, draft: CardDraft, draft_version: int) -> CardDraft:
         """
@@ -668,9 +814,12 @@ class ReviewService:
                     language=language,
                 )
             )
-        except Exception:
-            # the lines are saved as they were written; the parse is a help, never a reason to lose an edit
-            logger.exception(f"Couldn't parse the ingredient lines edited on recipe card job {job_id}")
+        except Exception as e:
+            # the lines are saved as they were written; the parse is a help, never a reason to lose an edit. No
+            # traceback or message: a database error's text holds its parameters, here food names from the card (§10)
+            logger.warning(
+                f"Couldn't parse the ingredient lines edited on recipe card job {job_id} ({type(e).__qualname__})"
+            )
             if self.session.in_transaction():
                 self.session.rollback()
             return draft
@@ -766,6 +915,41 @@ class ReviewService:
             raise self._refuse_enqueue(job_id, IngestStatus.failed)
         return self._queued(job_id)
 
+    def read_with_cloud(self, job_id: UUID) -> RecipeIngestionJobState:
+        """
+        Reads a failed local-only card again, this time with any of the group's providers (`can_read_with_cloud`): one
+        update clears the card's `local_only` and queues the retry, conditional on the card still being in that state.
+        The worker still applies the group's setting when the task starts, so a switch-on meanwhile keeps it local.
+        """
+        job = self.job(job_id)
+        if not (self._uploaded(job) or self.user.can_manage_household):
+            raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+        if self._group_local_only:
+            raise JobActionError(status.HTTP_409_CONFLICT, GROUP_LOCAL_ONLY)
+        if not self._cloud_readable(job):
+            raise invalid_status(job.status)
+
+        where = [
+            Job.status == IngestStatus.failed.value,
+            Job.error_code == IngestErrorCode.local_only_unavailable.value,
+            Job.local_only.is_(True),
+        ]
+        values = {
+            "status": IngestStatus.processing.value,
+            "error_code": None,
+            "error_params": None,
+            "local_only": False,
+        }
+        queued = self.repos.jobs.enqueue_task(
+            job_id, IngestTaskKind.extract, None, limits.PRIORITY_EXTRACT, where=where, values=values
+        )
+        if not queued:
+            current = self.job(job_id)
+            if current.task_state is not None and current.status == IngestStatus.failed.value:
+                raise busy()
+            raise invalid_status(current.status)
+        return self._queued(job_id)
+
     def cancel(self, job_id: UUID) -> RecipeIngestionJobState:
         """
         §3.5: a queued task is cleared (a `processing` job fails with `cancelled`, a `ready` one stays ready); a
@@ -843,6 +1027,116 @@ class ReviewService:
             current = self.job(job_id)
             raise invalid_status(current.status)
         storage.remove_job_dir(self.group_id, job_id)
+
+    def merge(self, job_id: UUID, into_job_id: UUID) -> RecipeIngestionJobState:
+        """
+        Adds a card's photos to another card of the household as its next pages (a back sent as a card of its own),
+        deletes the card, and reads the other one again: an unedited draft is replaced, an edited one gets a proposal.
+        Both must be ready or failed with no task, the user must have uploaded both or manage the household, and the
+        pages must fit in one card. The files move first, then one transaction writes the target and deletes the
+        source, fenced on both rows' `row_version`; when that matches nothing the files move back. The caller holds
+        the ingest write lock.
+        """
+        if job_id == into_job_id:
+            raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, SAME_CARD)
+        source, target = self.job(job_id), self.job(into_job_id)
+        movable = (IngestStatus.ready.value, IngestStatus.failed.value)
+        for job in (source, target):
+            if not (self._uploaded(job) or self.user.can_manage_household):
+                raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+        for job in (source, target):
+            if job.status not in movable:
+                raise invalid_status(job.status)
+            if job.task_state is not None:
+                raise busy()
+        source_pages, target_pages = parse_pages(source.pages), parse_pages(target.pages)
+        if len(source_pages) + len(target_pages) > limits.MAX_PAGES_PER_CARD:
+            raise JobActionError(status.HTTP_409_CONFLICT, TOO_MANY_PAGES, max=limits.MAX_PAGES_PER_CARD)
+
+        first = max((page.index for page in target_pages), default=-1) + 1
+        moves = [
+            (
+                storage.page_dir(self.group_id, job_id, page.index),
+                storage.page_dir(self.group_id, into_job_id, first + offset),
+                page.model_copy(update={"index": first + offset}),
+            )
+            for offset, page in enumerate(source_pages)
+        ]
+        if not all(origin.is_dir() for origin, _, _ in moves) or any(dest.exists() for _, dest, _ in moves):
+            raise JobActionError(status.HTTP_409_CONFLICT, FILES_MISSING)
+
+        done: list[tuple[Path, Path]] = []
+        try:
+            for origin, dest, _ in moves:
+                os.rename(origin, dest)
+                done.append((origin, dest))
+            merged = [*target_pages, *(page for _, _, page in moves)]
+            written = self._write_merge(source, target, merged)
+        except BaseException:
+            self._move_back(done)
+            raise
+        if not written:
+            self._move_back(done)
+            current = self.repos.jobs.get(into_job_id), self.repos.jobs.get(job_id)
+            if any(job is not None and job.task_state is not None for job in current):
+                raise busy()
+            raise invalid_status(next((job.status for job in current if job is not None), IngestStatus.ready.value))
+
+        storage.remove_job_dir(self.group_id, job_id)
+        return self._queued(into_job_id)
+
+    def _write_merge(self, source: RecipeIngestionJob, target: RecipeIngestionJob, pages: list[PageMeta]) -> bool:
+        """
+        One transaction: the target gets the pages and an extract task (a failed one goes back to `processing`), and
+        the source is deleted, each only if its `row_version`, status and idle task are as read. Whether both happened.
+        """
+        movable = [IngestStatus.ready.value, IngestStatus.failed.value]
+        failed = target.status == IngestStatus.failed.value
+        values: dict[str, Any] = {
+            "pages": [page.model_dump(mode="json") for page in pages],
+            "source_sha256": source_sha256(pages),
+        }
+        if failed:
+            values |= {"status": IngestStatus.processing.value, "error_code": None, "error_params": None}
+        where = [Job.row_version == target.row_version, Job.status == target.status]
+        try:
+            queued = enqueue_task(
+                self.session,
+                target.id,
+                self.household_id,
+                IngestTaskKind.extract,
+                None,
+                limits.PRIORITY_EXTRACT,
+                where=where,
+                values=values,
+                commit=False,
+            )
+            deleted = queued and self.session.execute(
+                sa.delete(Job).where(
+                    Job.id == source.id,
+                    *self.repos.jobs.scope,
+                    Job.row_version == source.row_version,
+                    Job.status.in_(movable),
+                    Job.task_state.is_(None),
+                ),
+                execution_options={"synchronize_session": False},
+            )
+            if not queued or getattr(deleted, "rowcount", 0) != 1:
+                self.session.rollback()
+                return False
+        except BaseException:
+            self.session.rollback()
+            raise
+        self.session.commit()
+        return True
+
+    @staticmethod
+    def _move_back(done: Sequence[tuple[Path, Path]]) -> None:
+        for origin, dest in reversed(done):
+            try:
+                os.rename(dest, origin)
+            except OSError:
+                logger.error("Couldn't move a merged card's page back; the card may be missing a page")
 
     def page_image(self, job_id: UUID, index: int, kind: str) -> PageImage:
         """One of a page's images, after the household check (§9)"""

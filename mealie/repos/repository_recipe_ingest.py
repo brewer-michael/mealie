@@ -37,7 +37,8 @@ repository factory stays untouched.
   - `.notifier_options`: `get`, `set` (for the household's notifiers), `enabled_notifier_ids`;
   - `processing_jobs_in_group()`, for the per-group quota.
 - `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids`, `claim`, `holds`, `heartbeat`,
-  `set_progress`, `expired`, `requeue_expired`, `release`, `cancel_requeued`, `update_job_json`.
+  `set_progress`, `expired`, `requeue_expired`, `release`, `release_owned` (every running task of one dispatcher),
+  `requeue_all_running` (after a backup restore), `cancel_requeued`, `update_job_json`.
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -53,6 +54,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mealie.db.models.household.events import GroupEventNotifierModel
+from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.db.models.recipe_ingest import (
     AIEventNotifierOptions,
     RecipeIngestionBatch,
@@ -375,10 +377,18 @@ class IngestJobsRepo:
         return _counts(self.session, [*self.scope, *([Job.batch_id == batch_id] if batch_id else [])])
 
     def find_duplicate(self, source_sha256: str) -> UUID | None:
-        """The household's oldest job holding the same card (committed ones included)"""
+        """
+        The household's oldest job holding the same card. A committed one counts only while its recipe exists: once
+        the recipe is deleted (nothing links the two, so the job stays), the card can be scanned again.
+        """
+        recipe_exists = sa.exists().where(RecipeModel.id == Job.recipe_id)
         stmt = (
             sa.select(Job.id)
-            .where(*self.scope, Job.source_sha256 == source_sha256)
+            .where(
+                *self.scope,
+                Job.source_sha256 == source_sha256,
+                sa.or_(Job.status != IngestStatus.committed.value, recipe_exists),
+            )
             .order_by(Job.created_at, Job.id)
             .limit(1)
         )
@@ -889,6 +899,51 @@ class IngestQueue:
         released = _execute_update(self.session, stmt) == 1
         _end_transaction(self.session)
         return released
+
+    def release_owned(self, owner: str) -> int:
+        """
+        Gives back every running task claimed by `owner` (a dispatcher's `host:pid:instance`), as `release` does each:
+        shutdown's last step, which also covers a claim that landed after shutdown stopped waiting for it. How many.
+        """
+        stmt = (
+            sa.update(Job)
+            .where(Job.lease_owner == owner[:64], Job.task_state == IngestTaskState.running.value)
+            .values(
+                task_state=IngestTaskState.queued.value,
+                lease_token=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                progress_key=None,
+                not_before=None,
+                attempts=sa.case((Job.attempts > 0, Job.attempts - 1), else_=0),
+            )
+        )
+        released = _execute_update(self.session, stmt)
+        _end_transaction(self.session)
+        return released
+
+    def requeue_all_running(self) -> int:
+        """
+        After a backup restore (§3.9): every running task back in the queue with no lease, its attempt given back. A
+        restored row can carry the live token of a task that was running when the backup was taken; cleared, that
+        task's result is refused by the fence rather than written to the restored row. How many.
+        """
+        stmt = (
+            sa.update(Job)
+            .where(Job.task_state == IngestTaskState.running.value)
+            .values(
+                task_state=IngestTaskState.queued.value,
+                lease_token=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                task_started_at=None,
+                progress_key=None,
+                attempts=sa.case((Job.attempts > 0, Job.attempts - 1), else_=0),
+            )
+        )
+        requeued = _execute_update(self.session, stmt)
+        _end_transaction(self.session)
+        return requeued
 
     def cancel_requeued(self) -> list[UUID]:
         """

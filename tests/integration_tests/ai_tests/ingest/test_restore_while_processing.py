@@ -8,8 +8,11 @@ The restore writes its marker and waits for the intake. Meanwhile new cards are 
 nothing, and a task whose card was read waits to store it. Then the restore replaces the database and the files with
 no dispatcher query in between, and removes its marker. The dispatcher carries on with nothing logged as an error and
 no traceback: the tasks it was running are dropped (their rows came back without a lease), the restored rows are read
-again from the queue, and a row the backup held as running is swept back into the queue, its lease being long expired.
-The files match the restored rows: the backup's job directories, and none for the card the restore wiped.
+again from the queue, and a row the backup held as running is queued again by the restore itself, its attempt given
+back. The files match the restored rows: the backup's job directories, and none for the card the restore wiped.
+
+A backup taken while a task ran holds that task's live lease token: the restore queues every running row again, so
+that task's result is refused by the fence rather than written to the restored row.
 
 A second run has one provider answer land just after the restore dropped the tables (a read takes about 25 s, so in
 production one often does): the task still waits for the restore and its result is still dropped, and its usage-log
@@ -43,6 +46,7 @@ from mealie.services import ocr
 from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import commit, events, inbox, limits, retention, storage
 from mealie.services.ai.ingest.intake import IntakeAccepted, IntakeCard, IntakeOptions, IntakePage, IntakeService
+from mealie.services.ai.ingest.runner import finalize
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from mealie.services.ai.policy import current_policy
 from mealie.services.backups_v2.alchemy_exporter import AlchemyExporter
@@ -56,6 +60,7 @@ from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import (
     configure,
     create_provider,
 )
+from tests.unit_tests.services_tests.ai.ingest.runner.ingest_runner_testing import extract_result
 from tests.utils.fixture_schemas import TestUser
 
 Job = RecipeIngestionJob
@@ -457,7 +462,8 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
                 lambda: _logged(caplog, f"Recipe card job {j2}: {second}"), "the second card's old task to end"
             )
 
-            # every restored card is read again, once; the fourth once its expired lease is swept back into the queue
+            # every restored card is read again, once; the fourth too, which the restore queued again with its attempt
+            # given back (the backup held it running)
             visible.add(j4)
             gates.release(j2)
             await _wait_for(
@@ -513,8 +519,9 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
     assert restore_steps["files"] == seeded
     assert _files(root) == seeded
 
-    # each card read again exactly once after the restore: one claim each from the queue (the fourth's second)
-    for job, claims in ((j1, 1), (j2, 1), (j3, 1), (j4, 2)):
+    # each card read again exactly once after the restore: one claim each from the queue (the fourth's earlier claim,
+    # which the backup held, given back by the restore)
+    for job, claims in ((j1, 1), (j2, 1), (j3, 1), (j4, 1)):
         row = _row(job)
         assert row is not None
         assert (row["status"], row["task_state"], row["lease_token"], row["attempts"], row["error_code"]) == (
@@ -539,3 +546,123 @@ def test_a_restore_while_cards_are_read_waits_completes_and_the_dispatcher_carri
         or '\n  File "' in record.getMessage()
     ]
     assert problems == []
+
+
+# ==========================================
+# A backup holding a live lease
+
+
+def test_a_restore_queues_the_tasks_its_backup_held_running(unique_user_fn_scoped: TestUser):
+    """
+    A backup taken while a task ran holds that task's live lease token. The restore queues every running row again
+    with no lease, so the task's result is refused by the restored row's fence instead of landing on it.
+    """
+    user = unique_user_fn_scoped
+    job_id = _intake(user, 1).job_id
+    token = uuid4()
+    with session_context() as session:
+        assert IngestQueue(session).claim(job_id, token=token, owner="worker:1:live", now=utcnow())
+        session.execute(sa.update(Job).where(Job.id == job_id).values(progress_key="recipe-ingest.progress.x"))
+        session.commit()
+
+    user.repos.session.commit()  # no transaction of the test's left open: on PostgreSQL it would hold the DROP
+    backup_v2 = BackupV2(get_app_settings().DB_URL)
+    backup_path = backup_v2.backup()
+    try:
+        backup_v2.restore(backup_path)
+    finally:
+        backup_v2.db_exporter.engine.dispose()
+        backup_path.unlink(missing_ok=True)
+
+    row = _row(job_id)
+    assert row is not None
+    assert (row["status"], row["task_state"], row["lease_token"], row["lease_owner"], row["lease_expires_at"]) == (
+        IngestStatus.processing,
+        IngestTaskState.queued,
+        None,
+        None,
+        None,
+    )
+    assert (row["task_started_at"], row["progress_key"], row["attempts"]) == (None, None, 0)
+
+    with session_context() as session:
+        assert finalize.finalize_extract(session, job_id, token, extract_result()) == finalize.DROPPED
+    row = _row(job_id)
+    assert row is not None
+    assert (row["status"], row["task_state"], row["draft"]) == (IngestStatus.processing, IngestTaskState.queued, None)
+
+
+def test_a_task_in_flight_when_its_backup_was_taken_doesnt_write_to_the_restored_row(
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    visible: set[UUID],
+):
+    """
+    The dispatcher's task holds the same token as the restored row (the backup was taken while it ran). Its result
+    is dropped, and the card is read again from the queue, once, with its attempt given back.
+    """
+    caplog.set_level(logging.INFO)
+    user = unique_user_fn_scoped
+    configure(user, image=create_provider(user, "Vision"), default=create_provider(user, "Text"))
+    gates = ProviderGates()
+    FakeCardAI(banana_answers(OpenAIRecipeCardTranscription=gates.read)).install(monkeypatch)
+    job_id = _intake(user, 1).job_id
+    visible.add(job_id)
+    user.repos.session.commit()
+    backup_v2 = BackupV2(get_app_settings().DB_URL)
+    dispatcher = IngestDispatcher(concurrency=2, instance="live-token")
+    restore_errors: list[BaseException] = []
+
+    def restore_in_thread(path: Path) -> None:
+        try:
+            backup_v2.restore(path)
+        except BaseException as e:
+            restore_errors.append(e)
+
+    async def scenario() -> Path:
+        await dispatcher.start()
+        try:
+            await _wait_for(lambda: gates.started(job_id) == 1, "the card's read")
+            row = _row(job_id)
+            assert row is not None and row["task_state"] == IngestTaskState.running
+            token = row["lease_token"]
+            path = await asyncio.to_thread(backup_v2.backup)  # the backup holds the running row and its token
+
+            restore = threading.Thread(target=restore_in_thread, args=(path,), name="restore", daemon=True)
+            restore.start()
+            await _join(restore, "the restore")
+            assert restore_errors == []
+            restored = _row(job_id)
+            assert restored is not None
+            assert (restored["task_state"], restored["lease_token"]) == (IngestTaskState.queued, None)
+            assert token is not None
+
+            gates.release(job_id)  # the old read answers now
+            await _wait_for(
+                lambda: (
+                    _logged(caplog, f"Recipe card job {job_id}: its task's outcome was dropped")
+                    or _logged(caplog, f"Recipe card job {job_id}: its task was stopped (vanished)")
+                ),
+                "the old task to end without writing",
+            )
+            await _wait_for(lambda: (_row(job_id) or {}).get("status") == IngestStatus.ready, "the card read again")
+            return path
+        finally:
+            gates.release_all()
+            await dispatcher.stop()
+
+    path = asyncio.run(scenario())
+    backup_v2.db_exporter.engine.dispose()
+    path.unlink(missing_ok=True)
+
+    row = _row(job_id)
+    assert row is not None
+    assert (row["status"], row["task_state"], row["lease_token"], row["attempts"], row["error_code"]) == (
+        IngestStatus.ready,
+        None,
+        None,
+        1,
+        None,
+    )
+    assert gates.started(job_id) == 2

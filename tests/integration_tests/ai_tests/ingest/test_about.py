@@ -25,6 +25,7 @@ def test_about_is_public_and_lists_the_upload_limits(api_client: TestClient):
                 "maxImagesPerRequest": limits.MAX_IMAGES_PER_REQUEST,
                 "maxPagesPerCard": limits.MAX_PAGES_PER_CARD,
                 "inbox": False,
+                "worker": False,
             },
             "mcp": True,
         },

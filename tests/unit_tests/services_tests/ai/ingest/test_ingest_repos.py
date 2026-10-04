@@ -26,6 +26,7 @@ from mealie.repos.repository_recipe_ingest import (
     utcnow,
 )
 from mealie.schema.household.group_events import GroupEventNotifierSave
+from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe_ingest import (
     AINotifierEventsOut,
     CardDraft,
@@ -38,6 +39,7 @@ from mealie.schema.recipe_ingest import (
     RecipeIngestionSettingsUpdate,
 )
 from mealie.services.ai.ingest import limits
+from tests.utils.factories import random_string
 from tests.utils.fixture_schemas import TestUser
 
 Job = RecipeIngestionJob
@@ -159,17 +161,46 @@ def test_paging_filters_and_counts(db: Session, unique_user_fn_scoped: TestUser)
     assert repos.processing_jobs_in_group() == 1
 
 
+def _recipe(user: TestUser) -> UUID:
+    recipe = user.repos.recipes.create(
+        Recipe(name=random_string(10), user_id=user.user_id, group_id=UUID(user.group_id))
+    )
+    assert recipe.id is not None
+    return recipe.id
+
+
 def test_duplicates_and_positions(db: Session, unique_user_fn_scoped: TestUser):
     repos = _repos(db, unique_user_fn_scoped)
     batch = repos.batches.create(source=IngestSource.app, created_by=None)
     assert repos.jobs.next_position(batch) == 0
-    first = _job(repos, batch, source_sha256="c" * 64, position=4, status=IngestStatus.committed.value)
+    recipe_id = _recipe(unique_user_fn_scoped)
+    first = _job(
+        repos, batch, source_sha256="c" * 64, position=4, status=IngestStatus.committed.value, recipe_id=recipe_id
+    )
     _job(repos, batch, source_sha256="c" * 64, position=1)
 
     assert repos.jobs.find_duplicate("c" * 64) == first  # the oldest, committed ones included
     assert repos.jobs.find_duplicate("d" * 64) is None
     assert repos.jobs.next_position(batch) == 5
     assert [job.position for job in repos.batches.jobs(batch)] == [1, 4]
+
+
+def test_a_committed_card_whose_recipe_was_deleted_is_no_duplicate(db: Session, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    repos = _repos(db, user)
+    recipe_id = _recipe(user)
+    committed = _job(repos, source_sha256="e" * 64, status=IngestStatus.committed.value, recipe_id=recipe_id)
+    assert repos.jobs.find_duplicate("e" * 64) == committed
+
+    user.repos.recipes.delete(recipe_id, match_key="id")
+    assert repos.jobs.find_duplicate("e" * 64) is None  # the card can be scanned again
+
+    # its new reading counts, as every job that isn't committed does, whatever its recipe link says
+    again = _job(repos, source_sha256="e" * 64)
+    assert repos.jobs.find_duplicate("e" * 64) == again
+    for status in (IngestStatus.ready, IngestStatus.failed, IngestStatus.committing):
+        other = _job(repos, source_sha256=f"{status.value:f<64}"[:64], status=status.value, recipe_id=uuid4())
+        assert repos.jobs.find_duplicate(f"{status.value:f<64}"[:64]) == other
 
 
 # ==========================================

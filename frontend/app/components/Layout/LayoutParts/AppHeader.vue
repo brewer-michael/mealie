@@ -29,6 +29,20 @@
       </v-toolbar-title>
     </div>
     <RecipeDialogSearch ref="domSearchDialog" />
+    <!-- fork: recipe cards (docs/ai/PHASE2.md §1.1): photos not uploaded yet are dropped at logout, so ask first -->
+    <BaseDialog
+      v-model="cardsLogoutDialog"
+      class="cards-logout-dialog"
+      :title="$t('user.logout')"
+      color="warning"
+      :icon="$globals.icons.alertCircle"
+      can-confirm
+      @confirm="logout(true)"
+    >
+      <v-card-text>
+        {{ $t("recipe-ingest.capture.logout-pending", cardPhotosNotUploaded) }}
+      </v-card-text>
+    </BaseDialog>
 
     <v-spacer />
 
@@ -86,6 +100,7 @@
 
 <script setup lang="ts">
 import { useLoggedInState } from "~/composables/use-logged-in-state";
+import { prepareRecipeIngestLogout, recipeIngestPhotosNotUploaded } from "~/composables/use-recipe-ingest-uploads"; // fork
 import type RecipeDialogSearch from "~/components/Domain/Recipe/RecipeDialogSearch.vue";
 
 defineProps({
@@ -123,7 +138,18 @@ onBeforeUnmount(() => {
   document.removeEventListener("keydown", handleKeyEvent);
 });
 
-async function logout() {
+// fork: recipe cards: asked before photos not uploaded yet are dropped
+const cardsLogoutDialog = ref(false);
+const cardPhotosNotUploaded = computed(() => recipeIngestPhotosNotUploaded.value);
+
+async function logout(confirmed = false) {
+  // fork: recipe cards (docs/ai/PHASE2.md §1.1): ask first when photos haven't been uploaded, then seal the open
+  // batches, so none is left open and empty on the server
+  if (!confirmed && cardPhotosNotUploaded.value > 0) {
+    cardsLogoutDialog.value = true;
+    return;
+  }
+  await prepareRecipeIngestLogout();
   try {
     await auth.signOut("/login?direct=1");
   }

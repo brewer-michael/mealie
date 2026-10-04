@@ -372,7 +372,7 @@ def test_with_the_cross_read_an_invented_2_is_flagged(
         invented_step,
         CardFlagSeverity.error,
         CardFlagSource.cross_read,
-        {"value": "2"},
+        {"value": "2", "start": 35, "end": 36},  # the invented "2", where the step has it
     )
     assert extraction.extraction.cross_read_lines == BANANA_TRANSCRIPT["text"].splitlines()
 
@@ -382,6 +382,38 @@ def test_with_the_cross_read_an_invented_2_is_flagged(
     calibration = scores.calibration
     assert calibration is not None
     assert (calibration.wrong, calibration.wrong_flagged, calibration.silent_errors) == (1, 1, 0)
+
+
+def test_the_report_ranks_the_flags_and_prices_each_error_caught(group: Group, monkeypatch: pytest.MonkeyPatch):
+    """The AUROC of the flags and the cost per caught error, with their n and the small-sample note"""
+    Replay(recorded_answers(**INVENTED)).install(monkeypatch)
+    prices = {group.vision.name: (1.0, 2.0), group.text.name: (0.5, 1.0)}
+    cards = ev.load_cards(CARDS_DIR, [ev.BANANA_CARD])
+    with session_context() as session:
+        group_id, household_id = group.user.repos.group_id, group.user.repos.household_id
+        repos = get_repositories(session, group_id=group_id, household_id=household_id)
+        settings = ev.EvalSettings(
+            cross_read=True,
+            group_options=ev.options_for_group(session, group_id),  # type: ignore[arg-type]
+            prices=prices,
+        )
+        results, _ = asyncio.run(
+            ev.run_eval(repos, cards, [group.config], settings=settings, catalog=IngestMatcher(repos))
+        )
+
+    (summary,) = ev.summarize(results, [group.config])
+    # the invented "2" is the one wrong item, and the only one flagged as an error: ranked first
+    assert (summary.cards, summary.auroc_wrong, summary.caught, summary.auroc) == (1, 1, 1, 1.0)
+    vision_tokens = (1893 + 1721) * 1.0 + (212 + 148) * 2.0
+    text_tokens = 1105 * 0.5 + 341 * 1.0
+    assert summary.cost_per_caught == pytest.approx((vision_tokens + text_tokens) / 1e6)
+
+    report = ev.format_report(results, [group.config], cards, settings=settings)
+    assert "AUROC" in report and "Cost/caught" in report
+    ranking = report.split("How well flags rank wrong items first")[1]
+    row = next(line for line in ranking.splitlines() if line.startswith(group.config.label))
+    assert row.split()[-6:] == ["1", "10", "1", "1.00", "1", "$0.0052"]  # cards, items, wrong, AUROC, caught, cost
+    assert "Under 50 cards (here 1) both are noisy" in report
 
 
 def test_without_the_cross_read_the_invented_2_is_silent(group: Group, monkeypatch: pytest.MonkeyPatch):

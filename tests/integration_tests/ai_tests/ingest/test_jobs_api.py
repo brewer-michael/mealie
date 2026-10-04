@@ -9,7 +9,7 @@ are shared with the other job, review and commit tests in this folder.
 import io
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -124,11 +124,14 @@ def fake_compute_flags(
     *,
     transcription: str | None = None,
     previous: Sequence[CardFlag] | None = None,
+    units: Iterable[str] = (),
+    ocr_lines: Sequence[str] | None = None,
 ) -> list[CardFlag]:
     """
     A small stand-in for B1's flag rules, so these tests don't depend on them: markers are errors, a missing name is
     an error, a low parse confidence is a warning and an unlinked food is an info. Resolutions are applied by id; the
-    transcription and the previous flags aren't used (`test_review_flags.py` runs the real rules).
+    transcription, the previous flags, the group's units and Tesseract's lines aren't used (`test_review_flags.py`
+    runs the real rules).
     """
     flags: list[CardFlag] = []
     if not draft.name.strip():
@@ -380,7 +383,15 @@ def test_get_job(api_client: TestClient, unique_user_fn_scoped: TestUser):
         assert page["viewUrl"].endswith(f"/pages/{page['index']}/view?v={version}")
         assert page["thumbUrl"].endswith(f"/pages/{page['index']}/thumb?v={version}")
     # a registered user owns their group and household
-    assert job["permissions"] == {"canCreateFoods": True, "canDiscard": True, "canExportEval": True}
+    assert job["permissions"] == {
+        "canCreateFoods": True,
+        "canCreateOrganizers": True,
+        "canDiscard": True,
+        "canExportEval": True,
+        "canReadWithCloud": False,
+        "canUncommit": False,
+        "canMerge": True,
+    }
     assert job["duplicateOf"] is None
     preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
     assert job["householdRecipesPublic"] is preferences["recipePublic"]
@@ -406,7 +417,15 @@ def test_get_job_permissions_of_a_plain_member(
     inbox_job = seed_job(user, source=IngestSource.inbox, created_by=None)
 
     permissions = api_client.get(job_url(job_id), headers=member.token).json()["permissions"]
-    assert permissions == {"canCreateFoods": False, "canDiscard": False, "canExportEval": False}
+    assert permissions == {
+        "canCreateFoods": False,
+        "canCreateOrganizers": False,
+        "canDiscard": False,
+        "canExportEval": False,
+        "canReadWithCloud": False,
+        "canUncommit": False,
+        "canMerge": False,
+    }
     inbox = api_client.get(job_url(inbox_job), headers=member.token).json()["permissions"]
     assert inbox["canDiscard"] is True
 

@@ -7,6 +7,10 @@ provider under test pinned and each config reading the card one way only (`read_
 older `/recipes/create/ai` import workflow instead, so earlier numbers stay reproducible. The draft is compared with
 the card's hand-checked JSON, and its flags with what is actually wrong. Nothing is saved. See `docs/ai/EVAL.md` for
 the fixture format, how to run this, and how to read the scores.
+
+`--check` validates the fixtures with no settings or database (it runs before they're imported), and `--dry-run`
+checks everything a run needs without calling a provider. Secrets given as `NAME_FILE` (Docker secrets) are read
+first, as `docker/entry.sh` does for the server, since `docker exec` skips it.
 """
 
 import argparse
@@ -15,6 +19,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -22,6 +27,7 @@ import statistics
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -34,11 +40,8 @@ from rapidfuzz import fuzz
 
 from mealie import __version__
 from mealie.core import root_logger
-from mealie.db.db_setup import session_context
 from mealie.lang import get_locale_provider
 from mealie.lang.providers import Translator
-from mealie.repos.all_repositories import get_repositories
-from mealie.repos.repository_factory import AllRepositories
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.recipe.recipe import Recipe
@@ -76,94 +79,58 @@ from mealie.services.ai.ingest.eval_export import (  # noqa: F401  (the fixture 
 )
 from mealie.services.ai.ingest.flag_rules import HIGHLIGHTED_SEVERITIES, is_clean
 from mealie.services.ai.ingest.images import PageRejected, normalize_page, sniff
-from mealie.services.ai.ingest.matching import IngestMatcher
-from mealie.services.ai.ingest.pipeline import (
-    CardExtraction,
-    CardPage,
-    CardPipelineOptions,
-    extract_card,
-    options_for_group,
-    orient_page,
-)
-from mealie.services.ai.ingest.pipeline.compilers import CapturedError, capture_errors
 from mealie.services.ai.local import is_local_provider
 from mealie.services.ai.policy import ai_call_policy, apply_policy
-from mealie.services.ai.runtime import AIRuntime
-from mealie.services.ai.usage import AITokenUsage
-from mealie.services.openai import OpenAINotEnabledException, OpenAIService
-from mealie.services.recipe.import_workflow import (
-    DEFAULT_WORKFLOW_STEPS,
-    RecipeImportWorkflow,
-    WorkflowContext,
-    WorkflowInput,
-    WorkflowOptions,
-    WorkflowStep,
-)
-from mealie.services.recipe.import_workflow.compilers import ImageCompiler, OCRImageCompiler
-from mealie.services.recipe.import_workflow.steps import CompileSourceStep
 
 logger = root_logger.get_logger()
+
+# ================================================================
+# Before the database: the fixtures check, the command line and the secrets
+#
+# `--check` needs no database and no settings (`PRODUCTION` may be unset), and secrets given as `NAME_FILE` must be
+# read before the settings are; run as a script, both happen here, before the imports further down read them.
 
 DEFAULT_CARDS_DIR = Path("tests/data/cards")
 DEFAULT_OUT = Path("recipe-card-eval.json")
 
-Pipeline = Literal["card", "import"]
+SECRET_FILE_VARS = (
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_SERVER",
+    "POSTGRES_PORT",
+    "POSTGRES_DB",
+    "POSTGRES_URL_OVERRIDE",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASSWORD",
+    "LDAP_SERVER_URL",
+    "LDAP_QUERY_PASSWORD",
+    "OIDC_CONFIGURATION_URL",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+)
+"""The settings `docker/entry.sh` reads from `NAME_FILE` (Docker secrets); `docker exec` skips `entry.sh`"""
 
-INGREDIENT_MATCH_THRESHOLD = 0.75
-"""
-Similarity at which an extracted ingredient counts as the expected line, once their quantities and
-units are written the same way. High enough that "1 egg" doesn't match "1 egg yolk", low enough that
-"1 T. coconut oil" still matches "1 T. coconut oil (melted)". The quantity and unit must also agree.
-"""
 
-INSTRUCTION_MATCH_THRESHOLD = 0.6
-"""
-Similarity below which an expected step counts as missing rather than partly covered. Unrelated
-cooking instructions still share words like "for", "minutes" and "until", and score around 0.5.
-"""
-
-NAME_CORRECT_THRESHOLD = 0.9
-"""Name similarity at which the name counts as read correctly, for flag calibration"""
-
-BLANK_MATCH_THRESHOLD = 0.6
-"""Similarity at which a draft item is taken for the expected item holding a blank"""
-
-LINK_NAME_THRESHOLD = 90
-"""How alike (fuzzy ratio) a food's name and the expected one must be to count as the same food"""
-
-SCORE_WEIGHTS: dict[str, float] = {
-    "name": 0.10,
-    "ingredient_recall": 0.30,
-    "ingredient_precision": 0.20,
-    "instruction_coverage": 0.25,
-    "description": 0.05,
-    "no_invention": 0.10,
-}
-"""Weights of the overall score. Components a card doesn't check are left out, and the rest reweighted."""
-
-# The decisions fixed in advance (docs/ai/PHASE2.md §11.4)
-SILENT_ERRORS_TARGET = 0.25
-"""At most this many unflagged errors per card for the default config"""
-FLAG_RECALL_TARGET = 0.8
-"""At least this share of the errors flagged"""
-BANANA_CARD = "banana-mug-cake"
-BANANA_REPEATS = 3
-"""The banana card's blank must be safe in 3 of 3 repeats (a Phase 2 release check)"""
-CROSS_READ_SILENT_DROP = 0.1
-"""Cross-read is turned on by default if it lowers silent errors per card by at least this much"""
-D3_RESCUED_CARDS = 2
-"""The OCR fallback is kept if the vision>OCR chain rescues at least this many cards (or its interval excludes 0)"""
-WRONG_TURNS_LIMIT = 1
-"""More upright cards turned by the orientation probe than this (in 20) raises `ORIENT_MIN_RATIO`"""
-
-BOOTSTRAP_SAMPLES = 2000
-BOOTSTRAP_SEED = 20261003
-"""The bootstrap is seeded, so a report can be reproduced exactly"""
-TIE_TOLERANCE = 0.005
-"""Per-card score differences within this are ties"""
-
-PER_CARD_TIMES = ("prep_time", "perform_time", "total_time")
-"""The time fields a card draft has"""
+def load_secret_files(environ: dict[str, str] | None = None) -> list[str]:
+    """
+    For each of `SECRET_FILE_VARS` whose `NAME` isn't set but `NAME_FILE` is, reads that file into `NAME`, without its
+    trailing newlines, as `docker/entry.sh` does for the server. Returns the names set. A variable already set wins:
+    `docker exec -e NAME=…` overrides a secret. Raises `EvalSetupError` for a file that can't be read.
+    """
+    env: Any = os.environ if environ is None else environ
+    loaded: list[str] = []
+    for name in SECRET_FILE_VARS:
+        path = env.get(f"{name}_FILE")
+        if not path or env.get(name):
+            continue
+        try:
+            env[name] = Path(path).read_text().rstrip("\n")
+        except OSError as e:
+            raise EvalSetupError(f"Can't read {name}_FILE ('{path}'): {e.strerror or e}") from e
+        loaded.append(name)
+    return loaded
 
 
 class EvalSetupError(Exception):
@@ -227,6 +194,273 @@ def check_cards(cards: Sequence[Card]) -> None:
                 problems.append(f"{card.id}: {image.name} isn't an image a card can be uploaded as")
     if problems:
         raise EvalSetupError("; ".join(problems))
+
+
+def run_check(args: argparse.Namespace) -> None:
+    """`--check`: loads and checks the fixtures and lists them. Raises `EvalSetupError` with the problems."""
+    cards = load_cards(args.cards, args.only_cards)
+    check_cards(cards)
+    for card in cards:
+        tags = f" [{', '.join(card.fixture.tags)}]" if card.fixture.tags else ""
+        state = "verified" if card.fixture.verified_by_owner else "unverified"
+        sys.stdout.write(f"{card.id}: v{card.fixture.schema_version}, {len(card.images)} image(s), {state}{tags}\n")
+    sys.stdout.write(f"{len(cards)} card(s) in {args.cards} are valid\n")
+
+
+def parse_chain(spec: str) -> list[str]:
+    """`A>B[>C]`: the labels, in the order they're tried"""
+    labels = [label.strip() for label in spec.split(">")]
+    if len(labels) < 2 or not all(labels) or len(set(labels)) != len(labels):
+        raise argparse.ArgumentTypeError(f"expected 'A>B' naming two or more different configs, got '{spec}'")
+    return labels
+
+
+def parse_price(value: str) -> tuple[str, tuple[float, float]]:
+    """Parses `NAME=INPUT,OUTPUT`, in USD per million tokens"""
+
+    name, sep, rates = value.rpartition("=")
+    try:
+        input_rate, output_rate = (float(rate) for rate in rates.split(","))
+    except ValueError:
+        input_rate = output_rate = -1
+
+    if not (sep and name and input_rate >= 0 and output_rate >= 0):
+        raise argparse.ArgumentTypeError(f"expected NAME=INPUT,OUTPUT in USD per million tokens, got '{value}'")
+
+    return name, (input_rate, output_rate)
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m mealie.scripts.eval_recipe_cards",
+        description=(
+            "Score how well the group's AI providers, and the OCR fallback, read recipe cards. Each card goes "
+            "through the production recipe card pipeline (or, with --pipeline import, the /recipes/create/ai "
+            "workflow), but nothing is saved."
+        ),
+    )
+    parser.add_argument("--group", help="slug or id of the group whose AI providers to use (required to run)")
+    parser.add_argument("--household", help="slug or id of a household in the group (optional)")
+    parser.add_argument(
+        "--provider",
+        dest="providers",
+        action="append",
+        default=[],
+        metavar="VISION[:TEXT]",
+        help=(
+            "an AI provider to evaluate, by name or id; VISION:TEXT reads the card with VISION and runs every other "
+            "step on TEXT; repeatable (default: the group's image provider)"
+        ),
+    )
+    parser.add_argument("--ocr", action="store_true", help="also evaluate the OCR fallback (needs Tesseract installed)")
+    parser.add_argument(
+        "--ocr-provider",
+        dest="ocr_providers",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "a provider that turns OCR text into a recipe, one OCR config each; repeatable; implies --ocr "
+            "(default: the group's default provider)"
+        ),
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=["card", "import"],
+        default="card",
+        help="card: the recipe card pipeline (default); import: the /recipes/create/ai workflow, as before Phase 2",
+    )
+    parser.add_argument(
+        "--cards", type=Path, default=DEFAULT_CARDS_DIR, help=f"card fixtures directory (default: {DEFAULT_CARDS_DIR})"
+    )
+    parser.add_argument(
+        "--card",
+        dest="only_cards",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="only evaluate this card, by file name without extension; repeatable",
+    )
+    parser.add_argument("--check", action="store_true", help="only validate the fixtures (no --group, no providers)")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "check everything a run needs (fixtures, providers, chains, prices) without calling a provider or "
+            "writing anything; exits 1 listing the problems"
+        ),
+    )
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"JSON results file (default: {DEFAULT_OUT})")
+    parser.add_argument(
+        "--repeat", type=positive_int, default=1, help="read each card this many times per provider (default: 1)"
+    )
+    parser.add_argument(
+        "--price",
+        dest="prices",
+        action="append",
+        type=parse_price,
+        default=[],
+        metavar="NAME=IN,OUT",
+        help="a provider's price in USD per million input and output tokens, to report cost; repeatable",
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="refuse providers that aren't marked as running on your network at a private address",
+    )
+    parser.add_argument(
+        "--cross-read", action="store_true", help="read every card a second time and compare (card pipeline)"
+    )
+    parser.add_argument(
+        "--no-intake-ocr",
+        dest="intake_ocr",
+        action="store_false",
+        help="skip orienting the pages with Tesseract, to see what orientation is worth (card pipeline)",
+    )
+    parser.add_argument(
+        "--baseline", metavar="LABEL", help="compare every config with this one, paired by card, with a 95%% interval"
+    )
+    parser.add_argument(
+        "--chain",
+        dest="chains",
+        action="append",
+        type=parse_chain,
+        default=[],
+        metavar="A>B",
+        help="also report A falling back to B when A can't read a card itself, from the same results; repeatable",
+    )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        metavar="FILE",
+        help="an earlier run's JSON, for the cross-read rule (with --cross-read) and orientation (--no-intake-ocr)",
+    )
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.check and not args.group:
+        parser.error("--group is required (except with --check)")
+    if args.check and args.dry_run:
+        parser.error("--check and --dry-run don't go together: --dry-run checks the fixtures too")
+    if args.pipeline == "import" and (args.cross_read or not args.intake_ocr):
+        parser.error("--cross-read and --no-intake-ocr need --pipeline card")
+    return args
+
+
+def _before_imports(argv: Sequence[str]) -> None:
+    """
+    Run as a script, before the settings and the database are imported: the secrets are read, and `--check` (which
+    needs neither) is done. The arguments are checked here too, so a mistake costs no start-up.
+    """
+    try:
+        load_secret_files()
+        args = parse_args(argv)
+        if args.check:
+            run_check(args)
+            sys.exit(0)
+    except EvalSetupError as e:
+        logger.error(str(e))
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    _before_imports(sys.argv[1:])
+
+from mealie.db.db_setup import session_context  # noqa: E402
+from mealie.repos.all_repositories import get_repositories  # noqa: E402
+from mealie.repos.repository_factory import AllRepositories  # noqa: E402
+from mealie.services.ai.ingest.matching import IngestMatcher  # noqa: E402
+from mealie.services.ai.ingest.pipeline import (  # noqa: E402
+    CardExtraction,
+    CardPage,
+    CardPipelineOptions,
+    extract_card,
+    options_for_group,
+    orient_page,
+)
+from mealie.services.ai.ingest.pipeline.cardtext import strip_from_prefix  # noqa: E402
+from mealie.services.ai.ingest.pipeline.compilers import CapturedError, capture_errors  # noqa: E402
+from mealie.services.ai.runtime import AIRuntime  # noqa: E402
+from mealie.services.ai.usage import AITokenUsage  # noqa: E402
+from mealie.services.openai import OpenAINotEnabledException, OpenAIService  # noqa: E402
+from mealie.services.recipe.import_workflow import (  # noqa: E402
+    DEFAULT_WORKFLOW_STEPS,
+    RecipeImportWorkflow,
+    WorkflowContext,
+    WorkflowInput,
+    WorkflowOptions,
+    WorkflowStep,
+)
+from mealie.services.recipe.import_workflow.compilers import ImageCompiler, OCRImageCompiler  # noqa: E402
+from mealie.services.recipe.import_workflow.steps import CompileSourceStep  # noqa: E402
+
+Pipeline = Literal["card", "import"]
+
+INGREDIENT_MATCH_THRESHOLD = 0.75
+"""
+Similarity at which an extracted ingredient counts as the expected line, once their quantities and
+units are written the same way. High enough that "1 egg" doesn't match "1 egg yolk", low enough that
+"1 T. coconut oil" still matches "1 T. coconut oil (melted)". The quantity and unit must also agree.
+"""
+
+INSTRUCTION_MATCH_THRESHOLD = 0.6
+"""
+Similarity below which an expected step counts as missing rather than partly covered. Unrelated
+cooking instructions still share words like "for", "minutes" and "until", and score around 0.5.
+"""
+
+NAME_CORRECT_THRESHOLD = 0.9
+"""Name similarity at which the name counts as read correctly, for flag calibration"""
+
+BLANK_MATCH_THRESHOLD = 0.6
+"""Similarity at which a draft item is taken for the expected item holding a blank"""
+
+LINK_NAME_THRESHOLD = 90
+"""How alike (fuzzy ratio) a food's name and the expected one must be to count as the same food"""
+
+SCORE_WEIGHTS: dict[str, float] = {
+    "name": 0.10,
+    "ingredient_recall": 0.30,
+    "ingredient_precision": 0.20,
+    "instruction_coverage": 0.25,
+    "description": 0.05,
+    "no_invention": 0.10,
+}
+"""Weights of the overall score. Components a card doesn't check are left out, and the rest reweighted."""
+
+# The decisions fixed in advance (docs/ai/PHASE2.md §11.4)
+SILENT_ERRORS_TARGET = 0.25
+"""At most this many unflagged errors per card for the default config"""
+FLAG_RECALL_TARGET = 0.8
+"""At least this share of the errors flagged"""
+BANANA_CARD = "banana-mug-cake"
+BANANA_REPEATS = 3
+"""The banana card's blank must be safe in 3 of 3 repeats (a Phase 2 release check)"""
+CROSS_READ_SILENT_DROP = 0.1
+"""Cross-read is turned on by default if it lowers silent errors per card by at least this much"""
+D3_RESCUED_CARDS = 2
+"""The OCR fallback is kept if the vision>OCR chain rescues at least this many cards (or its interval excludes 0)"""
+WRONG_TURNS_LIMIT = 1
+"""More upright cards turned by the orientation probe than this (in 20) raises `ORIENT_MIN_RATIO`"""
+
+BOOTSTRAP_SAMPLES = 2000
+BOOTSTRAP_SEED = 20261003
+"""The bootstrap is seeded, so a report can be reproduced exactly"""
+TIE_TOLERANCE = 0.005
+"""Per-card score differences within this are ties"""
+
+PER_CARD_TIMES = ("prep_time", "perform_time", "total_time")
+"""The time fields a card draft has"""
 
 
 # ================================================================
@@ -650,10 +884,13 @@ def find_number_inventions(view: RecipeView, numbers: Sequence[float]) -> list[I
 
 
 def score_attribution(expected: str | None, actual: str | None) -> float | None:
-    """How alike the attribution is to the card's ("From Grandma Jo"); None when the card has none"""
+    """
+    How alike the attribution is to the card's ("From Grandma Jo"); None when the card has none. A leading "From" is
+    left out on both sides: the draft keeps "Grandma Jo" under a field labelled "From", and older fixtures say it.
+    """
     if not expected:
         return None
-    return score_name(expected, actual)
+    return score_name(strip_from_prefix(expected), strip_from_prefix(actual) if actual else actual)
 
 
 def score_yield(expected: str | None, view: RecipeView) -> float | None:
@@ -845,12 +1082,17 @@ def _snake(name: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
+SEVERITY_RANK = {CardFlagSeverity.info: 1, CardFlagSeverity.warning: 2, CardFlagSeverity.error: 3}
+"""An item's flag score for the AUROC: its highest unresolved flag's severity (0 without one)"""
+
+
 class FlagIndex:
     """The draft's unresolved flags by the item they're on"""
 
     def __init__(self, flags: Sequence[CardFlag]) -> None:
         self.highlighted: set[tuple[str, str | None]] = set()
         self.errors: set[tuple[str, str | None]] = set()
+        self.severities: dict[tuple[str, str | None], int] = {}
         for flag in flags:
             if flag.resolution is not None:
                 continue
@@ -859,6 +1101,11 @@ class FlagIndex:
                 self.highlighted.add(key)
             if flag.severity == CardFlagSeverity.error:
                 self.errors.add(key)
+            self.severities[key] = max(self.severities.get(key, 0), SEVERITY_RANK.get(flag.severity, 0))
+
+    def severity(self, field_name: str, ref: str | None = None) -> int:
+        """The highest severity of the item's unresolved flags, or its whole field's (`SEVERITY_RANK`)"""
+        return max(self.severities.get((field_name, ref), 0), self.severities.get((field_name, None), 0))
 
     def flagged(self, field_name: str, ref: str | None = None) -> bool:
         """Whether the item (or its whole field) has an unresolved error or warning, as the review page highlights"""
@@ -939,6 +1186,8 @@ class CalibrationItem:
     correct: bool
     flagged: bool
     ref: str | None = None
+    severity: int = 0
+    """Its highest unresolved flag's severity (`SEVERITY_RANK`): the score the AUROC ranks items by"""
 
 
 @dataclass
@@ -991,6 +1240,7 @@ def calibrate(
             kind="name",
             correct=score_name(expected.name, view.name) >= NAME_CORRECT_THRESHOLD,
             flagged=index.flagged("name"),
+            severity=index.severity("name"),
         )
     )
 
@@ -1003,10 +1253,16 @@ def calibrate(
                 correct=correct,
                 flagged=index.flagged("ingredients", ingredient.ref),
                 ref=ingredient.ref,
+                severity=index.severity("ingredients", ingredient.ref),
             )
         )
     items.extend(
-        CalibrationItem(kind="missing_ingredient", correct=False, flagged=index.flagged("ingredients"))
+        CalibrationItem(
+            kind="missing_ingredient",
+            correct=False,
+            flagged=index.flagged("ingredients"),
+            severity=index.severity("ingredients"),
+        )
         for _ in lines.missing
     )
 
@@ -1020,7 +1276,13 @@ def calibrate(
             )
             correct = similar and ("steps", step.ref) not in invented_refs and ("steps", step.ref) not in lost_blanks
             items.append(
-                CalibrationItem(kind="step", correct=correct, flagged=index.flagged("steps", step.ref), ref=step.ref)
+                CalibrationItem(
+                    kind="step",
+                    correct=correct,
+                    flagged=index.flagged("steps", step.ref),
+                    ref=step.ref,
+                    severity=index.severity("steps", step.ref),
+                )
             )
 
     times = _expected_times(expected)
@@ -1032,18 +1294,26 @@ def calibrate(
             correct = (name, None) not in invented_refs and name not in invented_fields
         else:
             continue
-        items.append(CalibrationItem(kind=name, correct=correct, flagged=index.flagged(name)))
+        items.append(
+            CalibrationItem(kind=name, correct=correct, flagged=index.flagged(name), severity=index.severity(name))
+        )
 
     yield_flagged = index.flagged("recipe_yield") or index.flagged("recipe_servings")
+    yield_severity = max(index.severity("recipe_yield"), index.severity("recipe_servings"))
     if expected.recipe_yield:
         items.append(
             CalibrationItem(
-                kind="recipe_yield", correct=score_yield(expected.recipe_yield, view) == 1.0, flagged=yield_flagged
+                kind="recipe_yield",
+                correct=score_yield(expected.recipe_yield, view) == 1.0,
+                flagged=yield_flagged,
+                severity=yield_severity,
             )
         )
     elif view.recipe_yield or view.yield_numbers:
         correct = ("recipe_yield", None) not in invented_refs and not (invented_fields & set(YIELD_FIELDS))
-        items.append(CalibrationItem(kind="recipe_yield", correct=correct, flagged=yield_flagged))
+        items.append(
+            CalibrationItem(kind="recipe_yield", correct=correct, flagged=yield_flagged, severity=yield_severity)
+        )
 
     return FlagCalibration(items=items, clean=is_clean(flags))
 
@@ -1858,15 +2128,122 @@ def build_configs(
 
 
 # ================================================================
+# Before spending: --dry-run
+
+
+def _slots(config: EvalConfig) -> list[AIProviderSlot]:
+    """The slots a config's runs ask: the image read (and the second reading), the build, and the fast steps"""
+    slots = [] if config.is_ocr else [AIProviderSlot.image]
+    return [*slots, AIProviderSlot.default, AIProviderSlot.fast]
+
+
+def dry_run(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    """
+    `--dry-run`: everything a run checks before its first provider call, all of it rather than up to the first
+    problem, and with no provider called and nothing written: the fixtures, the group and household, the providers
+    each config names (and that a local-only run's are local, and Tesseract for OCR), the chains and baseline, each
+    config's provider for every slot it asks under the run's call policy, and a price for every provider when any
+    `--price` is given. Returns the problems, and notes that don't stop a run.
+    """
+    problems: list[str] = []
+    notes: list[str] = []
+
+    def problem(error: Exception) -> None:
+        if str(error) not in problems:
+            problems.append(str(error))
+
+    cards: list[Card] = []
+    try:
+        cards = load_cards(args.cards, args.only_cards)
+        check_cards(cards)
+    except EvalSetupError as e:
+        problem(e)
+    if args.reference:
+        try:
+            load_reference(args.reference)
+        except EvalSetupError as e:
+            problem(e)
+
+    with session_context() as session:
+        group = get_repositories(session, group_id=None, household_id=None).groups.get_by_slug_or_id(args.group)
+        if not group:
+            problems.append(f"No group '{args.group}'")
+            return problems, notes
+        household: HouseholdInDB | None = None
+        if args.household:
+            household = get_repositories(session, group_id=group.id).households.get_by_slug_or_id(args.household)
+            if not household:
+                problems.append(f"No household '{args.household}' in group '{group.slug}'")
+        repos = get_repositories(session, group_id=group.id, household_id=household.id if household else None)
+
+        # each named provider on its own, so every unknown name is listed; the configs from those that exist
+        providers = repos.group_ai_providers.get_all()
+        specs: list[str] = []
+        for spec in args.providers:
+            try:
+                parse_provider_spec(providers, spec)
+                specs.append(spec)
+            except EvalSetupError as e:
+                problem(e)
+        ocr_names: list[str] = []
+        for name in args.ocr_providers:
+            try:
+                find_provider(providers, name)
+                ocr_names.append(name)
+            except EvalSetupError as e:
+                problem(e)
+
+        configs: list[EvalConfig] = []
+        # named providers that all failed don't fall back to the group's: their names are the problem to fix first
+        if (specs or not args.providers) and (ocr_names or not args.ocr_providers):
+            try:
+                configs = build_configs(
+                    repos,
+                    specs,
+                    ocr=args.ocr or bool(args.ocr_providers),
+                    ocr_provider_names=ocr_names,
+                    local_only=args.local_only,
+                )
+                check_labels(args.chains, args.baseline, configs)
+            except EvalSetupError as e:
+                problem(e)
+
+        for config in configs:
+            ai = EvalOpenAIService(repos, image_provider=config.image_provider, text_provider=config.text_provider)
+            for slot in _slots(config):
+                try:
+                    with ai_call_policy(local_only=args.local_only):
+                        ai.runtime.candidates(slot)
+                except (OpenAINotEnabledException, AIProviderLocalOnlyError) as e:
+                    problems.append(f"{config.label}: the {slot.value} slot can't be asked: {e}")
+
+        used = sorted({p.name for config in configs for p in (config.image_provider, config.text_provider) if p})
+        prices = dict(args.prices)
+        if prices:
+            if missing := [name for name in used if name not in prices]:
+                problems.append(f"No --price for {', '.join(missing)}: give every provider a price, or none")
+            if unused := sorted(set(prices) - set(used)):
+                notes.append(f"--price for {', '.join(unused)}, which no config uses")
+        elif configs:
+            notes.append("No --price given: the report will show no costs")
+        if not_local := [config.label for config in configs if not config.local]:
+            if local_cards := [card.id for card in cards if card.fixture.local_only]:
+                notes.append(
+                    f"Local-only cards ({', '.join(local_cards)}) won't be sent to {', '.join(not_local)}: refused"
+                )
+        session.rollback()  # it only read
+
+    notes.insert(
+        0,
+        f"Dry run: {len(cards)} card(s), {len(configs)} config(s)"
+        + (f" ({', '.join(config.label for config in configs)})" if configs else "")
+        + f", {args.repeat} repeat(s); no provider was called",
+    )
+    return problems, notes
+
+
+# ================================================================
 # Comparing configs: chains and baselines
-
-
-def parse_chain(spec: str) -> list[str]:
-    """`A>B[>C]`: the labels, in the order they're tried"""
-    labels = [label.strip() for label in spec.split(">")]
-    if len(labels) < 2 or not all(labels) or len(set(labels)) != len(labels):
-        raise argparse.ArgumentTypeError(f"expected 'A>B' naming two or more different configs, got '{spec}'")
-    return labels
 
 
 def check_labels(chains: Sequence[Sequence[str]], baseline: str | None, configs: Sequence[EvalConfig]) -> None:
@@ -2080,6 +2457,36 @@ class ConfigSummary:
     tokens_by_slot: dict[str, float] = field(default_factory=dict)
     """Mean tokens per run, by provider and slot"""
     models: list[str] = field(default_factory=list)
+    cards: int = 0
+    """Cards read: AUROC and cost per caught error are noisy under `NOISY_UNDER_CARDS`"""
+    auroc: float | None = None
+    """How well the flags rank wrong items above right ones (`flag_auroc`)"""
+    auroc_items: int = 0
+    auroc_wrong: int = 0
+    """The items the AUROC ranks (its n), and how many of them are wrong"""
+    caught: int = 0
+    """Wrong items that were highlighted"""
+    cost_per_caught: float | None = None
+    """Total cost over the errors highlighted, in USD; None without a price for every provider, or nothing caught"""
+
+
+NOISY_UNDER_CARDS = 50
+"""Below this many cards, the AUROC and the cost per caught error move a lot from card to card"""
+
+
+def flag_auroc(items: Sequence[CalibrationItem]) -> float | None:
+    """
+    How well the flags rank a card's wrong items above its right ones: the chance that a wrong item's score (its
+    highest unresolved flag's severity: none, info, warning or error) is above a right item's, ties counting half (the
+    Mann-Whitney rank statistic). 0.5 is no better than chance, 1.0 perfect. None unless there are both.
+    """
+    wrong = [item.severity for item in items if not item.correct]
+    right = Counter(item.severity for item in items if item.correct)
+    if not wrong or not right:
+        return None
+    above = sum(sum(count for score, count in right.items() if score < severity) for severity in wrong)
+    ties = sum(right.get(severity, 0) for severity in wrong)
+    return (above + 0.5 * ties) / (len(wrong) * right.total())
 
 
 def _card_std(runs: Sequence[RunResult]) -> float | None:
@@ -2104,6 +2511,12 @@ def summarize_runs(label: str, model: str, all_runs: Sequence[RunResult], **extr
     for run in runs:
         for key, tally in run.usage_by_slot.items():
             by_slot.setdefault(key, []).append(tally.prompt_tokens + tally.completion_tokens)
+
+    items = [item for calibration in calibrations for item in calibration.items]
+    caught = sum(c.wrong_flagged for c in calibrations)
+    costs = [run.cost_usd for run in runs]
+    priced = [cost for cost in costs if cost is not None]
+    total_cost = sum(priced) if costs and len(priced) == len(costs) else None
 
     return ConfigSummary(
         label=label,
@@ -2144,6 +2557,12 @@ def summarize_runs(label: str, model: str, all_runs: Sequence[RunResult], **extr
         new_food_rate=_ratio(sum(x.food_unlinked for x in linkings), sum(x.food_checked for x in linkings)),
         tokens_by_slot={key: statistics.fmean(values) for key, values in sorted(by_slot.items())},
         models=sorted({model for run in runs for model in run.models}),
+        cards=len({run.card for run in runs}),
+        auroc=flag_auroc(items),
+        auroc_items=len(items),
+        auroc_wrong=sum(1 for item in items if not item.correct),
+        caught=caught,
+        cost_per_caught=total_cost / caught if total_cost is not None and caught else None,
         **extra,
     )
 
@@ -2551,6 +2970,26 @@ def format_report(
             )
         sections.append(f"Flags, blanks and linking:\n{format_table(card_rows)}")
 
+        ranking_rows = [["Config", "Cards", "Items", "Wrong", "AUROC", "Caught", "Cost/caught"]]
+        for s in summaries:
+            ranking_rows.append(
+                [
+                    *(s.label, str(s.cards), str(s.auroc_items), str(s.auroc_wrong), _fmt(s.auroc)),
+                    str(s.caught),
+                    "-" if s.cost_per_caught is None else f"${s.cost_per_caught:.4f}",
+                ]
+            )
+        cards_read = max((s.cards for s in summaries), default=0)
+        noisy = (
+            f" Under {NOISY_UNDER_CARDS} cards (here {cards_read}) both are noisy: read them as rough."
+            if cards_read < NOISY_UNDER_CARDS
+            else ""
+        )
+        sections.append(
+            "How well flags rank wrong items first (AUROC over Items, of which Wrong are wrong), and the cost of each "
+            f"error flagged (total cost / Caught).{noisy}\n{format_table(ranking_rows)}"
+        )
+
     labels = [s.label for s in summaries]
     card_rows = [["Card", *labels]]
     for card in cards:
@@ -2665,154 +3104,23 @@ def build_report(
 # CLI
 
 
-def parse_price(value: str) -> tuple[str, tuple[float, float]]:
-    """Parses `NAME=INPUT,OUTPUT`, in USD per million tokens"""
-
-    name, sep, rates = value.rpartition("=")
-    try:
-        input_rate, output_rate = (float(rate) for rate in rates.split(","))
-    except ValueError:
-        input_rate = output_rate = -1
-
-    if not (sep and name and input_rate >= 0 and output_rate >= 0):
-        raise argparse.ArgumentTypeError(f"expected NAME=INPUT,OUTPUT in USD per million tokens, got '{value}'")
-
-    return name, (input_rate, output_rate)
-
-
-def positive_int(value: str) -> int:
-    number = int(value)
-    if number < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return number
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="python -m mealie.scripts.eval_recipe_cards",
-        description=(
-            "Score how well the group's AI providers, and the OCR fallback, read recipe cards. Each card goes "
-            "through the production recipe card pipeline (or, with --pipeline import, the /recipes/create/ai "
-            "workflow), but nothing is saved."
-        ),
-    )
-    parser.add_argument("--group", help="slug or id of the group whose AI providers to use (required to run)")
-    parser.add_argument("--household", help="slug or id of a household in the group (optional)")
-    parser.add_argument(
-        "--provider",
-        dest="providers",
-        action="append",
-        default=[],
-        metavar="VISION[:TEXT]",
-        help=(
-            "an AI provider to evaluate, by name or id; VISION:TEXT reads the card with VISION and runs every other "
-            "step on TEXT; repeatable (default: the group's image provider)"
-        ),
-    )
-    parser.add_argument("--ocr", action="store_true", help="also evaluate the OCR fallback (needs Tesseract installed)")
-    parser.add_argument(
-        "--ocr-provider",
-        dest="ocr_providers",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help=(
-            "a provider that turns OCR text into a recipe, one OCR config each; repeatable; implies --ocr "
-            "(default: the group's default provider)"
-        ),
-    )
-    parser.add_argument(
-        "--pipeline",
-        choices=["card", "import"],
-        default="card",
-        help="card: the recipe card pipeline (default); import: the /recipes/create/ai workflow, as before Phase 2",
-    )
-    parser.add_argument(
-        "--cards", type=Path, default=DEFAULT_CARDS_DIR, help=f"card fixtures directory (default: {DEFAULT_CARDS_DIR})"
-    )
-    parser.add_argument(
-        "--card",
-        dest="only_cards",
-        action="append",
-        default=[],
-        metavar="ID",
-        help="only evaluate this card, by file name without extension; repeatable",
-    )
-    parser.add_argument("--check", action="store_true", help="only validate the fixtures (no --group, no providers)")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"JSON results file (default: {DEFAULT_OUT})")
-    parser.add_argument(
-        "--repeat", type=positive_int, default=1, help="read each card this many times per provider (default: 1)"
-    )
-    parser.add_argument(
-        "--price",
-        dest="prices",
-        action="append",
-        type=parse_price,
-        default=[],
-        metavar="NAME=IN,OUT",
-        help="a provider's price in USD per million input and output tokens, to report cost; repeatable",
-    )
-    parser.add_argument(
-        "--local-only",
-        action="store_true",
-        help="refuse providers that aren't marked as running on your network at a private address",
-    )
-    parser.add_argument(
-        "--cross-read", action="store_true", help="read every card a second time and compare (card pipeline)"
-    )
-    parser.add_argument(
-        "--no-intake-ocr",
-        dest="intake_ocr",
-        action="store_false",
-        help="skip orienting the pages with Tesseract, to see what orientation is worth (card pipeline)",
-    )
-    parser.add_argument(
-        "--baseline", metavar="LABEL", help="compare every config with this one, paired by card, with a 95%% interval"
-    )
-    parser.add_argument(
-        "--chain",
-        dest="chains",
-        action="append",
-        type=parse_chain,
-        default=[],
-        metavar="A>B",
-        help="also report A falling back to B when A can't read a card itself, from the same results; repeatable",
-    )
-    parser.add_argument(
-        "--reference",
-        type=Path,
-        metavar="FILE",
-        help="an earlier run's JSON, for the cross-read rule (with --cross-read) and orientation (--no-intake-ocr)",
-    )
-    return parser
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if not args.check and not args.group:
-        parser.error("--group is required (except with --check)")
-    if args.pipeline == "import" and (args.cross_read or not args.intake_ocr):
-        parser.error("--cross-read and --no-intake-ocr need --pipeline card")
-    return args
-
-
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
 
     try:
-        cards = load_cards(args.cards, args.only_cards)
         if args.check:
-            check_cards(cards)
-            for card in cards:
-                tags = f" [{', '.join(card.fixture.tags)}]" if card.fixture.tags else ""
-                state = "verified" if card.fixture.verified_by_owner else "unverified"
-                sys.stdout.write(
-                    f"{card.id}: v{card.fixture.schema_version}, {len(card.images)} image(s), {state}{tags}\n"
-                )
-            sys.stdout.write(f"{len(cards)} card(s) in {args.cards} are valid\n")
+            run_check(args)
+            return
+        if args.dry_run:
+            problems, notes = dry_run(args)
+            sys.stdout.write("".join(f"{note}\n" for note in notes))
+            if problems:
+                sys.stdout.write("Problems:\n" + "".join(f"- {problem}\n" for problem in problems))
+                sys.exit(1)
+            sys.stdout.write("No problems found: the run can start.\n")
             return
 
+        cards = load_cards(args.cards, args.only_cards)
         reference = load_reference(args.reference) if args.reference else None
         with session_context() as session:
             group = get_repositories(session, group_id=None, household_id=None).groups.get_by_slug_or_id(args.group)

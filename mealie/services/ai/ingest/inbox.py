@@ -33,8 +33,17 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   hash, and the file is just moved to `processed/`.
 - **Paused** for a restore: the scan stops before each file while the marker is set. A group that can't read cards, or
   is at its processing quota, keeps its files where they are until it can.
+- **Folders Mealie creates** get `AI_INGEST_INBOX_DIR_MODE` (2775 by default: setgid and group-writable, so whatever
+  writes the photos as a member of Mealie's group can write there), set on the open folder so the umask can't strip
+  it. Folders that already exist are never changed.
+- **`processed/` is purged** when `AI_INGEST_INBOX_PROCESSED_DAYS` is set: once a day per process (first 10 minutes
+  after the first scan), each household's `processed/YYYY-MM/` loses the regular files processed longer ago than
+  that, through the same descriptors and never through a link, at most `PURGE_ENTRIES` a run; a month folder left
+  empty is removed. A file's processing time is the later of its mtime and its ctime (the move into `processed/` sets
+  it; a photo copied with its old date keeps its mtime), and never before its month folder's first day.
 """
 
+import calendar
 import errno
 import os
 import re
@@ -89,6 +98,14 @@ INBOX_LOCALE = "en-US"
 
 NAME_MAX_BYTES = 255
 _CLAIM_NAME = re.compile(r"^(?P<ms>\d+)__(?P<token>[0-9a-f]{32})__(?P<name>.+)$", re.DOTALL)
+_MONTH_NAME = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})$")
+
+PURGE_ENTRIES = 5000
+"""At most this many entries of `processed/` are looked at in one purge; a purge that stops there resumes next scan"""
+
+_monotonic = time.monotonic
+_wall_clock = time.time
+"""The purge's clocks (tests move them)"""
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _ROOT_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -151,6 +168,8 @@ class _ScanState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     seen: dict[str, dict[str, tuple]] = field(default_factory=dict)
     logged: set[str] = field(default_factory=set)
+    next_purge: float | None = None
+    """When `processed/` is purged next (`time.monotonic()`); None until the first scan"""
 
     def first(self, key: str) -> bool:
         """Whether `key` is new since it was last forgotten (and marks it seen)"""
@@ -172,6 +191,7 @@ class _ScanState:
         with self.lock:
             self.seen.clear()
             self.logged.clear()
+            self.next_purge = None
 
 
 _state = _ScanState()
@@ -200,20 +220,35 @@ def _display_name(name: str) -> str:
 
 def _open_dir(name: str, dir_fd: int, label: str, *, create: bool = False) -> int:
     """
-    The directory `name` inside `dir_fd`, opened without following a link (and created first when asked). Raises
-    `_UnsafeFolder` when it's a link or not a directory, `FileNotFoundError` when it's missing.
+    The directory `name` inside `dir_fd`, opened without following a link (and created first when asked, with
+    `AI_INGEST_INBOX_DIR_MODE`). Raises `_UnsafeFolder` when it's a link or not a directory, `FileNotFoundError` when
+    it's missing.
     """
+    created = False
+    mode = get_ingest_settings().inbox_dir_mode if create else 0
     if create:
         try:
-            os.mkdir(name, dir_fd=dir_fd)
+            os.mkdir(name, mode, dir_fd=dir_fd)
+            created = True
         except FileExistsError:
-            pass  # a link or a file in its place fails below
+            pass  # a link or a file in its place fails below; an existing folder keeps its mode
     try:
-        return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+        fd = os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
     except OSError as e:
         if e.errno in (errno.ELOOP, errno.ENOTDIR):
             raise _UnsafeFolder(label) from e
         raise
+    if created:
+        _set_mode(fd, mode, label)
+    return fd
+
+
+def _set_mode(fd: int, mode: int, label: str) -> None:
+    """A folder Mealie just created gets the configured mode in full: `mkdir` applied the umask (022: no group write)"""
+    try:
+        os.fchmod(fd, mode)
+    except OSError as e:
+        _state.log_once(f"mode:{label}", f"Couldn't set the mode of the recipe card inbox folder {label}: {e}")
 
 
 def _lexists(name: str, dir_fd: int) -> bool:
@@ -683,6 +718,138 @@ def _rejection(reason: IngestRejectReason) -> str:
 
 
 # ==================================================================================================================
+# Purging processed/
+
+
+@dataclass
+class _Purge:
+    cutoff: float
+    """Files processed before this (seconds since the epoch) are removed"""
+    current_month: str
+    budget: int
+    """Entries still to look at"""
+    files: int = 0
+    folders: int = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self.budget <= 0
+
+
+def _month_start(name: str) -> float | None:
+    """The first instant (UTC) of a `YYYY-MM` folder's month; None for any other name"""
+    match = _MONTH_NAME.match(name)
+    if not match or not 1 <= int(match.group("month")) <= 12:
+        return None
+    return float(calendar.timegm((int(match.group("year")), int(match.group("month")), 1, 0, 0, 0)))
+
+
+def _purge_month(processed: int, month_name: str, start: float, purge: _Purge, label: str) -> None:
+    """Removes the month folder's regular files processed before the cutoff, then the folder if that emptied it"""
+    month = _open_dir(month_name, processed, label)
+    try:
+        with os.scandir(month) as entries:
+            for entry in entries:
+                if purge.exhausted:
+                    return
+                purge.budget -= 1
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue  # a link, a folder: never followed or removed
+                processed_at = max(st.st_mtime, st.st_ctime, start)
+                if processed_at >= purge.cutoff:
+                    continue
+                try:
+                    os.unlink(entry.name, dir_fd=month)
+                except FileNotFoundError:
+                    continue  # another process's purge
+                purge.files += 1
+        if month_name != purge.current_month and not os.listdir(month):
+            try:
+                os.rmdir(month_name, dir_fd=processed)
+                purge.folders += 1
+            except OSError:
+                pass  # something arrived meanwhile, or another process removed it
+    finally:
+        os.close(month)
+
+
+def _purge_folder(root_fd: int, folder: HouseholdFolder, purge: _Purge) -> None:
+    """One household's `processed/`, oldest month first: only months begun before the cutoff can hold old files"""
+    with _open_folder(root_fd, folder) as dirs:
+        label = f"{folder.key}/{PROCESSED_DIR}"
+        try:
+            processed = _open_dir(PROCESSED_DIR, dirs.fd, label)
+        except FileNotFoundError:
+            return
+        try:
+            months = sorted(
+                (start, name) for name in os.listdir(processed) if (start := _month_start(name)) is not None
+            )
+            for start, name in months:
+                if purge.exhausted or start >= purge.cutoff:
+                    return
+                try:
+                    _purge_month(processed, name, start, purge, f"{label}/{name}")
+                except _UnsafeFolder as e:
+                    _log_unsafe(e)
+                except FileNotFoundError:
+                    continue
+        finally:
+            os.close(processed)
+
+
+def purge_processed(root_fd: int, folders: list[HouseholdFolder], days: int, now: float) -> _Purge:
+    """
+    Removes the files every household's `processed/YYYY-MM/` folders received more than `days` days before `now`
+    (seconds since the epoch), at most `PURGE_ENTRIES` entries looked at; logs what it removed. One folder's trouble
+    never stops the others.
+    """
+    purge = _Purge(
+        cutoff=now - days * 86400,
+        current_month=datetime.fromtimestamp(now, UTC).strftime("%Y-%m"),
+        budget=PURGE_ENTRIES,
+    )
+    for folder in folders:
+        if purge.exhausted:
+            break
+        try:
+            _purge_folder(root_fd, folder, purge)
+        except _UnsafeFolder as e:
+            _log_unsafe(e)
+        except OSError as e:
+            _state.log_once(f"purge:{folder.key}", f"Couldn't clean up the recipe card inbox of {folder.key}: {e}")
+    if purge.files or purge.folders:
+        logger.info(
+            f"Removed {purge.files} files processed more than {days} days ago (and {purge.folders} empty month "
+            "folders) from the recipe card inbox"
+        )
+    return purge
+
+
+def _purge_if_due(root_fd: int, folders: list[HouseholdFolder]) -> None:
+    """
+    `purge_processed` once a day per process, the first time `PURGE_FIRST_DELAY` after the first scan; again at the
+    next scan when it stopped at `PURGE_ENTRIES`. Nothing while `AI_INGEST_INBOX_PROCESSED_DAYS` is unset.
+    """
+    days = get_ingest_settings().INBOX_PROCESSED_DAYS
+    now = _monotonic()
+    with _state.lock:
+        if _state.next_purge is None:
+            _state.next_purge = now + limits.PURGE_FIRST_DELAY
+        if days is None or now < _state.next_purge:
+            return
+        _state.next_purge = now + limits.PURGE_INTERVAL
+    purge = purge_processed(root_fd, folders, days, _wall_clock())
+    if purge.exhausted:
+        with _state.lock:
+            _state.next_purge = now  # more to look at: the next scan goes on
+
+
+# ==================================================================================================================
 # The scan
 
 
@@ -853,7 +1020,10 @@ def _scan_folder(
 
 
 def scan_once() -> int:
-    """One scan of every household folder (skipped while paused): the number of files ingested"""
+    """
+    One scan of every household folder (skipped while paused), then `processed/`'s purge when it's due: the number of
+    files ingested
+    """
     root = inbox_root()
     if root is None or not get_ingest_settings().ENABLED or storage.is_paused():
         return 0
@@ -894,6 +1064,8 @@ def scan_once() -> int:
                 created += scanned.created
                 if scanned.paused:
                     break
+        if not storage.is_paused():
+            _purge_if_due(root_fd, folders)
     finally:
         os.close(root_fd)
     return created

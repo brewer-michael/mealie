@@ -273,7 +273,25 @@ def test_ingest_rows_and_files_survive_a_backup(unique_user_fn_scoped: TestUser)
         backup_v2.db_exporter.engine.dispose()
 
     after = _snapshot(user, seeded)
-    assert after == before
+    # every column comes back as it was, except that a task running when the backup was taken is queued again with
+    # no lease and its attempt given back (`IngestQueue.requeue_all_running`, §3.9), which touches `update_at`
+    requeued = {
+        "task_state": IngestTaskState.queued.value,
+        "lease_token": None,
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "task_started_at": None,
+        "progress_key": None,
+    }
+    expected = dict(before)
+    expected["jobs"] = []
+    for row, restored in zip(before["jobs"], after["jobs"], strict=True):
+        if row["task_state"] == IngestTaskState.running.value:
+            assert restored["update_at"] >= row["update_at"]
+            row = {**row, **requeued, "attempts": row["attempts"] - 1, "update_at": restored["update_at"]}
+        expected["jobs"].append(row)
+    assert sum(row["task_state"] == IngestTaskState.queued.value for row in expected["jobs"]) == 2
+    assert after == expected
     # the strings a restore would reformat if it took them for UUIDs came back as they were
     for row in after["jobs"]:
         assert UUID(row["source_name"].removeprefix("upload/"))

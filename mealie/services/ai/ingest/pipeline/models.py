@@ -3,7 +3,7 @@ The recipe card pipeline's inputs, options and result (docs/ai/PHASE2.md §4.1).
 pipeline's other modules can import them without importing the package's entry points.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -50,3 +50,9 @@ class CardExtraction:
     flags: list[CardFlag]
     transcription: str | None
     extraction: ExtractionMeta
+    rotations: dict[int, int] = field(default_factory=dict)
+    """
+    How far the image reader said each page not yet oriented must turn clockwise to be upright (90, 180 or 270), by
+    page index: the runner turns those pages (`rotation_source` model). Pages Tesseract or the reviewer oriented, and
+    pages read as upright, aren't listed.
+    """

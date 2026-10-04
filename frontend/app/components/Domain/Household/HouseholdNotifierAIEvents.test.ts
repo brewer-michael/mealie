@@ -88,7 +88,7 @@ describe("HouseholdNotifierAIEvents", () => {
     expect(wrapper.get("h4").text()).toBe("Recipe cards");
     expect(wrapper.get(".label").text()).toBe("Recipe cards ready to review");
     expect(wrapper.get(".hint").text())
-      .toBe("One notification when a batch of cards has been read, with a link to review them.");
+      .toBe("One notification when a batch of cards has been read, with a link to review them, and one when photos put in the inbox couldn't be added.");
     expect(checkbox(wrapper).checked).toBe(true);
     expect(checkbox(wrapper).disabled).toBe(false);
   });

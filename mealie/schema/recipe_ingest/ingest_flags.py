@@ -9,7 +9,14 @@ from pydantic import UUID4, ConfigDict, Field
 from mealie.schema._mealie import MealieModel
 
 from .ingest_draft import CardDraft
-from .ingest_enums import CardFlagKind, CardFlagSeverity, CardFlagSource, CardProposalKind, FlagResolution
+from .ingest_enums import (
+    CardFlagKind,
+    CardFlagSeverity,
+    CardFlagSource,
+    CardProposalKind,
+    CardProposalOrigin,
+    FlagResolution,
+)
 
 
 class CardFlag(MealieModel):
@@ -65,6 +72,8 @@ class CardProposal(MealieModel):
     """Tesseract read the region, since the group has no image provider"""
     draft: CardDraft | None = None
     """A re-extract's whole new draft"""
+    origin: CardProposalOrigin = CardProposalOrigin.reextract
+    """What made a whole-card proposal: the card read again, or the recipe built again from the edited transcription"""
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     model_config = ConfigDict(extra="ignore")

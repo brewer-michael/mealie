@@ -2,29 +2,54 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { defineComponent } from "vue";
 import IngestRegionDialog from "./IngestRegionDialog.vue";
+import IngestRegionStencil from "./IngestRegionStencil.vue";
 import { normalizeDraft, rereadTargets, rereadTargetValue } from "~/composables/use-recipe-ingest-review";
 import type { PageOut } from "~/lib/api/types/recipe-ingest";
+
+type Coordinates = { left: number; top: number; width: number; height: number };
+type Transform = (params: { coordinates: Coordinates; imageSize: { width: number; height: number } }) => Coordinates;
 
 const cropper = vi.hoisted(() => ({
   result: { coordinates: { left: 0, top: 0, width: 0, height: 0 }, image: { width: 2048, height: 1536 } },
   refresh: vi.fn(),
+  setCoordinates: vi.fn(),
   props: [] as Record<string, unknown>[],
+  instance: null as null | { $emit: (event: string, value: unknown) => void },
 }));
 
 vi.mock("vue-advanced-cropper", async () => ({
   Cropper: (await import("vue")).defineComponent({
     name: "Cropper",
-    props: ["src", "canvas", "checkOrientation", "defaultSize"],
+    props: ["src", "canvas", "checkOrientation", "defaultSize", "stencilComponent", "stencilProps"],
+    emits: ["change", "ready"],
     created() {
       cropper.props.push({ ...this.$props });
+      cropper.instance = this as unknown as { $emit: (event: string, value: unknown) => void };
     },
     methods: {
       getResult: () => cropper.result,
       refresh: () => cropper.refresh(),
+      setCoordinates: (transform: Transform, options: unknown) => cropper.setCoordinates(transform, options),
     },
-    template: "<div class=\"cropper\" :data-src=\"src\" />",
+    // the stencil stands in for the selection the cropper draws
+    template: `
+      <div class="cropper" :data-src="src">
+        <div class="ingest-region-stencil" tabindex="0" :aria-label="stencilProps?.label" :aria-describedby="stencilProps?.describedBy" />
+      </div>
+    `,
   }),
+  BoundingBox: { template: "<div><slot /></div>" },
+  DraggableArea: { template: "<div><slot /></div>" },
+  StencilPreview: { template: "<div />" },
 }));
+
+/** Applies the transform the dialog last gave `setCoordinates` to the cropper's current selection, in whole pixels */
+function lastTransform(): Coordinates {
+  const transform = cropper.setCoordinates.mock.calls.at(-1)![0] as Transform;
+  const moved = transform({ coordinates: cropper.result.coordinates, imageSize: cropper.result.image });
+  const round = (value: number) => Math.round(value * 100) / 100;
+  return { left: round(moved.left), top: round(moved.top), width: round(moved.width), height: round(moved.height) };
+}
 
 function page(index: number): PageOut {
   const base = `/api/ai/ingest/jobs/j1/pages/${index}`;
@@ -102,6 +127,7 @@ describe("IngestRegionDialog", () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     cropper.refresh.mockClear();
+    cropper.setCoordinates.mockClear();
     cropper.props.length = 0;
     cropper.result = { coordinates: { left: 153.6, top: 1024, width: 1228.8, height: 204.8 }, image: { width: 1536, height: 2048 } };
   });
@@ -137,8 +163,9 @@ describe("IngestRegionDialog", () => {
   test("the back of the card and another field can be chosen", async () => {
     const wrapper = mountDialog();
     await flushPromises();
-    // opened from the toolbar, the first field is preselected
-    expect((wrapper.get("select").element as HTMLSelectElement).value).toBe("name");
+    // opened from the toolbar or the ⋯ menu, nothing is preselected: the reviewer says what it's for first
+    expect((wrapper.get("select").element as HTMLSelectElement).value).toBe("");
+    expect(wrapper.get(".submit").attributes("disabled")).toBeDefined();
 
     await wrapper.findAll(".pages button")[1]!.trigger("click");
     await wrapper.get("select").setValue("ingredients:i1");
@@ -187,5 +214,58 @@ describe("IngestRegionDialog", () => {
     const wrapper = mountDialog({ pages: [] });
     await flushPromises();
     expect(wrapper.get(".submit").attributes("disabled")).toBeDefined();
+  });
+  test("the selection follows a finger from the first pixel: the dialog draws it with its own stencil", async () => {
+    mountDialog({ initialTarget: "name" });
+    await flushPromises();
+
+    expect(cropper.props[0]!.stencilComponent).toBe(IngestRegionStencil);
+    expect(cropper.props[0]!.stencilProps).toMatchObject({ label: "Selected area" });
+  });
+
+  test("arrow keys on the selection move it by 2% of the page; Shift and arrow keys resize it", async () => {
+    // a band from 10% to 90% across, 50% to 60% down, of a 1536 x 2048 page
+    const wrapper = mountDialog({ initialTarget: "name" });
+    await flushPromises();
+    const selection = wrapper.get(".ingest-region-stencil");
+    expect(wrapper.get(`[id="${selection.attributes("aria-describedby")}"]`).text())
+      .toBe("Arrow keys move the selected area. Shift and arrow keys resize it.");
+
+    await selection.trigger("keydown", { key: "ArrowDown" });
+    expect(cropper.setCoordinates).toHaveBeenCalledOnce();
+    expect(cropper.setCoordinates.mock.calls[0]![1]).toEqual({ transitions: false });
+    expect(lastTransform()).toEqual({ left: 153.6, top: 1064.96, width: 1228.8, height: 204.8 });
+
+    await selection.trigger("keydown", { key: "ArrowLeft" });
+    expect(lastTransform()).toEqual({ left: 122.88, top: 1024, width: 1228.8, height: 204.8 });
+
+    await selection.trigger("keydown", { key: "ArrowRight", shiftKey: true });
+    expect(lastTransform()).toEqual({ left: 153.6, top: 1024, width: 1259.52, height: 204.8 });
+
+    await selection.trigger("keydown", { key: "ArrowUp", shiftKey: true });
+    expect(lastTransform()).toEqual({ left: 153.6, top: 1024, width: 1228.8, height: 163.84 });
+
+    // other keys, and arrows anywhere else in the dialog, leave it alone
+    await selection.trigger("keydown", { key: "Enter" });
+    await wrapper.get(".cropper").trigger("keydown", { key: "ArrowDown" });
+    expect(cropper.setCoordinates).toHaveBeenCalledTimes(4);
+  });
+
+  test("after an arrow key a screen reader hears where the selection is", async () => {
+    const wrapper = mountDialog({ initialTarget: "name" });
+    await flushPromises();
+    const live = wrapper.get(".ingest-region-dialog__position");
+    expect(live.attributes("aria-live")).toBe("polite");
+
+    // a drag with the pointer isn't read out
+    cropper.instance!.$emit("change", cropper.result);
+    await flushPromises();
+    expect(live.text()).toBe("");
+
+    await wrapper.get(".ingest-region-stencil").trigger("keydown", { key: "ArrowDown" });
+    cropper.result = { coordinates: { left: 153.6, top: 1064.96, width: 1228.8, height: 204.8 }, image: { width: 1536, height: 2048 } };
+    cropper.instance!.$emit("change", cropper.result);
+    await flushPromises();
+    expect(live.text()).toBe("10% from the left, 52% from the top, 80% wide, 10% high");
   });
 });

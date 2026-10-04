@@ -18,7 +18,7 @@ export class AdminAIProvidersApi extends BaseAPI {
   }
 
   async updateProvider(groupId: string, providerId: string, payload: AIProviderUpdate) {
-    return await this.requests.put<AIProviderOut>(routes.providersId(groupId, providerId), payload);
+    return await this.requests.put<AIProviderOut, AIProviderUpdate>(routes.providersId(groupId, providerId), payload);
   }
 
   async deleteProvider(groupId: string, providerId: string) {

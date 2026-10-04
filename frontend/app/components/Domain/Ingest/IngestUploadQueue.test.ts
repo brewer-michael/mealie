@@ -213,3 +213,51 @@ describe("IngestUploadQueue", () => {
     expect(wrapper.find(".sealing").exists()).toBe(false);
   });
 });
+
+describe("IngestUploadQueue, more", () => {
+  test("Scan again sends a card marked Already scanned as a new card", async () => {
+    api.upload
+      .mockResolvedValueOnce({
+        data: { batchId: "b1", jobs: [], rejected: [{ index: 0, reason: "duplicate", duplicateOf: "j-earlier" }], summary: "" },
+        error: null,
+      })
+      .mockResolvedValue({ data: accepted, error: null });
+    const queue = useRecipeIngestUploads();
+    const wrapper = mountQueue();
+    queue.takePhoto(photo());
+    await flushPromises();
+
+    expect(wrapper.get(".already-scanned .upload-scan-again").text()).toBe("Scan again");
+    await wrapper.get(".upload-scan-again").trigger("click");
+    await flushPromises();
+    expect(api.upload.mock.calls[1]?.[1]).toMatchObject({ allowDuplicate: true });
+    expect(rows(wrapper)).toHaveLength(0);
+  });
+
+  test("a photo too large that this browser can't make smaller says what to do", async () => {
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => {
+      throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+    }));
+    api.upload.mockResolvedValue({
+      data: null,
+      error: { response: { status: 400, headers: {}, data: { detail: {
+        batchId: "b1",
+        jobs: [],
+        rejected: [{ index: 0, reason: "too_large" }],
+        summary: "",
+      } } } },
+    });
+    const queue = useRecipeIngestUploads();
+    const wrapper = mountQueue();
+    queue.takePhoto(new File(["big"], "IMG_0001.HEIC", { type: "image/heic" }));
+    await flushPromises();
+
+    expect(wrapper.get(".upload-status").text()).toBe("Upload failed");
+    expect(wrapper.get(".upload-detail").text())
+      .toBe("This photo is too large, and this browser can't make it smaller. Take it again or upload it from the phone.");
+    // the browser can't show it either: its name tells the cards apart
+    expect(wrapper.get(".upload-name").text()).toBe("IMG_0001.HEIC");
+    expect(wrapper.find(".upload-retry").exists()).toBe(false);
+    vi.unstubAllGlobals();
+  });
+});

@@ -156,7 +156,7 @@
 <script setup lang="ts">
 import { useAdminApi } from "~/composables/api";
 import type { AllBackups } from "~/lib/api/types/admin";
-import { alert } from "~/composables/use-toast";
+import { alert, alertUnreportedError } from "~/composables/use-toast";
 
 definePageMeta({
   layout: "admin",
@@ -199,9 +199,14 @@ async function restoreBackup(fileName: string) {
 
   if (error) {
     console.log(error);
-    state.importDialog = false;
     state.runningRestore = false;
-    alert.error(i18n.t("settings.backup.restore-fail"));
+    // fork hook (docs/ai/PHASE2.md §3.9): the axios interceptor already toasted the server's message. A restore
+    // refused as busy (503) restored nothing and works on a retry, so its dialog stays open
+    if (error.response?.status === 503 && error.response.data?.detail?.message) {
+      return;
+    }
+    state.importDialog = false;
+    alertUnreportedError(error, i18n.t("settings.backup.restore-fail"));
   }
   else {
     alert.success(i18n.t("settings.backup.restore-success"));

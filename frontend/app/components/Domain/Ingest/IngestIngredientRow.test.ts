@@ -21,7 +21,11 @@ const stubs = {
   VIcon: { props: ["icon", "color", "title"], template: "<i class=\"icon\" :data-color=\"color\" :title=\"title\" />" },
   VChip: { template: "<span class=\"chip\"><slot /></span>" },
   VSpacer: { template: "<span />" },
-  VBtn: { emits: ["click"], template: "<button type=\"button\" @click=\"$emit('click')\"><slot /></button>" },
+  VBtn: {
+    props: ["disabled"],
+    emits: ["click"],
+    template: "<button type=\"button\" :class=\"$attrs.class\" :aria-label=\"$attrs['aria-label']\" :disabled=\"disabled\" @click=\"$emit('click')\"><slot /></button>",
+  },
   VTextField: field("text-field"),
   VCombobox: field("combobox"),
 };
@@ -41,7 +45,19 @@ function oil(overrides: Partial<CardDraftIngredient> = {}): CardDraftIngredient 
 
 const wrappers: VueWrapper[] = [];
 
-function mountRow(ingredient: CardDraftIngredient, props: { expanded?: boolean; canCreateFoods?: boolean; flags?: CardFlag[]; infos?: CardFlag[] } = {}) {
+interface RowProps {
+  expanded?: boolean;
+  canCreateFoods?: boolean;
+  flags?: CardFlag[];
+  infos?: CardFlag[];
+  readonly?: boolean;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
+  draggable?: boolean;
+  canReread?: boolean;
+}
+
+function mountRow(ingredient: CardDraftIngredient, props: RowProps = {}) {
   const wrapper = mount(IngestIngredientRow, {
     props: { modelValue: ingredient, foodOptions: foods, unitOptions: units, ...props },
     global: { mocks: { $globals: { icons: {} } }, stubs },
@@ -167,5 +183,42 @@ describe("IngestIngredientRow", () => {
     const wrapper = mountRow(oil(), { expanded: true });
     await wrapper.findAll("button").find(b => b.text() === "Delete")!.trigger("click");
     expect(wrapper.emitted("remove")).toHaveLength(1);
+  });
+
+  test("open, it moves up or down from the keyboard; the way it can't go is off", async () => {
+    const wrapper = mountRow(oil(), { expanded: true, canMoveUp: false, canMoveDown: true });
+
+    const up = wrapper.get("[aria-label=\"Move up\"]");
+    const down = wrapper.get("[aria-label=\"Move down\"]");
+    expect(up.attributes("disabled")).toBeDefined();
+    expect(down.attributes("disabled")).toBeUndefined();
+
+    await down.trigger("click");
+    expect(wrapper.emitted("move-down")).toHaveLength(1);
+    await wrapper.setProps({ canMoveUp: true });
+    await wrapper.get("[aria-label=\"Move up\"]").trigger("click");
+    expect(wrapper.emitted("move-up")).toHaveLength(1);
+  });
+
+  test("open, it re-reads its line from the card when the card can be read", async () => {
+    expect(mountRow(oil(), { expanded: true }).find(".ingest-ingredient__reread").exists()).toBe(false);
+
+    const wrapper = mountRow(oil(), { expanded: true, canReread: true });
+    await wrapper.get(".ingest-ingredient__reread").trigger("click");
+    expect(wrapper.emitted("reread")).toHaveLength(1);
+  });
+
+  test("on desktop a handle drags the line; dragging doesn't open it", async () => {
+    expect(mountRow(oil()).find(".ingest-ingredient__handle").exists()).toBe(false);
+    expect(mountRow(oil(), { draggable: true, readonly: true }).find(".ingest-ingredient__handle").exists()).toBe(false);
+
+    const wrapper = mountRow(oil(), { draggable: true });
+    await wrapper.get(".ingest-ingredient__handle").trigger("click");
+    expect(wrapper.emitted("toggle")).toBeUndefined();
+  });
+
+  test("nothing moves or goes while read-only", () => {
+    const wrapper = mountRow(oil(), { expanded: true, readonly: true, canMoveUp: true, canMoveDown: true });
+    expect(wrapper.findAll("button")).toHaveLength(0);
   });
 });

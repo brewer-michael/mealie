@@ -144,3 +144,15 @@ def test_matching_never_writes(unique_user_fn_scoped: TestUser):
         assert statements
         assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
         assert not session.new and not session.dirty
+
+
+def test_the_units_names_for_the_flags(unique_user_fn_scoped: TestUser):
+    """Every way the group writes a unit, normalized: what `compute_flags` takes as `units`"""
+    user = unique_user_fn_scoped
+    _seed(user)
+
+    with session_context() as session:
+        matcher = IngestMatcher(get_repositories(session, group_id=user.repos.group_id, household_id=None))
+        names = set(matcher.unit_names())
+
+    assert {"tablespoon", "tablespoons", "tbsp", "tbs", "package", "pkg"} <= names

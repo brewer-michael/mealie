@@ -46,7 +46,7 @@ APP_BATCH_IDLE = 10 * 60
 AUTO_BATCH_IDLE = 2 * 60
 """API and inbox uploads join a batch that saw an upload this recently; it seals after this long without one"""
 NOTIFY_CUTOFF = 24 * 60 * 60
-"""Batches created longer ago never notify, so a restore doesn't replay old notifications"""
+"""Batches whose cards were last written longer ago never notify, so a restore doesn't replay old notifications"""
 
 # ==========================================
 # The runner (§3)
@@ -85,6 +85,10 @@ PURGE_FIRST_DELAY = 10 * 60
 """The daily purge's first run after boot"""
 ORPHAN_DIR_AGE = 60 * 60
 """Job directories with no row are removed once they're this old"""
+EMPTY_BATCH_AGE = 24 * 60 * 60
+"""Batches with no cards (a duplicate-only or abandoned upload) are removed once their last upload is this old"""
+DISPATCHER_SEEN_INTERVAL = 60
+"""How often a running dispatcher writes its presence file (`storage.dispatcher_seen_at`)"""
 ORIENT_MIN_RATIO = 1.5
 """A page is turned only when the best orientation scores at least this many times the upright one (§4.4)"""
 
@@ -94,9 +98,16 @@ ORIENT_MIN_RATIO = 1.5
 PAUSE_REFRESH = 60
 """How often a restore rewrites the pause marker's time"""
 PAUSE_TTL = 5 * 60
-"""How long a marker is honoured after its last refresh: a crash mid-restore pauses ingestion for this long at most"""
-RESTORE_LOCK_WAIT = 120
-"""How long a restore waits for in-flight writers before giving up, having changed nothing"""
+"""
+How long a marker is honoured after its last refresh. A marker whose restore is gone is removed at once
+(`storage.is_paused`); this bounds one whose restore can't be told (an older version's, or another host's where file
+locks don't work).
+"""
+RESTORE_LOCK_WAIT = 45
+"""
+How long a restore waits for in-flight writers before giving up, having changed nothing ("try again"). Write sections
+take seconds; this stays under the 60 s that reverse proxies commonly allow a request, so the browser sees the answer.
+"""
 RESTORE_LOCK_POLL = 0.25
 PAUSED_TASK_POLL = 5
 """How often a task that hit the pause checks whether it's over"""

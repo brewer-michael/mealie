@@ -80,6 +80,11 @@ class AlchemyExporter(BaseService):
         "last_upload_at",
         "sealed_at",
         "notified_at",
+        # fork: delivery leases, the automatic retry and the recipe event mark (docs/ai/PHASE2.md §13)
+        "notify_claimed_at",
+        "auto_retry_at",
+        "recipe_event_claimed_at",
+        "recipe_event_sent_at",
     }
     """Column names restored back into datetimes. Anything stored as a `NaiveDateTime` and missing
     here comes back from a backup as a string; `test_every_datetime_column_survives_a_backup` guards

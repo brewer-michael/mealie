@@ -237,8 +237,9 @@ def generate_typescript_types() -> None:  # noqa: C901
                 log.exception(f"Module Error: {module}")
 
     # Run ESLint --fix on the files to clean up any formatting issues
+    # fork: on these files only; `pnpm lint` is `eslint .`, which also rewrote every other fixable file in the frontend
     subprocess.run(
-        ["pnpm", "lint", "--fix", *(str(path) for path in out_paths)],
+        ["pnpm", "exec", "eslint", "--fix", *(str(path) for path in out_paths)],
         check=True,
         cwd=PROJECT_DIR / "frontend",
     )

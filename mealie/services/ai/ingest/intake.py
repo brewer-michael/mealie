@@ -4,10 +4,13 @@ normalized into the new job's directory, then one transaction checks for a dupli
 only) and inserts the job with its extraction queued; the dispatcher is woken. The uploaded bytes never reach
 `DATA_DIR`. Used by the upload route and the inbox.
 
-**Order inside the transaction:** the batch touch comes first. On SQLite it takes the database's write lock, so the
-duplicate check, the position and the insert that follow can't interleave with another intake; on PostgreSQL it
-holds the batch's row lock, which serializes cards sent to the same batch (a resend usually is) and makes a waiting
-seal re-check its `WHERE` after the insert (§1.4).
+**One household's intakes take turns.** The transaction starts with the household's intake lock
+(`lock_household_intake`): a transaction-level advisory lock on PostgreSQL, the database's write lock on SQLite (plus
+a lock per household in this process, so its own threads queue there rather than in SQLite's busy wait). So the
+batch choice, the duplicate check, the position and the insert can't interleave with another upload or inbox card
+of the household, in any worker process: two cards sent at once share one batch, and the same card sent twice at
+once is one job and one `duplicate`. The batch touch then holds the batch's row (§1.4): a waiting seal re-checks its
+`WHERE` after the insert.
 
 **Failures** remove the job's directory, still under the write lock, so nothing is left in `DATA_DIR`: a rejected
 image, a duplicate, a lost inbox claim or a database error. A pause is found before the directory exists.
@@ -21,6 +24,7 @@ Public interface:
 - `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots, the inbox's
   included.
 - `ClaimLost`: the inbox's claimed file moved away before the insert (another scanner retried it).
+- `lock_household_intake(session, household_id)`: the household's intake lock, held until the transaction ends.
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
   local providers only or at all, its own local-only setting, its processing jobs (the upload's checks 3 and 4,
   and the inbox's) and whether the monthly token limits stop a card being read now (the capture page's warning).
@@ -36,9 +40,11 @@ from uuid import UUID, uuid4
 
 import anyio
 import anyio.to_thread
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from mealie.core.root_logger import get_logger
+from mealie.db.models.recipe_ingest import RecipeIngestionBatch
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
@@ -73,8 +79,39 @@ _intake_slots = threading.BoundedSemaphore(limits.INTAKE_CONCURRENCY)
 """The same bound for every caller of `ingest`, the inbox's scan included: one large photo takes hundreds of MB"""
 
 
+_household_locks: dict[UUID, threading.Lock] = {}
+"""This process's intake lock per household, taken before the database's (`lock_household_intake`)"""
+_household_locks_guard = threading.Lock()
+
+
 class ClaimLost(Exception):
     """The inbox's claimed file was no longer at its path before the insert: another scanner is retrying it"""
+
+
+def _household_lock(household_id: UUID) -> threading.Lock:
+    """This process's intake lock for one household"""
+    with _household_locks_guard:
+        return _household_locks.setdefault(household_id, threading.Lock())
+
+
+def _advisory_key(household_id: UUID) -> int:
+    """The household's PostgreSQL advisory lock key: a signed 64-bit number from a hash of its id"""
+    digest = hashlib.sha256(b"ai-ingest-intake:" + household_id.bytes).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def lock_household_intake(session: Session, household_id: UUID) -> None:
+    """
+    Takes the household's intake lock for the session's transaction (it's released when the transaction ends), waiting
+    for another worker process's intake of the same household to finish. PostgreSQL: `pg_advisory_xact_lock`. SQLite:
+    a write statement that changes nothing but takes the database's write lock, which a second writer waits for (its
+    busy timeout); every later read in the transaction then sees the other intake's committed rows.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": _advisory_key(household_id)})
+        return
+    batch = RecipeIngestionBatch.__table__
+    session.connection().execute(sa.update(batch).where(sa.false()).values(id=batch.c.id))
 
 
 @dataclass
@@ -200,9 +237,10 @@ class IntakeService:
         """
         Turns one card into a job, holding the ingest write lock from its directory's creation through the insert,
         and one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one). Each image is normalized into
-        `pages/<n>/`; then one transaction touches the batch (choosing another if it was sealed meanwhile), checks for
-        a duplicate (unless allowed), calls `confirm` (the inbox checks that its claimed file is still there) and
-        inserts the job, `processing` with its extraction queued. The dispatcher is woken.
+        `pages/<n>/`; then one transaction takes the household's intake lock, chooses and touches the batch (choosing
+        again if it was sealed meanwhile), checks for a duplicate (unless allowed), calls `confirm` (the inbox checks
+        that its claimed file is still there) and inserts the job, `processing` with its extraction queued. The
+        dispatcher is woken.
 
         A rejected image or a duplicate is an `IntakeRejected`, and leaves nothing on disk. Raises `IngestPaused`
         (nothing written) while a restore pauses ingestion, `NoEntryFound` for an unknown batch and `ClaimLost` when
@@ -264,15 +302,32 @@ class IntakeService:
         options: IntakeOptions,
         confirm: Callable[[], bool] | None,
     ) -> IntakeOutcome:
-        """The duplicate check, the batch touch and the job insert, in one transaction"""
+        """
+        The batch choice, the duplicate check, the batch touch and the job insert, in one transaction that holds the
+        household's intake lock (this process's first, then the database's)
+        """
+        with _household_lock(self.household_id):
+            return self._insert_locked(job_id, card, pages, options, confirm)
+
+    def _insert_locked(
+        self,
+        job_id: UUID,
+        card: IntakeCard,
+        pages: list[PageMeta],
+        options: IntakeOptions,
+        confirm: Callable[[], bool] | None,
+    ) -> IntakeOutcome:
         session = self.session
         repos = self.repos
         if session.in_transaction():
             session.commit()  # start from a fresh transaction (and a fresh snapshot)
 
-        now = utcnow()
         digest = source_sha256(pages)
         try:
+            # first in the transaction: waits for another intake of the household to commit, so everything read
+            # below (the open batch, a duplicate, the next position) includes its rows
+            lock_household_intake(session, self.household_id)
+            now = utcnow()
             batch_id = self._join_batch(repos, options, now)
 
             if not options.allow_duplicate:

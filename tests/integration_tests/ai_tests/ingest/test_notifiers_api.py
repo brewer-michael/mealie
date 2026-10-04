@@ -5,9 +5,9 @@ A notifier's "recipe cards ready" toggle and its test notification, `/api/ai/not
 
 import json
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
+import apprise
 import pytest
 from fastapi.testclient import TestClient
 
@@ -143,7 +143,10 @@ def test_the_test_notification(api_client: TestClient, unique_user_fn_scoped: Te
 
     [sent] = urls
     assert sent.startswith(url + "?")
-    params = {key: values[0] for key, values in parse_qs(urlsplit(sent).query).items()}
+    # what Home Assistant gets, after Apprise has decoded the URL
+    plugin = apprise.Apprise.instantiate(sent)
+    assert plugin is not None
+    params = {f":{key}": value for key, value in plugin.payload_extras.items()}
     assert params[":event_type"] == "recipe_ingestion_ready"
     assert params[":integration_id"] == "test_event"
     slug = api_client.get(api_routes.groups_self, headers=user.token).json()["slug"]

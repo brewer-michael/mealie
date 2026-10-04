@@ -72,9 +72,16 @@ def rename_non_compliant_paths():
 
     ignore_extensions = [".pyc", ".pyo", ".py"]
 
+    # fork: recipe card eval fixtures name their photos in their JSON's `source`, which a rename would break
+    # (docs/ai/EVAL.md), so their file names are left as they are
+    ignore_dirs = [TEST_DATA / "cards"]
+
     def recursive_rename(p: Path):
         for child in p.iterdir():
             if str(child).startswith("."):
+                continue
+
+            if child in ignore_dirs:
                 continue
 
             if child.suffix in ignore_extensions:

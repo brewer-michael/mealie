@@ -154,7 +154,7 @@ def test_the_purge(seeder: Seeder):
     processing_old = seeder.job(IngestStatus.processing, age=old, task_state="queued", task_kind="extract")
 
     empty_old = seeder.batch(last_upload_ago=old)
-    empty_recent = seeder.batch(last_upload_ago=recent)
+    empty_recent = seeder.batch(last_upload_ago=timedelta(hours=2))
     busy_old = seeder.batch(last_upload_ago=old)
     seeder.job(IngestStatus.ready, batch_id=busy_old)
 
@@ -208,6 +208,37 @@ def test_the_purge(seeder: Seeder):
     snapshot = {job_id: _row(job_id) for job_id in (committed_old, committed_recent, ready_old)}
     retention.purge_once(utcnow())
     assert {job_id: _row(job_id) for job_id in snapshot} == snapshot
+
+
+def test_empty_batches_go_a_day_after_their_last_upload_sealed_or_not(seeder: Seeder):
+    """
+    A duplicate-only upload or one the app abandoned (a logout) leaves an empty batch nobody seals: it goes a day after
+    its last upload, as a sealed one does, not after the card retention. A batch with cards stays.
+    """
+    two_days, two_hours = timedelta(days=2), timedelta(hours=2)
+    open_old = seeder.batch(last_upload_ago=two_days)
+    open_recent = seeder.batch(last_upload_ago=two_hours)
+    sealed_old = seeder.batch(last_upload_ago=two_days)
+    with_cards = seeder.batch(last_upload_ago=two_days)
+    seeder.job(IngestStatus.ready, batch_id=with_cards)
+    with session_context() as session:
+        repos = IngestRepos(session, seeder.group_id, seeder.household_id)
+        assert repos.batches.seal(sealed_old, utcnow() - two_days)
+        assert repos.batches.seal(with_cards, utcnow() - two_days)
+        # no upload since it was made (an app batch whose first card was refused): its age counts from its creation
+        never_used = repos.batches.create(source=IngestSource.app, created_by=None, now=utcnow() - two_days)
+        session.execute(
+            sa.update(RecipeIngestionBatch).where(RecipeIngestionBatch.id == never_used).values(last_upload_at=None)
+        )
+        session.commit()
+
+    retention.purge_once(utcnow())
+
+    assert not _batch_exists(open_old)
+    assert not _batch_exists(sealed_old)
+    assert not _batch_exists(never_used)
+    assert _batch_exists(open_recent)
+    assert _batch_exists(with_cards)
 
 
 def test_nothing_is_purged_while_a_restore_pauses_ingestion(seeder: Seeder):

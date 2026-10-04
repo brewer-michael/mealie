@@ -1,13 +1,16 @@
 """
 `IngestDispatcher` (docs/ai/PHASE2.md §3.2-§3.9): one per worker process, started by the ingest router's lifespan
 (`APIRouter(lifespan=dispatcher.lifespan)`, so `app.py` needs no change), unless `AI_INGEST_ENABLED` or
-`AI_INGEST_WORKER` is off. `AI_INGEST_WORKER` is off under `TESTING`, where tests call `run_once()`.
+`AI_INGEST_WORKER` is off. `AI_INGEST_WORKER` is off under `TESTING`, where tests call `run_once()`. Off otherwise, the
+lifespan logs a warning: uploads are still accepted, and only a worker in another process reads them.
 
 Its loop runs on the app's event loop, and **every database call goes through `anyio.to_thread.run_sync` with the
 dispatcher's own `CapacityLimiter`**, so an upload burst can't starve heartbeats and no query blocks the loop. Each
 tick runs these phases; each one survives its own errors, logging once and backing off (doubling up to
 `PHASE_BACKOFF_MAX`), so a failed query never stops the dispatcher for the life of the process:
 
+- **Presence** (every `DISPATCHER_SEEN_INTERVAL`, paused or not): the presence file's time, which tells the app a card
+  reader runs (`storage.dispatcher_seen_at`).
 - **Pause check:** while a backup restore's marker is set, nothing below runs (§3.9).
 - **Heartbeat** (every `HEARTBEAT_INTERVAL`): renews this process's leases; a task whose token is gone (commit,
   discard, sweep, restore) or that was asked to stop is cancelled through its own loop.
@@ -25,8 +28,9 @@ call. A task past `TASK_DEADLINE` is cancelled (`timeout`); one stuck in synchro
 returns, and is logged.
 
 **Shutdown** (the lifespan's exit): stop claiming, cancel the running tasks, wait up to `SHUTDOWN_GRACE`, then release
-every lease still held (`queued`, `attempts - 1`, so deploys don't use up retries). A claim still in flight when the
-loop is cancelled is waited for within that grace, so the tasks it took are released too.
+every lease this dispatcher holds (`queued`, `attempts - 1`, so deploys don't use up retries), by its owner id rather
+than by the tasks it knows of. A claim still in flight takes no further task once shutdown begins and is waited for
+within that grace; whatever it claimed is given back rather than started, by the claim itself when it ends later.
 
 Every time stored or compared is `utcnow()` from Python: never the database's own clock (§3.2).
 """
@@ -48,6 +52,7 @@ import anyio
 import anyio.to_thread
 from sqlalchemy.orm import Session
 
+from mealie.core.config import get_app_settings
 from mealie.core.root_logger import get_logger
 from mealie.db.db_setup import session_context
 from mealie.repos.repository_recipe_ingest import IngestQueue, utcnow
@@ -68,6 +73,7 @@ STOP_WAIT = 3.0
 
 
 class Phase(StrEnum):
+    presence = "presence file"
     pause = "pause check"
     heartbeat = "heartbeat"
     sweep = "sweep"
@@ -101,23 +107,29 @@ class ClaimBatch:
     """Claiming stopped at this error; the claims before it stand"""
 
 
-def claim_tasks(session: Session, *, owner: str, general_slots: int, reread_slots: int) -> ClaimBatch:
+def claim_tasks(
+    session: Session, *, owner: str, general_slots: int, reread_slots: int, stop: threading.Event | None = None
+) -> ClaimBatch:
     """
     Claims up to `reread_slots` queued re-reads (priority `PRIORITY_REREAD`) for the re-read slot, then up to
     `general_slots` queued tasks of any kind, by priority then age (§3.2). Each claim is a conditional `UPDATE` with a
-    new lease token, kept only when it changed one row, so two processes never claim the same task.
+    new lease token, kept only when it changed one row, so two processes never claim the same task. Once `stop` is set
+    (shutdown), no further task is claimed.
     """
     queue = IngestQueue(session)
     batch = ClaimBatch()
 
+    def stopping() -> bool:
+        return stop is not None and stop.is_set()
+
     def claim(slots: int, *, reread_slot: bool) -> None:
-        if slots <= 0:
+        if slots <= 0 or stopping():
             return
         taken = 0
         # a few more candidates than slots, so a claim lost to another process doesn't leave a slot idle a tick
         candidates = queue.queued_ids(utcnow(), slots * 2, max_priority=limits.PRIORITY_REREAD if reread_slot else None)
         for job_id in candidates:
-            if taken >= slots:
+            if taken >= slots or stopping():
                 break
             token = uuid4()
             if queue.claim(job_id, token=token, owner=owner, now=utcnow()):
@@ -133,7 +145,7 @@ def claim_tasks(session: Session, *, owner: str, general_slots: int, reread_slot
 
 
 def release_leases(session: Session, leases: Iterable[tuple[UUID, UUID]]) -> int:
-    """Gives back tasks this process holds (shutdown): queued again without using up an attempt. How many."""
+    """Gives back tasks this process claimed (shutdown): queued again without using up an attempt. How many."""
     queue = IngestQueue(session)
     released = 0
     for job_id, token in leases:
@@ -143,6 +155,22 @@ def release_leases(session: Session, leases: Iterable[tuple[UUID, UUID]]) -> int
         except Exception as e:
             logger.error(f"Recipe card job {job_id}: couldn't release its task's lease:\n{safe_trace(e)}")
     return released
+
+
+def claim_unless_stopping(
+    session: Session, *, owner: str, general_slots: int, reread_slots: int, stop: threading.Event
+) -> ClaimBatch:
+    """
+    `claim_tasks`, in the claim's worker thread. When shutdown began meanwhile, what it claimed is given back here,
+    never started: shutdown may already have released this dispatcher's leases and stopped waiting for the claim (or
+    the event loop may be gone), so only the claim itself can still release them.
+    """
+    batch = claim_tasks(session, owner=owner, general_slots=general_slots, reread_slots=reread_slots, stop=stop)
+    if stop.is_set() and batch.claims:
+        released = release_leases(session, [(claim.job_id, claim.token) for claim in batch.claims])
+        logger.info(f"Recipe card dispatcher stopping: {released} task(s) claimed meanwhile queued again")
+        batch.claims = []
+    return batch
 
 
 def _with_session[T](call: Callable[[Session], T]) -> T:
@@ -212,6 +240,8 @@ class IngestDispatcher:
         self._limiter: anyio.CapacityLimiter | None = None
         self._runner: asyncio.Task[None] | None = None
         self._claiming: asyncio.Task[None] | None = None
+        self._stop_claims = threading.Event()
+        """Set when shutdown begins: a claim in flight takes no further task (a new one for each run)"""
         self._stopping = False
         self._paused = False
         self._last_paused_at: float | None = None
@@ -227,8 +257,12 @@ class IngestDispatcher:
 
     @property
     def owner(self) -> str:
-        """`host:pid:instance`, stored on each claim for the logs"""
-        return f"{socket.gethostname()}:{os.getpid()}:{self._instance}"[:64]
+        """
+        `host:pid:instance`, stored on each claim: for the logs, and shutdown releases by it. A long host name is cut,
+        never the process and instance that make it unique.
+        """
+        unique = f":{os.getpid()}:{self._instance}"[-64:]
+        return f"{socket.gethostname()[: 64 - len(unique)]}{unique}"
 
     @property
     def running(self) -> bool:
@@ -245,6 +279,11 @@ class IngestDispatcher:
         """Runs the dispatcher while the app runs; on exit, stops claiming, cancels its tasks and releases leases"""
         settings = get_ingest_settings()
         if not (settings.ENABLED and settings.WORKER) or self.running:
+            if settings.ENABLED and not settings.WORKER and not get_app_settings().TESTING:
+                logger.warning(
+                    "Recipe card ingestion: uploads are accepted but this process reads no cards (AI_INGEST_WORKER is "
+                    "off); run the worker in another process"
+                )
             yield
             return
 
@@ -300,6 +339,11 @@ class IngestDispatcher:
             await self._call(storage.flock_supported)
         except Exception as e:
             logger.warning(f"Couldn't check file locking for recipe card ingestion: {type(e).__name__}: {e}")
+        try:
+            # a restore that crashed (or whose container stopped) left its pause marker: ingestion carries on now
+            await self._call(storage.clear_stale_pause)
+        except Exception as e:
+            logger.warning(f"Couldn't check the recipe card pause marker: {type(e).__name__}: {e}")
         self._runner = asyncio.get_running_loop().create_task(self._run(), name="ai-ingest-dispatcher")
         logger.info(
             f"Recipe card dispatcher started ({self.concurrency} task threads + {limits.REREAD_SLOTS} for re-reads)"
@@ -308,10 +352,11 @@ class IngestDispatcher:
     async def stop(self) -> None:
         """
         Stops claiming (waiting for a claim in flight), cancels this process's tasks, waits up to `SHUTDOWN_GRACE` in
-        all, then releases their leases
+        all, then releases every lease this dispatcher holds
         """
         self._bind_loop()
         self._stopping = True
+        self._stop_claims.set()
         self.wake()
         runner, self._runner = self._runner, None
         if runner is not None:
@@ -333,13 +378,14 @@ class IngestDispatcher:
             stuck = [str(handle.job_id) for handle in handles if not handle.done.is_set()]
             logger.warning(f"Recipe card tasks still running at shutdown, their leases are released: {stuck}")
 
-        if handles:
-            leases = [(handle.job_id, handle.token) for handle in handles]
-            try:
-                released = await self._call(_with_session, functools.partial(release_leases, leases=leases))
+        # by owner, not by the tasks it knows of: a claim that landed after the claim phase gave up is covered too
+        owner = self.owner
+        try:
+            released = await self._call(_with_session, lambda session: IngestQueue(session).release_owned(owner))
+            if handles or released:
                 logger.info(f"Recipe card dispatcher stopped; {released} task(s) queued again")
-            except Exception as e:
-                logger.error(f"Couldn't release the recipe card tasks' leases at shutdown:\n{safe_trace(e)}")
+        except Exception as e:
+            logger.error(f"Couldn't release the recipe card tasks' leases at shutdown:\n{safe_trace(e)}")
         self._tasks = {handle.token: handle for handle in handles if not handle.done.is_set()}
 
         background = [state.task for state in self._phases.values() if state.task is not None]
@@ -348,6 +394,8 @@ class IngestDispatcher:
         await asyncio.gather(*background, return_exceptions=True)
         for state in self._phases.values():
             state.task = None
+        # a claim still in flight keeps the event it started with (set); the next run gets its own
+        self._stop_claims = threading.Event()
         self._stopping = False
 
     # ==========================================
@@ -394,6 +442,7 @@ class IngestDispatcher:
         self._reap()
         self._check_deadlines()
 
+        await self._phase(Phase.presence, self._mark_seen, limits.DISPATCHER_SEEN_INTERVAL)
         paused = await self._phase(Phase.pause, self._check_pause, 0)
         if paused is None or paused:
             return
@@ -455,6 +504,9 @@ class IngestDispatcher:
     # ==========================================
     # Phases
 
+    async def _mark_seen(self) -> None:
+        await self._call(storage.mark_dispatcher_seen)
+
     async def _check_pause(self) -> bool:
         paused = await self._call(storage.is_paused)
         if paused:
@@ -513,11 +565,18 @@ class IngestDispatcher:
                 self._claiming = None
 
     async def _claim_and_start(self, general: int, reread: int) -> None:
-        owner = self.owner
+        owner, stop = self.owner, self._stop_claims
         batch: ClaimBatch = await self._call(
             _with_session,
-            lambda session: claim_tasks(session, owner=owner, general_slots=general, reread_slots=reread),
+            lambda session: claim_unless_stopping(
+                session, owner=owner, general_slots=general, reread_slots=reread, stop=stop
+            ),
         )
+        if stop.is_set() and batch.claims:
+            # shutdown began after the claim's own check: give them back rather than start them
+            leases = [(claim.job_id, claim.token) for claim in batch.claims]
+            await self._call(_with_session, functools.partial(release_leases, leases=leases))
+            batch.claims = []
         # the threads start in this same step, so a claim is never left without its task
         for claim in batch.claims:
             self._start(claim)
@@ -526,8 +585,8 @@ class IngestDispatcher:
 
     async def _finish_claiming(self, timeout: float) -> None:
         """
-        Shutdown: waits up to `timeout` for a claim that was in flight when the loop was cancelled, so its tasks are
-        started, then stopped and released with the others
+        Shutdown: waits up to `timeout` for a claim that was in flight when the loop was cancelled. It takes no further
+        task and gives back what it took (`claim_unless_stopping`), so nothing it claimed is left running.
         """
         claiming, self._claiming = self._claiming, None
         if claiming is None:
@@ -535,7 +594,7 @@ class IngestDispatcher:
         await asyncio.wait({claiming}, timeout=timeout)
         if not claiming.done():
             logger.warning(
-                "A recipe card claim was still running at shutdown; its tasks wait for their leases to expire"
+                "A recipe card claim was still running at shutdown; what it claims is queued again when it ends"
             )
         elif not claiming.cancelled() and (error := claiming.exception()) is not None:
             logger.error(f"Recipe card dispatcher: the {Phase.claim.value} failed at shutdown:\n{safe_trace(error)}")

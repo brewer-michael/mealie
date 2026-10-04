@@ -34,5 +34,5 @@ def test_a_restore_refused_while_ingestion_writes_says_to_try_again(
 
     assert response.status_code == 503, response.text
     message = response.json()["detail"]["message"]
-    assert message == "Recipe card ingestion is busy writing files. Try the restore again in a minute."
+    assert message == "Mealie is still saving changes. Try the restore again in a minute."
     assert not storage.pause_marker_path().exists()  # ingestion isn't left paused

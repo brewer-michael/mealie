@@ -55,9 +55,9 @@ const stubs = {
 
 const wrappers: VueWrapper[] = [];
 
-function mountItem(value: NeedsALookItem, readonly = false) {
+function mountItem(value: NeedsALookItem, readonly = false, canReread = true) {
   const wrapper = mount(IngestFlagItem, {
-    props: { item: value, readonly },
+    props: { item: value, readonly, canReread },
     global: { mocks: { $globals: { icons: {} } }, stubs },
   });
   wrappers.push(wrapper);
@@ -200,6 +200,13 @@ describe("IngestFlagItem", () => {
 
     expect(wrapper.emitted("use-proposal")).toEqual([[proposal, "replace"]]);
     expect(wrapper.emitted("dismiss-proposal")).toEqual([[proposal]]);
+  });
+
+  test("Re-read is off while it can't happen (the page is busy turning a page); the rest still works", () => {
+    const wrapper = mountItem(item(flag({ id: "illegible:steps:s1", kind: "illegible" })), false, false);
+
+    expect(button(wrapper, "Re-read").attributes("disabled")).toBeDefined();
+    expect(button(wrapper, "Keep as written").attributes("disabled")).toBeUndefined();
   });
 
   test("nothing can be changed while the card is read again", () => {

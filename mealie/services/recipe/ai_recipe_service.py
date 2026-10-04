@@ -61,6 +61,8 @@ class AIRecipeService(RecipeService):
             if local_images:
                 with open(local_images[0], "rb") as f:
                     RecipeDataService(recipe.id).write_image(f.read(), "webp")
+                # fork hook (docs/ai/PHASE2.md F21): the cover key, without which the recipe shows no cover
+                recipe.image = self.group_recipes.update_image(recipe.slug, "webp")
 
             return recipe
 

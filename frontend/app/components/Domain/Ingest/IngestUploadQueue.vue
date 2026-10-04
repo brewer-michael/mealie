@@ -17,19 +17,22 @@
         :data-status="card.status"
       >
         <template #prepend>
-          <img
+          <IngestCapturePhoto
             v-if="card.photos[0]"
-            :src="previewUrl(card.photos[0])"
             class="upload-thumb mr-3"
-            alt=""
-            loading="lazy"
-            decoding="async"
-          >
+            :photo="card.photos[0]"
+            :size="48"
+            :show-name="false"
+          />
         </template>
         <v-list-item-title class="upload-title">
           {{ $t("recipe-ingest.capture.card-number", { number: card.position + 1 }) }}
         </v-list-item-title>
-        <div v-if="card.duplicateOf" class="already-scanned mt-1">
+        <!-- the browser can't show the photo: its name tells the cards apart -->
+        <div v-if="unshownName(card)" class="upload-name text-caption text-medium-emphasis">
+          {{ unshownName(card) }}
+        </div>
+        <div v-if="card.duplicateOf" class="already-scanned d-flex flex-wrap align-center ga-1 mt-1">
           <v-chip
             size="small"
             color="info"
@@ -39,6 +42,15 @@
           >
             {{ $t("recipe-ingest.capture.already-scanned") }}
           </v-chip>
+          <!-- the earlier card was added badly, or its recipe was deleted: read the photos again as a new card -->
+          <v-btn
+            class="upload-scan-again"
+            size="small"
+            variant="text"
+            @click="scanAgain(card.key)"
+          >
+            {{ $t("recipe-ingest.capture.scan-again") }}
+          </v-btn>
         </div>
         <div v-else class="upload-status text-body-2">
           {{ statusText(card) }}
@@ -89,14 +101,22 @@
 </template>
 
 <script setup lang="ts">
+import IngestCapturePhoto from "./IngestCapturePhoto.vue";
 import { INGEST_API_ERROR_CODES, INGEST_ERROR_CODES, useRecipeIngestText } from "~/composables/use-recipe-ingest";
-import { hasNote, isBatchFinished, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
+import {
+  CANNOT_SHRINK,
+  hasNote,
+  isBatchFinished,
+  photoName,
+  useRecipeIngestUploads,
+} from "~/composables/use-recipe-ingest-uploads";
 import type { UploadCard } from "~/composables/use-recipe-ingest-uploads";
 import type { IngestRejected } from "~/lib/api/types/recipe-ingest";
 
 /**
  * The cards on their way to the server (docs/ai/PHASE2.md §1.1): progress, retries, an "Already scanned" chip linking
- * to the earlier card, and photos the server didn't use. Uploaded cards move to the job list. Fork-owned.
+ * to the earlier card with Scan again, and photos the server didn't use. Uploaded cards move to the job list.
+ * Fork-owned.
  */
 const props = defineProps<{
   groupSlug: string;
@@ -104,7 +124,7 @@ const props = defineProps<{
 
 const i18n = useI18n();
 const { ingestErrorText, rejectReasonText } = useRecipeIngestText();
-const { cards, batches, previewUrl, retry, remove } = useRecipeIngestUploads();
+const { cards, batches, previewState, retry, scanAgain, remove } = useRecipeIngestUploads();
 
 const KNOWN_CODES = new Set<string>([...INGEST_ERROR_CODES, ...INGEST_API_ERROR_CODES]);
 /** Why a card waits to go again, where the error's own text asks the user to try again */
@@ -154,7 +174,16 @@ function detailText(card: UploadCard): string | null {
   if (retrying) {
     return i18n.t(retrying);
   }
+  if (card.error === CANNOT_SHRINK) {
+    return rejectReasonText(CANNOT_SHRINK);
+  }
   return KNOWN_CODES.has(card.error) ? ingestErrorText(card.error) : null;
+}
+
+/** The front's file name, when the browser can't show the photo */
+function unshownName(card: UploadCard): string | null {
+  const front = card.photos[0];
+  return front && previewState(front) === "unavailable" ? photoName(front) || null : null;
 }
 
 /** Photos the server didn't use, except the duplicate the chip already shows */
@@ -166,13 +195,3 @@ function isRemovable(card: UploadCard): boolean {
   return card.status === "waiting" || card.status === "failed" || hasNote(card);
 }
 </script>
-
-<style scoped>
-.upload-thumb {
-  width: 48px;
-  height: 48px;
-  object-fit: cover;
-  border-radius: 6px;
-  display: block;
-}
-</style>

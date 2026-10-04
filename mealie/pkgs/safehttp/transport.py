@@ -117,6 +117,11 @@ class _SafeTransportMixin:
 
     def _validate(self, request: httpx.Request) -> list[str] | None:
         """Validate the request target. Returns the curl RESOLVE pins, or None for an IP literal."""
+        # fork hook (redirects.py): curl also fetches file://, ftp:// and more, which a redirect could lead to
+        if request.url.scheme not in ("http", "https"):
+            self._warn(request, "only http and https are fetched")
+            raise InvalidDomainError(f"refusing a {request.url.scheme}: URL")
+
         # Force our timeout onto every request.
         request.extensions["timeout"] = httpx.Timeout(self.timeout, pool=self.timeout).as_dict()
 
@@ -215,6 +220,8 @@ def post(
     Drop-in for `requests.post(url, json=..., timeout=...)` on server-initiated
     requests to user-supplied URLs. Redirects are followed and re-validated per hop.
     """
+    from .redirects import check_redirect  # fork hook: no redirect off http(s), or from https to http
+
     transport = SafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout)
-    with httpx.Client(transport=transport, follow_redirects=True) as client:
+    with httpx.Client(transport=transport, follow_redirects=True, event_hooks={"response": [check_redirect]}) as client:
         return client.post(url, json=json, timeout=timeout, **kwargs)

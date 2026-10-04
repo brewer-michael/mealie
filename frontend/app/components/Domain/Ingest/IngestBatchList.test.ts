@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   getJobs: vi.fn(),
   getCounts: vi.fn(),
   retry: vi.fn(),
+  cancel: vi.fn(),
   discard: vi.fn(),
   upload: vi.fn(),
   createBatch: vi.fn(),
@@ -170,10 +171,8 @@ describe("IngestBatchList", () => {
 
     expect(batchSections(wrapper).map(section => section.attributes("data-batch"))).toEqual(["newer", "older"]);
     const [newer, older] = batchSections(wrapper);
-    expect(newer!.findAll(".job-status").map(chip => chip.text())).toEqual([
-      "Waiting to be read",
-      "Failed: No recipe was found on this card.",
-    ]);
+    expect(newer!.findAll(".job-status").map(chip => chip.text())).toEqual(["Waiting to be read", "Failed"]);
+    expect(newer!.get(".job-caption").text()).toBe("No recipe was found on this card.");
     expect(newer!.get(".batch-meta").text()).toBe("2 cards · Scanned in the app");
     expect(newer!.find(".batch-review").exists()).toBe(false);
     expect(newer!.find(".batch-retry-failed").exists()).toBe(true);
@@ -225,7 +224,8 @@ describe("IngestBatchList", () => {
       added,
     ];
     const wrapper = await mountList();
-    expect(wrapper.get(".ingest-batch .job-status").text()).toBe("Reading the card");
+    expect(wrapper.get(".ingest-batch .job-status").text()).toBe("Reading");
+    expect(wrapper.get(".ingest-batch .job-caption").text()).toBe("Reading the card");
     // Loading the list refreshes the sidebar's count
     expect(api.getCounts).toHaveBeenCalledOnce();
     api.getJobs.mockClear();
@@ -267,8 +267,15 @@ describe("IngestBatchList", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(api.getJobs).not.toHaveBeenCalled();
 
+    // back on the page: the whole list once, then the batch being read every 3 s
     setVisibility("visible");
     await vi.advanceTimersByTimeAsync(0);
+    expect(jobsCalls()).toEqual([
+      { status: ["processing", "ready", "failed", "committing"], page: 1, perPage: 100 },
+      { status: "committed", perPage: 50 },
+    ]);
+    api.getJobs.mockClear();
+    await vi.advanceTimersByTimeAsync(3000);
     expect(jobsCalls()).toEqual([{ batchId: "b1", page: 1, perPage: 100 }]);
   });
 
@@ -293,7 +300,8 @@ describe("IngestBatchList", () => {
   test("Retry queues a failed card again", async () => {
     serverJobs = [job({ status: "failed", error: { code: "timeout" } })];
     const wrapper = await mountList();
-    expect(wrapper.get(".job-status").text()).toBe("Failed: Reading this card took too long. Try again.");
+    expect(wrapper.get(".job-status").text()).toBe("Failed");
+    expect(wrapper.get(".job-caption").text()).toBe("Reading this card took too long. Try again.");
 
     const answered = deferred();
     api.retry.mockImplementation(async (id: string) => {
@@ -352,7 +360,7 @@ describe("IngestBatchList", () => {
     await wrapper.get(".job-discard").trigger("click");
     await wrapper.get(".dialog-confirm").trigger("click");
     await flushPromises();
-    expect(toast.error).toHaveBeenCalledExactlyOnceWith("Only the person who scanned this card, or a household manager, can discard it.");
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("You don't have permission to do this with this card.");
     expect(rowTitles(wrapper)).toEqual(["Banana Mug Cake"]);
   });
 
@@ -369,5 +377,100 @@ describe("IngestBatchList", () => {
     expect(rowTitles(wrapper)).toEqual(["Pancakes"]);
     expect(rowTitles(wrapper, ".recently-added")).toEqual(["Banana Mug Cake"]);
     expect(wrapper.get(".show-all").attributes("href")).toBe("/g/home/recipes/cards");
+  });
+
+  test("cards that arrive elsewhere show up: the counts are checked every 20 s, and a change reloads the list", async () => {
+    vi.useFakeTimers();
+    serverJobs = [job()];
+    const wrapper = await mountList();
+    api.getJobs.mockClear();
+    api.getCounts.mockClear();
+
+    // nothing changed: the counts are checked, and the list stays
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(api.getCounts).toHaveBeenCalledOnce();
+    expect(api.getJobs).not.toHaveBeenCalled();
+
+    // a card from the inbox
+    serverJobs = [...serverJobs, job({ id: "i1", batchId: "inbox-b", title: null, status: "processing", source: "inbox", sourceName: "inbox/home/kitchen/scan.jpg" })];
+    api.getCounts.mockResolvedValue({ data: { processing: 1, ready: 1, needsAttention: 0, failed: 0 }, error: null });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(jobsCalls()).toEqual([
+      { status: ["processing", "ready", "failed", "committing"], page: 1, perPage: 100 },
+      { status: "committed", perPage: 50 },
+    ]);
+    expect(rowTitles(wrapper)).toContain("scan.jpg");
+
+    // one reload per change
+    api.getJobs.mockClear();
+    serverJobs = serverJobs.map(j => (j.id === "i1" ? { ...j, status: "ready", title: "Scones" } : j));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(api.getJobs).not.toHaveBeenCalledWith(expect.objectContaining({ status: "committed" }));
+  });
+
+  test("a hidden page checks nothing", async () => {
+    vi.useFakeTimers();
+    serverJobs = [job()];
+    await mountList();
+    api.getJobs.mockClear();
+    api.getCounts.mockClear();
+
+    setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.getCounts).not.toHaveBeenCalled();
+    expect(api.getJobs).not.toHaveBeenCalled();
+  });
+
+  test("a refused Retry says why, and the row shows the card as it is now", async () => {
+    serverJobs = [job({ status: "failed", error: { code: "timeout" } })];
+    const wrapper = await mountList();
+
+    // retried on another device meanwhile: the server says the card changed, without a message
+    serverJobs = [job({ status: "processing", task: { kind: "extract", state: "queued" } })];
+    api.retry.mockResolvedValue({ data: null, error: { response: { status: 409, data: { detail: { code: "invalid_status", status: "processing" } } } } });
+    await wrapper.get(".job-retry").trigger("click");
+    await flushPromises();
+
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("This card has changed since this page loaded. Reload it and try again.");
+    expect(jobsCalls()).toContainEqual({ batchId: "b1", page: 1, perPage: 100 });
+    expect(wrapper.get(".job-status").text()).toBe("Waiting to be read");
+  });
+
+  test("a refusal the API client already showed isn't shown twice", async () => {
+    serverJobs = [job({ status: "failed", error: { code: "timeout" } })];
+    api.retry.mockResolvedValue({ data: null, error: { response: { status: 503, data: { detail: { code: "paused_for_restore", message: "Paused" } } } } });
+    const wrapper = await mountList();
+    await wrapper.get(".job-retry").trigger("click");
+    await flushPromises();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("Cancel stops reading a card; it shows as cancelled and can be retried", async () => {
+    serverJobs = [job({ status: "processing", title: null, task: { kind: "extract", state: "queued" } })];
+    api.cancel.mockImplementation(async (id: string) => {
+      const error = { code: "cancelled" as const, params: {} };
+      serverJobs = serverJobs.map(j => (j.id === id ? { ...j, status: "failed" as const, task: null, error } : j));
+      return { data: { draftVersion: 0, status: "failed", task: null, error }, error: null };
+    });
+    const wrapper = await mountList();
+
+    await wrapper.get(".job-cancel").trigger("click");
+    await flushPromises();
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(wrapper.get(".job-status").text()).toBe("Failed");
+    expect(wrapper.get(".job-caption").text()).toBe("Cancelled.");
+    expect(wrapper.find(".job-retry").exists()).toBe(true);
+  });
+
+  test("a refused Cancel says why", async () => {
+    serverJobs = [job({ status: "processing", task: { kind: "extract", state: "running" } })];
+    api.cancel.mockResolvedValue({ data: null, error: { response: { status: 404, data: { detail: { code: "not_found" } } } } });
+    const wrapper = await mountList();
+    serverJobs = [];
+
+    await wrapper.get(".job-cancel").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("This card no longer exists.");
+    expect(wrapper.find(".job-cancel").exists()).toBe(false);
   });
 });

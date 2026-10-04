@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mealie.db.db_setup import session_context
+from mealie.lang.providers import get_locale_provider
 from mealie.repos.repository_recipe_ingest import IngestRepos
 from mealie.schema.recipe_ingest import IngestSource, IngestStatus, RecipeIngestionJobCounts
 from mealie.services.ai.tools import get_tool
@@ -45,12 +46,53 @@ def counts(ready: int = 0, needs_attention: int = 0, processing: int = 0, failed
     ],
 )
 def test_speech(queue: RecipeIngestionJobCounts, speech: str):
-    assert queue_speech(queue) == speech
+    english = get_locale_provider("en-US")
+    assert queue_speech(queue, english) == speech
     # what the result keeps of it: at most two sentences, plain, within the limit
     assert (
-        RecipeCardQueueResult(speech=queue_speech(queue), ready=0, needs_attention=0, processing=0, failed=0).speech
+        RecipeCardQueueResult(
+            speech=queue_speech(queue, english), ready=0, needs_attention=0, processing=0, failed=0
+        ).speech
         == speech
     )
+    # a language without the texts yet speaks English, never the texts' keys
+    assert queue_speech(queue, get_locale_provider("de-DE")) == speech
+
+
+class RecordingTranslator:
+    """Answers every text with its key's last part and its values, and records what it was asked"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def t(self, key: str, default=None, **kwargs) -> str:
+        self.calls.append((key, kwargs))
+        if key.endswith(".list-separator"):
+            return " / "
+        values = ",".join(f"{name}={value}" for name, value in kwargs.items())
+        return f"{key.rsplit('.', 1)[-1]}[{values}]"
+
+
+def test_speech_goes_through_the_translator():
+    translator = RecordingTranslator()
+    speech = queue_speech(counts(ready=5, needs_attention=2, processing=3, failed=1), translator)
+
+    voice = "recipe-ingest.voice"
+    assert translator.calls[:2] == [(f"{voice}.ready", {"count": 5}), (f"{voice}.need-a-look", {"count": 2})]
+    assert (f"{voice}.still-reading", {"count": 3}) in translator.calls
+    assert (f"{voice}.failed", {"count": 1}) in translator.calls
+    # the list and the sentence are the language's too
+    assert speech == (
+        "ready[count=5] Details[details=list-and[first=need-a-look[count=2] / still-reading[count=3],"
+        "last=failed[count=1]]]"
+    )
+
+    translator = RecordingTranslator()
+    queue_speech(counts(ready=2, needs_attention=2), translator)
+    assert (f"{voice}.all-need-a-look", {"count": 2}) in translator.calls
+
+    translator = RecordingTranslator()
+    assert queue_speech(counts(), translator) == "none-waiting[]"
 
 
 def test_the_tool_is_a_read_tool_without_arguments():
@@ -118,6 +160,37 @@ def test_counts_only_for_the_callers_household(
     other = call(api_client, h2_user)
     assert other["ready"] == 0
     assert SECRET_TITLE not in json.dumps(other)
+
+
+def test_the_speech_is_in_the_callers_language(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """The request's language (`Accept-Language`, as MCP clients and Home Assistant send it) reaches the speech"""
+    user = unique_user_fn_scoped
+    seed(user, "ready", "ready!", "processing")
+    german = get_locale_provider("de-DE")  # the provider every de-DE request gets
+    monkeypatch.setitem(
+        german.translations,  # type: ignore[attr-defined]
+        "recipe-ingest",
+        {
+            "voice": {
+                "ready": "Keine Rezeptkarten | {count} Rezeptkarte ist bereit. | {count} Rezeptkarten sind bereit.",
+                "need-a-look": "{count} muss geprüft werden | {count} müssen geprüft werden",
+                "still-reading": "{count} wird noch gelesen | {count} werden noch gelesen",
+                "list-separator": ", ",
+                "list-and": "{first} und {last}",
+                "details": "{details}.",
+            }
+        },
+    )
+
+    response = api_client.post(
+        api_routes.ai_tools_name("recipe_card_queue"), json={}, headers=user.token | {"Accept-Language": "de-DE"}
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert result["speech"] == "2 Rezeptkarten sind bereit. 1 muss geprüft werden und 1 wird noch gelesen."
+    assert result["ready"] == 2 and result["needs_attention"] == 1 and result["processing"] == 1
 
 
 def test_an_empty_queue(api_client: TestClient, unique_user_fn_scoped: TestUser):

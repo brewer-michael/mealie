@@ -15,7 +15,7 @@ from mealie.core.config import get_app_settings
 from mealie.schema.recipe_ingest import PageOCR, PageRotationSource
 from mealie.services import ocr
 from mealie.services.ai.ingest import limits
-from mealie.services.ai.ingest.pipeline import CardPage, orient_page
+from mealie.services.ai.ingest.pipeline import CardPage, OrientDecision, decide_orientation, orient_page, oriented_meta
 from mealie.services.ai.ingest.pipeline import orient as orient_module
 from tests import data as test_data
 from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import card_image, make_pages
@@ -80,6 +80,66 @@ def test_extract_text_reports_its_scores_and_reads_at_the_rotation_chosen(
     # the text is read at the rotation chosen: a quarter turn swaps the sides
     width, height = read_sizes[-1]
     assert (width > height) is (rotation == 90)
+
+
+def _files(page: CardPage) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in sorted(page.dir.iterdir())}
+
+
+@pytest.mark.parametrize(
+    ("result", "decision"),
+    [
+        (
+            ocr.OCRResult(text="Banana Mug Cake", confidence=61.0, rotation=90),
+            OrientDecision(rotation=90, ocr=PageOCR(text="Banana Mug Cake", confidence=61.0), settled=True),
+        ),
+        (
+            ocr.OCRResult(text="Banana Mug Cake", confidence=70.0, rotation=0),
+            OrientDecision(rotation=0, ocr=PageOCR(text="Banana Mug Cake", confidence=70.0), settled=True),
+        ),
+        (ocr.OCRResult(text="", confidence=0.0, rotation=0, failed=True), OrientDecision(0, None, settled=False)),
+    ],
+)
+def test_the_orientation_is_decided_without_writing_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, result: ocr.OCRResult, decision: OrientDecision
+):
+    """The runner stages the turned files and stores their metadata before it swaps them in (no crash window)"""
+    (page,) = make_pages(tmp_path)
+    before = _files(page)
+    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    monkeypatch.setattr(ocr, "extract_text", lambda path, *, min_ratio=1.0: result)
+
+    assert decide_orientation(page) == decision
+    assert _files(page) == before
+
+    # a page left as it is is settled with its text; a turn's metadata comes from the turned files
+    if decision.settled and not decision.rotation:
+        assert oriented_meta(page.meta, decision) == page.meta.model_copy(
+            update={"oriented": True, "ocr": decision.ocr}
+        )
+    if not decision.settled:
+        assert oriented_meta(page.meta, decision) == page.meta
+
+
+def test_a_page_already_oriented_or_without_tesseract_is_decided_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    (page,) = make_pages(tmp_path)
+
+    def extract_text(path: Path, *, min_ratio: float = 1.0) -> ocr.OCRResult:
+        raise AssertionError("not probed")
+
+    monkeypatch.setattr(ocr, "extract_text", extract_text)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    assert decide_orientation(page) == OrientDecision(rotation=0, ocr=None, settled=False)
+
+    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    oriented = CardPage(dir=page.dir, meta=page.meta.model_copy(update={"oriented": True}))
+    assert decide_orientation(oriented) == OrientDecision(rotation=0, ocr=None, settled=True)
+
+    (page.dir / "page.jpg").unlink()
+    with pytest.raises(FileNotFoundError):
+        decide_orientation(page)
 
 
 def test_without_tesseract_nothing_is_settled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

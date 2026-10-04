@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from uuid import UUID
 
 import apprise
@@ -313,7 +313,14 @@ class Notified:
 
 
 def params(url: str) -> dict[str, str]:
-    return {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
+    """
+    The URL's query as Apprise reads it: a `:key` field is decoded twice (once with the query, once by the notifier),
+    which is why the listener escapes its `%` once more
+    """
+    return {
+        key: unquote(values[0]) if key.startswith(":") else values[0]
+        for key, values in parse_qs(urlsplit(url).query).items()
+    }
 
 
 @pytest.fixture()

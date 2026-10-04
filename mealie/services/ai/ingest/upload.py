@@ -219,6 +219,8 @@ class UploadOptions:
     split: bool = False
     local_only: bool = False
     allow_duplicate: bool = False
+    done: bool = False
+    """This upload ends its batch: the route seals it once the card is in (the app's Done, for a Shortcut)"""
 
     @classmethod
     def parse(cls, values: Mapping[str, Any]) -> UploadOptions:
@@ -233,6 +235,7 @@ class UploadOptions:
             split=parse_bool(get("split", "split")),
             local_only=parse_bool(get("localOnly", "local_only")),
             allow_duplicate=parse_bool(get("allowDuplicate", "allow_duplicate")),
+            done=parse_bool(get("done", "done")),
         )
 
 
@@ -484,6 +487,8 @@ class UploadHandler:
     integration_id: str | None = None
     locale: str = field(init=False)
     translator: Translator = field(init=False)
+    options: UploadOptions | None = field(init=False, default=None)
+    """The upload's options, once its body has been read"""
 
     def __post_init__(self) -> None:
         self.locale = resolve_locale(self.request.headers.get("accept-language"))
@@ -598,7 +603,7 @@ class UploadHandler:
 
         body = await self._read_body(kind, cap)
         try:
-            options = body.options
+            options = self.options = body.options
             # a card's own "keep it on this server", with the same refusal as the group's setting
             if options.local_only and not readiness.local_ready:
                 raise UploadRefused(

@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestRepos
+from mealie.schema.recipe.recipe_ingredient import SaveIngredientUnit
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
@@ -233,6 +234,42 @@ async def test_handle_reread_parses_an_ingredient_reading(
     )
     assert parsed.unit is not None and parsed.unit.name == "cup"
     assert row(job_id) == before
+
+
+@pytest.mark.asyncio
+async def test_handle_reread_parses_a_line_in_another_language_with_the_ai_parser(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """A German card's re-read line goes to the AI parser on the card's own service, as extraction's lines do"""
+    user = unique_user_fn_scoped
+    _providers(user)
+    user.repos.ingredient_units.create(
+        SaveIngredientUnit(name="gram", plural_name="grams", abbreviation="g", group_id=user.repos.group_id)
+    )
+    region = {"readable": True, "text": "200 g Mehl", "alternatives": []}
+    answer = {"ingredients": [{"quantity": 200, "unit": "g", "food": "Mehl", "note": "", "substitutes": []}]}
+    fake = FakeCardAI(banana_answers(OpenAIRecipeCardRegion=region, OpenAIIngredients=answer)).install(monkeypatch)
+    line = CardDraftIngredient(original_text="20 g Mehl", note="20 g Mehl")
+    job_id, token = create_job(
+        user,
+        status="ready",
+        draft=CardDraft(name="Rührkuchen", ingredients=[line]).model_dump(mode="json"),
+        extraction=ExtractionMeta(language="German").model_dump(mode="json"),
+    )
+    target = ProposalTarget(field="ingredients", ref=str(line.reference_id))
+    payload = RereadRequest(page=0, x=0.1, y=0.2, width=0.5, height=0.1, target=target).model_dump(mode="json")
+
+    result = await tasks.handle_reread(task(user, job_id, token, [], kind=IngestTaskKind.reread, payload=payload))
+
+    assert result.proposal.draft is not None
+    (parsed,) = result.proposal.draft.ingredients
+    assert (parsed.quantity, parsed.unit and parsed.unit.name, parsed.food and parsed.food.name) == (
+        200,
+        "gram",
+        "Mehl",
+    )
+    assert parsed.reference_id == line.reference_id
+    assert [call.schema for call in fake.calls] == ["OpenAIRecipeCardRegion", "OpenAIIngredients"]
 
 
 @pytest.mark.asyncio

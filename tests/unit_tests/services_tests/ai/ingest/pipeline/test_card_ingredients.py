@@ -114,6 +114,93 @@ async def test_a_size_word_before_shorthand_becomes_the_note(
     assert parsed.original_text == line
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "unit", "food", "note"),
+    [
+        ("1 c. sugar (scant)", "cup", "sugar", "scant"),
+        ("1 c. (scant) sugar", "cup", "sugar", "scant"),
+        ("1 c. scant sugar", "cup", "sugar", "scant"),
+        ("1 T. heaping flour", "tablespoon", "flour", "heaping"),
+        ("scant 1 c. sugar", "cup", "sugar", "scant"),
+        ("1 c. sugar, scant", "cup", "sugar", "scant"),
+        ("1 c. sugar scant", "cup", "sugar", "scant"),
+    ],
+)
+async def test_a_size_word_anywhere_on_the_line_goes_to_the_note(
+    unique_user_fn_scoped: TestUser, line: str, unit: str, food: str, note: str
+):
+    """Not the unit "cup scant" or the food "heaping flour", which commit would create, and nothing to look at"""
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+
+    (parsed,) = await _normalize(user, [line])
+
+    assert (parsed.unit and parsed.unit.name, parsed.food and parsed.food.name, parsed.note) == (unit, food, note)
+    assert parsed.unit is not None and parsed.unit.id is not None
+    assert (parsed.quantity, parsed.original_text) == (1, line)
+    assert _highlighted([parsed]) == {line: []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "quantity", "unit", "food", "note"),
+    [
+        ("1 doz. eggs", 1, "dozen", "egg", ""),
+        ("1 dozen eggs", 1, "dozen", "egg", ""),
+        ("1 env. Dream Whip", 1, "envelope", "Dream Whip", ""),
+        ("1 sq. chocolate", 1, "square", "chocolate", ""),
+        ("1 (8 oz.) pkg. cream cheese", 1, "package", "cream cheese", "(8 oz.)"),
+        ("1 (10 3/4 oz.) can soup", 1, "can", "soup", "(10 3/4 oz.)"),
+        ("1 #2 can pineapple", 1, "can", "pineapple", "#2"),
+        ("1 #10 can tomatoes", 1, "can", "tomatoes", "#10"),
+    ],
+)
+async def test_more_card_shorthand_is_read(
+    unique_user_fn_scoped: TestUser, line: str, quantity: float, unit: str, food: str, note: str
+):
+    """ "doz.", "env." and "sq." are units, a package's size and a can's number go to the note, and none needs a look"""
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+
+    (parsed,) = await _normalize(user, [line])
+
+    assert (parsed.quantity, parsed.unit and parsed.unit.name, parsed.food and parsed.food.name, parsed.note) == (
+        quantity,
+        unit,
+        food,
+        note,
+    )
+    assert parsed.original_text == line
+    assert _highlighted([parsed]) == {line: []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "quantity", "note", "value", "start"),
+    [
+        ("1 can (10 3/4 oz.) soup", 1, "(10 3/4 oz.)", "10 3/4", 7),
+        ("2-3 c. flour", 2, "to 3", "2-3", 0),
+        ("1 c. sugar + 2 T.", 1, "+ 2 T.", "2", 13),
+        ("1 c. sugar, 1 c. brown sugar", 1, "1 c. brown sugar", "1", 12),
+    ],
+)
+async def test_an_amount_the_fields_lose_is_kept_in_the_note_and_still_checked(
+    unique_user_fn_scoped: TestUser, line: str, quantity: float, note: str, value: str, start: int
+):
+    """Whatever the reviewer taps, commit writes the fields: the note keeps the amount, and the line is still flagged"""
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+
+    (parsed,) = await _normalize(user, [line])
+
+    assert (parsed.quantity, parsed.note) == (quantity, note)
+    assert note in parsed.display
+    assert _highlighted([parsed]) == {
+        line: [(CardFlagKind.check_parse, {"value": value, "start": start, "end": start + len(value)})]
+    }
+
+
 def _highlighted(lines: list[CardDraftIngredient]) -> dict[str, list[tuple[CardFlagKind, dict]]]:
     """Each line's highlighted flags, by its card text"""
     flags = compute_flags(CardDraft(name="Card", ingredients=lines), ExtractionMeta(language="English"), {})
@@ -140,20 +227,26 @@ async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(uni
     ]
     fine = ["1 egg yolk", "2 egg whites", "1 red pepper, chopped", "1 bay leaf", "1 pie crust", "1 hot dog"]
     fine += ["1 heaping T. flour", "1 1/2 c. flour", "2 eggs, beaten", "1 9-inch pie shell"]
-    lost = ["2-3 T. milk", "1 to 2 c. water", "2 or 3 eggs", "1 dozen eggs", "1 (16 oz.) can tomatoes"]
-    unclear = ["1 doz. eggs", "1 env. yeast"]
+    # a dozen, an envelope and a package's size are read whole now
+    fine += ["1 dozen eggs", "1 doz. eggs", "1 env. yeast", "1 (16 oz.) can tomatoes"]
+    # short food words aren't lost units
+    fine += ["2 TV dinners", "2 new potatoes", "2 dry figs", "1 wax bean", "1 big onion"]
+    lost = ["2-3 T. milk", "1 to 2 c. water", "2 or 3 eggs"]
+    unclear = ["2 pk yeast"]
 
-    flags = _highlighted(await _normalize(user, banana + fine + lost + unclear))
+    parsed = await _normalize(user, banana + fine + lost + unclear)
+    flags = _highlighted(parsed)
 
     assert {line: flags[line] for line in banana + fine} == {line: [] for line in banana + fine}
     assert {line: flags[line] for line in lost} == {
-        "2-3 T. milk": [(CardFlagKind.check_parse, {"value": "2-3"})],
-        "1 to 2 c. water": [(CardFlagKind.check_parse, {"value": "1 to 2"})],
-        "2 or 3 eggs": [(CardFlagKind.check_parse, {"value": "3"})],
-        "1 dozen eggs": [(CardFlagKind.check_parse, {"value": "1 dozen"})],
-        "1 (16 oz.) can tomatoes": [(CardFlagKind.check_parse, {"value": "16"})],
+        "2-3 T. milk": [(CardFlagKind.check_parse, {"value": "2-3", "start": 0, "end": 3})],
+        "1 to 2 c. water": [(CardFlagKind.check_parse, {"value": "1 to 2", "start": 0, "end": 6})],
+        "2 or 3 eggs": [(CardFlagKind.check_parse, {"value": "3", "start": 5, "end": 6})],
     }
-    assert all(CardFlagKind.unit_unclear in [kind for kind, _ in flags[line]] for line in unclear)
+    # nothing read is lost: the note keeps what the fields don't
+    notes = {line.original_text: line.note for line in parsed}
+    assert [notes[line] for line in lost] == ["to 3", "to 2", "or 3 eggs"]
+    assert flags["2 pk yeast"] == [(CardFlagKind.unit_unclear, {"token": "pk", "start": 2, "end": 4})]
 
 
 @pytest.mark.asyncio
@@ -182,8 +275,10 @@ async def test_mixed_numbers_names_and_second_ingredients_through_the_parser(uni
     assert [line.quantity for line in parsed[: len(mixed)]] == [2.25, 1.5, 1.5, 1.5, 3.5]
     assert [line.original_text for line in parsed[: len(mixed)]] == mixed
     assert {line: flags[line] for line in mixed + named + kept} == {line: [] for line in mixed + named + kept}
+    starts = [15, 20, 12, 12, 18]  # the second ingredient's amount, not the first one's
     assert {line: flags[line] for line in merged} == {
-        line: [(CardFlagKind.check_parse, {"value": value})] for line, value in merged.items()
+        line: [(CardFlagKind.check_parse, {"value": value, "start": start, "end": start + len(value)})]
+        for (line, value), start in zip(merged.items(), starts, strict=True)
     }
 
 

@@ -4,9 +4,12 @@ in `mealie/schema/openai/`, so upstream's package and the code generator are unt
 adds them to `RESPONSE_SCHEMAS`, so Claude's limit test and the minimal-answer parse cover them.
 
 Claude compiles at most 24 optional and 16 union parameters per request and rejects numeric constraints: the
-transcription has 4 optional parameters, the region 1 and the transcript none, with no unions. Guidance lives in the
+transcription has 5 optional parameters, the region 1 and the transcript none, with no unions. Guidance lives in the
 prompts (`card-*.txt`), list-field descriptions and class docstrings, since Claude drops the description of a field
 typed as one nested model. The class names label the usage log's `feature`.
+
+A page's rotation is a plain list of integers, checked by the compiler (`VALID_ROTATIONS`), so an odd answer costs
+that page's turn, not the whole reading.
 """
 
 from typing import Literal
@@ -14,6 +17,9 @@ from typing import Literal
 from pydantic import Field
 
 from mealie.schema.openai._base import OpenAIBase
+
+VALID_ROTATIONS = frozenset({90, 180, 270})
+"""The turns `rotation_clockwise` may ask for; anything else (0 included) leaves the page as it is"""
 
 
 class OpenAIRecipeCardUnsure(OpenAIBase):
@@ -53,6 +59,13 @@ class OpenAIRecipeCardTranscription(OpenAIBase):
         description=(
             "Every word or number in `content` you could read but aren't sure of, with the other ways it could be "
             "read. Leave it empty when you're sure of everything."
+        ),
+    )
+    rotation_clockwise: list[int] = Field(
+        default_factory=list,
+        description=(
+            "For each image, in order: how many degrees it must be turned clockwise for its writing to read upright, "
+            "0, 90, 180 or 270. 0 when the writing already reads upright."
         ),
     )
 

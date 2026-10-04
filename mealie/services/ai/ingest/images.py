@@ -4,14 +4,25 @@ Turning an uploaded photo into a card page, and the page operations after that (
 `normalize_page` runs inside the upload request (or the inbox scan), so the uploaded bytes, GPS included, never
 outlive it: what's stored is an upright, metadata-free JPEG plus two smaller copies. One Pillow path covers every
 accepted format and enforces the pixel cap before anything is decoded.
+
+**Turning a page is staged**, so a crash can't leave its files turned and its stored metadata not (or the reverse):
+1. `stage_rotation` writes the turned page beside the current one (`page.next.jpg` first, then `view.next.jpg` and
+   `thumb.next.webp`) and returns its metadata, whose `page_sha256` names `page.next.jpg`;
+2. the caller stores that metadata (a conditional update);
+3. `apply_staged` moves the staged files over the current ones (thumbnail, view, then `page.jpg` last), or
+   `discard_staged` removes them (`page.next.jpg` last) when the update was refused.
+
+`recover_staged(page_dir, stored_meta)` finishes or undoes whatever a crash left: staged files whose page matches the
+stored metadata were committed and are swapped in; any others are discarded. Callers hold `storage.ingest_write()`.
 """
 
 import hashlib
 import io
+import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, Protocol
+from typing import BinaryIO, Literal, NamedTuple, Protocol
 
 from PIL import ExifTags, Image
 
@@ -24,6 +35,10 @@ from .storage import atomic_save_image, atomic_write_bytes
 PAGE_FILE = "page.jpg"
 VIEW_FILE = "view.jpg"
 THUMB_FILE = "thumb.webp"
+STAGED_FILES = {PAGE_FILE: "page.next.jpg", VIEW_FILE: "view.next.jpg", THUMB_FILE: "thumb.next.webp"}
+"""A page file's staged name: where a turned page waits until its metadata is stored"""
+SWAP_ORDER = (THUMB_FILE, VIEW_FILE, PAGE_FILE)
+"""The order staged files replace the current ones: `page.jpg` last, as its hash says the page changed"""
 
 SNIFF_BYTES = 16
 """How much of a file `sniff` needs"""
@@ -236,19 +251,26 @@ class _PageFiles(NamedTuple):
     view_size: tuple[int, int]
 
 
-def _write_page_files(page_dir: Path, page: Image.Image, icc: bytes | None) -> _PageFiles:
-    """Writes `page.jpg`, `view.jpg` and `thumb.webp` from an upright RGB image"""
+def _write_page_files(page_dir: Path, page: Image.Image, icc: bytes | None, *, staged: bool = False) -> _PageFiles:
+    """
+    Writes `page.jpg`, `view.jpg` and `thumb.webp` from an upright RGB image (`page.jpg` last: its hash is what says
+    the page changed). `staged`: their staged names instead, `page.next.jpg` first, so a staging cut short always
+    leaves a staged page that the stored metadata doesn't name (`recover_staged` then discards it).
+    """
     page_image = _fit(page, limits.PAGE_MAX_SIDE)
     page_bytes = _jpeg_bytes(page_image, icc)
-
     view = _fit(page_image, limits.VIEW_MAX_SIDE)
-    atomic_write_bytes(page_dir / VIEW_FILE, _jpeg_bytes(view, icc))
-
     thumb = _fit(view, limits.THUMB_MAX_SIDE)
-    atomic_save_image(thumb, page_dir / THUMB_FILE, "WEBP", quality=limits.THUMB_WEBP_QUALITY)
 
-    # page.jpg last: its hash is what says the page changed
-    atomic_write_bytes(page_dir / PAGE_FILE, page_bytes)
+    def name(file: str) -> Path:
+        return page_dir / (STAGED_FILES[file] if staged else file)
+
+    if staged:
+        atomic_write_bytes(name(PAGE_FILE), page_bytes)
+    atomic_write_bytes(name(VIEW_FILE), _jpeg_bytes(view, icc))
+    atomic_save_image(thumb, name(THUMB_FILE), "WEBP", quality=limits.THUMB_WEBP_QUALITY)
+    if not staged:
+        atomic_write_bytes(name(PAGE_FILE), page_bytes)
     return _PageFiles(hashlib.sha256(page_bytes).hexdigest(), page_image.size, view.size)
 
 
@@ -320,22 +342,30 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
     )
 
 
-def rotate_page_files(page_dir: Path, meta: PageMeta, degrees_clockwise: int, source: PageRotationSource) -> PageMeta:
+def stage_rotation(page_dir: Path, meta: PageMeta, degrees_clockwise: int, source: PageRotationSource) -> PageMeta:
     """
-    Turns a page clockwise by 90, 180 or 270 degrees: rewrites `page.jpg` and regenerates `view.jpg` and the thumbnail
-    from it. Returns the page's new metadata: its size, its total rotation, `oriented` set (its orientation has now
-    been decided) and its OCR text cleared (read at the old orientation). Callers hold `storage.ingest_write()`.
+    Writes the page turned clockwise by 90, 180 or 270 degrees under the staged names (`page.next.jpg`, then
+    `view.next.jpg` and `thumb.next.webp`, each atomically), leaving the current files as they are. Returns the turned
+    page's metadata: its size, its total rotation, `oriented` set (its orientation has now been decided), its OCR text
+    cleared (read at the old orientation) and `page_sha256` of `page.next.jpg`. Store it, then `apply_staged`; or
+    `discard_staged`. `meta` is the page's stored metadata: a turn an earlier crash left staged is settled against it
+    first (`recover_staged`), so it's never overwritten unapplied. Callers hold `storage.ingest_write()`.
     """
     if degrees_clockwise not in _ROTATE_CLOCKWISE:
         raise ValueError("A page can only be turned by 90, 180 or 270 degrees")
 
+    recover_staged(page_dir, meta)
     with Image.open(page_dir / PAGE_FILE, formats=["JPEG"]) as image:
         image.load()
         icc = _rgb_icc_profile(image)
         turned = image.convert("RGB").transpose(_ROTATE_CLOCKWISE[degrees_clockwise])
     turned.info = {}
 
-    files = _write_page_files(page_dir, turned, icc)
+    try:
+        files = _write_page_files(page_dir, turned, icc, staged=True)
+    except BaseException:
+        discard_staged(page_dir)
+        raise
     return meta.model_copy(
         update={
             "width": files.page_size[0],
@@ -349,6 +379,69 @@ def rotate_page_files(page_dir: Path, meta: PageMeta, degrees_clockwise: int, so
             "ocr": None,
         }
     )
+
+
+def has_staged(page_dir: Path) -> bool:
+    """Whether any staged page file is waiting in the page's directory"""
+    return any((page_dir / staged).exists() for staged in STAGED_FILES.values())
+
+
+def apply_staged(page_dir: Path) -> None:
+    """
+    Moves the staged files over the current ones with `os.replace`: the thumbnail, the view, then `page.jpg` last. A
+    staged file already moved (a swap a crash cut short) is skipped. Callers hold `storage.ingest_write()`.
+    """
+    for name in SWAP_ORDER:
+        try:
+            os.replace(page_dir / STAGED_FILES[name], page_dir / name)
+        except FileNotFoundError:
+            pass
+
+
+def discard_staged(page_dir: Path) -> None:
+    """Removes the staged files, `page.next.jpg` last. Callers hold `storage.ingest_write()`."""
+    for name in SWAP_ORDER:
+        (page_dir / STAGED_FILES[name]).unlink(missing_ok=True)
+
+
+def _file_sha256(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as file:
+            while chunk := file.read(1024 * 1024):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return None
+    return digest.hexdigest()
+
+
+def recover_staged(page_dir: Path, stored_meta: PageMeta) -> Literal["none", "applied", "discarded"]:
+    """
+    What a crash left between staging a turn and swapping it in, settled against the page's stored metadata: when any
+    staged file exists, the swap is finished if the staged page (or `page.jpg`, once the staged page has been moved)
+    is the one `stored_meta.page_sha256` names, since that metadata was stored; otherwise the staged files are
+    discarded, since it wasn't. Callers hold `storage.ingest_write()`.
+    """
+    if not has_staged(page_dir):
+        return "none"
+    staged_page = page_dir / STAGED_FILES[PAGE_FILE]
+    page = staged_page if staged_page.exists() else page_dir / PAGE_FILE
+    if _file_sha256(page) == stored_meta.page_sha256:
+        apply_staged(page_dir)
+        return "applied"
+    discard_staged(page_dir)
+    return "discarded"
+
+
+def rotate_page_files(page_dir: Path, meta: PageMeta, degrees_clockwise: int, source: PageRotationSource) -> PageMeta:
+    """
+    Turns a page clockwise by 90, 180 or 270 degrees at once, for a caller without stored metadata to commit in
+    between (`stage_rotation`, then `apply_staged`): returns the page's new metadata. Callers hold
+    `storage.ingest_write()`.
+    """
+    turned = stage_rotation(page_dir, meta, degrees_clockwise, source)
+    apply_staged(page_dir)
+    return turned
 
 
 def crop_region(page_path: Path, region: RegionLike, *, margin: float = limits.REREAD_MARGIN) -> bytes:

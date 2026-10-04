@@ -244,7 +244,8 @@ def _uuid(value: str | None) -> UUID | None:
 async def handle_reread(ctx: TaskContext) -> RereadResult:
     """
     A region re-read (`ctx.payload` holds the page, region and target): `pipeline.reread_region`. A reading for an
-    ingredient line is parsed and linked as extraction does, and comes back as the proposal's one-line draft.
+    ingredient line is parsed and linked as extraction does (a card in another language by the AI parser, on the same
+    service), and comes back as the proposal's one-line draft.
     """
     index, region, target = _reread_request(ctx.payload)
 
@@ -276,6 +277,7 @@ async def handle_reread(ctx: TaskContext) -> RereadResult:
                 translator=get_locale_provider(ctx.locale),
                 matcher=IngestMatcher(repos),
                 language=extraction.language if extraction else None,
+                ai=ai,
             )
             if ingredients:
                 proposal.draft = CardDraft(ingredients=ingredients)

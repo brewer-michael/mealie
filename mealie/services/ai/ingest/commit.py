@@ -10,13 +10,19 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    cancels a pending re-read or re-extract. Every check of step 1 is repeated in its `WHERE`.
 3. **A recipe with that id exists?** Skip to step 6: `create_one` commits more than once, so a partial create leaves a
    row, and creating it again would only clash.
-4. **Files** into `recipes/<id>/`: each `page.jpg` as `assets/recipe-card-<token>-<n>.jpg`, and the front's `view.jpg`
-   as the cover when the draft asks for it.
+4. **Files** into `recipes/<id>/`: each `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is
+   attached (`attaches_card_photo`: the draft's switch, else not in a household whose recipes are public), and the
+   front's `view.jpg` as the cover when the draft asks for it, a portrait card letterboxed to 4:3 (`cover_image`).
 5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): ingredients re-linked through a fresh
-   `IngestMatcher` (§5), organizers looked up in the group by id, the kept markers converted, the attribution as a
-   note titled "From", the card assets, and settings from the household with `show_assets` on.
-6. **Cover key:** `update_image(slug)` when the cover was written.
-7. **Finish:** `committing → committed` with `recipe_id`; whichever call wins it publishes `recipe_created`.
+   `IngestMatcher` (§5), organizers looked up in the group by id (or created by name, for a committer who can
+   organize), the kept markers converted, the attribution as a
+   note titled "From", the card assets when attached, and settings from the household with `show_assets` on when
+   they are.
+6. **Cover key:** `update_image(slug)` when the cover was written, and upstream's `is_ocr_recipe` set.
+7. **Finish:** `committing → committed` with `recipe_id`; whichever call wins it publishes `recipe_created`, holding
+   `recipe_event_claimed_at` from the finish, and records `recipe_event_sent_at` once it went out. Housekeeping sends
+   it for a committed card whose event wasn't recorded a minute on (`resend_recipe_events`), so it's sent at least
+   once, even when the process stops between the finish and the send.
 
 A validation error before `create_one` returns the job to `ready` with `commit_invalid` (and removes `recipes/<id>`
 when no recipe has that id). Once `create_one` has been called the job never goes back to `ready`: any failure leaves
@@ -32,19 +38,23 @@ was taken over therefore can't undo the new owner's commit or delete its files; 
 restore waits for that lock.
 """
 
+import io
 import re
 import secrets
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 import sqlalchemy as sa
 from fastapi import BackgroundTasks, status
+from PIL import Image, ImageStat
 from pydantic import ValidationError
+from slugify import slugify
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -63,6 +73,7 @@ from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, Ing
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.recipe.recipe import Recipe, RecipeCategory, RecipeTag, RecipeTool
 from mealie.schema.recipe.recipe_asset import RecipeAsset
+from mealie.schema.recipe.recipe_category import CategorySave, TagSave
 from mealie.schema.recipe.recipe_image_types import RecipeImageTypes
 from mealie.schema.recipe.recipe_ingredient import (
     IngredientFood,
@@ -74,7 +85,12 @@ from mealie.schema.recipe.recipe_ingredient import (
 from mealie.schema.recipe.recipe_notes import RecipeNote
 from mealie.schema.recipe.recipe_settings import RecipeSettings
 from mealie.schema.recipe.recipe_step import RecipeStep
+from mealie.schema.recipe.recipe_tool import RecipeToolSave
 from mealie.schema.recipe_ingest import (
+    BulkCommitOut,
+    BulkCommitRequest,
+    BulkCommitSkipped,
+    BulkCommitted,
     CardDraft,
     CardDraftIngredient,
     CardDraftRef,
@@ -84,6 +100,8 @@ from mealie.schema.recipe_ingest import (
     IngestErrorCode,
     IngestStatus,
     PageMeta,
+    RecipeIngestionJobState,
+    UncommitRequest,
     UnresolvedFlagsDetail,
 )
 from mealie.schema.user.user import DEFAULT_INTEGRATION_ID, PrivateUser
@@ -94,10 +112,22 @@ from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.review import (
     COMMIT_INVALID,
+    FORBIDDEN,
+    INVALID_STATUS,
+    NOT_CLEAN,
+    NOT_FOUND,
+    PAUSED_FOR_RESTORE,
+    PURGED,
+    RECIPE_EDITED,
+    UNCOMMIT_GRACE,
     UNRESOLVED_FLAGS,
+    VERSION_CONFLICT,
     JobActionError,
     ReviewService,
+    attaches_card_photo,
     invalid_status,
+    is_slimmed,
+    not_found,
     parse_flags,
     parse_pages,
     version_conflict,
@@ -119,6 +149,23 @@ BLANK_TEXT = "___"
 """What a `[blank]` the reviewer kept becomes in the recipe"""
 
 _MARKER = re.compile(r"\[\s*(illegible|blank)\s*\]", re.IGNORECASE)
+
+COVER_ASPECT = 4 / 3
+"""A portrait card's cover is letterboxed to this landscape shape, so the recipe header doesn't crop off its top"""
+COVER_BORDER = 0.02
+"""The strip along each edge of the page whose average colour fills the letterbox"""
+COVER_BACKGROUND = (0xF5, 0xF5, 0xF5)
+"""The letterbox colour when the page's border can't be measured"""
+COVER_QUALITY = 90
+
+RECIPE_EVENT_GRACE = timedelta(seconds=60)
+"""How long after a commit's finish housekeeping leaves `recipe_created` to the call that won it"""
+RECIPE_EVENT_LEASE = timedelta(minutes=5)
+"""How long a sender holds `recipe_event_claimed_at` before another may send the event again"""
+RECIPE_EVENT_CUTOFF = timedelta(hours=24)
+"""Older commits never get a late `recipe_created`, so a restored backup doesn't replay old events"""
+RECIPE_EVENT_BATCH = 50
+"""The most late `recipe_created` events one housekeeping run sends"""
 
 # ==========================================
 # Names and conversions
@@ -303,18 +350,57 @@ def _ingredient(
 # The recipe
 
 
-def recipe_settings(household: HouseholdInDB) -> RecipeSettings:
-    """The household's defaults for new recipes, as `create_one` would use them, but with the card assets shown"""
+def recipe_settings(household: HouseholdInDB, *, show_assets: bool = True) -> RecipeSettings:
+    """
+    The household's defaults for new recipes, as `create_one` would use them, but with the card assets shown when
+    they're attached (`show_assets`); otherwise the household's own default
+    """
     preferences = household.preferences
     if preferences is None:
-        return RecipeSettings(show_assets=True)
+        return RecipeSettings(show_assets=True) if show_assets else RecipeSettings()
     return RecipeSettings(
         public=preferences.recipe_public,
         show_nutrition=preferences.recipe_show_nutrition,
-        show_assets=True,
+        show_assets=show_assets or preferences.recipe_show_assets,
         landscape_view=preferences.recipe_landscape_view,
         disable_comments=preferences.recipe_disable_comments,
     )
+
+
+class OrganizerMaker:
+    """
+    Creates the tags, categories and tools a draft names without an id, for a committer who can organize (§7), like
+    the foods: found by slug first (an earlier attempt at this commit, or anyone, may have made it), and looked up
+    again when another commit creates the same one at the same moment (the slug is unique per group)
+    """
+
+    def __init__(self, repos: AllRepositories, group_id: UUID) -> None:
+        self.repos = repos
+        self.group_id = group_id
+
+    def _find_or_create(self, repo: Any, save: Any, name: str) -> Any | None:
+        name = name.strip()
+        slug = slugify(name)
+        if not slug or _MARKER.search(name):
+            return None
+        if (found := repo.get_one(slug, "slug")) is not None:
+            return found
+        try:
+            return repo.create(save)
+        except IntegrityError:
+            # `create` has rolled back: another commit in the group created it just now
+            return repo.get_one(slug, "slug")
+
+    def tag(self, name: str) -> Any | None:
+        return self._find_or_create(self.repos.tags, TagSave(name=name.strip(), group_id=self.group_id), name)
+
+    def category(self, name: str) -> Any | None:
+        return self._find_or_create(
+            self.repos.categories, CategorySave(name=name.strip(), group_id=self.group_id), name
+        )
+
+    def tool(self, name: str) -> Any | None:
+        return self._find_or_create(self.repos.tools, RecipeToolSave(name=name.strip(), group_id=self.group_id), name)
 
 
 def _organizers[T: RecipeTag](
@@ -323,12 +409,19 @@ def _organizers[T: RecipeTag](
     build: Callable[[Any], T],
     kind: str,
     warnings: list[str],
+    create: Callable[[str], Any] | None = None,
 ) -> list[T]:
-    """The group's organizers by id; unknown or foreign ones are dropped with a warning, and none is created"""
+    """
+    The group's organizers by id; one named without an id is created when `create` is given (the committer can
+    organize). Unknown or foreign ids, and names nobody may create, are dropped with a warning.
+    """
     found: list[T] = []
     seen: set[UUID] = set()
     for ref in refs:
-        organizer = lookup(ref.id) if ref.id else None
+        if ref.id:
+            organizer = lookup(ref.id)
+        else:
+            organizer = create(ref.name) if create and ref.name.strip() else None
         if organizer is None:
             warnings.append(f"{kind}_dropped:{ref.name or ref.id}")
             continue
@@ -349,11 +442,13 @@ def draft_to_recipe(
     translator: Translator,
     unreadable: str,
     linker: IngredientLinker | None,
+    organizers: OrganizerMaker | None = None,
 ) -> tuple[Recipe, list[str]]:
     """
     The recipe a draft becomes (§7 step 5), and warnings about what was left out. Only the draft's own fields are
-    used; the id, slug, assets, settings and owners are the server's. Without a `linker` no food or unit is linked
-    (or created): a dry run that only validates.
+    used; the id, slug, assets, settings and owners are the server's. `page_count` card assets are listed (0 when the
+    card photo isn't attached). Without a `linker` no food or unit is linked (or created): a dry run that only
+    validates. Organizers named without an id are created only with `organizers`.
 
     Raises `DraftInvalid`.
     """
@@ -366,7 +461,9 @@ def draft_to_recipe(
         raise DraftInvalid(["name"])
 
     try:
-        return _build_recipe(draft, name, recipe_id, token, page_count, repos, settings, translator, convert, linker)
+        return _build_recipe(
+            draft, name, recipe_id, token, page_count, repos, settings, translator, convert, linker, organizers
+        )
     except ValidationError as e:
         raise DraftInvalid.of(e) from e
 
@@ -392,6 +489,7 @@ def _build_recipe(
     translator: Translator,
     convert: Callable[[str | None], str],
     linker: IngredientLinker | None,
+    organizers: OrganizerMaker | None,
 ) -> tuple[Recipe, list[str]]:
     warnings: list[str] = []
     ingredients = [ing for line in draft.ingredients if (ing := _ingredient(line, linker, convert)) is not None]
@@ -418,6 +516,7 @@ def _build_recipe(
         lambda t: RecipeTag(id=t.id, group_id=t.group_id, name=t.name, slug=t.slug),
         "tag",
         warnings,
+        organizers.tag if organizers else None,
     )
     categories = _organizers(
         draft.categories,
@@ -425,6 +524,7 @@ def _build_recipe(
         lambda c: RecipeCategory(id=c.id, group_id=c.group_id, name=c.name, slug=c.slug),
         "category",
         warnings,
+        organizers.category if organizers else None,
     )
     tools = _organizers(
         draft.tools,
@@ -434,6 +534,7 @@ def _build_recipe(
         ),
         "tool",
         warnings,
+        organizers.tool if organizers else None,
     )
 
     assets = [
@@ -490,11 +591,21 @@ def _lease_fence(job_id: UUID, lease: datetime) -> list[sa.ColumnElement[bool]]:
     return [Job.id == job_id, Job.status == IngestStatus.committing.value, Job.commit_started_at == lease]
 
 
-def _claim(session: Session, job_id: UUID, household_id: UUID, user_id: UUID, version: int, now: datetime) -> bool:
+def _claim(
+    session: Session,
+    job_id: UUID,
+    household_id: UUID,
+    user_id: UUID,
+    version: int,
+    now: datetime,
+    *,
+    require_clean: bool = False,
+) -> bool:
     """
     Step 2: `ready → committing`, with the recipe id and asset token kept from an earlier attempt or made now. The
-    commit's lease is `now`.
+    commit's lease is `now`. `require_clean` (a bulk commit) also needs no unresolved warning.
     """
+    clean = [Job.warning_count == 0] if require_clean else []
     stmt = (
         sa.update(Job)
         .where(
@@ -503,6 +614,7 @@ def _claim(session: Session, job_id: UUID, household_id: UUID, user_id: UUID, ve
             Job.status == IngestStatus.ready.value,
             Job.draft_version == version,
             Job.error_count == 0,
+            *clean,
         )
         .values(
             **TASK_CLEARED,
@@ -609,17 +721,74 @@ def _refused(
     return invalid_status(IngestStatus.committing.value)
 
 
-def _write_files(job: RecipeIngestionJob, draft: CardDraft, pages: Sequence[PageMeta], token: str) -> None:
-    """Step 4: the card assets, and the cover when the draft asks for it. Only `recipes/<new id>/` is created."""
+def _border_colour(page: Image.Image) -> tuple[int, int, int]:
+    """The average colour of the strip along the page's edges (`COVER_BORDER` of each side), else `COVER_BACKGROUND`"""
+    width, height = page.size
+    side = max(1, round(min(width, height) * COVER_BORDER))
+    if width <= 2 * side or height <= 2 * side:
+        return COVER_BACKGROUND
+    strips = [
+        page.crop((0, 0, width, side)),
+        page.crop((0, height - side, width, height)),
+        page.crop((0, side, side, height - side)),
+        page.crop((width - side, side, width, height - side)),
+    ]
+    totals, pixels = [0.0, 0.0, 0.0], 0
+    for strip in strips:
+        stat = ImageStat.Stat(strip)
+        count = strip.width * strip.height
+        totals = [total + band * count for total, band in zip(totals, stat.mean[:3], strict=True)]
+        pixels += count
+    red, green, blue = (round(total / pixels) for total in totals)
+    return red, green, blue
+
+
+def cover_image(view: Path) -> Path | bytes:
+    """
+    The recipe's cover from the front page's `view.jpg`. Upstream's recipe header crops its image to a landscape box,
+    which cuts the top (the title) off a portrait card, so a portrait page is letterboxed to 4:3: the whole page at
+    its own height, centred on the average colour of its border, as a JPEG. A landscape or square page is used as it
+    is. Either way the card asset stays the full page.
+    """
+    with Image.open(view) as image:
+        if image.width >= image.height:
+            return view
+        icc_profile = image.info.get("icc_profile")
+        page = image.convert("RGB")
+
+    width = round(page.height * COVER_ASPECT)
+    try:
+        background = _border_colour(page)
+    except Exception:
+        background = COVER_BACKGROUND
+    cover = Image.new("RGB", (width, page.height), background)
+    cover.paste(page, ((width - page.width) // 2, 0))
+    buffer = io.BytesIO()
+    cover.save(buffer, "JPEG", quality=COVER_QUALITY, icc_profile=icc_profile)
+    return buffer.getvalue()
+
+
+def _write_files(
+    job: RecipeIngestionJob, draft: CardDraft, pages: Sequence[PageMeta], token: str, attach: bool = True
+) -> None:
+    """
+    Step 4: the card assets when the card photo is attached (`attach`), and the cover when the draft asks for it. Only
+    `recipes/<new id>/` is created. Assets an earlier attempt wrote are removed when the photo isn't attached now.
+    """
     recipe_id = job.commit_recipe_id
     if recipe_id is None:
         raise ValueError("The job has no reserved recipe id")
     data = RecipeDataService(recipe_id)
     for page in pages:
+        asset = data.dir_assets / asset_file_name(token, page.index)
+        if not attach:
+            asset.unlink(missing_ok=True)
+            continue
         source = images.page_file(storage.page_dir(job.group_id, job.id, page.index), "page")
-        storage.atomic_write_bytes(data.dir_assets / asset_file_name(token, page.index), source.read_bytes())
+        storage.atomic_write_bytes(asset, source.read_bytes())
     if draft.use_card_as_cover and pages:
-        data.write_image(images.page_file(storage.page_dir(job.group_id, job.id, pages[0].index), "view"), "jpg")
+        view = images.page_file(storage.page_dir(job.group_id, job.id, pages[0].index), "view")
+        data.write_image(cover_image(view), "jpg")
 
 
 def _create_recipe(
@@ -643,8 +812,28 @@ def _set_cover_key(session: Session, job: RecipeIngestionJob, draft: CardDraft |
         recipes.update_image(slug)
 
 
+def _mark_card_recipe(session: Session, job: RecipeIngestionJob) -> None:
+    """
+    Step 6 too: upstream's own provenance bit on the recipe row, `is_ocr_recipe`, which a backup keeps even where the
+    fork's tables are gone (`recipe_ingestion_jobs.recipe_id` stays the fork's link). Idempotent, so a resumed commit
+    sets it again. Upstream marks the column deprecated: if a sync drops it, this is skipped and commit still works.
+    """
+    recipe_id = job.commit_recipe_id
+    if recipe_id is None or not hasattr(RecipeModel, "is_ocr_recipe"):
+        return
+    stmt = (
+        sa.update(RecipeModel)
+        .where(RecipeModel.id == recipe_id, RecipeModel.group_id == job.group_id)
+        .values(is_ocr_recipe=True)
+    )
+    _update(session, stmt)
+
+
 def _finish(session: Session, job: RecipeIngestionJob, lease: datetime, now: datetime) -> bool:
-    """Step 7: `committing → committed`; whether this call won it (and so publishes `recipe_created`)"""
+    """
+    Step 7: `committing → committed`; whether this call won it (and so publishes `recipe_created`, holding the event's
+    claim from now)
+    """
     stmt = (
         sa.update(Job)
         .where(*_lease_fence(job.id, lease), Job.commit_recipe_id == job.commit_recipe_id)
@@ -652,6 +841,8 @@ def _finish(session: Session, job: RecipeIngestionJob, lease: datetime, now: dat
             status=IngestStatus.committed.value,
             recipe_id=job.commit_recipe_id,
             committed_at=now,
+            recipe_event_claimed_at=now,
+            recipe_event_sent_at=None,
             error_code=None,
             error_params=None,
             row_version=Job.row_version + 1,
@@ -669,13 +860,15 @@ def _publish_recipe_created(
     name: str,
     translator: Translator,
     integration_id: str,
-    background: BackgroundTasks | None,
-) -> None:
-    """Upstream's `recipe_created`, as `RecipeController._publish_recipe_created` sends it"""
+) -> bool:
+    """
+    Upstream's `recipe_created`, as `RecipeController._publish_recipe_created` sends it, but to the listeners right
+    away (in this thread); whether it went out without an error
+    """
     try:
         group = get_repositories(session).groups.get_one(group_id)
         url = urls.recipe_url(group.slug if group else "", slug, get_app_settings().BASE_URL)
-        EventBusService(background, session, translator).dispatch(
+        EventBusService(None, session, translator).dispatch(
             integration_id=integration_id,
             group_id=group_id,
             household_id=household_id,
@@ -684,8 +877,58 @@ def _publish_recipe_created(
             message=translator.t("notifications.generic-created-with-url", name=name, url=url),
         )
     except Exception as e:
-        # the recipe is committed either way; the event is at most once
+        # the recipe is committed either way; housekeeping sends the event again later (`resend_recipe_events`)
+        session.rollback()
         logger.error(f"Couldn't publish recipe_created for a committed recipe card ({type(e).__name__})")
+        return False
+    return True
+
+
+def _mark_event_sent(session: Session, job_id: UUID) -> None:
+    """Records that the committed recipe's `recipe_created` went out"""
+    unsent = [Job.id == job_id, Job.recipe_event_sent_at.is_(None)]
+    _update(session, sa.update(Job).where(*unsent).values(recipe_event_sent_at=utcnow()))
+
+
+def _send_recipe_created(
+    session: Session | None,
+    *,
+    job_id: UUID,
+    group_id: UUID,
+    household_id: UUID,
+    slug: str,
+    name: str,
+    translator: Translator,
+    integration_id: str,
+) -> None:
+    """
+    Publishes `recipe_created` and records it as sent, with `session` or (from a request's background task, after the
+    response) a session of its own
+    """
+    if session is None:
+        with session_context() as own:
+            _send_recipe_created(
+                own,
+                job_id=job_id,
+                group_id=group_id,
+                household_id=household_id,
+                slug=slug,
+                name=name,
+                translator=translator,
+                integration_id=integration_id,
+            )
+        return
+    published = _publish_recipe_created(
+        session,
+        group_id=group_id,
+        household_id=household_id,
+        slug=slug,
+        name=name,
+        translator=translator,
+        integration_id=integration_id,
+    )
+    if published:
+        _mark_event_sent(session, job_id)
 
 
 def _job_translator(job: RecipeIngestionJob) -> Translator:
@@ -745,25 +988,27 @@ def _run(
         repos = get_repositories(session, group_id=job.group_id, household_id=job.household_id)
         household = repos.households.get_one(job.household_id)
         pages = parse_pages(job.pages)
-        build = partial(
-            draft_to_recipe,
-            recipe_id=recipe_id,
-            token=token,
-            page_count=len(pages),
-            repos=repos,
-            translator=translator,
-            unreadable=_job_translator(job).t("recipe-ingest.unreadable"),
-        )
 
         try:
             if draft is None or household is None:
                 raise DraftInvalid(["draft"])
-            settings = recipe_settings(household)
+            attach = attaches_card_photo(draft, household)
+            settings = recipe_settings(household, show_assets=attach)
+            build = partial(
+                draft_to_recipe,
+                recipe_id=recipe_id,
+                token=token,
+                page_count=len(pages) if attach else 0,
+                repos=repos,
+                translator=translator,
+                unreadable=_job_translator(job).t("recipe-ingest.unreadable"),
+            )
             build(draft, settings=settings, linker=None)  # validates before anything is written or created
-            _write_files(job, draft, pages, token)
+            _write_files(job, draft, pages, token, attach)
             lease = _renew_lease(session, job, lease)
             linker = IngredientLinker(repos, job.group_id, can_create_foods=bool(user.can_organize))
-            recipe, warnings = build(draft, settings=settings, linker=linker)
+            organizers = OrganizerMaker(repos, job.group_id) if user.can_organize else None
+            recipe, warnings = build(draft, settings=settings, linker=linker, organizers=organizers)
         except _LeaseLost as e:
             # taken over while this caller wrote the files: the new owner finishes the commit
             raise invalid_status(IngestStatus.committing.value) from e
@@ -788,6 +1033,7 @@ def _run(
         slug, name = existing.slug, existing.name or ""
 
     _set_cover_key(session, job, draft, slug)
+    _mark_card_recipe(session, job)
     published = _finish(session, job, lease, utcnow())
     return _Outcome(recipe_id=recipe_id, slug=slug, name=name, published=published, warnings=warnings)
 
@@ -801,18 +1047,26 @@ def _announce(
     integration_id: str,
     background: BackgroundTasks | None,
 ) -> None:
-    """`recipe_created` for the call that won the finish, sent once the ingest write lock is released"""
-    if outcome.published:
-        _publish_recipe_created(
-            session,
-            group_id=job.group_id,
-            household_id=job.household_id,
-            slug=outcome.slug,
-            name=outcome.name,
-            translator=translator,
-            integration_id=integration_id,
-            background=background,
-        )
+    """
+    `recipe_created` for the call that won the finish, sent once the ingest write lock is released: after the response
+    for a request (`background`), else in this thread
+    """
+    if not outcome.published:
+        return
+    send = partial(
+        _send_recipe_created,
+        job_id=job.id,
+        group_id=job.group_id,
+        household_id=job.household_id,
+        slug=outcome.slug,
+        name=outcome.name,
+        translator=translator,
+        integration_id=integration_id,
+    )
+    if background is not None:
+        background.add_task(send, None)
+    else:
+        send(session)
 
 
 # ==========================================
@@ -852,7 +1106,13 @@ def _refusal(review: ReviewService, job_id: UUID, version: int) -> CommitResult:
     if job.draft_version != version:
         raise version_conflict(job.draft_version)
     unresolved = UnresolvedFlagsDetail.of(parse_flags(job.flags)).flags
+    if not unresolved and not job.error_count:
+        raise not_clean()  # a bulk commit's claim: a warning came back meanwhile
     raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNRESOLVED_FLAGS, flags=unresolved)
+
+
+def not_clean() -> JobActionError:
+    return JobActionError(status.HTTP_409_CONFLICT, NOT_CLEAN)
 
 
 def _take_over(
@@ -898,10 +1158,12 @@ def commit_job(
     translator: Translator,
     integration_id: str = DEFAULT_INTEGRATION_ID,
     background: BackgroundTasks | None = None,
+    require_clean: bool = False,
 ) -> CommitResult:
     """
     Commits a reviewed card for the user (§7). `request.draft`, when sent, is saved first with the version check.
-    `recipe_created` goes out through `background` after the response.
+    `recipe_created` goes out through `background` after the response. `require_clean` (a bulk commit) refuses a card
+    with an unresolved warning too (409 `not_clean`).
 
     Raises `JobActionError` (404, 409 `version_conflict` / `invalid_status` / `commit_interrupted`, 422
     `unresolved_flags` / `commit_invalid`) and `IngestPaused` while a backup restore holds ingestion.
@@ -935,10 +1197,15 @@ def commit_job(
     unresolved = UnresolvedFlagsDetail.of(parse_flags(job.flags)).flags
     if unresolved or job.error_count:
         raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNRESOLVED_FLAGS, flags=unresolved)
+    if require_clean and job.warning_count:
+        raise not_clean()
 
     with storage.ingest_write():
         lease = utcnow()
-        if not _claim(review.session, job_id, review.household_id, user.id, version, lease):
+        claimed = _claim(
+            review.session, job_id, review.household_id, user.id, version, lease, require_clean=require_clean
+        )
+        if not claimed:
             return _refusal(review, job_id, version)
         job = review.job(job_id)
         outcome = _run(review.session, job, lease=lease, user=user, translator=translator)
@@ -953,6 +1220,228 @@ def commit_job(
         ),
         created=True,
     )
+
+
+def commit_clean(
+    repos: IngestRepos,
+    user: PrivateUser,
+    batch_id: UUID,
+    request: BulkCommitRequest,
+    *,
+    translator: Translator,
+    integration_id: str = DEFAULT_INTEGRATION_ID,
+    background: BackgroundTasks | None = None,
+) -> BulkCommitOut:
+    """
+    Commits the listed cards of a batch, one by one through `commit_job` (the same checks, lease and events), each
+    that is still `ready` at the version the page showed and has no unresolved error or warning; the others are left
+    for review with the reason. A restore pausing ingestion stops the run. 404 `not_found` for another household's
+    batch.
+    """
+    if repos.batches.get(batch_id) is None:
+        raise not_found()
+
+    out = BulkCommitOut()
+    paused = False
+    for job_id in request.job_ids:
+        code: str | None = None
+        job = repos.jobs.get(job_id)
+        if paused:
+            code = PAUSED_FOR_RESTORE
+        elif job is None or job.batch_id != batch_id:
+            code = NOT_FOUND
+        elif job.status != IngestStatus.ready.value:
+            code = INVALID_STATUS
+        elif job.draft_version != request.draft_versions[job_id]:
+            code = VERSION_CONFLICT
+        elif job.error_count or job.warning_count:
+            code = NOT_CLEAN
+        if code is not None:
+            out.skipped.append(BulkCommitSkipped(job_id=job_id, code=code))
+            continue
+
+        try:
+            result = commit_job(
+                repos,
+                user,
+                job_id,
+                CommitRequest(draft_version=request.draft_versions[job_id]),
+                translator=translator,
+                integration_id=integration_id,
+                background=background,
+                require_clean=True,
+            )
+        except JobActionError as e:
+            out.skipped.append(BulkCommitSkipped(job_id=job_id, code=e.code))
+        except IngestPaused:
+            paused = True
+            out.skipped.append(BulkCommitSkipped(job_id=job_id, code=PAUSED_FOR_RESTORE))
+        except Exception as e:
+            repos.session.rollback()
+            logger.error(f"Couldn't commit recipe card job {job_id} with its batch ({type(e).__name__})")
+            out.skipped.append(BulkCommitSkipped(job_id=job_id, code=IngestErrorCode.internal_error.value))
+        else:
+            out.committed.append(BulkCommitted(job_id=job_id, recipe_id=result.out.recipe_id, slug=result.out.slug))
+    return out
+
+
+def _naive_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo else value
+
+
+def _edited_since(recipe: Recipe, committed_at: datetime | None) -> bool:
+    """Whether the recipe was updated after its commit (beyond the commit's own cover update)"""
+    if recipe.date_updated is None or committed_at is None:
+        return False
+    return _naive_utc(recipe.date_updated) > _naive_utc(committed_at) + UNCOMMIT_GRACE
+
+
+def uncommit_job(
+    repos: IngestRepos,
+    user: PrivateUser,
+    job_id: UUID,
+    request: UncommitRequest,
+    *,
+    translator: Translator,
+    integration_id: str = DEFAULT_INTEGRATION_ID,
+    background: BackgroundTasks | None = None,
+) -> RecipeIngestionJobState:
+    """
+    Undoes a commit (back to review): deletes the recipe through upstream's recipe service (its files go too, and
+    `recipe_deleted` is published as for any delete), then puts the card back to `ready` with its stored draft in
+    one guarded update, with a new `draft_version` and the commit's ids and times cleared, so its next commit makes a
+    new recipe. For the committer or a household manager, who must also be allowed to delete the recipe (its owner,
+    or an admin). A recipe edited since the commit is a 409 `recipe_edited` unless `force`; one already deleted just
+    lets the card go back. The caller holds the ingest write lock, so the retention purge can't remove the card's
+    files meanwhile.
+
+    Raises `JobActionError`: 404, 403 `forbidden`, 409 `invalid_status` / `purged` / `recipe_edited`.
+    """
+    translator = with_fallback(translator)
+    review = ReviewService(repos, user)
+    session = review.session
+    job = review.job(job_id)
+    if job.status != IngestStatus.committed.value:
+        raise invalid_status(job.status)
+    if is_slimmed(job):
+        raise JobActionError(status.HTTP_409_CONFLICT, PURGED)
+    if job.committed_by != user.id and not user.can_manage_household:
+        raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+
+    recipe_id = job.recipe_id
+    recipe = None
+    if recipe_id is not None:
+        recipe = get_repositories(session, group_id=job.group_id, household_id=None).recipes.get_one(recipe_id, "id")
+    if recipe is not None:
+        household_repos = get_repositories(session, group_id=user.group_id, household_id=user.household_id)
+        household = household_repos.households.get_one(user.household_id)
+        if household is None:
+            raise not_found()
+        service = RecipeService(household_repos, user, household, translator)
+        if not service.can_delete([recipe.slug]):
+            raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+        if not request.force and _edited_since(recipe, job.committed_at):
+            raise JobActionError(status.HTTP_409_CONFLICT, RECIPE_EDITED)
+
+        deleted = service.delete_one(recipe.slug)
+        EventBusService(background, session, translator).dispatch(
+            integration_id=integration_id,
+            group_id=deleted.group_id,
+            household_id=deleted.household_id,
+            event_type=EventTypes.recipe_deleted,
+            document_data=EventRecipeData(operation=EventOperation.delete, recipe_slug=deleted.slug),
+            message=translator.t("notifications.generic-deleted", name=deleted.name),
+        )
+
+    stmt = (
+        sa.update(Job)
+        .where(
+            Job.id == job_id,
+            Job.household_id == review.household_id,
+            Job.status == IngestStatus.committed.value,
+            Job.draft.is_not(None),
+            Job.recipe_id.is_(None) if recipe_id is None else Job.recipe_id == recipe_id,
+        )
+        .values(
+            status=IngestStatus.ready.value,
+            draft_version=Job.draft_version + 1,
+            recipe_id=None,
+            commit_recipe_id=None,
+            commit_asset_token=None,
+            committed_by=None,
+            commit_started_at=None,
+            committed_at=None,
+            recipe_event_claimed_at=None,
+            recipe_event_sent_at=None,
+            error_code=None,
+            error_params=None,
+            row_version=Job.row_version + 1,
+        )
+    )
+    if not _update(session, stmt):
+        current = review.job(job_id)
+        if current.status != IngestStatus.ready.value:
+            raise invalid_status(current.status)
+    return review.get_state(job_id)
+
+
+def resend_recipe_events(now: datetime) -> int:
+    """
+    Sends `recipe_created` for committed cards whose event wasn't recorded as sent (the process stopped, or the send
+    failed): committed more than `RECIPE_EVENT_GRACE` and less than `RECIPE_EVENT_CUTOFF` before `now`, with no claim
+    or one older than `RECIPE_EVENT_LEASE`. Each is claimed with a conditional update first, so two processes never
+    both send it; at most `RECIPE_EVENT_BATCH` a run. A card whose recipe is gone is marked sent without an event.
+    Returns how many were sent.
+    """
+    if storage.is_paused():
+        return 0
+
+    def due(cutoff: datetime) -> list[sa.ColumnElement[bool]]:
+        return [
+            Job.status == IngestStatus.committed.value,
+            Job.recipe_event_sent_at.is_(None),
+            Job.recipe_id.is_not(None),
+            Job.committed_at < now - RECIPE_EVENT_GRACE,
+            Job.committed_at > now - RECIPE_EVENT_CUTOFF,
+            sa.or_(Job.recipe_event_claimed_at.is_(None), Job.recipe_event_claimed_at < cutoff),
+        ]
+
+    sent = 0
+    with session_context() as session:
+        stmt = sa.select(Job.id).where(*due(now - RECIPE_EVENT_LEASE)).order_by(Job.committed_at, Job.id)
+        job_ids = list(session.execute(stmt.limit(RECIPE_EVENT_BATCH)).scalars())
+        session.commit()
+
+        queue = IngestQueue(session)
+        for job_id in job_ids:
+            try:
+                claimed_at = max(now, utcnow())
+                claim = sa.update(Job).where(Job.id == job_id, *due(now - RECIPE_EVENT_LEASE))
+                if not _update(session, claim.values(recipe_event_claimed_at=claimed_at)):
+                    continue  # another process has it
+                job = queue.get(job_id)
+                if job is None or job.recipe_id is None:
+                    continue
+                recipes = get_repositories(session, group_id=job.group_id, household_id=None).recipes
+                recipe = recipes.get_one(job.recipe_id, "id")
+                if recipe is None:
+                    _mark_event_sent(session, job_id)  # deleted since: nothing to announce
+                    continue
+                _send_recipe_created(
+                    session,
+                    job_id=job_id,
+                    group_id=job.group_id,
+                    household_id=job.household_id,
+                    slug=recipe.slug,
+                    name=recipe.name or "",
+                    translator=_job_translator(job),
+                    integration_id=DEFAULT_INTEGRATION_ID,
+                )
+                sent += 1
+            except Exception as e:
+                session.rollback()
+                logger.error(f"Couldn't send recipe_created for recipe card job {job_id} ({type(e).__name__})")
+    return sent
 
 
 def resume_stale_commits(now: datetime) -> int:
@@ -1006,4 +1495,10 @@ def resume_stale_commits(now: datetime) -> int:
                 session.rollback()
                 # never the exception's text: it can hold card text (a recipe name in a failed INSERT)
                 logger.error(f"Couldn't resume the commit of recipe card job {job_id} ({type(e).__name__})")
+
+    # and the events of finished commits that weren't recorded as sent
+    try:
+        resend_recipe_events(now)
+    except Exception as e:
+        logger.error(f"Couldn't send the late recipe_created events ({type(e).__name__})")
     return resumed

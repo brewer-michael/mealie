@@ -93,7 +93,7 @@
               size="small"
               variant="tonal"
               :prepend-icon="mdiCropFree"
-              :disabled="readonly"
+              :disabled="readonly || !canReread"
               @click="emit('reread', item.flag)"
             >
               {{ $t("recipe-ingest.review.re-read") }}
@@ -146,8 +146,11 @@ import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/rec
 const props = withDefaults(defineProps<{
   item: NeedsALookItem;
   readonly?: boolean;
+  /** Whether Re-read works now (the page is busy turning a page, say) */
+  canReread?: boolean;
 }>(), {
   readonly: false,
+  canReread: true,
 });
 
 const emit = defineEmits<{

@@ -17,6 +17,7 @@
       </v-btn>
     </v-btn-toggle>
 
+    <!-- one row in every state from 375 px: the shutter, Choose and Done never move (narrower, Done wraps) -->
     <div class="capture-actions d-flex flex-wrap align-center ga-2">
       <v-btn
         class="take-photo"
@@ -27,21 +28,15 @@
       >
         {{ cameraLabel }}
       </v-btn>
-      <template v-if="pendingFront">
-        <v-btn class="no-back" variant="tonal" @click="noBack">
-          {{ $t("recipe-ingest.capture.no-back") }}
-        </v-btn>
-        <v-btn class="retake" variant="text" @click="openCamera('retake')">
-          {{ $t("recipe-ingest.capture.retake") }}
-        </v-btn>
-      </template>
       <v-btn
         class="choose-photos"
         variant="tonal"
         :prepend-icon="mdiImageMultiple"
         @click="chooseInput?.click()"
       >
-        {{ $t("recipe-ingest.capture.choose-photos") }}
+        <!-- phones: a short label, so the row fits 343 px -->
+        <span class="d-none d-sm-inline">{{ $t("recipe-ingest.capture.choose-photos") }}</span>
+        <span class="d-sm-none">{{ $t("recipe-ingest.capture.choose-photos-short") }}</span>
       </v-btn>
       <v-spacer />
       <v-btn
@@ -56,14 +51,15 @@
       </v-btn>
     </div>
     <!-- below the buttons, so the Back side shutter stays where Take photo was (the top half of a phone screen) -->
-    <div v-if="pendingFront" class="pending-front d-flex align-center mt-3">
-      <img
-        :src="previewUrl(pendingFront)"
-        class="capture-thumb"
-        :alt="$t('recipe-ingest.capture.front')"
-        decoding="async"
-      >
-      <span class="ml-3 text-body-2">{{ $t("recipe-ingest.capture.front") }}</span>
+    <div v-if="pendingFront" class="pending-front d-flex flex-wrap align-center ga-2 mt-3">
+      <IngestCapturePhoto :photo="pendingFront" :label="$t('recipe-ingest.capture.front')" :show-name="false" />
+      <span class="text-body-2 mr-2">{{ $t("recipe-ingest.capture.front") }}</span>
+      <v-btn class="no-back" variant="tonal" @click="noBack">
+        {{ $t("recipe-ingest.capture.no-back") }}
+      </v-btn>
+      <v-btn class="retake" variant="text" @click="openCamera('retake')">
+        {{ $t("recipe-ingest.capture.retake") }}
+      </v-btn>
     </div>
     <p v-if="openBatchCardCount" class="cards-queued text-caption mt-2 mb-0">
       {{ $t("recipe-ingest.capture.cards-queued", openBatchCardCount) }}
@@ -106,13 +102,7 @@
                 :key="side"
                 class="draft-photo ma-0"
               >
-                <img
-                  :src="previewUrl(photo)"
-                  class="capture-thumb"
-                  :alt="sideLabel(card.photos.length, side)"
-                  loading="lazy"
-                  decoding="async"
-                >
+                <IngestCapturePhoto :photo="photo" :label="sideLabel(card.photos.length, side)" />
                 <figcaption v-if="card.photos.length > 1" class="text-caption text-center">
                   {{ sideLabel(card.photos.length, side) }}
                 </figcaption>
@@ -186,17 +176,42 @@
         {{ $t("recipe-ingest.capture.drop-zone-hint") }}
       </div>
     </div>
+
+    <!-- below everything, so it never moves the shutter; remembered in this browser -->
+    <v-switch
+      v-model="dataSaver"
+      class="data-saver mt-2"
+      color="primary"
+      density="compact"
+      :label="$t('recipe-ingest.capture.data-saver')"
+      :hint="$t('recipe-ingest.capture.data-saver-hint')"
+      persistent-hint
+      inset
+    />
+    <v-alert
+      v-if="storageFailed"
+      class="storage-failed mt-3"
+      type="warning"
+      variant="tonal"
+      density="compact"
+      closable
+      @click:close="storageFailed = false"
+    >
+      {{ $t("recipe-ingest.capture.storage-failed") }}
+    </v-alert>
   </div>
 </template>
 
 <script setup lang="ts">
 import { mdiCallMerge, mdiCallSplit, mdiCamera, mdiCheck, mdiImageMultiple, mdiImagePlus, mdiSwapHorizontal } from "@mdi/js";
 import { useDropZone } from "@vueuse/core";
+import IngestCapturePhoto from "./IngestCapturePhoto.vue";
 import { canJoin, DEFAULT_MAX_PAGES_PER_CARD, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 
 /**
  * Taking and choosing card photos (docs/ai/PHASE2.md §1.1). A card taken with the camera uploads as soon as it's
- * complete; chosen or dropped photos are paired into cards first, with Swap and Split/Join. Fork-owned.
+ * complete; chosen or dropped photos are paired into cards first, with Swap and Split/Join. The tray shows small
+ * thumbnails (a placeholder where the browser can't show a photo), and Data saver sends smaller photos. Fork-owned.
  */
 withDefaults(defineProps<{
   /** The server's limit, from the card settings */
@@ -208,11 +223,12 @@ withDefaults(defineProps<{
 const i18n = useI18n();
 const {
   mode,
+  dataSaver,
+  storageFailed,
   drafts,
   pendingFront,
   openBatch,
   openBatchCardCount,
-  previewUrl,
   takePhoto,
   retake,
   noBack,
@@ -286,12 +302,12 @@ const { isOverDropZone } = useDropZone(dropZone, (files) => {
 </script>
 
 <style scoped>
-.capture-thumb {
-  width: 72px;
-  height: 72px;
-  object-fit: cover;
-  border-radius: 6px;
-  display: block;
+/* phones: the shutter, Choose and Done fit one row of 343 px in every state, one height, one top */
+@media (max-width: 599.98px) {
+  .capture-actions .v-btn {
+    height: 44px;
+    padding-inline: 12px;
+  }
 }
 
 .drop-zone {

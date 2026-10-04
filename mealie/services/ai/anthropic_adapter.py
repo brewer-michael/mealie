@@ -19,6 +19,7 @@ from mealie.services.openai.openai import OpenAIAttachment, OpenAIImageBase, Ope
 
 from .errors import AIProviderOutputTruncatedError, AIProviderRefusedError, AIProviderUnsupportedError
 from .listing import MAX_LISTED_MODELS, take
+from .local import local_only_http_client
 from .usage import AITokenUsage
 
 if TYPE_CHECKING:
@@ -47,6 +48,8 @@ def get_client(provider: AIProviderOut) -> AsyncAnthropic:
     `ANTHROPIC_BASE_URL` for a blank base URL, and the headers in `ANTHROPIC_CUSTOM_HEADERS`, which would then
     go to whatever host a group manager sets. (It reads credentials from the environment only when no
     `api_key` is given, and the provider's key is always passed, even when it's blank.)
+
+    Under a local-only call policy it connects only to the private addresses it checks (`local_only_http_client`).
     """
     from anthropic import AsyncAnthropic
 
@@ -56,6 +59,7 @@ def get_client(provider: AIProviderOut) -> AsyncAnthropic:
         timeout=provider.timeout,
         default_headers=provider.request_headers or None,
         default_query=provider.request_params or None,
+        http_client=local_only_http_client(provider),
     )
     # The SDK has no option to skip ANTHROPIC_CUSTOM_HEADERS, which it merges into these
     client._custom_headers = dict(provider.request_headers or {})

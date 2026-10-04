@@ -395,19 +395,22 @@ async def test_get_response_raises_on_content_filter_finish_reason(settings_stub
 
 @pytest.mark.asyncio
 async def test_get_response_reports_token_usage_for_the_usage_log(settings_stub):
-    """The fork's usage log (docs/ai/PHASE1.md §4) reads the completion's usage, also when it's then rejected"""
+    """
+    The fork's usage log (docs/ai/PHASE1.md §4) reads the completion's usage and the model that answered (the
+    response's `model`), also when it's then rejected
+    """
     svc = OpenAIService(_make_mock_repos())
     completions = _FakeCompletions(parse_result=_make_body('{"answer": "hi"}', usage=(120, 30)))
     svc.get_client = MagicMock(return_value=_FakeClient(completions))
 
     with track_usage() as usage:
         await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
-    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=30)
+    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=30, model="test-model")
 
     completions._parse_result = _make_body('{"answer": "h', finish_reason="length", usage=(120, 16000))
     with track_usage() as usage, pytest.raises(Exception, match="length limit"):
         await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
-    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=16000)
+    assert usage == AITokenUsage(prompt_tokens=120, completion_tokens=16000, model="test-model")
 
     # Outside an attempt the fork logs, there's nothing to report to
     completions._parse_result = _make_body('{"answer": "hi"}', usage=(120, 30))

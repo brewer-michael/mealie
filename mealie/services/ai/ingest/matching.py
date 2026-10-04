@@ -49,6 +49,13 @@ class IngestMatcher(FoodMatcher):
             return None
         return self.units_by_alias.get(IngredientUnitModel.normalize(name))
 
+    def unit_names(self) -> list[str]:
+        """
+        Every name, plural, abbreviation and alias of the group's units (normalized): what `flags.compute_flags` takes
+        as `units`, so a short word on a card that is one of the group's own units counts as a lost unit
+        """
+        return list(self.units_by_alias)
+
     def food_by_id(self, food_id: UUID4 | None) -> IngredientFood | None:
         """The group's food with this id; None for an id that isn't one of the group's"""
         return self.foods_by_id.get(food_id) if food_id else None

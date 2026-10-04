@@ -15,6 +15,7 @@ from mealie.db.fixes.fix_ai_provider_api_keys import fix_unencrypted_ai_provider
 from mealie.db.fixes.fix_group_with_no_name import fix_group_with_no_name
 from mealie.db.fixes.fix_migration_data import fix_migration_data
 from mealie.db.fork_compat import fix_legacy_fork_revision
+from mealie.db.migration_lock import migration_lock
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
 from mealie.repos.seed.init_users import default_user_init
@@ -89,6 +90,13 @@ def connect(session: orm.Session) -> bool:
 
 
 def main():
+    # fork hook: one process at a time migrates and seeds the database, so several workers can start together; one
+    # that waited finds it at head and seeded (mealie/db/migration_lock.py)
+    with migration_lock():
+        _main()
+
+
+def _main():
     # Wait for database to connect
     max_retry = 10
     wait_seconds = 1

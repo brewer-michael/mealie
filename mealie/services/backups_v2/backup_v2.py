@@ -24,6 +24,18 @@ class BackupV2(BaseService):
 
     RESTORE_FILES = {".secret"}
 
+    # fork: files of the running instance rather than its data (recipe card ingestion's locks, pause marker, dispatcher
+    # heartbeat and kept results; the migration lock). Never backed up, and a restore leaves them alone
+    RUNTIME_FILES = {
+        ".ai-ingest-lock",
+        ".ai-ingest-lock.restore",
+        ".ai-ingest-paused",
+        ".ai-ingest-dispatcher",
+        ".mealie-migrate.lock",
+    }
+    RUNTIME_FILES_REGEX = re.compile(r"^\.ai-ingest-paused\..+\.tmp$")  # the marker while it's being replaced
+    RUNTIME_DIRS = {".ai-ingest-results"}
+
     def __init__(self, db_url: str | None = None) -> None:
         super().__init__()
 
@@ -62,6 +74,9 @@ class BackupV2(BaseService):
             zip_file.writestr("database.json", json.dumps(database_json))
 
             for data_file in self.directories.DATA_DIR.glob("**/*"):
+                if self._is_runtime_file(data_file):  # fork
+                    continue
+
                 if data_file.name in self.EXCLUDE_FILES:
                     continue
 
@@ -76,8 +91,18 @@ class BackupV2(BaseService):
 
         return backup_file
 
+    def _is_runtime_file(self, path: Path) -> bool:
+        """Fork: whether `path` (under `DATA_DIR`) is one of the instance's runtime files, or in a runtime folder"""
+        parts = path.relative_to(self.directories.DATA_DIR).parts
+        if parts[0] in self.RUNTIME_DIRS:
+            return True
+        return len(parts) == 1 and (parts[0] in self.RUNTIME_FILES or bool(self.RUNTIME_FILES_REGEX.match(parts[0])))
+
     def _copy_data(self, data_path: Path) -> None:
         for f in data_path.iterdir():
+            if f.name in self.RUNTIME_DIRS:  # fork: an older backup's copy is stale, and the live one stays
+                continue
+
             if f.is_file():
                 if f.name not in self.RESTORE_FILES:
                     continue

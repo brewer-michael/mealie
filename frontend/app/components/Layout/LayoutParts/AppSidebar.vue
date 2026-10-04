@@ -66,7 +66,19 @@
                 :to="nav.to"
                 :prepend-icon="nav.icon"
                 :title="nav.title"
-              />
+              >
+                <!-- fork: a link's badge (recipe cards that failed to upload, docs/ai/PHASE2.md §1.1) -->
+                <template v-if="nav.badge" #append>
+                  <v-badge
+                    class="nav-badge"
+                    inline
+                    :content="nav.badge.content"
+                    :color="nav.badge.color"
+                    :title="nav.badge.label"
+                    :aria-label="nav.badge.label"
+                  />
+                </template>
+              </v-list-item>
             </template>
           </div>
         </template>

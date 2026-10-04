@@ -94,6 +94,9 @@ def test_a_group_without_ai_cant_read_cards(api_client: TestClient, unique_user_
         "crossRead": False,
         "canReadCards": False,
         "limitReached": False,
+        "limitedFeatures": [],
+        "baseUrlSet": False,
+        "readerRunning": False,
         "ocrAvailable": False,
         "reader": None,
         "localOnlyAvailable": False,
@@ -104,8 +107,9 @@ def test_a_group_without_ai_cant_read_cards(api_client: TestClient, unique_user_
             "maxImagesPerRequest": limits.MAX_IMAGES_PER_REQUEST,
             "maxPagesPerCard": limits.MAX_PAGES_PER_CARD,
             "maxPixels": limits.MAX_PIXELS,
+            "maxJpegPixels": limits.MAX_PIXELS,
         },
-        "inbox": {"enabled": False, "folder": None},
+        "inbox": {"enabled": False, "folder": None, "waiting": 0, "waitingReason": None, "rejections": []},
     }
 
 
@@ -249,6 +253,9 @@ def test_the_households_inbox_folder(
     assert get_settings(api_client, user)["inbox"] == {
         "enabled": True,
         "folder": f"{group['slug']}/{household['slug']}",
+        "waiting": 0,
+        "waitingReason": None,
+        "rejections": [],
     }
 
 
@@ -264,7 +271,13 @@ def test_with_ingestion_turned_off(
     assert settings["enabled"] is False  # the settings card says so, rather than asking for a provider
     assert settings["canReadCards"] is False
     assert settings["reader"] is None
-    assert settings["inbox"] == {"enabled": False, "folder": None}
+    assert settings["inbox"] == {
+        "enabled": False,
+        "folder": None,
+        "waiting": 0,
+        "waitingReason": None,
+        "rejections": [],
+    }
 
     response = api_client.put(SETTINGS, json={"localOnly": True}, headers=unique_user_fn_scoped.token)
     assert response.status_code == 503

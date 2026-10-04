@@ -4,8 +4,10 @@ without following links, `processed/` and `failed/`, retrying stale claims, cras
 and the pause. Runs on SQLite and PostgreSQL.
 """
 
+import calendar
 import io
 import os
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -753,3 +755,234 @@ def test_the_pause_is_checked_before_each_file(root: Path, reader: TestUser, mon
         storage.pause_marker_path().unlink(missing_ok=True)
     assert [os.path.exists(folder / name) for name in ("first.jpg", "second.jpg")].count(True) == 1
     assert _claimed(folder) == []
+
+
+# ==========================================
+# The folders Mealie creates are writable by its group
+
+
+@pytest.fixture()
+def umask_022() -> Iterator[None]:
+    """The container's usual umask, which strips group write from a plain `mkdir`"""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _created_folders(root: Path, user: TestUser) -> list[Path]:
+    """Lets the scan create every folder it makes: the group's, the household's, the claim folder, `processed/` (with
+    its month) and `failed/`"""
+    group_slug, household_slug = _slugs(user)
+    assert inbox.scan_once() == 0
+    folder = root / group_slug / household_slug
+    _drop(folder, "card.jpg")
+    _drop(folder, "menu.pdf", b"%PDF-1.7 a menu")
+    _scan_twice()
+    return [
+        root / group_slug,
+        folder,
+        folder / inbox.CLAIM_DIR,
+        folder / "processed",
+        folder / "processed" / _month(),
+        folder / "failed",
+    ]
+
+
+def test_created_folders_are_setgid_and_group_writable(root: Path, reader: TestUser, umask_022: None):
+    for path in _created_folders(root, reader):
+        assert _mode(path) == 0o2775, path
+
+
+def test_the_folder_mode_is_a_setting(root: Path, reader: TestUser, umask_022: None, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(inbox, "get_ingest_settings", lambda: IngestSettings(INBOX_DIR_MODE="755", WORKER=False))
+    for path in _created_folders(root, reader):
+        assert _mode(path) == 0o755, path
+
+
+def test_existing_folders_keep_their_mode(root: Path, reader: TestUser, umask_022: None):
+    group_slug, household_slug = _slugs(reader)
+    folder = root / group_slug / household_slug
+    for path, mode in ((root / group_slug, 0o750), (folder, 0o700), (folder / "processed", 0o711)):
+        path.mkdir(exist_ok=True)
+        os.chmod(path, mode)
+
+    _drop(folder, "card.jpg")
+    assert _scan_twice() == 1
+    assert (_mode(root / group_slug), _mode(folder), _mode(folder / "processed")) == (0o750, 0o700, 0o711)
+    assert _mode(folder / "processed" / _month()) == 0o2775  # the one Mealie made
+
+
+# ==========================================
+# processed/ is purged after AI_INGEST_INBOX_PROCESSED_DAYS
+
+
+DAY = 86400
+
+
+def _keep_days(monkeypatch: pytest.MonkeyPatch, days: int | None) -> None:
+    monkeypatch.setattr(inbox, "get_ingest_settings", lambda: IngestSettings(INBOX_PROCESSED_DAYS=days, WORKER=False))
+
+
+def _processed(root: Path, user: TestUser, month: str) -> Path:
+    path = _folder(root, user) / "processed" / month
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _purge(root: Path, user: TestUser, days: int, now: float) -> Any:
+    """One purge of `user`'s household, `now` being seconds since the epoch"""
+    group_slug, household_slug = _slugs(user)
+    folder = inbox.HouseholdFolder(UUID(user.group_id), UUID(user.household_id), group_slug, household_slug)
+    root_fd = os.open(root, os.O_RDONLY)
+    try:
+        return inbox.purge_processed(root_fd, [folder], days, now)
+    finally:
+        os.close(root_fd)
+
+
+def test_files_processed_before_the_cutoff_are_removed(root: Path, reader: TestUser, tmp_path: Path):
+    # 40 days from now, with a 30-day setting: what's in processed/ today is ten days past it
+    later = time.time() + 40 * DAY
+    month = _processed(root, reader, _month())
+    old = _drop(month, "old.jpg")
+    recent = _drop(month, "recent.jpg")
+    os.utime(recent, (later - DAY, later - DAY))  # changed since: kept by its mtime
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"not the inbox's")
+    os.utime(outside, (0, 0))
+    (month / "link.jpg").symlink_to(outside)
+    (month / "nested").mkdir()
+    _drop(month / "nested", "deep.jpg")
+
+    purged = _purge(root, reader, 30, later)
+    assert purged.files == 1
+    assert not old.exists()
+    assert recent.exists()
+    assert (month / "link.jpg").is_symlink() and outside.read_bytes() == b"not the inbox's"
+    assert (month / "nested" / "deep.jpg").exists()
+
+
+def test_an_old_photo_moved_in_today_is_kept(root: Path, reader: TestUser):
+    # cp -p, rsync and Syncthing keep a photo's old mtime: the move into processed/ (its ctime) is what counts
+    month = _processed(root, reader, "2019-01")
+    photo = _drop(month, "from-2019.jpg")
+    os.utime(photo, (1_546_300_800, 1_546_300_800))
+    assert _purge(root, reader, 30, time.time()).files == 0
+    assert photo.exists()
+
+
+def test_an_emptied_month_folder_is_removed_but_not_this_months(root: Path, reader: TestUser):
+    later = float(calendar.timegm((2030, 1, 25, 12, 0, 0)))
+    old_month = _processed(root, reader, "2001-02")
+    _drop(old_month, "a.jpg")
+    current = _processed(root, reader, "2030-01")  # empty, and the month new cards go into
+    other = _processed(root, reader, "not-a-month")
+    _drop(other, "c.jpg")
+
+    purged = _purge(root, reader, 1, later)
+    assert not old_month.exists()
+    assert current.is_dir()
+    assert (other / "c.jpg").exists()  # only YYYY-MM folders are Mealie's
+    assert (purged.files, purged.folders) == (1, 1)
+
+
+def test_a_purge_looks_at_most_at_its_budget(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(inbox, "PURGE_ENTRIES", 3)
+    later = time.time() + 40 * DAY
+    month = _processed(root, reader, "2002-03")
+    for n in range(5):
+        _drop(month, f"{n}.jpg")
+    first = _purge(root, reader, 30, later)
+    assert first.files == 3 and first.exhausted
+    assert len(os.listdir(month)) == 2
+    second = _purge(root, reader, 30, later)
+    assert second.files == 2 and not month.exists()
+
+
+def test_a_processed_folder_that_is_a_link_is_never_followed(root: Path, reader: TestUser, tmp_path: Path):
+    elsewhere = tmp_path / "elsewhere" / "2003-04"
+    elsewhere.mkdir(parents=True)
+    _drop(elsewhere, "keep.jpg")
+    folder = _folder(root, reader)
+    (folder / "processed").symlink_to(tmp_path / "elsewhere")
+    assert _purge(root, reader, 30, time.time() + 40 * DAY).files == 0
+    assert (elsewhere / "keep.jpg").exists()
+
+
+def test_the_scan_purges_once_a_day_starting_ten_minutes_in(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    _keep_days(monkeypatch, 1)
+    clock = [1000.0]
+    monkeypatch.setattr(inbox, "_monotonic", lambda: clock[0])
+    runs: list[float] = []
+    real = inbox.purge_processed
+
+    def purge(*args: Any) -> Any:
+        runs.append(clock[0])
+        return real(*args)
+
+    monkeypatch.setattr(inbox, "purge_processed", purge)
+    inbox.scan_once()
+    assert runs == []
+    clock[0] += limits.PURGE_FIRST_DELAY - 1
+    inbox.scan_once()
+    assert runs == []
+    clock[0] += 1
+    inbox.scan_once()
+    inbox.scan_once()
+    assert runs == [1000.0 + limits.PURGE_FIRST_DELAY]
+    clock[0] += limits.PURGE_INTERVAL
+    inbox.scan_once()
+    assert len(runs) == 2
+
+
+def test_unset_keeps_everything(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    _keep_days(monkeypatch, None)
+    month = _processed(root, reader, "2004-05")
+    photo = _drop(month, "kept.jpg")
+    monkeypatch.setattr(inbox, "_monotonic", lambda: 10.0**9)  # long past the first delay
+    inbox.reset_state()
+    calls: list[Any] = []
+    monkeypatch.setattr(inbox, "purge_processed", lambda *args: calls.append(args))
+    inbox.scan_once()
+    inbox.scan_once()
+    assert calls == []
+    assert photo.exists()
+
+
+def test_a_purge_logs_one_summary(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    logged: list[str] = []
+    monkeypatch.setattr(inbox.logger, "info", logged.append)
+    month = _processed(root, reader, "2005-06")
+    _drop(month, "a.jpg")
+    _drop(month, "b.jpg")
+    _purge(root, reader, 30, time.time() + 40 * DAY)
+    assert logged == [
+        "Removed 2 files processed more than 30 days ago (and 1 empty month folders) from the recipe card inbox"
+    ]
+
+
+def test_a_purge_that_stops_at_its_budget_goes_on_at_the_next_scan(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    _keep_days(monkeypatch, 30)
+    monkeypatch.setattr(inbox, "PURGE_ENTRIES", 1)
+    monkeypatch.setattr(inbox, "_wall_clock", lambda: time.time() + 40 * DAY)
+    clock = [5000.0]
+    monkeypatch.setattr(inbox, "_monotonic", lambda: clock[0])
+    month = _processed(root, reader, "2006-07")
+    _drop(month, "a.jpg")
+    _drop(month, "b.jpg")
+
+    inbox.scan_once()
+    clock[0] += limits.PURGE_FIRST_DELAY
+    inbox.scan_once()
+    assert len(os.listdir(month)) == 1
+    inbox.scan_once()  # no day's wait: there's more to look at
+    inbox.scan_once()
+    assert not month.exists()

@@ -44,6 +44,16 @@ const stubs = {
   VCard: slot("div", "card"),
   VCardTitle: slot("h4"),
   VCardActions: slot(),
+  VSwitch: {
+    props: ["modelValue", "label"],
+    emits: ["update:modelValue"],
+    template: `<label class="switch"><input type="checkbox" :checked="modelValue"
+      @change="$emit('update:modelValue', $event.target.checked)">{{ label }}</label>`,
+  },
+  VAlert: {
+    emits: ["click:close"],
+    template: "<div class=\"alert\"><slot /><button class=\"alert-close\" @click=\"$emit('click:close')\" /></div>",
+  },
 };
 
 const wrappers: VueWrapper[] = [];
@@ -155,9 +165,9 @@ describe("IngestCapture", () => {
 
     await pick(wrapper.get<HTMLInputElement>(".camera-input"), [front]);
     expect(button(wrapper, ".take-photo").text()).toBe("Back side");
-    expect(wrapper.get(".pending-front").text()).toBe("Front");
-    expect(wrapper.find(".no-back").exists()).toBe(true);
-    expect(wrapper.find(".retake").exists()).toBe(true);
+    expect(wrapper.get(".pending-front").text()).toContain("Front");
+    expect(wrapper.find(".pending-front .no-back").exists()).toBe(true);
+    expect(wrapper.find(".pending-front .retake").exists()).toBe(true);
     expect(api.upload).not.toHaveBeenCalled();
 
     await pick(wrapper.get<HTMLInputElement>(".camera-input"), [back]);
@@ -202,7 +212,7 @@ describe("IngestCapture", () => {
     // B has no back: Split it, and C pairs up again
     await cards()[1]!.get(".draft-split").trigger("click");
     expect(cards()).toHaveLength(3);
-    expect(cards()[1]!.findAll("img")).toHaveLength(1);
+    expect(cards()[1]!.findAll(".ingest-capture-photo")).toHaveLength(1);
     expect(cards()[2]!.findAll("figcaption").map(caption => caption.text())).toEqual(["Front", "Back"]);
 
     await cards()[2]!.get(".draft-swap").trigger("click");
@@ -253,5 +263,94 @@ describe("IngestCapture", () => {
 
     expect(wrapper.findAll(".draft-card")).toHaveLength(2);
     expect(wrapper.get(".drop-zone").text()).toContain("Drop photos here");
+  });
+});
+
+describe("IngestCapture on a phone", () => {
+  test("the shutter, Choose and Done share one row in every state; the waiting front comes below it", async () => {
+    useRecipeIngestUploads().mode.value = "front-and-back";
+    const wrapper = mountCapture();
+    const row = () => wrapper.get(".capture-actions");
+    const inRow = () => row().findAll("button").map(b => b.classes().find(c => ["take-photo", "choose-photos", "done"].includes(c)));
+
+    expect(inRow()).toEqual(["take-photo", "choose-photos"]);
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    // a front taken: Back side, Choose and Done stay where they were; No back and Retake go with the front
+    expect(inRow()).toEqual(["take-photo", "choose-photos", "done"]);
+    expect(row().find(".no-back").exists()).toBe(false);
+
+    const children = Array.from(wrapper.get(".ingest-capture").element.children);
+    expect(children.indexOf(wrapper.get(".pending-front").element))
+      .toBeGreaterThan(children.indexOf(row().element));
+    // a short label on phones, the full one from sm up
+    expect(wrapper.get(".choose-photos .d-sm-none").text()).toBe("Choose");
+    expect(wrapper.get(".choose-photos .d-none.d-sm-inline").text()).toBe("Choose photos");
+  });
+});
+
+describe("IngestCapture thumbnails", () => {
+  test("a photo the browser can't show is a card placeholder with its name", async () => {
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => {
+      throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+    }));
+    try {
+      const wrapper = mountCapture();
+      useRecipeIngestUploads().mode.value = "front-and-back";
+      await pick(wrapper.get<HTMLInputElement>(".choose-input"), [
+        new File(["a"], "IMG_0001.HEIC", { type: "image/heic" }),
+        new File(["b"], "IMG_0002.HEIC", { type: "image/heic" }),
+      ]);
+      await flushPromises();
+
+      const placeholders = wrapper.findAll(".draft-card .photo-placeholder");
+      expect(placeholders).toHaveLength(2);
+      expect(placeholders.map(p => p.text())).toEqual(["IMG_0001.HEIC", "IMG_0002.HEIC"]);
+      expect(placeholders.map(p => p.attributes("aria-label"))).toEqual(["Front: IMG_0001.HEIC", "Back: IMG_0002.HEIC"]);
+      expect(wrapper.find(".draft-card img").exists()).toBe(false);
+    }
+    finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("a thumbnail the browser fails to show turns into the placeholder", async () => {
+    vi.stubGlobal("createImageBitmap", undefined);
+    vi.stubGlobal("URL", Object.assign(Object.create(URL), { createObjectURL: () => "blob:original", revokeObjectURL: vi.fn() }));
+    try {
+      const wrapper = mountCapture();
+      await pick(wrapper.get<HTMLInputElement>(".choose-input"), [photo()]);
+      await flushPromises();
+
+      const img = wrapper.get(".draft-card img");
+      expect(img.attributes("src")).toBe("blob:original");
+      await img.trigger("error");
+      expect(wrapper.find(".draft-card img").exists()).toBe(false);
+      expect(wrapper.get(".draft-card .photo-placeholder").text()).toMatch(/^IMG_\d+\.jpg$/);
+    }
+    finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("IngestCapture options", () => {
+  test("Data saver is off by default and remembered in this browser", async () => {
+    const wrapper = mountCapture();
+    const toggle = wrapper.get<HTMLInputElement>(".data-saver input");
+    expect(toggle.element.checked).toBe(false);
+
+    await toggle.setValue(true);
+    expect(useRecipeIngestUploads().dataSaver.value).toBe(true);
+    expect(localStorage.getItem("mealie.recipe-ingest.data-saver")).toBe("true");
+  });
+
+  test("a queue that can't be kept on this device says so, until dismissed", async () => {
+    const wrapper = mountCapture();
+    expect(wrapper.find(".storage-failed").exists()).toBe(false);
+    useRecipeIngestUploads().storageFailed.value = true;
+    await nextTick();
+    expect(wrapper.get(".storage-failed").text()).toContain("keep this page open");
+    await wrapper.get(".storage-failed .alert-close").trigger("click");
+    expect(wrapper.find(".storage-failed").exists()).toBe(false);
   });
 });

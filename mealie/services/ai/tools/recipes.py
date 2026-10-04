@@ -50,6 +50,8 @@ ORGANIZER_FUZZY_MATCH_THRESHOLD = 85
 SEARCH_PAGE_SIZE = 50
 SEARCH_MAX_PAGES = 10
 """With a time limit, results are filtered after the query, so up to this many pages are read to fill `limit`"""
+SEARCH_TIE_ORDER = "created_at:asc,id:asc"
+"""How a search's equally close recipes are ordered, so its pages neither repeat nor skip one"""
 HAS_A_TIME = "total_time IS NOT NULL OR prep_time IS NOT NULL OR perform_time IS NOT NULL OR cook_time IS NOT NULL"
 
 _DIGIT = re.compile(r"\d")
@@ -327,13 +329,16 @@ def _search_recipes(ctx: ToolContext, args: SearchRecipesArgs) -> SearchRecipesR
     # like upstream's recipe search: every household's recipes in the group, with the caller's ratings
     recipes = ctx.group_repos.recipes.by_user(ctx.user.id)
     page_size = SEARCH_PAGE_SIZE if args.max_total_minutes else args.limit
+    # a search orders by closeness to the name only, which ties for every name containing the words, and PostgreSQL
+    # returns tied rows in no fixed order: pages could repeat or skip recipes. Among equals, oldest first, as SQLite
+    order_by = SEARCH_TIE_ORDER if args.query else None
 
     hits: list[RecipeHit] = []
     total: int | None = None
     more_unchecked = False
     for page in range(1, SEARCH_MAX_PAGES + 1):
         results = recipes.page_all(
-            PaginationQuery(page=page, per_page=page_size, query_filter=query_filter),
+            PaginationQuery(page=page, per_page=page_size, query_filter=query_filter, order_by=order_by),
             tags=list(tag_ids) or None,
             categories=list(category_ids) or None,
             foods=list(include) or None,

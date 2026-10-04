@@ -7,6 +7,7 @@ PostgreSQL.
 import io
 import json
 import shutil
+import zipfile
 from collections.abc import Iterator
 from uuid import UUID, uuid4
 
@@ -281,3 +282,97 @@ def test_saving_needs_ingestion_on(
 
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "ingest_disabled"
+
+
+# ==================================================================================================================
+# Tags, notes, editing and download
+
+
+def test_tags_and_notes_are_written_into_the_case(api_client: TestClient, unique_user: TestUser, jobs: list[UUID]):
+    job_id = seed_job(unique_user)
+    jobs.append(job_id)
+    body = {"slug": "tagged", "tags": ["handwritten", "faded", "handwritten"], "notes": "Pencil, very faint"}
+
+    assert api_client.post(eval_case_url(job_id), json=body, headers=unique_user.token).status_code == 201
+
+    fixture = CardFixture.model_validate_json(
+        (storage.eval_cards_dir(UUID(unique_user.group_id)) / "tagged.json").read_text()
+    )
+    # the reviewer's tags, then the ones found from the card
+    assert fixture.tags == ["handwritten", "faded", "sideways", "two-sided", "blank"]
+    assert fixture.notes == "Pencil, very faint"
+    [case] = api_client.get(EVAL_CASES, headers=unique_user.token).json()
+    assert case["tags"] == fixture.tags
+    assert case["notes"] == "Pencil, very faint"
+
+    # a tag found from the card can't be chosen
+    refused = api_client.post(
+        eval_case_url(job_id), json={"slug": "other", "tags": ["sideways"]}, headers=unique_user.token
+    )
+    assert refused.status_code == 422
+
+
+def test_a_case_is_edited_in_place(api_client: TestClient, unique_user: TestUser, jobs: list[UUID]):
+    job_id = seed_job(unique_user)
+    jobs.append(job_id)
+    body = {"slug": "edited", "tags": ["printed"], "notes": "first"}
+    assert api_client.post(eval_case_url(job_id), json=body, headers=unique_user.token).status_code == 201
+    path = storage.eval_cards_dir(UUID(unique_user.group_id)) / "edited.json"
+    before = CardFixture.model_validate_json(path.read_text())
+
+    response = api_client.put(
+        eval_case_item("edited"), json={"verified": True, "tags": ["handwritten", "faded"]}, headers=unique_user.token
+    )
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    assert summary["verified"] is True
+    assert summary["tags"] == ["handwritten", "faded", "sideways", "two-sided", "blank"]
+    assert summary["notes"] == "first"  # left out: kept
+
+    after = CardFixture.model_validate_json(path.read_text())
+    assert after.verified_by_owner is True
+    assert after.tags == summary["tags"]
+    assert after.expected == before.expected and after.source == before.source and after.origin == before.origin
+
+    response = api_client.put(eval_case_item("edited"), json={"notes": "  second  "}, headers=unique_user.token)
+    assert response.json()["notes"] == "second"
+    assert CardFixture.model_validate_json(path.read_text()).verified_by_owner is True
+
+    unknown = api_client.put(eval_case_item("nothing-here"), json={"verified": True}, headers=unique_user.token)
+    assert (unknown.status_code, unknown.json()["detail"]["code"]) == (404, "not_found")
+    assert api_client.put(eval_case_item("edited"), json={"slug": "x"}, headers=unique_user.token).status_code == 422
+
+
+def test_a_case_downloads_as_a_zip(api_client: TestClient, unique_user: TestUser, jobs: list[UUID]):
+    job_id = seed_job(unique_user)
+    jobs.append(job_id)
+    assert api_client.post(eval_case_url(job_id), json={"slug": "zipped"}, headers=unique_user.token).status_code == 201
+    directory = storage.eval_cards_dir(UUID(unique_user.group_id))
+    (directory / "unrelated.jpg").write_bytes(b"another card's photo")
+
+    response = api_client.get(f"{eval_case_item('zipped')}/download", headers=unique_user.token)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == 'attachment; filename="zipped.zip"'
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert sorted(archive.namelist()) == ["zipped-1.jpg", "zipped-2.jpg", "zipped.json"]
+        assert archive.read("zipped.json") == (directory / "zipped.json").read_bytes()
+        assert archive.read("zipped-1.jpg") == (directory / "zipped-1.jpg").read_bytes()
+
+    missing = api_client.get(f"{eval_case_item('nothing-here')}/download", headers=unique_user.token)
+    assert missing.status_code == 404
+
+
+def test_editing_and_downloading_are_for_group_managers(
+    api_client: TestClient, unique_user: TestUser, not_a_manager: TestUser, jobs: list[UUID]
+):
+    job_id = seed_job(unique_user)
+    jobs.append(job_id)
+    assert (
+        api_client.post(eval_case_url(job_id), json={"slug": "managed"}, headers=unique_user.token).status_code == 201
+    )
+
+    put = api_client.put(eval_case_item("managed"), json={"verified": True}, headers=not_a_manager.token)
+    download = api_client.get(f"{eval_case_item('managed')}/download", headers=not_a_manager.token)
+    assert (put.status_code, download.status_code) == (403, 403)

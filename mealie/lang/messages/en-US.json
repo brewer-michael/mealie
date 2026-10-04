@@ -157,6 +157,16 @@
         "upload-summary-none": "No recipe cards were queued.",
         "upload-summary-duplicate": "{count} card was already scanned. | {count} cards were already scanned.",
         "upload-summary-rejected": "{count} card couldn't be used. | {count} cards couldn't be used.",
+        "upload-failed": {
+            "bad-request": "Mealie couldn't use this upload. Send the card as a photo.",
+            "unauthorized": "Mealie didn't accept the API token. Check it and try again.",
+            "forbidden": "This account can't upload recipe cards.",
+            "not-found": "Mealie couldn't find what this upload refers to.",
+            "too-large": "The upload is too large.",
+            "busy": "Mealie is busy. Try again in a minute.",
+            "unavailable": "Mealie can't take recipe cards right now. Try again in a minute.",
+            "other": "The recipe card couldn't be uploaded (error {status})."
+        },
         "notification-title": "Recipe cards ready",
         "notification-ready": "No cards are ready to review | {count} card is ready to review | {count} cards are ready to review",
         "notification-needs-attention": "{count} needs a look | {count} need a look",
@@ -171,6 +181,33 @@
         "asset-card": "Recipe card",
         "asset-card-back": "Recipe card (back)",
         "asset-card-page": "Recipe card (page {number})",
+        "voice": {
+            "none-waiting": "No recipe cards are waiting to be reviewed.",
+            "ready": "No recipe cards are ready to review yet. | {count} recipe card is ready to review. | {count} recipe cards are ready to review.",
+            "all-need-a-look": "it needs a closer look | all of them need a closer look",
+            "need-a-look": "{count} needs a closer look | {count} need a closer look",
+            "still-reading": "{count} is still being read | {count} are still being read",
+            "failed": "{count} couldn't be read | {count} couldn't be read",
+            "list-separator": ", ",
+            "list-and": "{first} and {last}",
+            "details": "{details}."
+        },
+        "notification-rejected": {
+            "title": "Recipe cards not added",
+            "body": "{count} recipe card from the inbox wasn't added ({details}). It's in the inbox's failed folder. | {count} recipe cards from the inbox weren't added ({details}). They're in the inbox's failed folder.",
+            "reasons": {
+                "too_large": "{count} too large",
+                "unsupported_format": "{count} not a supported image | {count} not supported images",
+                "pdf_not_supported": "{count} unusable PDF | {count} unusable PDFs",
+                "too_many_pixels": "{count} with too many pixels",
+                "unreadable_image": "{count} unreadable",
+                "too_many_pages": "{count} with too many pages",
+                "duplicate": "{count} already scanned",
+                "url_not_allowed": "{count} from an address that isn't allowed | {count} from addresses that aren't allowed",
+                "url_fetch_failed": "{count} couldn't be downloaded",
+                "other": "{count} for another reason | {count} for other reasons"
+            }
+        },
         "errors": {
             "authorization-required": "Send your API token in the Authorization header to upload recipe cards.",
             "paused-for-restore": "Recipe card uploads are paused while a backup is restored. Try again in a minute.",
@@ -180,9 +217,12 @@
             "unsupported-media-type": "Send recipe cards as images, a multipart form or JSON.",
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",
             "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
-            "busy-restore": "Recipe card ingestion is busy writing files. Try the restore again in a minute.",
+            "busy-restore": "Mealie is still saving changes. Try the restore again in a minute.",
             "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again.",
             "unknown-batch": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one."
+        },
+        "restore": {
+            "writes-paused": "A backup is being restored. Try again in a minute."
         }
     }
 }

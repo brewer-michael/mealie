@@ -5,6 +5,7 @@ food, with "C." written out. A line with an amount, unit or food is the reviewer
 nobody changed isn't parsed again. Uses the real flag rules and Mealie's NLP parser. Runs on SQLite and PostgreSQL.
 """
 
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -191,3 +192,31 @@ def test_a_parser_failure_never_loses_the_edit(
     assert saved["draftVersion"] == 2
     line = job_row(job_id)["draft"]["ingredients"][2]
     assert (line["quantity"], line["unit"], line["food"], line["note"]) == (None, None, None, "1 C. brown sugar")
+
+
+def test_a_failed_parse_logs_no_card_text(
+    api_client: TestClient,
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A database error's text holds its parameters, here names typed from the card: neither it nor a traceback is
+    logged (§10), only the job and the error's type"""
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("INSERT INTO ingredient_foods (name) VALUES ('brown sugar') failed")
+
+    monkeypatch.setattr(review, "normalize_lines", broken)
+    user = unique_user_fn_scoped
+    job_id = _card(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    draft["ingredients"][2] = _fill(draft["ingredients"][2], "1 C. brown sugar")
+
+    with caplog.at_level("DEBUG"):
+        _put(api_client, user, job_id, draft)
+
+    records = [r for r in caplog.records if r.levelno >= logging.WARNING and str(job_id) in r.getMessage()]
+    assert [(record.levelname, record.exc_info) for record in records] == [("WARNING", None)]
+    assert "(ValueError)" in records[0].getMessage()
+    assert "brown" not in caplog.text and "sugar" not in caplog.text
+    assert "Traceback" not in caplog.text

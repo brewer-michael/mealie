@@ -56,6 +56,11 @@ class CardWorkflowContext(WorkflowContext):
     """Which reader produced the transcription"""
     ocr_confidence: float | None = None
     """Tesseract's mean word confidence over the pages, when the OCR fallback read the card"""
+    rotations: dict[int, int] = field(default_factory=dict)
+    """
+    How far the image reader said each page not yet oriented must turn clockwise to be upright (90, 180 or 270), by
+    page index; pages it read as upright aren't listed
+    """
 
     _last_progress: str | None = field(default=None, repr=False)
 

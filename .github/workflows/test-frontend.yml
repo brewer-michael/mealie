@@ -40,6 +40,11 @@ jobs:
         run: pnpm lint --max-warnings=0
         working-directory: "frontend"
 
+      # fork: vue-tsc over the app; fails only on the AI and recipe card frontend's own files (upstream has errors)
+      - name: Type check the fork's files 🔎
+        run: pnpm typecheck:fork
+        working-directory: "frontend"
+
       - name: Run tests 🧪
         run: pnpm test:ci
         working-directory: "frontend"

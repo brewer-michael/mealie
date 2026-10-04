@@ -88,7 +88,8 @@ class FakeProviders:
     Stands in for the OpenAI-compatible providers' APIs at `OpenAIService.get_client`, so that upstream's own
     request code runs. Each provider, by name, either fails with the given error or answers, reporting
     `tokens` (prompt, completion) of usage. `empty` providers answer without a choice and `truncated` ones run
-    out of output tokens. Schemas other than `OpenAIText` and `OpenAIIngredients` get an empty answer.
+    out of output tokens. Schemas other than `OpenAIText` and `OpenAIIngredients` get an empty answer. Each answer
+    names the provider's configured model as the one that answered, unless `answered_by` gives another.
     """
 
     def __init__(
@@ -99,12 +100,14 @@ class FakeProviders:
         truncated: Collection[str] = (),
         tokens: tuple[int, int] = (12, 5),
         transcription_failures: dict[str, Exception] | None = None,
+        answered_by: dict[str, str] | None = None,
     ) -> None:
         self.failures = failures or {}
         self.empty = empty
         self.truncated = truncated
         self.tokens = tokens
         self.transcription_failures = transcription_failures or {}
+        self.answered_by = answered_by or {}
         self.calls: list[str] = []
         self.transcriptions: list[str] = []
 
@@ -152,7 +155,7 @@ class FakeProviders:
             "id": "chatcmpl-test",
             "object": "chat.completion",
             "created": 0,
-            "model": provider.model,
+            "model": self.answered_by.get(provider.name, provider.model),
             "choices": [choice] if answer else [],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -432,6 +435,60 @@ async def test_the_model_that_answered_is_logged(unique_user_fn_scoped: TestUser
     await ask(user)
 
     assert usage_rows(user)["Claude"].model == "claude-fallback-test"
+
+
+@pytest.mark.asyncio
+async def test_the_model_an_openai_compatible_provider_says_answered_is_logged(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """e.g. the dated snapshot behind an OpenAI alias, or the model an OpenRouter route picked"""
+    user = unique_user_fn_scoped
+    alias = user.repos.group_ai_providers.create(AIProviderCreate(name="Alias", model="gpt-4o", api_key="k"))
+    blank = user.repos.group_ai_providers.create(AIProviderCreate(name="Blank", model="llama3", api_key="k"))
+    configure(user, default=alias)
+    FakeProviders(answered_by={"Alias": "gpt-4o-2024-08-06"}).install(monkeypatch)
+    await ask(user)
+
+    # a provider that doesn't say which model answered is logged with the configured one
+    configure(user, default=blank)
+    FakeProviders(answered_by={"Blank": ""}).install(monkeypatch)
+    await ask(user)
+
+    rows = usage_rows(user)
+    assert (rows["Alias"].model, rows["Blank"].model) == ("gpt-4o-2024-08-06", "llama3")
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_answer_logs_the_model_that_answered(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    primary, backup = create_provider(user, "Primary"), create_provider(user, "Backup")
+    configure(user, default=primary, routes={AIProviderSlot.default: [backup]})
+    FakeProviders(truncated={"Primary"}, answered_by={"Primary": "m-2026-01"}).install(monkeypatch)
+
+    await ask(user)
+
+    assert usage_rows(user)["Primary"].model == "m-2026-01"
+    assert usage_rows(user)["Backup"].model == "m"
+
+
+@pytest.mark.asyncio
+async def test_the_eval_reports_the_model_that_answered(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """The eval's `models` (docs/ai/PHASE2.md §11.3) for an OpenAI-compatible provider, which writes no usage rows"""
+    from mealie.scripts.eval_recipe_cards import EvalOpenAIService
+
+    user = unique_user_fn_scoped
+    provider = user.repos.group_ai_providers.create(AIProviderCreate(name="OpenAI", model="gpt-4o", api_key="k"))
+    FakeProviders(answered_by={"OpenAI": "gpt-4o-2024-08-06"}).install(monkeypatch)
+    service = EvalOpenAIService(user.repos, image_provider=None, text_provider=provider)
+
+    assert await service.get_response("prompt", "message", response_schema=OpenAIText) == OpenAIText(text="from OpenAI")
+
+    assert service.models == ["gpt-4o-2024-08-06"]
+    assert user.repos.group_ai_usage.get_all() == []
 
 
 # ==========================================

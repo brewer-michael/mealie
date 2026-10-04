@@ -51,6 +51,13 @@ class RecipeIngestionRecipeRef(MealieModel):
     name: str | None = None
 
 
+class RecipeIngestionJobRef(MealieModel):
+    """Another card of the household"""
+
+    id: UUID4
+    title: str | None = None
+
+
 class RecipeIngestionJobSummary(MealieModel):
     id: UUID4
     batch_id: UUID4
@@ -75,8 +82,17 @@ class RecipeIngestionJobSummary(MealieModel):
     read again (it isn't committed)
     """
     can_discard: bool = False
-    """The user may discard the card (§9): its uploader, anyone for an inbox card, otherwise household managers"""
+    """
+    The user may discard the card (§9): its uploader, any household member for a card from the inbox or sent with an
+    API token, otherwise household managers
+    """
     created_at: datetime | None = None
+    committed_at: datetime | None = None
+    """When the card was added as a recipe"""
+    auto_retry_at: datetime | None = None
+    """A card that failed because every provider was over its monthly limit is read again by then (UTC)"""
+    expires_at: datetime | None = None
+    """A failed card is removed then, with its photos (UTC)"""
 
 
 class RecipeIngestionJobPagination(PaginationBase):
@@ -86,9 +102,20 @@ class RecipeIngestionJobPagination(PaginationBase):
 class RecipeIngestionJobPermissions(MealieModel):
     can_create_foods: bool = False
     """Commit creates foods that don't exist yet; otherwise their names are kept as text"""
+    can_create_organizers: bool = False
+    """Commit creates tags, categories and tools added by name; otherwise they are left out with a warning"""
     can_discard: bool = False
     can_export_eval: bool = False
     """May save the card as an eval case (group managers)"""
+    can_read_with_cloud: bool = False
+    """
+    May have this failed local-only card read by any of the group's providers: its uploader or a household manager,
+    while the group doesn't keep cards local
+    """
+    can_uncommit: bool = False
+    """May delete the recipe this card became and bring the card back for review (its committer or a manager)"""
+    can_merge: bool = False
+    """May add this card's photos to another card as its back (both uploaded by the user, or a household manager)"""
 
 
 class RecipeIngestionJobOut(RecipeIngestionJobSummary):
@@ -102,8 +129,14 @@ class RecipeIngestionJobOut(RecipeIngestionJobSummary):
     permissions: RecipeIngestionJobPermissions = Field(default_factory=RecipeIngestionJobPermissions)
     duplicate_of: RecipeIngestionRecipeRef | None = None
     """A group recipe whose slug matches the draft's name: committing would make "Name (1)\""""
+    duplicate_job: RecipeIngestionJobRef | None = None
+    """Another card of the household, waiting or being read, with the same name"""
+    duplicate_name: str | None = None
+    """The name the recipe would get when `duplicate_of` is set, e.g. "Banana Bread (2)\""""
     household_recipes_public: bool = False
     """New recipes in the household are public, so the card photo would be too"""
+    card_photo_default: bool = True
+    """Whether the card's photos are attached to the recipe when the draft doesn't say (not in public households)"""
 
 
 class RecipeIngestionJobState(MealieModel):

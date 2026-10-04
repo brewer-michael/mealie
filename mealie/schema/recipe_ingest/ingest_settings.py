@@ -1,8 +1,12 @@
 """Fork: a group's recipe card settings, notifier toggles and `/api/ai/about` (docs/ai/PHASE2.md §10, §14)"""
 
+from datetime import datetime
+
 from pydantic import ConfigDict, Field
 
 from mealie.schema._mealie import MealieModel
+
+from .ingest_enums import InboxWaitingReason, IngestLimitedFeature, IngestRejectReason
 
 _STRICT = ConfigDict(extra="forbid")
 
@@ -46,12 +50,31 @@ class IngestLimits(MealieModel):
     max_images_per_request: int
     max_pages_per_card: int
     max_pixels: int
+    """The most pixels a PNG, WebP, HEIC, AVIF or TIFF page may have"""
+    max_jpeg_pixels: int
+    """The most pixels a JPEG may have (phone JPEGs are decoded at a reduced size, so they may be larger)"""
+
+
+class IngestInboxRejection(MealieModel):
+    """A photo the inbox couldn't add, kept in the household folder's `failed/`"""
+
+    name: str
+    """The file's name"""
+    reason: IngestRejectReason | None = None
+    at: datetime | None = None
+    """When it was refused (UTC)"""
 
 
 class IngestInboxInfo(MealieModel):
     enabled: bool = False
     folder: str | None = None
     """This household's folder, relative to the inbox share: `<group-slug>/<household-slug>`"""
+    waiting: int = 0
+    """Photos in the folder that haven't been added yet (counting stops at 1000)"""
+    waiting_reason: InboxWaitingReason | None = None
+    """Why they wait, when they can't be added now"""
+    rejections: list[IngestInboxRejection] = Field(default_factory=list)
+    """The newest photos the inbox refused, newest first"""
 
 
 class RecipeIngestionSettingsOut(MealieModel):
@@ -66,6 +89,12 @@ class RecipeIngestionSettingsOut(MealieModel):
     Cards can be uploaded, but every provider their reading would use under the group's policy is over its monthly
     token limit: a card read now fails `limit_reached`
     """
+    limited_features: list[IngestLimitedFeature] = Field(default_factory=list)
+    """Optional parts of reading a card that are skipped because their providers are over their monthly limit"""
+    base_url_set: bool = False
+    """`BASE_URL` is this server's address, so links in notifications work from a phone"""
+    reader_running: bool = False
+    """A card reader (the ingest worker) has run in the last 3 minutes; without one, cards wait"""
     ocr_available: bool = False
     reader: ReaderInfo | None = None
     """Under the group's policy"""
@@ -94,6 +123,8 @@ class IngestAboutFeature(MealieModel):
     max_images_per_request: int
     max_pages_per_card: int
     inbox: bool
+    worker: bool = False
+    """A card reader (the ingest worker) has run in the last 3 minutes, so uploaded cards are read"""
 
 
 class IngestAboutFeatures(MealieModel):

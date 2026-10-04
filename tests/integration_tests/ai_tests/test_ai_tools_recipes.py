@@ -2,10 +2,12 @@ import re
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy import event
 
-from mealie.db.db_setup import engine
+from mealie.db.db_setup import engine, session_context
+from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe.recipe_category import TagSave
 from mealie.schema.recipe.recipe_ingredient import IngredientFood, RecipeIngredient, SaveIngredientFood
@@ -176,6 +178,31 @@ def test_search_recipes_by_total_time_reads_a_limited_number(
     result = run(api_client, unique_user, "search_recipes", query=token, max_total_minutes=30)
     assert slugs(result) == {quick.slug}
     assert result["speech"].endswith("I only checked the times of 4 recipes, so there may be more.")
+
+
+def test_search_pages_equally_close_recipes_oldest_first(
+    api_client: TestClient, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Every name holding the words is as close to them as the next, and PostgreSQL returns such ties in no fixed order
+    (a rewritten row moves to the end of its table): the pages take them oldest first, so none is read twice or skipped
+    """
+    monkeypatch.setattr(recipe_tools, "SEARCH_PAGE_SIZE", 1)
+    monkeypatch.setattr(recipe_tools, "SEARCH_MAX_PAGES", 2)
+    token = random_string()
+    first = create_recipe(unique_user, f"{token} first", total_time="3 hours")
+    create_recipe(unique_user, f"{token} second", total_time="2 hours")
+    create_recipe(unique_user, f"{token} third", total_time="10 minutes")
+    with session_context() as session:
+        # an indexed column, so PostgreSQL writes the row anew at the end of the table (not a HOT update)
+        session.execute(sa.update(RecipeModel).where(RecipeModel.id == first.id).values(rating=4))
+        session.commit()
+
+    result = run(api_client, unique_user, "search_recipes", query=token, max_total_minutes=30)
+
+    # the two oldest were read, and neither is quick enough
+    assert slugs(result) == set()
+    assert result["speech"].endswith("I only checked the times of 2 recipes, so there may be more.")
 
 
 def test_search_loads_foods_once(api_client: TestClient, unique_user_fn_scoped: TestUser):

@@ -1,10 +1,12 @@
 /**
  * The recipe card upload queue (docs/ai/PHASE2.md §1.1, §1.4): photos grouped into cards, one upload request per card,
- * two at a time, three retries with backoff, one browser re-encode after a 413, a batch created with the first card
- * and sealed once Done was tapped and every card of the batch has uploaded or failed for good.
+ * two at a time, three retries with backoff, one browser re-encode when the server finds a photo too large, a batch
+ * created with the first card and sealed once Done was tapped and every card of the batch has uploaded or failed for
+ * good.
  *
- * Everything lives at module level, so the queue keeps going while the user reviews a card and comes back. The
- * transitions are a pure reducer (`reduceUploadQueue`); the requests, timers and preview URLs live around it.
+ * Everything lives at module level, so the queue keeps going while the user reviews a card and comes back, and it is
+ * kept in IndexedDB per user (`use-recipe-ingest-upload-storage.ts`), so a reload or a closed tab resumes it. The
+ * transitions are a pure reducer (`reduceUploadQueue`); the requests, timers, storage and previews live around it.
  * Fork-owned.
  */
 import type { AxiosProgressEvent } from "axios";
@@ -16,8 +18,12 @@ import {
   errorStatusOf,
   resetRecipeIngestCounts,
   resetRecipeIngestReviewState,
+  resetRecipeIngestSettings,
   useRecipeIngestCounts,
 } from "~/composables/use-recipe-ingest";
+import { resetCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
+import { openUploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
+import type { UploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
 import type { IngestedJob, IngestRejected, IngestResponse } from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestAPI } from "~/lib/api/user/recipe-ingest";
 
@@ -29,12 +35,27 @@ export const MAX_CONCURRENT_UPLOADS = 2;
 export const MAX_AUTO_RETRIES = 3;
 export const RETRY_BASE_DELAY_MS = 2000;
 export const MAX_RETRY_DELAY_MS = 60_000;
-/** A 413 re-encodes the card's photos once, to at most this many pixels on the long side */
+/**
+ * A 413, or a photo refused as too large or with too many pixels, re-encodes the card's photos once, to at most this
+ * many pixels on the long side
+ */
 export const REENCODE_MAX_SIDE = 3072;
 export const REENCODE_QUALITY = 0.9;
+/** Data saver: photos go at most this size, the server's page size (`page.jpg`), so nothing it keeps is lost */
+export const DATA_SAVER_MAX_SIDE = 4096;
+/** The card's error when the server found a photo too large and this browser can't decode it to make it smaller */
+export const CANNOT_SHRINK = "cannot-shrink";
+/** Thumbnails are made once per photo at this width (the tray shows 72 px), never from the full photo */
+export const PREVIEW_WIDTH = 320;
+export const PREVIEW_QUALITY = 0.8;
+/** Thumbnails decoded at a time: each decode holds a full photo (48-190 MB) for a moment */
+export const PREVIEW_CONCURRENCY = 2;
 /** The server's limit (`limits.maxPagesPerCard`) */
 export const DEFAULT_MAX_PAGES_PER_CARD = 4;
 export const CAPTURE_MODE_STORAGE_KEY = "mealie.recipe-ingest.capture-mode";
+export const DATA_SAVER_STORAGE_KEY = "mealie.recipe-ingest.data-saver";
+/** "Keep these cards on this server", per user: `<key>.<user id>` */
+export const LOCAL_ONLY_STORAGE_KEY = "mealie.recipe-ingest.local-only";
 
 // ==========================================
 // Grouping photos into cards (pure)
@@ -189,8 +210,12 @@ export interface UploadCard {
   retries: number;
   /** When a `retrying` card is due (ms since the epoch) */
   retryAt: number | null;
-  /** Re-encoded after a 413 (only once) */
+  /** Re-encoded because the server found a photo too large (only once) */
   reencoded: boolean;
+  /** Made smaller before the upload (data saver) */
+  downscaled: boolean;
+  /** Sent with `allowDuplicate` ("Scan again" on a card already scanned) */
+  allowDuplicate: boolean;
   jobs: IngestedJob[];
   /** Photos the server didn't use */
   rejected: IngestRejected[];
@@ -218,12 +243,14 @@ export type UploadQueueAction
     | { type: "progress"; key: string; progress: number }
     | { type: "re-encoding"; key: string }
     | { type: "re-encoded"; key: string; photos: readonly Blob[] }
+    | { type: "downscaled"; key: string; photos: readonly Blob[] }
     | { type: "batch-created"; batchKey: string; serverId: string }
     | { type: "batch-lost"; batchKey: string; serverId: string }
     | { type: "uploaded"; key: string; response: IngestResponse }
     | { type: "attempt-failed"; key: string; error: string | null; retryAt: number }
     | { type: "failed"; key: string; error: string | null; retryable: boolean }
     | { type: "retry"; key: string }
+    | { type: "scan-again"; key: string }
     | { type: "remove"; key: string }
     | { type: "seal-requested"; batchKey: string }
     | { type: "sealed"; batchKey: string; serverId: string };
@@ -319,8 +346,10 @@ function applyUploaded(state: UploadQueueState, key: string, response: IngestRes
       error: null,
       retryable: false,
     };
-    // The photos aren't needed any more, except the front as the thumbnail of a card with something to show
-    return { ...done, photos: hasNote(done) ? c.photos.slice(0, 1) : [] };
+    // The photos aren't needed any more, except all of a card already scanned (for Scan again) and the front as the
+    // thumbnail of a card with photos the server didn't use
+    const photos = done.duplicateOf ? c.photos : hasNote(done) ? c.photos.slice(0, 1) : [];
+    return { ...done, photos };
   });
 }
 
@@ -351,6 +380,8 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
         retries: 0,
         retryAt: null,
         reencoded: false,
+        downscaled: false,
+        allowDuplicate: false,
         jobs: [],
         rejected: [],
         duplicateOf: null,
@@ -380,6 +411,8 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
         reencoded: true,
         progress: 0,
       }));
+    case "downscaled":
+      return updateCard(state, action.key, c => ({ ...c, photos: action.photos, downscaled: true }));
     case "batch-created":
       return updateBatch(state, action.batchKey, b => (b.serverId ? b : withServerId(b, action.serverId)));
     case "batch-lost":
@@ -408,6 +441,22 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
     case "retry":
       return updateCard(state, action.key, c => (c.status === "failed" && c.retryable
         ? { ...c, status: "waiting", retries: 0, retryAt: null, error: null, rejected: [] }
+        : c));
+    case "scan-again":
+      // queued again even though the server has the same photos: it was asked to, by the user
+      return updateCard(state, action.key, c => (c.status === "done" && c.duplicateOf && c.photos.length
+        ? {
+            ...c,
+            status: "waiting",
+            progress: 0,
+            retries: 0,
+            retryAt: null,
+            allowDuplicate: true,
+            duplicateOf: null,
+            rejected: [],
+            jobs: [],
+            error: null,
+          }
         : c));
     case "remove": {
       const card = state.cards.find(c => c.key === action.key);
@@ -482,7 +531,7 @@ export function retryDelay(retry: number, retryAfterSeconds: number | null = nul
 }
 
 // ==========================================
-// Re-encoding after a 413
+// Re-encoding and thumbnails
 
 function jpegName(photo: Blob): string {
   const name = photo instanceof File && photo.name ? photo.name : "photo.jpg";
@@ -501,38 +550,85 @@ function drawOnWhite(context: Canvas2D | null, bitmap: ImageBitmap, width: numbe
   context.drawImage(bitmap, 0, 0, width, height);
 }
 
+/** The bitmap drawn at `width` x `height`, as a JPEG */
+async function encodeJpeg(bitmap: ImageBitmap, width: number, height: number, quality: number): Promise<Blob> {
+  let blob: Blob | null;
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(width, height);
+    drawOnWhite(canvas.getContext("2d"), bitmap, width, height);
+    blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
+  }
+  else {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    drawOnWhite(canvas.getContext("2d"), bitmap, width, height);
+    blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", quality));
+  }
+  if (!blob) {
+    throw new Error("The photo couldn't be encoded");
+  }
+  return blob;
+}
+
 /**
- * A photo as a JPEG of at most `REENCODE_MAX_SIDE` pixels on the long side, upright as the browser shows it.
- * Rejects when the browser can't decode it.
+ * A photo as a JPEG of at most `maxSide` pixels on the long side, upright as the browser shows it. Rejects when the
+ * browser can't decode it (HEIC outside Safari).
  */
-export async function reencodePhoto(photo: Blob): Promise<File> {
+export async function reencodePhoto(photo: Blob, maxSide = REENCODE_MAX_SIDE): Promise<File> {
   const bitmap = await createImageBitmap(photo, { imageOrientation: "from-image" });
   try {
-    const scale = Math.min(1, REENCODE_MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
     const width = Math.max(1, Math.round(bitmap.width * scale));
     const height = Math.max(1, Math.round(bitmap.height * scale));
-
-    let blob: Blob | null;
-    if (typeof OffscreenCanvas !== "undefined") {
-      const canvas = new OffscreenCanvas(width, height);
-      drawOnWhite(canvas.getContext("2d"), bitmap, width, height);
-      blob = await canvas.convertToBlob({ type: "image/jpeg", quality: REENCODE_QUALITY });
-    }
-    else {
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      drawOnWhite(canvas.getContext("2d"), bitmap, width, height);
-      blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", REENCODE_QUALITY));
-    }
-    if (!blob) {
-      throw new Error("The photo couldn't be encoded");
-    }
+    const blob = await encodeJpeg(bitmap, width, height, REENCODE_QUALITY);
     return new File([blob], jpegName(photo), { type: "image/jpeg" });
   }
   finally {
     bitmap.close();
   }
+}
+
+/**
+ * Data saver: the photo at most `DATA_SAVER_MAX_SIDE` on the long side, when that makes it smaller. A photo this
+ * browser can't decode goes as it is.
+ */
+export async function shrinkForUpload(photo: Blob): Promise<Blob> {
+  try {
+    const smaller = await reencodePhoto(photo, DATA_SAVER_MAX_SIDE);
+    return smaller.size < photo.size ? smaller : photo;
+  }
+  catch {
+    return photo;
+  }
+}
+
+/**
+ * A thumbnail of the photo, `width` pixels wide, upright as the browser shows it: the browser decodes the photo
+ * straight to that size (`resizeWidth`), and one that ignores the option is scaled on the canvas. Only the small JPEG
+ * is kept, so a tray of 40 photos holds 40 small images instead of 40 decoded photos. Rejects when the browser can't
+ * decode the photo (HEIC outside Safari, a PDF).
+ */
+export async function makePreview(photo: Blob, width = PREVIEW_WIDTH): Promise<Blob> {
+  const bitmap = await createImageBitmap(photo, {
+    imageOrientation: "from-image",
+    resizeWidth: width,
+    resizeQuality: "medium",
+  });
+  try {
+    const scale = Math.min(1, width / bitmap.width);
+    const scaledWidth = Math.max(1, Math.round(bitmap.width * scale));
+    const scaledHeight = Math.max(1, Math.round(bitmap.height * scale));
+    return await encodeJpeg(bitmap, scaledWidth, scaledHeight, PREVIEW_QUALITY);
+  }
+  finally {
+    bitmap.close();
+  }
+}
+
+/** The name a photo was chosen or taken with; "" for one without */
+export function photoName(photo: Blob): string {
+  return photo instanceof File ? photo.name : "";
 }
 
 // ==========================================
@@ -547,12 +643,22 @@ const pendingFront = shallowRef<Blob | null>(null);
 const modeRef = ref<CaptureMode | null>(null);
 /** "Keep these cards on this server": every upload request carries it as it is when the request goes */
 const localOnlyRef = ref(false);
+/** Data saver, as this browser remembers it; null until read */
+const dataSaverRef = ref<boolean | null>(null);
 /** Counts successful uploads, so the job list can reload at once */
 const uploadedCount = ref(0);
 /** The server batch of the last successful upload */
 const lastUploadBatchId = ref<string | null>(null);
 /** The cards that had gone with the other setting when "Keep these cards on this server" last changed */
 const sentBeforeChange = shallowRef<ReadonlySet<string>>(new Set());
+/** The last change of "Keep these cards on this server" finished the open batch; until the next photo or Done */
+const finishedBySwitch = ref(false);
+/** Cards that failed for good while no cards page was open, since one was last opened */
+const failedAway = ref(0);
+/** The cards pages open now (they show a failed card themselves) */
+let cardsPageViews = 0;
+/** The queue couldn't be kept on this device: it lives in memory only (shown once) */
+const storageFailedNotice = ref(false);
 
 let api: RecipeIngestAPI | null = null;
 let refreshCounts: (() => Promise<unknown>) | null = null;
@@ -565,16 +671,30 @@ const uploadsInFlight = new Set<AbortController>();
 /** Bumped by a reset, so requests still in flight change nothing */
 let generation = 0;
 let scope: EffectScope | null = null;
-const previews = new Map<Blob, string>();
 
 const hasPending = computed(
   () => state.value.cards.some(card => !isSettled(card)) || drafts.value.length > 0 || pendingFront.value !== null,
 );
 
+/**
+ * Photos a logout would drop: of cards not uploaded (on their way, or failed with Retry), in the tray, and a front
+ * waiting for its back. Cards the server refused for good don't count.
+ */
+export const recipeIngestPhotosNotUploaded = computed(() =>
+  state.value.cards
+    .filter(card => card.status !== "done" && !isRefused(card))
+    .reduce((count, card) => count + card.photos.length, 0)
+    + drafts.value.reduce((count, card) => count + card.photos.length, 0)
+    + (pendingFront.value ? 1 : 0),
+);
+
 function dispatch(action: UploadQueueAction) {
-  state.value = reduceUploadQueue(state.value, action);
-  forgetResentCards();
+  const before = state.value;
+  state.value = reduceUploadQueue(before, action);
+  noteFailure(before, action);
+  forgetStaleNotes();
   releaseUnusedPreviews();
+  schedulePersist();
 }
 
 function findCard(key: string) {
@@ -592,24 +712,124 @@ function client(): RecipeIngestAPI {
   return api;
 }
 
-// ---- preview URLs
-
-/** An object URL showing a photo; revoked once the photo leaves the queue */
-function previewUrl(photo: Blob): string {
-  let url = previews.get(photo);
-  if (url === undefined) {
-    try {
-      url = URL.createObjectURL(photo);
-    }
-    catch {
-      // no object URLs here (server rendering, tests): no preview
-      url = "";
-    }
-    previews.set(photo, url);
+/** A card that just failed for good while no cards page is open: the layout says so (toast, sidebar badge) */
+function noteFailure(before: UploadQueueState, action: UploadQueueAction) {
+  if (!("key" in action) || cardsPageViews > 0) {
+    return;
   }
-  return url;
+  const was = before.cards.find(card => card.key === action.key)?.status;
+  if (findCard(action.key)?.status === "failed" && was !== "failed") {
+    failedAway.value += 1;
+  }
 }
 
+// ---- thumbnails
+
+export type PreviewState = "pending" | "ready" | "unavailable";
+
+interface Preview {
+  state: PreviewState;
+  url: string | null;
+}
+
+const previews = new Map<Blob, Preview>();
+/** Bumped when a preview changes, so the templates showing it render again */
+const previewVersion = ref(0);
+const previewQueue: Blob[] = [];
+let previewsRunning = 0;
+
+function objectUrl(blob: Blob): string | null {
+  try {
+    return URL.createObjectURL(blob);
+  }
+  catch {
+    // no object URLs here (server rendering, tests)
+    return null;
+  }
+}
+
+function revokeUrl(url: string | null) {
+  if (url && typeof URL.revokeObjectURL === "function") {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function setPreview(photo: Blob, preview: Preview) {
+  previews.set(photo, preview);
+  previewVersion.value += 1;
+}
+
+/** Makes the queued thumbnails, `PREVIEW_CONCURRENCY` at a time */
+function pumpPreviews() {
+  while (previewsRunning < PREVIEW_CONCURRENCY && previewQueue.length) {
+    const photo = previewQueue.shift() as Blob;
+    if (previews.get(photo)?.state !== "pending") {
+      continue; // the photo left the queue meanwhile
+    }
+    previewsRunning += 1;
+    makePreview(photo)
+      .then((small) => {
+        if (previews.get(photo)?.state === "pending") {
+          const url = objectUrl(small);
+          setPreview(photo, url ? { state: "ready", url } : { state: "unavailable", url: null });
+        }
+      })
+      .catch(() => {
+        // a photo this browser can't decode (HEIC outside Safari, a PDF): a placeholder with its name
+        if (previews.get(photo)?.state === "pending") {
+          setPreview(photo, { state: "unavailable", url: null });
+        }
+      })
+      .finally(() => {
+        previewsRunning -= 1;
+        pumpPreviews();
+      });
+  }
+}
+
+/** The photo's preview, asked for the first time: made in the background */
+function requestPreview(photo: Blob): Preview {
+  const known = previews.get(photo);
+  if (known) {
+    return known;
+  }
+  let preview: Preview;
+  if (typeof createImageBitmap !== "function") {
+    // no way to make a small one: the photo itself, which the browser shows if it can (`markPreviewBroken` if not)
+    const url = objectUrl(photo);
+    preview = url ? { state: "ready", url } : { state: "unavailable", url: null };
+  }
+  else {
+    preview = { state: "pending", url: null };
+    previewQueue.push(photo);
+    // not while the template that asked renders
+    queueMicrotask(pumpPreviews);
+  }
+  previews.set(photo, preview);
+  return preview;
+}
+
+/** An object URL of the photo's thumbnail; null while it's made, or when the browser can't show the photo */
+function previewUrl(photo: Blob): string | null {
+  void previewVersion.value;
+  return requestPreview(photo).url;
+}
+
+function previewState(photo: Blob): PreviewState {
+  void previewVersion.value;
+  return requestPreview(photo).state;
+}
+
+/** The browser couldn't show the thumbnail after all (`<img @error>`): a placeholder instead */
+function markPreviewBroken(photo: Blob) {
+  const preview = previews.get(photo);
+  if (preview && preview.state !== "unavailable") {
+    revokeUrl(preview.url);
+    setPreview(photo, { state: "unavailable", url: null });
+  }
+}
+
+/** Forgets the thumbnails of photos that left the queue, and revokes their URLs */
 function releaseUnusedPreviews() {
   if (!previews.size) {
     return;
@@ -619,14 +839,330 @@ function releaseUnusedPreviews() {
     ...drafts.value.flatMap(card => card.photos),
     ...(pendingFront.value ? [pendingFront.value] : []),
   ]);
-  for (const [photo, url] of previews) {
+  let released = false;
+  for (const [photo, preview] of previews) {
     if (!used.has(photo)) {
-      if (url && typeof URL.revokeObjectURL === "function") {
-        URL.revokeObjectURL(url);
-      }
+      revokeUrl(preview.url);
       previews.delete(photo);
+      released = true;
     }
   }
+  if (released) {
+    const waiting = previewQueue.filter(photo => previews.has(photo));
+    previewQueue.splice(0, previewQueue.length, ...waiting);
+  }
+}
+
+// ---- keeping the queue between visits (per user)
+
+/** The signed-in user whose queue this is; null until `connect` */
+let owner: string | null = null;
+/** Where the queue is kept; null when it lives in memory only */
+let storage: UploadStorage | null = null;
+/** The stored queue being read back: writes wait for it */
+let restoring: Promise<void> | null = null;
+let persistQueued = false;
+let persistChain: Promise<void> = Promise.resolve();
+/** What the storage holds: each record as JSON, and the photo ids */
+const writtenRecords = new Map<string, string>();
+const writtenPhotos = new Set<string>();
+const photoIds = new WeakMap<Blob, string>();
+
+/** A card as it is stored: its photos by id; nothing about an attempt in flight */
+type StoredCard = Omit<UploadCard, "photos" | "progress" | "retryAt"> & { photoIds: string[] };
+
+interface StoredDraft {
+  key: string;
+  photoIds: string[];
+  locked: boolean;
+  index: number;
+}
+
+function photoId(photo: Blob): string {
+  let id = photoIds.get(photo);
+  if (!id) {
+    id = newKey("photo");
+    photoIds.set(photo, id);
+  }
+  return id;
+}
+
+/**
+ * The records the queue is kept as, and the photos they name: every batch, every card not uploaded yet, the tray,
+ * the front waiting for its back and the open batch
+ */
+function snapshot(): { records: Map<string, string>; photos: Map<string, Blob> } {
+  const records = new Map<string, string>();
+  const photos = new Map<string, Blob>();
+  const ids = (list: readonly Blob[]) => list.map((photo) => {
+    const id = photoId(photo);
+    photos.set(id, photo);
+    return id;
+  });
+  const current = state.value;
+  for (const batch of current.batches) {
+    records.set(`batch:${batch.key}`, JSON.stringify(batch));
+  }
+  for (const card of current.cards) {
+    if (card.status === "done") {
+      continue; // uploaded: nothing to send again
+    }
+    const { photos: cardPhotos, progress: _progress, retryAt: _retryAt, ...rest } = card;
+    const stored: StoredCard = { ...rest, photoIds: ids(cardPhotos) };
+    records.set(`card:${card.key}`, JSON.stringify(stored));
+  }
+  drafts.value.forEach((draft, index) => {
+    const stored: StoredDraft = { key: draft.key, photoIds: ids(draft.photos), locked: !!draft.locked, index };
+    records.set(`draft:${draft.key}`, JSON.stringify(stored));
+  });
+  if (pendingFront.value) {
+    records.set("front", JSON.stringify({ photoId: ids([pendingFront.value])[0] }));
+  }
+  if (current.openBatchKey) {
+    records.set("open", JSON.stringify({ batchKey: current.openBatchKey }));
+  }
+  return { records, photos };
+}
+
+/** The storage failed: the queue lives in memory only from now on, and the capture page says so once */
+function storageFailed(error: unknown) {
+  console.error(error);
+  storage = null;
+  writtenRecords.clear();
+  writtenPhotos.clear();
+  storageFailedNotice.value = true;
+}
+
+/** Writes what changed since the last write: new and changed records, new photos, and what's gone */
+async function persistOnce() {
+  persistQueued = false;
+  const target = storage;
+  if (restoring) {
+    await restoring;
+  }
+  if (!target || target !== storage) {
+    return;
+  }
+  const { records, photos } = snapshot();
+  const putRecords = new Map<string, unknown>();
+  records.forEach((json, key) => {
+    if (writtenRecords.get(key) !== json) {
+      putRecords.set(key, JSON.parse(json));
+    }
+  });
+  const deleteRecords = [...writtenRecords.keys()].filter(key => !records.has(key));
+  const putPhotos = new Map([...photos].filter(([id]) => !writtenPhotos.has(id)));
+  const deletePhotos = [...writtenPhotos].filter(id => !photos.has(id));
+  if (!putRecords.size && !deleteRecords.length && !putPhotos.size && !deletePhotos.length) {
+    return;
+  }
+  try {
+    await target.save({ putRecords, deleteRecords, putPhotos, deletePhotos });
+  }
+  catch (error) {
+    if (target === storage) {
+      storageFailed(error);
+    }
+    return;
+  }
+  if (target !== storage) {
+    return;
+  }
+  putRecords.forEach((_record, key) => writtenRecords.set(key, records.get(key) as string));
+  deleteRecords.forEach(key => writtenRecords.delete(key));
+  putPhotos.forEach((_photo, id) => writtenPhotos.add(id));
+  deletePhotos.forEach(id => writtenPhotos.delete(id));
+}
+
+/** Writes the queue soon: changes made together (and progress, which isn't stored) cost one write */
+function schedulePersist() {
+  if (!storage || persistQueued) {
+    return;
+  }
+  persistQueued = true;
+  persistChain = persistChain.then(persistOnce).catch(error => console.error(error));
+}
+
+/** A stored card as the queue takes it back: whatever was in flight goes again (the server spots a duplicate) */
+function restoredCard(stored: Omit<StoredCard, "photoIds">, photos: Blob[]): UploadCard {
+  const failed = stored.status === "failed";
+  return {
+    ...stored,
+    photos,
+    status: failed ? "failed" : "waiting",
+    progress: 0,
+    retryAt: null,
+    localOnly: failed ? stored.localOnly : null,
+    downscaled: !!stored.downscaled,
+    allowDuplicate: !!stored.allowDuplicate,
+  };
+}
+
+/** Reads the stored queue back, before anything added meanwhile, and resumes it */
+async function restoreFrom(target: UploadStorage, gen: number) {
+  let loaded: Awaited<ReturnType<UploadStorage["load"]>>;
+  try {
+    loaded = await target.load();
+  }
+  catch (error) {
+    if (target === storage) {
+      storageFailed(error);
+    }
+    return;
+  }
+  if (gen !== generation || target !== storage) {
+    return;
+  }
+
+  const photo = (id: string | undefined) => {
+    const found = id ? loaded.photos.get(id) : undefined;
+    if (!found || !id) {
+      return null;
+    }
+    photoIds.set(found, id);
+    return markRaw(found);
+  };
+  const allPhotos = (ids: string[] | undefined) => {
+    const found = (ids ?? []).map(photo);
+    return found.length && found.every(Boolean) ? (found as Blob[]) : null;
+  };
+
+  const batches: UploadBatch[] = [];
+  const cards: UploadCard[] = [];
+  const trays: StoredDraft[] = [];
+  let front: Blob | null = null;
+  let openBatchKey: string | null = null;
+  for (const [key, value] of loaded.records) {
+    writtenRecords.set(key, JSON.stringify(value));
+    if (key.startsWith("batch:")) {
+      batches.push(value as UploadBatch);
+    }
+    else if (key.startsWith("card:")) {
+      const { photoIds: ids, ...rest } = value as StoredCard;
+      const cardPhotos = allPhotos(ids);
+      // a card whose photos are gone can't be sent; its record goes with the next write
+      if (cardPhotos && rest.status !== "done") {
+        cards.push(restoredCard(rest, cardPhotos));
+      }
+    }
+    else if (key.startsWith("draft:")) {
+      trays.push(value as StoredDraft);
+    }
+    else if (key === "front") {
+      front = photo((value as { photoId?: string }).photoId);
+    }
+    else if (key === "open") {
+      openBatchKey = (value as { batchKey?: string }).batchKey ?? null;
+    }
+  }
+  loaded.photos.forEach((_photo, id) => writtenPhotos.add(id));
+
+  const current = state.value;
+  const knownBatches = new Set(current.batches.map(batch => batch.key));
+  const knownCards = new Set(current.cards.map(card => card.key));
+  const restoredBatches = batches.filter(batch => !knownBatches.has(batch.key));
+  const order = new Map(restoredBatches.map((batch, index) => [batch.key, index]));
+  const restoredCards = cards
+    .filter(card => !knownCards.has(card.key) && order.has(card.batchKey))
+    .sort((a, b) => (order.get(a.batchKey) ?? 0) - (order.get(b.batchKey) ?? 0) || a.position - b.position);
+  const reopened = restoredBatches.find(batch => batch.key === openBatchKey && !batch.sealing);
+  state.value = {
+    batches: [...restoredBatches, ...current.batches],
+    cards: [...restoredCards, ...current.cards],
+    openBatchKey: current.openBatchKey ?? reopened?.key ?? null,
+  };
+
+  const knownDrafts = new Set(drafts.value.map(draft => draft.key));
+  const restoredDrafts = trays
+    .filter(draft => !knownDrafts.has(draft.key))
+    .sort((a, b) => a.index - b.index)
+    .flatMap((draft) => {
+      const draftPhotos = allPhotos(draft.photoIds);
+      return draftPhotos ? [{ key: draft.key, photos: draftPhotos, locked: draft.locked || undefined }] : [];
+    });
+  if (restoredDrafts.length) {
+    drafts.value = [...restoredDrafts, ...drafts.value];
+  }
+  if (front && !pendingFront.value) {
+    pendingFront.value = front;
+  }
+  schedulePersist();
+  pump();
+}
+
+function localOnlyKey(userId: string): string {
+  return `${LOCAL_ONLY_STORAGE_KEY}.${userId}`;
+}
+
+function readLocalOnly(userId: string): boolean {
+  try {
+    return localStorage.getItem(localOnlyKey(userId)) === "true";
+  }
+  catch {
+    return false;
+  }
+}
+
+/** Remembers "Keep these cards on this server" for the user, in this browser */
+function writeLocalOnly(localOnly: boolean) {
+  if (!owner) {
+    return;
+  }
+  try {
+    if (localOnly) {
+      localStorage.setItem(localOnlyKey(owner), "true");
+    }
+    else {
+      localStorage.removeItem(localOnlyKey(owner));
+    }
+  }
+  catch {
+    // private browsing: the switch lasts for this visit
+  }
+}
+
+function forgetLocalOnly(userId: string) {
+  try {
+    localStorage.removeItem(localOnlyKey(userId));
+  }
+  catch {
+    // nothing was stored
+  }
+}
+
+/**
+ * Whose queue this is: the default layout calls it with the signed-in user. Their stored queue is read back and
+ * resumes, and their "Keep these cards on this server" comes back. Another user's queue in memory is forgotten here;
+ * it stays stored for that user, and a logout deletes it.
+ */
+function connectUser(userId: string | null, open: (userId: string) => UploadStorage | null): Promise<void> {
+  if (userId === owner) {
+    return restoring ?? Promise.resolve();
+  }
+  if (owner !== null) {
+    resetRecipeIngestUploads();
+  }
+  owner = userId;
+  if (!userId) {
+    return Promise.resolve();
+  }
+  localOnlyRef.value = readLocalOnly(userId);
+  try {
+    storage = open(userId);
+  }
+  catch (error) {
+    storageFailed(error);
+  }
+  if (!storage) {
+    return Promise.resolve();
+  }
+  const reading = restoreFrom(storage, generation).catch(storageFailed).finally(() => {
+    if (restoring === reading) {
+      restoring = null;
+    }
+  });
+  restoring = reading;
+  return reading;
 }
 
 // ---- leaving the page with photos pending
@@ -654,6 +1190,8 @@ function ensureScope() {
         window.removeEventListener("beforeunload", warnBeforeUnload);
       }
     }, { immediate: true });
+    // the tray and the waiting front are kept too
+    watch([drafts, pendingFront], () => schedulePersist());
   });
 }
 
@@ -673,6 +1211,9 @@ function rejectedBody(error: unknown): IngestResponse | null {
   }
   return null;
 }
+
+/** Rejections a smaller copy of the photo gets past (over the server's per-photo size or pixel limit) */
+const SHRINKABLE_REASONS = new Set<string>(["too_large", "too_many_pixels"]);
 
 /** Network errors, timeouts, rate limits, a restore's pause and server errors are worth retrying on their own */
 function isTransient(status: number | null): boolean {
@@ -720,21 +1261,31 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
   }
   const status = errorStatusOf(error);
   const code = errorCodeOf(error);
+  const body = status === 400 ? rejectedBody(error) : null;
 
-  if (status === 413) {
+  // Too large for the server: a proxy's body limit (413), or a photo over its size or pixel limit (400 with nothing
+  // accepted). The card's photos go again, smaller, once.
+  const tooLarge = status === 413
+    || (!!body && !body.jobs?.length && (body.rejected ?? []).some(rejected => SHRINKABLE_REASONS.has(rejected.reason)));
+  if (tooLarge) {
     if (card.reencoded) {
-      dispatch({ type: "failed", key, error: code ?? "too_large", retryable: false });
+      if (body) {
+        dispatch({ type: "uploaded", key, response: body });
+      }
+      else {
+        dispatch({ type: "failed", key, error: code ?? "too_large", retryable: false });
+      }
       return;
     }
-    // Usually a proxy's body limit: the card's photos go again, smaller
     dispatch({ type: "re-encoding", key });
     let photos: File[];
     try {
       photos = await Promise.all(card.photos.map(photo => reencodePhoto(photo)));
     }
     catch {
+      // this browser can't decode the photo (HEIC outside Safari), so it can't make it smaller
       if (gen === generation) {
-        dispatch({ type: "failed", key, error: code ?? "too_large", retryable: false });
+        dispatch({ type: "failed", key, error: CANNOT_SHRINK, retryable: false });
       }
       return;
     }
@@ -744,7 +1295,6 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
     return;
   }
 
-  const body = status === 400 ? rejectedBody(error) : null;
   if (body) {
     dispatch({ type: "uploaded", key, response: body });
     return;
@@ -764,13 +1314,52 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
   dispatch({ type: "failed", key, error: code, retryable: true });
 }
 
+function currentDataSaver(): boolean {
+  if (dataSaverRef.value === null) {
+    try {
+      dataSaverRef.value = localStorage.getItem(DATA_SAVER_STORAGE_KEY) === "true";
+    }
+    catch {
+      dataSaverRef.value = false;
+    }
+  }
+  return dataSaverRef.value;
+}
+
+function setDataSaver(on: boolean) {
+  dataSaverRef.value = on;
+  try {
+    if (on) {
+      localStorage.setItem(DATA_SAVER_STORAGE_KEY, "true");
+    }
+    else {
+      localStorage.removeItem(DATA_SAVER_STORAGE_KEY);
+    }
+  }
+  catch {
+    // private browsing: the choice lasts for this visit
+  }
+}
+
 async function runCard(key: string) {
   const gen = generation;
   dispatch({ type: "start", key });
   try {
-    const card = findCard(key);
+    let card = findCard(key);
     if (!card) {
       return;
+    }
+    if (currentDataSaver() && !card.downscaled && !card.reencoded) {
+      // data saver: the photos go at most the size the server keeps
+      const smaller = await Promise.all(card.photos.map(photo => shrinkForUpload(photo)));
+      if (gen !== generation) {
+        return;
+      }
+      dispatch({ type: "downscaled", key, photos: smaller.map(photo => markRaw(photo)) });
+      card = findCard(key);
+      if (!card) {
+        return;
+      }
     }
     const batch = await ensureBatch(card.batchKey, gen);
     if (gen !== generation) {
@@ -790,7 +1379,12 @@ async function runCard(key: string) {
     try {
       answer = await client().upload(
         card.photos,
-        { batchId: batch.id, position: card.position, localOnly },
+        {
+          batchId: batch.id,
+          position: card.position,
+          localOnly,
+          ...(card.allowDuplicate ? { allowDuplicate: true } : {}),
+        },
         {
           onUploadProgress: (event: AxiosProgressEvent) => {
             if (event.total && gen === generation) {
@@ -876,6 +1470,9 @@ function scheduleRetries() {
 
 /** Starts what can start: seals that are due, then cards up to the free upload slots */
 function pump() {
+  if (!api) {
+    return; // nothing can be sent before `useRecipeIngestUploads()`; it pumps then
+  }
   for (const { batchKey, serverId } of batchesToSeal(state.value)) {
     void sealBatch(batchKey, serverId);
   }
@@ -908,6 +1505,7 @@ function enqueueCard(photos: readonly Blob[]) {
   if (!photos.length) {
     return;
   }
+  finishedBySwitch.value = false;
   dispatch({
     type: "add-card",
     key: newKey("card"),
@@ -949,6 +1547,7 @@ function takePhoto(photo: Blob) {
     enqueueCard([front, photo]);
   }
   else {
+    finishedBySwitch.value = false;
     pendingFront.value = markRaw(photo);
   }
 }
@@ -978,6 +1577,7 @@ function addPhotos(photos: readonly Blob[]) {
   if (!photos.length) {
     return;
   }
+  finishedBySwitch.value = false;
   const all = [...drafts.value.flatMap(card => card.photos), ...photos.map(photo => markRaw(photo))];
   // Locked cards keep their shape; the new photos pair up after the last of them
   let keptCount = drafts.value.length;
@@ -1003,7 +1603,8 @@ function uploadDrafts() {
 
 /**
  * Done: a front waiting for its back and the draft cards are queued, and the batch is sealed once every card has
- * uploaded or failed for good. Photos taken after this start a new batch.
+ * uploaded or failed for good, whether or not the server took any of them (one already scanned, or refused). Photos
+ * taken after this start a new batch.
  */
 function done() {
   noBack();
@@ -1013,6 +1614,7 @@ function done() {
     dispatch({ type: "seal-requested", batchKey });
   }
   sentBeforeChange.value = new Set();
+  finishedBySwitch.value = false;
   pump();
 }
 
@@ -1023,17 +1625,18 @@ function wentWith(card: UploadCard, localOnly: boolean): boolean {
 }
 
 /**
- * "Keep these cards on this server". Every card that hasn't gone yet takes the new setting when it goes, whatever
- * batch it's in: waiting, about to retry, failed (for Retry), or one whose attempt fails and goes again. The server
- * stores the setting with each card when it arrives, so the cards already on their way or uploaded keep theirs (they
- * are counted for the note), and the open batch with such cards is finished (as with Done), so the next photo starts
- * a new batch.
+ * "Keep these cards on this server", remembered for the user in this browser. Every card that hasn't gone yet takes
+ * the new setting when it goes, whatever batch it's in: waiting, about to retry, failed (for Retry), or one whose
+ * attempt fails and goes again. The server stores the setting with each card when it arrives, so the cards already on
+ * their way or uploaded keep theirs (they are counted for the note), and the open batch with such cards is finished
+ * (as with Done), so the next photo starts a new batch.
  */
 function setLocalOnly(localOnly: boolean) {
   if (localOnly === localOnlyRef.value) {
     return;
   }
   localOnlyRef.value = localOnly;
+  writeLocalOnly(localOnly);
   const current = state.value;
   // the cards of batches still in progress; a finished batch's cards stay listed only for their notes
   const inProgress = new Set(current.batches.filter(batch => !isBatchFinished(current, batch)).map(batch => batch.key));
@@ -1041,22 +1644,26 @@ function setLocalOnly(localOnly: boolean) {
   sentBeforeChange.value = new Set(gone.map(card => card.key));
   const batchKey = current.openBatchKey;
   if (batchKey && gone.some(card => card.batchKey === batchKey)) {
+    finishedBySwitch.value = true;
     dispatch({ type: "seal-requested", batchKey });
     pump();
   }
 }
 
 /**
- * A card counted for the note whose attempt failed doesn't keep the other setting: it goes again with the switch's
- * (or not at all). An uploaded card forgotten once its batch was sealed still counts.
+ * The note counts cards of batches still in progress that went with the other setting: one whose batch is sealed
+ * (and so finished) no longer counts, nor one whose attempt failed, which goes again with the switch's setting (or not
+ * at all)
  */
-function forgetResentCards() {
+function forgetStaleNotes() {
   if (!sentBeforeChange.value.size) {
     return;
   }
+  const current = state.value;
   const kept = [...sentBeforeChange.value].filter((key) => {
     const card = findCard(key);
-    return !card || wentWith(card, !localOnlyRef.value);
+    const batch = card ? findBatch(card.batchKey) : undefined;
+    return !!card && !!batch && !isBatchFinished(current, batch) && wentWith(card, !localOnlyRef.value);
   });
   if (kept.length < sentBeforeChange.value.size) {
     sentBeforeChange.value = new Set(kept);
@@ -1068,21 +1675,48 @@ function retry(key: string) {
   pump();
 }
 
+/** Sends a card marked Already scanned again, as a new card (`allowDuplicate`) */
+function scanAgain(key: string) {
+  dispatch({ type: "scan-again", key });
+  pump();
+}
+
 function remove(key: string) {
   dispatch({ type: "remove", key });
   pump();
 }
 
+/**
+ * The cards page is open, and shows failed cards itself: the count of cards that failed meanwhile starts again.
+ * Returns what to call when the page closes.
+ */
+function openCardsPage(): () => void {
+  cardsPageViews += 1;
+  failedAway.value = 0;
+  let closed = false;
+  return () => {
+    if (!closed) {
+      closed = true;
+      cardsPageViews = Math.max(0, cardsPageViews - 1);
+    }
+  };
+}
+
 /** The upload queue, shared by every component (docs/ai/PHASE2.md §1.1) */
 export function useRecipeIngestUploads() {
-  if (!api) {
-    api = useUserApi().recipeIngest;
-  }
-  if (!refreshCounts) {
-    refreshCounts = useRecipeIngestCounts().refresh;
-  }
+  const clients = {
+    api: api ?? useUserApi().recipeIngest,
+    refresh: refreshCounts ?? useRecipeIngestCounts().refresh,
+  };
+  const firstUse = !api;
+  api = clients.api;
+  refreshCounts = clients.refresh;
   currentMode();
+  currentDataSaver();
   ensureScope();
+  if (firstUse) {
+    pump(); // a queue read back before the first use
+  }
 
   const openBatch = computed(() => state.value.batches.find(b => b.key === state.value.openBatchKey) ?? null);
 
@@ -1098,10 +1732,16 @@ export function useRecipeIngestUploads() {
     pendingFront: computed(() => pendingFront.value),
     mode: computed<CaptureMode>({ get: () => modeRef.value ?? "one-side", set: setMode }),
     localOnly: computed<boolean>({ get: () => localOnlyRef.value, set: setLocalOnly }),
-    /** Cards already sent with the other setting when `localOnly` last changed (they keep it); 0 after Done */
+    /** Data saver: photos go at most 4096 px (JPEG), remembered in this browser */
+    dataSaver: computed<boolean>({ get: () => !!dataSaverRef.value, set: setDataSaver }),
+    /** Cards of batches still in progress that went with the other setting when `localOnly` last changed */
     sentBeforeLocalOnlyChange: computed(() => sentBeforeChange.value.size),
+    /** The last change of `localOnly` finished the open batch: the next photo starts a new one */
+    localOnlyFinishedBatch: computed(() => finishedBySwitch.value),
     /** Photos not uploaded yet, or not yet sent */
     hasPending,
+    /** Photos a logout would drop */
+    photosNotUploaded: recipeIngestPhotosNotUploaded,
     /** Cards waiting, uploading or about to retry */
     isUploading: computed(() => state.value.cards.some(card => !isSettled(card))),
     /** Server batches with cards still on their way */
@@ -1111,7 +1751,18 @@ export function useRecipeIngestUploads() {
     }),
     uploadedCount: readonly(uploadedCount),
     lastUploadBatchId: readonly(lastUploadBatchId),
+    /** Cards that failed for good while no cards page was open (the sidebar badge), until one opens */
+    failedWhileAway: readonly(failedAway),
+    /** The queue couldn't be kept on this device, so it's lost if the page closes; until dismissed */
+    storageFailed: computed<boolean>({
+      get: () => storageFailedNotice.value,
+      set: (on) => {
+        storageFailedNotice.value = on;
+      },
+    }),
     previewUrl,
+    previewState,
+    markPreviewBroken,
     takePhoto,
     retake,
     noBack,
@@ -1124,11 +1775,87 @@ export function useRecipeIngestUploads() {
     uploadDrafts,
     done,
     retry,
+    scanAgain,
     remove,
+    openCardsPage,
+    /**
+     * Whose queue this is (the default layout passes the signed-in user): their stored queue comes back and resumes.
+     * `open` gives the storage (IndexedDB by default).
+     */
+    connect: (userId: string | null, open: (userId: string) => UploadStorage | null = openUploadStorage) => {
+      const reading = connectUser(userId, open);
+      // after another user's queue was forgotten: this browser's choices, and the requests, again
+      api ??= clients.api;
+      refreshCounts ??= clients.refresh;
+      currentMode();
+      currentDataSaver();
+      ensureScope();
+      return reading;
+    },
   };
 }
 
-/** Forgets the queue (between tests, and on logout); requests still in flight then change nothing */
+/**
+ * A logout the user chose (the header asks first when photos haven't been uploaded): stops the uploads, seals every
+ * server batch the queue started that isn't sealed yet, so none stays open and empty on the server, and deletes what
+ * this device keeps for the user (the stored queue, the remembered privacy switch). Sealing is best effort: it waits
+ * at most `timeoutMs`. The logout then forgets the queue in memory (`resetRecipeIngestState`).
+ */
+export async function prepareRecipeIngestLogout(timeoutMs = 3000): Promise<void> {
+  const sender = api;
+  // nothing in flight changes the queue any more, and nothing more is stored
+  generation += 1;
+  uploadsInFlight.forEach(controller => controller.abort());
+  uploadsInFlight.clear();
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  const forgotten = forgetStoredQueue();
+
+  const unsealed = [...new Set(state.value.batches.flatMap(batch =>
+    batch.serverIds.filter(serverId => !batch.sealedIds.includes(serverId))))];
+  if (sender && unsealed.length) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(unsealed.map(serverId => sender.sealBatch(serverId, { suppressAlert: true }))),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+  await forgotten;
+}
+
+/** Deletes what this device keeps for the signed-in user: the stored queue and the remembered privacy switch */
+async function forgetStoredQueue(): Promise<void> {
+  const user = owner;
+  let stored = storage;
+  storage = null;
+  writtenRecords.clear();
+  writtenPhotos.clear();
+  if (!user) {
+    return;
+  }
+  forgetLocalOnly(user);
+  if (!stored) {
+    try {
+      stored = openUploadStorage(user);
+    }
+    catch {
+      stored = null;
+    }
+  }
+  try {
+    await stored?.clear();
+  }
+  catch (error) {
+    console.error(error);
+  }
+}
+
+/** Forgets the queue in memory (between tests, on logout and when the user changes); the stored queue stays */
 export function resetRecipeIngestUploads() {
   generation += 1;
   uploadsInFlight.forEach(controller => controller.abort());
@@ -1142,29 +1869,48 @@ export function resetRecipeIngestUploads() {
   if (typeof window !== "undefined") {
     window.removeEventListener("beforeunload", warnBeforeUnload);
   }
+  // nothing more is written for the user who was here
+  owner = null;
+  storage = null;
+  restoring = null;
+  persistQueued = false;
+  persistChain = Promise.resolve();
+  writtenRecords.clear();
+  writtenPhotos.clear();
+  storageFailedNotice.value = false;
+
   state.value = emptyUploadQueue();
   drafts.value = [];
   pendingFront.value = null;
   modeRef.value = null;
   localOnlyRef.value = false;
+  dataSaverRef.value = null;
   uploadedCount.value = 0;
   lastUploadBatchId.value = null;
   sentBeforeChange.value = new Set();
+  finishedBySwitch.value = false;
+  failedAway.value = 0;
   batchRequests.clear();
   sealsInFlight.clear();
   sealFailures.clear();
   releaseUnusedPreviews();
+  previewQueue.length = 0;
   api = null;
   refreshCounts = null;
 }
 
 /**
- * Forgets what recipe card ingestion keeps for the signed-in user: the upload queue, with its photos, retries and
- * open batch, the card counts, and what review pages carry over. Called on logout (`clearComposableCaches`), so the
- * next user of the device neither sees the photos nor sends them.
+ * Forgets what recipe card ingestion holds in memory for the signed-in user: the upload queue, with its photos,
+ * retries and open batch, the card counts and settings, and what review pages carry over. Called on every sign-out
+ * (`clearComposableCaches`), so the next user of the device neither sees the photos nor sends them. What this device
+ * stores for the user goes too when they chose to log out (`prepareRecipeIngestLogout`); after a forced sign-out (a
+ * changed password, another account on the consent page) it stays for them, and their queue resumes when they sign
+ * in again.
  */
 export function resetRecipeIngestState() {
   resetRecipeIngestUploads();
   resetRecipeIngestCounts();
   resetRecipeIngestReviewState();
+  resetCarriedReviewNotice();
+  resetRecipeIngestSettings();
 }

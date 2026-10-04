@@ -1,9 +1,13 @@
 /**
- * Recipe card ingestion (docs/ai/PHASE2.md): the group's card settings, the ready/processing counts the sidebar and the
- * cards page share, and the text for error codes, rejections, progress keys and flags. Fork-owned.
+ * Recipe card ingestion (docs/ai/PHASE2.md): the group's card settings and the ready/processing counts that the
+ * sidebar, the cards page and the settings card share, the layout's recipe card entries, and the text for error
+ * codes, rejections, progress keys and flags. Fork-owned.
  */
+import { useEventListener } from "@vueuse/core";
+import type { Ref } from "vue";
 import { useUserApi } from "~/composables/api";
 import { useGlobalI18n } from "~/composables/use-global-i18n";
+import { alert } from "~/composables/use-toast";
 import type {
   CardFlag,
   CardFlagKind,
@@ -56,6 +60,12 @@ export const INGEST_API_ERROR_CODES = [
   "not_exportable",
   "eval_case_exists",
   "eval_case_error",
+  "group_local_only",
+  "too_many_pages",
+  "same_card",
+  "purged",
+  "recipe_edited",
+  "not_clean",
 ] as const;
 
 /** Kinds of the warnings a commit answers with (`tag_dropped:<name>`: an organizer that no longer exists) */
@@ -80,6 +90,8 @@ export const CARD_FLAG_KINDS = [
   "not_parsed",
   "new_food",
   "new_unit",
+  "linked_fuzzy",
+  "organizers_skipped",
 ] as const satisfies readonly CardFlagKind[];
 
 export const INGEST_REJECT_REASONS = [
@@ -90,6 +102,8 @@ export const INGEST_REJECT_REASONS = [
   "unreadable_image",
   "too_many_pages",
   "duplicate",
+  "url_not_allowed",
+  "url_fetch_failed",
 ] as const satisfies readonly IngestRejectReason[];
 
 const PROGRESS_PREFIX = "recipe-ingest.progress.";
@@ -109,6 +123,19 @@ export function errorCodeOf(error: unknown): string | null {
   const detail = (error as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail;
   const code = (detail as { code?: unknown } | null | undefined)?.code;
   return typeof code === "string" ? code : null;
+}
+
+/**
+ * The file a card came from, from its `sourceName` (`upload/<name>` for the app and the API,
+ * `inbox/<group>/<household>/<name>` for the inbox); null without one
+ */
+export function sourceFileName(sourceName: string | null | undefined): string | null {
+  if (!sourceName) {
+    return null;
+  }
+  const parts = sourceName.split("/");
+  const name = parts[0] === "upload" ? parts.slice(1) : parts[0] === "inbox" ? parts.slice(3) : parts;
+  return name.join("/") || null;
 }
 
 /** The HTTP status of a failed API call, if it got a response */
@@ -196,6 +223,13 @@ function explanationKey(flag: CardFlag, context: FlagTextContext): string {
   switch (flag.kind) {
     case "blank":
       return flag.source === "cross_read" ? `${base}.explanation-cross-read` : `${base}.explanation`;
+    case "read_disagreement":
+      // Tesseract's check of a printed card's numbers, rather than a second reading by the AI provider
+      return flag.source === "ocr" ? `${base}.explanation-ocr` : `${base}.explanation`;
+    case "organizers_skipped":
+      return params.reason === "local_only" || params.reason === "limit_reached"
+        ? `${base}.explanation-${params.reason}`
+        : `${base}.explanation`;
     case "empty_section":
       return params.section === "steps" ? `${base}.explanation-steps` : `${base}.explanation-ingredients`;
     case "implausible_amount":
@@ -228,61 +262,95 @@ export function flagText(flag: CardFlag, t: TranslateFn = globalT, context: Flag
 // ==========================================
 // Composables
 
-/** The group's recipe card settings: everyone reads them (the privacy chip), group managers change them */
+const sharedSettings = ref<RecipeIngestionSettingsOut | null>(null);
+const settingsLoading = ref(false);
+const settingsLoaded = ref(false);
+const settingsLoadFailed = ref(false);
+const settingsSaving = ref(false);
+let settingsRequest: Promise<RecipeIngestionSettingsOut | null> | null = null;
+/** Bumped by a reset (logout), so an answer still in flight changes nothing */
+let settingsGeneration = 0;
+
+/**
+ * The group's recipe card settings: everyone reads them (the privacy chip, the layout's entries), group managers
+ * change them. One module-level state, so a reload anywhere (the settings card after a provider changes) shows
+ * everywhere; `load()` calls made while one is in flight share it.
+ */
 export function useRecipeIngestSettings() {
   const api = useUserApi();
-  const settings = ref<RecipeIngestionSettingsOut | null>(null);
-  const loading = ref(false);
-  /** Whether the settings have loaded at least once */
-  const loaded = ref(false);
-  /** Whether the last load failed; the settings loaded before it are kept */
-  const loadFailed = ref(false);
-  const saving = ref(false);
 
-  async function load() {
-    loading.value = true;
-    try {
-      const { data } = await api.recipeIngest.getSettings();
-      if (data) {
-        settings.value = data;
-        loaded.value = true;
-      }
-      loadFailed.value = !data;
-      return data;
+  async function load(): Promise<RecipeIngestionSettingsOut | null> {
+    if (!settingsRequest) {
+      const gen = settingsGeneration;
+      settingsRequest = (async () => {
+        settingsLoading.value = true;
+        try {
+          const { data } = await api.recipeIngest.getSettings();
+          if (gen !== settingsGeneration) {
+            return null;
+          }
+          if (data) {
+            sharedSettings.value = data;
+            settingsLoaded.value = true;
+          }
+          settingsLoadFailed.value = !data;
+          return data;
+        }
+        finally {
+          if (gen === settingsGeneration) {
+            settingsLoading.value = false;
+            settingsRequest = null;
+          }
+        }
+      })();
     }
-    finally {
-      loading.value = false;
-    }
+    return await settingsRequest;
   }
 
   /** Saves the settings (managers); returns whether that worked. The saved settings replace the loaded ones. */
   async function save(update: RecipeIngestionSettingsUpdate) {
-    saving.value = true;
+    settingsSaving.value = true;
     try {
       const { data } = await api.recipeIngest.updateSettings(update);
       if (data) {
-        settings.value = data;
+        sharedSettings.value = data;
       }
       return !!data;
     }
     finally {
-      saving.value = false;
+      settingsSaving.value = false;
     }
   }
 
   return {
-    settings,
-    loading: readonly(loading),
-    loaded: readonly(loaded),
-    loadFailed: readonly(loadFailed),
-    saving: readonly(saving),
+    settings: sharedSettings,
+    loading: readonly(settingsLoading),
+    /** Whether the settings have loaded at least once */
+    loaded: readonly(settingsLoaded),
+    /** Whether the last load failed; the settings loaded before it are kept */
+    loadFailed: readonly(settingsLoadFailed),
+    saving: readonly(settingsSaving),
     load,
     save,
   };
 }
 
+/** Forgets the shared settings (on logout, and between tests) */
+export function resetRecipeIngestSettings() {
+  settingsGeneration += 1;
+  sharedSettings.value = null;
+  settingsLoading.value = false;
+  settingsLoaded.value = false;
+  settingsLoadFailed.value = false;
+  settingsSaving.value = false;
+  settingsRequest = null;
+}
+
 const sharedCounts = ref<RecipeIngestionJobCounts | null>(null);
 let countsRequest: Promise<RecipeIngestionJobCounts | null> | null = null;
+/** The layout refreshes the counts at most this often, on focus, on coming back to the tab and on route changes */
+export const NAV_REFRESH_INTERVAL_MS = 30_000;
+let lastNavRefresh = 0;
 
 /**
  * The household's card counts, shared by every component (the sidebar's "Recipe cards (N)", the cards page): one
@@ -327,6 +395,121 @@ export function useRecipeIngestCounts() {
 export function resetRecipeIngestCounts() {
   sharedCounts.value = null;
   countsRequest = null;
+  lastNavRefresh = 0;
+}
+
+// ==========================================
+// The layout's recipe card entries
+
+export interface RecipeIngestNavOptions {
+  /** The signed-in user is in their own group, where the entries belong */
+  active: Ref<boolean>;
+  /** The current route: a change refreshes the counts and retries settings that failed to load */
+  routePath: Ref<string>;
+  /** Cards whose upload failed for good while no cards page was open (the upload queue's `failedWhileAway`) */
+  failedWhileAway: Ref<number>;
+  /** Opens the cards page (the failure toast's action) */
+  openCards: () => void;
+}
+
+/** A small badge after a sidebar entry's title */
+export interface RecipeIngestNavBadge {
+  content: number;
+  color: string;
+  label: string;
+}
+
+/**
+ * The default layout's recipe card entries (docs/ai/PHASE2.md §1.1): the sidebar's "Recipe cards (N)" and the Create
+ * menu's "Scan recipe cards". Both follow the shared settings, which a group manager's changes reload; the counts are
+ * refreshed on window focus, on coming back to the tab and on route changes, at most every 30 s, and settings that
+ * failed to load are tried again on the next route change. The sidebar entry also shows while the household has cards
+ * open (ready, failed or being read) even when new cards can't be read, and gets a red badge, with one toast, when an
+ * upload failed for good while no cards page was open. Nothing is asked of a server with card scanning turned off.
+ */
+export function useRecipeIngestNav(options: RecipeIngestNavOptions) {
+  const i18n = useI18n();
+  const { settings, loaded, loading, loadFailed, load } = useRecipeIngestSettings();
+  const counts = useRecipeIngestCounts();
+
+  /** Whether the server takes cards (`AI_INGEST_ENABLED`): unknown counts as yes until the settings say otherwise */
+  const serverTakesCards = computed(() => settings.value?.enabled !== false);
+  const canReadCards = computed(() => options.active.value && !!settings.value?.canReadCards);
+  const openCards = computed(() => {
+    const current = counts.counts.value;
+    return (current?.ready ?? 0) + (current?.failed ?? 0) + (current?.processing ?? 0);
+  });
+
+  function refreshCounts(force = false) {
+    if (!options.active.value || !loaded.value || !serverTakesCards.value) {
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - lastNavRefresh < NAV_REFRESH_INTERVAL_MS) {
+      return;
+    }
+    lastNavRefresh = now;
+    void counts.refresh();
+  }
+
+  async function loadSettings() {
+    if (!loading.value) {
+      await load();
+    }
+  }
+
+  watch(options.active, (active) => {
+    if (active && !loaded.value) {
+      void loadSettings();
+    }
+  }, { immediate: true });
+  // the settings loaded (here, or on a page that loaded them first): the counts follow
+  watch(() => options.active.value && loaded.value && serverTakesCards.value, (allowed) => {
+    if (allowed) {
+      refreshCounts(true);
+    }
+  }, { immediate: true });
+  watch(options.routePath, () => {
+    if (options.active.value && loadFailed.value) {
+      void loadSettings();
+    }
+    refreshCounts();
+  });
+  if (typeof window !== "undefined") {
+    useEventListener(window, "focus", () => refreshCounts());
+    useEventListener(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        refreshCounts();
+      }
+    });
+  }
+
+  watch(options.failedWhileAway, (count, before) => {
+    if (count > (before ?? 0)) {
+      alert.error(i18n.t("recipe-ingest.nav.upload-failed", count), null, {
+        timeout: 10_000,
+        action: { message: i18n.t("recipe-ingest.nav.open-recipe-cards"), onClick: options.openCards },
+      });
+    }
+  });
+
+  return {
+    /** The sidebar's "Recipe cards (N)" */
+    showCardsLink: computed(() => options.active.value && serverTakesCards.value
+      && (canReadCards.value || openCards.value > 0 || options.failedWhileAway.value > 0)),
+    /** The Create menu's "Scan recipe cards" (and the AI import page's link) */
+    showScanLink: canReadCards,
+    cardsTitle: computed(() => counts.ready.value
+      ? i18n.t("recipe-ingest.nav.recipe-cards-count", { count: counts.ready.value })
+      : i18n.t("recipe-ingest.nav.recipe-cards")),
+    cardsBadge: computed<RecipeIngestNavBadge | null>(() => options.failedWhileAway.value > 0
+      ? {
+          content: options.failedWhileAway.value,
+          color: "error",
+          label: i18n.t("recipe-ingest.nav.upload-failed", options.failedWhileAway.value),
+        }
+      : null),
+  };
 }
 
 // ==========================================

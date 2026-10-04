@@ -16,6 +16,8 @@ import {
   progressText,
   rejectReasonText,
   resetRecipeIngestCounts,
+  resetRecipeIngestSettings,
+  sourceFileName,
   useRecipeIngestCounts,
   useRecipeIngestSettings,
 } from "../use-recipe-ingest";
@@ -67,6 +69,7 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
       maxImagesPerRequest: 20,
       maxPagesPerCard: 4,
       maxPixels: 100000000,
+      maxJpegPixels: 256000000,
     },
     inbox: { enabled: false, folder: null },
     ...overrides,
@@ -268,6 +271,18 @@ describe("text", () => {
       action: "Keep blank",
     });
     expect(flagText(flag({ source: "cross_read", params: { value: "2" } }), t).explanation).toContain("\"2\"");
+    const disagreement = { kind: "read_disagreement", severity: "warning", params: { text: "Bake at 350°" } } as const;
+    expect(flagText(flag(disagreement), t).explanation).toBe(
+      "A second reading of the card says \"Bake at 350°\" here.",
+    );
+    expect(flagText(flag({ ...disagreement, source: "ocr", params: { value: "375", read: "350" } }), t).explanation)
+      .toBe("Text recognition read \"350\" here. Check the number against the card.");
+    const skipped = { kind: "organizers_skipped", severity: "info" } as const;
+    expect(flagText(flag({ ...skipped, params: { reason: "failed" } }), t).explanation).toMatch(/couldn't be suggested/);
+    expect(flagText(flag({ ...skipped, params: { reason: "local_only" } }), t).explanation).toMatch(/on your network/);
+    expect(flagText(flag({ ...skipped, params: { reason: "limit_reached" } }), t).explanation).toMatch(/monthly/);
+    expect(flagText(flag({ kind: "linked_fuzzy", severity: "warning", params: { name: "red onion", kind: "food" } }), t))
+      .toEqual({ title: "Check the link", explanation: "Linked to \"red onion\": check it's the same thing.", action: "Looks right" });
     expect(flagText(flag({ kind: "empty_section", severity: "warning", params: { section: "steps" } }), t).explanation)
       .toMatch(/^No steps/);
     expect(flagText(flag({ kind: "implausible_amount", severity: "warning", params: { suggestion: "1 1/2" } }), t)
@@ -326,6 +341,13 @@ describe("text", () => {
     expect(progressText("recipe-ingest.progress.something-new", t)).toBe("recipe-ingest.progress.something-new");
   });
 
+  test("a card's file name, from where it came", () => {
+    expect(sourceFileName("upload/IMG_1.jpg")).toBe("IMG_1.jpg");
+    expect(sourceFileName("inbox/home/kitchen/scan 2.jpg")).toBe("scan 2.jpg");
+    expect(sourceFileName("upload/")).toBeNull();
+    expect(sourceFileName(null)).toBeNull();
+  });
+
   test("error codes and statuses are read off failed API calls", () => {
     const error = { response: { status: 409, data: { detail: { code: "version_conflict", current: 4 } } } };
     expect(errorCodeOf(error)).toBe("version_conflict");
@@ -339,6 +361,42 @@ describe("text", () => {
 describe("useRecipeIngestSettings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRecipeIngestSettings();
+  });
+
+  test("is shared by every caller, and loads made while one is in flight share it", async () => {
+    let answer: (value: unknown) => void = () => {};
+    api.getSettings.mockReturnValueOnce(new Promise((resolve) => {
+      answer = resolve;
+    }));
+    const layout = useRecipeIngestSettings();
+    const settingsCard = useRecipeIngestSettings();
+
+    const first = layout.load();
+    const second = settingsCard.load();
+    expect(layout.loading.value).toBe(true);
+    answer({ data: settings({ canReadCards: false }) });
+    await Promise.all([first, second]);
+    expect(api.getSettings).toHaveBeenCalledOnce();
+    expect(layout.settings.value?.canReadCards).toBe(false);
+
+    api.getSettings.mockResolvedValueOnce({ data: settings({ canReadCards: true }) });
+    await settingsCard.load();
+    expect(layout.settings.value?.canReadCards).toBe(true);
+  });
+
+  test("a logout forgets them, and an answer still in flight changes nothing", async () => {
+    let answer: (value: unknown) => void = () => {};
+    api.getSettings.mockReturnValueOnce(new Promise((resolve) => {
+      answer = resolve;
+    }));
+    const { settings: shared, loaded, load } = useRecipeIngestSettings();
+    const loading = load();
+    resetRecipeIngestSettings();
+    answer({ data: settings() });
+    await loading;
+    expect(shared.value).toBeNull();
+    expect(loaded.value).toBe(false);
   });
 
   test("loads the settings, and keeps them when a later load fails", async () => {

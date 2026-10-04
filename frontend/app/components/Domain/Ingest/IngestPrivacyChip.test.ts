@@ -18,6 +18,7 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
       maxImagesPerRequest: 20,
       maxPagesPerCard: 4,
       maxPixels: 100000000,
+      maxJpegPixels: 256000000,
     },
     inbox: { enabled: false, folder: null },
     ...overrides,
@@ -28,7 +29,12 @@ const slot = (tag = "div", className = "") => ({ template: `<${tag} class="${cla
 
 const wrappers: VueWrapper[] = [];
 
-function mountChip(props: { settings: RecipeIngestionSettingsOut | null; localOnly?: boolean; alreadySent?: number }) {
+function mountChip(props: {
+  settings: RecipeIngestionSettingsOut | null;
+  localOnly?: boolean;
+  alreadySent?: number;
+  finishedBatch?: boolean;
+}) {
   const wrapper = mount(IngestPrivacyChip, {
     props: {
       ...props,
@@ -44,6 +50,7 @@ function mountChip(props: { settings: RecipeIngestionSettingsOut | null; localOn
         VCard: slot("div", "card"),
         VCardTitle: slot("h4"),
         VCardText: slot(),
+        VAlert: { props: ["type"], template: "<div class=\"alert\" :data-type=\"type\"><slot /></div>" },
         VSwitch: {
           props: ["modelValue", "label", "hint"],
           emits: ["update:modelValue"],
@@ -115,11 +122,60 @@ describe("IngestPrivacyChip", () => {
     const wrapper = mountChip({ settings: settings({ localOnlyAvailable: true }), localOnly: true, alreadySent: 3 });
     await wrapper.get(".chip").trigger("click");
     expect(wrapper.get(".already-sent").text()).toBe("3 cards already sent aren't affected.");
+    // its own box, spaced from the switch's hint
+    expect(wrapper.get(".already-sent").classes()).toContain("mt-4");
+    expect(wrapper.get(".already-sent").attributes("data-type")).toBe("info");
 
     await wrapper.setProps({ alreadySent: 1 });
     expect(wrapper.get(".already-sent").text()).toBe("1 card already sent isn't affected.");
     await wrapper.setProps({ alreadySent: 0 });
     expect(wrapper.find(".already-sent").exists()).toBe(false);
+  });
+
+  test("when the switch finished the open batch, says so until the next photo", async () => {
+    const wrapper = mountChip({
+      settings: settings({ localOnlyAvailable: true }),
+      localOnly: true,
+      alreadySent: 2,
+      finishedBatch: true,
+    });
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.findAll(".already-sent p").map(p => p.text())).toEqual([
+      "2 cards already sent aren't affected.",
+      "The cards already sent finish as their own batch; the next photo starts a new one.",
+    ]);
+    // the batch is sealed: only why it finished is left
+    await wrapper.setProps({ alreadySent: 0 });
+    expect(wrapper.get(".already-sent").text())
+      .toBe("The cards already sent finish as their own batch; the next photo starts a new one.");
+    await wrapper.setProps({ finishedBatch: false });
+    expect(wrapper.find(".already-sent").exists()).toBe(false);
+  });
+
+  test("the switch says it's remembered on this device", async () => {
+    const wrapper = mountChip({ settings: settings({ localOnlyAvailable: true }) });
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.get(".switch small").text()).toContain("Remembered on this device.");
+  });
+
+  test("a local-only group with nothing on the network to read cards: a warning, not the green lock", async () => {
+    const wrapper = mountChip({ settings: settings({ localOnly: true, localOnlyAvailable: false }) });
+    const chip = wrapper.get(".chip");
+    expect(chip.text()).toBe("Kept on this server, but nothing here can read it");
+    expect(chip.classes()).toContain("privacy-blocked");
+    expect(chip.attributes("data-color")).toBe("warning");
+    expect(chip.attributes("data-icon")).not.toBe(mountChip({ settings: settings({ localOnly: true, localOnlyAvailable: true }) })
+      .get(".chip").attributes("data-icon"));
+  });
+
+  test("the switch remembered on while nothing local can read cards: a warning, and the switch to turn it off", async () => {
+    const wrapper = mountChip({ settings: settings({ localOnlyAvailable: false }), localOnly: true });
+    expect(wrapper.get(".chip").attributes("data-color")).toBe("warning");
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.get(".keep-local-unavailable").text()).toContain("cards sent with this on fail");
+
+    await wrapper.get(".switch input").setValue(false);
+    expect(wrapper.emitted("update:localOnly")).toEqual([[false]]);
   });
 
   test("no batch opt-in when nothing local can read cards", async () => {

@@ -8,14 +8,17 @@ no id, slug, assets, settings, rating or extras on it.
 """
 
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import UUID4, ConfigDict, Field, model_validator
 
 from mealie.schema._mealie import MealieModel
 
-CARD_DRAFT_SCHEMA_VERSION = 1
-"""The current `CardDraft.schema_version`"""
+CARD_DRAFT_SCHEMA_VERSION = 2
+"""The current `CardDraft.schema_version`. Version 2 gave notes an `id`."""
+
+NOTE_ID_NAMESPACE = UUID("6f1d2b8e-4c3a-4e57-9a0d-2b5c7e9f1a34")
+"""The `uuid5` namespace of the ids a note sent or stored without one is given (`note_id_for`)"""
 
 # NaN and infinity would reach the flag rules and the recipe as numbers; a save with one gets a 422
 _LENIENT = ConfigDict(extra="ignore", allow_inf_nan=False)
@@ -60,6 +63,8 @@ class CardDraftStep(MealieModel):
 
 
 class CardDraftNote(MealieModel):
+    id: UUID4 = Field(default_factory=uuid4)
+    """Server-made and stable; flags are keyed to it. A note without one gets `note_id_for` its place and text."""
     title: str = ""
     text: str = ""
 
@@ -82,13 +87,21 @@ class CardDraft(MealieModel):
     """Who the recipe is from, exactly as on the card ("From Grandma Jo"); becomes a note titled "From" at commit"""
     use_card_as_cover: bool = True
     """Whether commit makes the front of the card the recipe's image"""
+    attach_card_photo: bool | None = None
+    """
+    Whether commit attaches the card's photos to the recipe as assets; None means the household's default (attached
+    unless the household's recipes are public)
+    """
     ingredients: list[CardDraftIngredient] = Field(default_factory=list)
     steps: list[CardDraftStep] = Field(default_factory=list)
     notes: list[CardDraftNote] = Field(default_factory=list)
     tags: list[CardDraftRef] = Field(default_factory=list)
     categories: list[CardDraftRef] = Field(default_factory=list)
     tools: list[CardDraftRef] = Field(default_factory=list)
-    """Suggestions matching the group's existing organizers; commit never creates any"""
+    """
+    Tags, categories and tools: suggestions matching the group's existing organizers by id, or names the reviewer
+    added, which commit creates when the committer can organize
+    """
 
     model_config = _LENIENT
 
@@ -96,12 +109,35 @@ class CardDraft(MealieModel):
     @classmethod
     def _migrate(cls, data: Any) -> Any:
         """
-        Brings a stored draft up to `CARD_DRAFT_SCHEMA_VERSION`. Version 1 is the first; later versions add their
-        steps here, keyed by the stored `schema_version`. A draft from a newer version is read as it is.
+        Brings a stored or sent draft up to `CARD_DRAFT_SCHEMA_VERSION`, keyed by its `schema_version`; a draft from a
+        newer version is read as it is.
+
+        Version 2 gave notes an `id`. A note without one (stored by version 1, or new on a page that sent none) gets
+        `note_id_for` its position and text, so reading the same draft twice gives the same ids until it's saved.
         """
-        if isinstance(data, dict):
-            version = data.get("schema_version", data.get("schemaVersion"))
-            if not isinstance(version, int) or version < 1:
-                data = {**data, "schema_version": CARD_DRAFT_SCHEMA_VERSION}
-                data.pop("schemaVersion", None)
+        if not isinstance(data, dict):
+            return data
+        version = data.get("schema_version", data.get("schemaVersion"))
+        if not isinstance(version, int) or version < CARD_DRAFT_SCHEMA_VERSION:
+            data = {**data, "schema_version": CARD_DRAFT_SCHEMA_VERSION}
+            data.pop("schemaVersion", None)
+
+        notes = data.get("notes")
+        if isinstance(notes, list) and any(isinstance(note, dict) and not note.get("id") for note in notes):
+            data = {
+                **data,
+                "notes": [
+                    {**note, "id": note_id_for(index, note)} if isinstance(note, dict) and not note.get("id") else note
+                    for index, note in enumerate(notes)
+                ],
+            }
         return data
+
+
+def note_id_for(index: int, note: dict[str, Any]) -> UUID:
+    """
+    The id of a note that has none: the same for the same position, title and text, so repeated reads of a stored
+    draft agree. Shaped as a version 4 UUID, like every other draft id.
+    """
+    key = f"note:{index}:{note.get('title') or ''}:{note.get('text') or ''}"
+    return UUID(bytes=uuid5(NOTE_ID_NAMESPACE, key).bytes, version=4)

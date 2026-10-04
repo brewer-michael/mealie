@@ -1,6 +1,7 @@
 """The second reading's alignment and comparison (docs/ai/PHASE2.md §4.5), and the card text it reads"""
 
 import textwrap
+import time
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -189,13 +190,36 @@ def test_the_same_food_in_two_sections_is_compared_with_its_own_line():
 
     # the main reading copied the cake's amount into the frosting: the second reading's frosting line says otherwise
     assert _cross_read(["1 c. sugar", "2 eggs", "1 c. sugar", "2 T. butter"], CAKE_AND_FROSTING) == [
-        (2, "read_disagreement", {"text": "1/2 c. sugar", "value": "1"}, ["1/2 c. sugar"])
+        (2, "read_disagreement", {"text": "1/2 c. sugar", "value": "1", "start": 0, "end": 1}, ["1/2 c. sugar"])
     ]
 
 
 def test_an_amount_the_second_reading_lacks_is_flagged_on_the_ingredients_own_line():
     assert _cross_read(["1 c. sugar", "1 c. brown sugar"], ["c. sugar", "1 c. brown sugar"]) == [
-        (0, "read_disagreement", {"text": "c. sugar", "value": "1"}, ["c. sugar"])
+        (0, "read_disagreement", {"text": "c. sugar", "value": "1", "start": 0, "end": 1}, ["c. sugar"])
+    ]
+
+
+def test_a_gap_in_the_second_reading_raises_one_flag_not_two():
+    """A marker stands where a number would: the unit after it agrees, and only the number is missing"""
+    assert salient_tokens("[blank] c. sugar") == [("marker", "blank"), ("unit", "cup")]
+    assert salient_tokens("[illegible] T. butter") == [("marker", "illegible"), ("unit", "tbsp")]
+
+    gap = compare("2 c. sugar", "[blank] c. sugar")
+    assert gap is not None and (gap.missing, gap.window_blank, gap.spans) == ([("number", "2")], True, [(0, 1)])
+
+    assert _cross_read(["2 c. sugar", "1 egg"], ["[blank] c. sugar", "1 egg"]) == [
+        (0, "blank", {"value": "2", "start": 0, "end": 1}, [])
+    ]
+    # a different unit next to the gap still disagrees
+    assert _cross_read(["2 c. sugar"], ["[blank] t. sugar"]) == [
+        (0, "blank", {"value": "2", "start": 0, "end": 1}, []),
+        (
+            0,
+            "read_disagreement",
+            {"text": "[blank] t. sugar", "value": "cup", "start": 2, "end": 3},
+            ["[blank] t. sugar"],
+        ),
     ]
 
 
@@ -343,6 +367,49 @@ def test_long_steps_align_whole_and_partial_ratio_only_sees_short_windows(monkey
     compute_flags(draft, extraction, {}, previous=extracted)
     assert set(counting.partial_windows) <= short_windows
     assert len(counting.partial_windows) <= (2 * len(PAGE_STEPS) + 1) * STEP_MAX_LINES * len(PAGE)
+
+
+def test_a_page_read_one_word_per_line_aligns_in_bounded_time(monkeypatch: pytest.MonkeyPatch):
+    """
+    Six 600-letter steps against a transcript of one word per line (685 lines): runs of short lines are windowed in
+    pieces, so a save stays fast. Every window used to be grown word by word from every line: about 21,000 scorer calls
+    here (97,000 on random words) and up to a second per save.
+    """
+    words = iter(" ".join(PAGE_STEPS * 6).split())
+    steps: list[str] = []
+    for _ in range(6):
+        step: list[str] = []
+        while len(" ".join(step)) < 575:
+            step.append(next(words))
+        steps.append(" ".join(step))
+    lines = [word for step in steps for word in step.split()]
+    lines += [next(words) for _ in range(685 - len(lines))]  # and more of the page after them
+    assert len(lines) == 685 and all(575 <= len(step) <= 600 for step in steps)
+
+    calls = 0
+
+    class Counting:
+        def __getattr__(self, name: str) -> Any:
+            scorer = getattr(fuzz, name)
+
+            def counted(*args: Any, **kwargs: Any) -> Any:
+                nonlocal calls
+                calls += 1
+                return scorer(*args, **kwargs)
+
+            return counted
+
+    monkeypatch.setattr(crossread, "fuzz", Counting())
+    draft = CardDraft(name="Page", steps=[CardDraftStep(text=step) for step in steps])
+
+    started = time.perf_counter()
+    flags = compute_flags(draft, ExtractionMeta(language="English", cross_read_lines=lines), {})
+    elapsed = time.perf_counter() - started
+
+    assert calls <= 2_000  # about 21,000 when windows grew line by line
+    assert elapsed < 0.15
+    # each step still finds its own words, so the two readings agree
+    assert [flag for flag in flags if flag.source == CardFlagSource.cross_read] == []
 
 
 def test_compare_lists_what_the_second_reading_lacks():

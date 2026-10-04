@@ -8,3 +8,4 @@ Rules for recipe cards, which override the rules above where they differ:
 - Keep side-by-side columns apart: the title first, then the ingredient column line by line, then the method. Never merge lines from different columns.
 - Skip words that are crossed out. Never add quantities, times, temperatures, ingredients or steps that aren't written on the card.
 - Set language to the language the card is written in.
+- For each image, in order, set rotation_clockwise to how many degrees that image must be turned clockwise for its writing to read upright: 0, 90, 180 or 270. Use 0 when the writing already reads upright. Transcribe the writing as it reads once upright.

@@ -24,6 +24,7 @@ from mealie.middleware.locale_context import LocaleContextMiddleware
 from mealie.routes import oauth, router, spa, utility_routes
 from mealie.routes.handlers import register_debug_handler
 from mealie.routes.media import media_router
+from mealie.services.ai.ingest.restore_guard import RestoreGuardMiddleware  # fork: docs/ai/PHASE2.md §3.9
 from mealie.services.scheduler import SchedulerRegistry, SchedulerService, tasks
 
 settings = get_app_settings()
@@ -106,6 +107,7 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
 app.add_middleware(LocaleContextMiddleware)
+app.add_middleware(RestoreGuardMiddleware)  # fork: upstream writes wait for, and stop during, a backup restore
 
 if not settings.PRODUCTION:
     allowed_origins = ["http://localhost:3000"]

@@ -3,7 +3,7 @@
     <v-chip
       class="privacy-chip"
       :class="`privacy-${kind}`"
-      :color="kind === 'local' ? 'success' : undefined"
+      :color="kind === 'local' ? 'success' : kind === 'blocked' ? 'warning' : undefined"
       :prepend-icon="icon"
       variant="tonal"
       :aria-expanded="open"
@@ -38,9 +38,25 @@
           <p v-else class="local-unavailable">
             {{ $t("recipe-ingest.privacy.local-unavailable") }}
           </p>
-          <p v-if="alreadySent > 0 && !settings?.localOnly" class="already-sent text-caption mt-2 mb-0">
-            {{ $t("recipe-ingest.privacy.already-sent", alreadySent) }}
+          <!-- remembered on, but nothing on the network can read cards now -->
+          <p v-if="kind === 'blocked' && !settings?.localOnly" class="keep-local-unavailable text-caption text-warning mt-4 mb-0">
+            {{ $t("recipe-ingest.privacy.keep-local-unavailable") }}
           </p>
+          <!-- spaced from the switch's hint: the cards that had already left keep the setting they went with -->
+          <v-alert
+            v-if="(alreadySent > 0 || finishedBatch) && !settings?.localOnly"
+            class="already-sent mt-4"
+            type="info"
+            variant="tonal"
+            density="compact"
+          >
+            <p v-if="alreadySent > 0" class="mb-0">
+              {{ $t("recipe-ingest.privacy.already-sent", alreadySent) }}
+            </p>
+            <p v-if="finishedBatch" class="finished-batch mb-0">
+              {{ $t("recipe-ingest.privacy.finished-batch") }}
+            </p>
+          </v-alert>
         </v-card-text>
       </v-card>
     </v-expand-transition>
@@ -53,14 +69,18 @@ import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 
 /**
  * Where the photos go (docs/ai/PHASE2.md §1.1, §10), from the card settings' `reader`. Tapping it offers keeping this
- * batch's cards on this server when local providers can read them. Fork-owned.
+ * user's cards on this server when local providers can read them (remembered on this device). Kept on this server with
+ * nothing local to read them, it's a warning. Fork-owned.
  */
 const props = withDefaults(defineProps<{
   settings: RecipeIngestionSettingsOut | null;
   /** Cards that had already left when the switch last changed: the server keeps the setting they were sent with */
   alreadySent?: number;
+  /** The switch's last change finished the open batch: the next photo starts a new one */
+  finishedBatch?: boolean;
 }>(), {
   alreadySent: 0,
+  finishedBatch: false,
 });
 
 /** The batch asks to stay on this server (a batch can opt in when the group doesn't, never out) */
@@ -72,11 +92,12 @@ const open = ref(false);
 /**
  * `local` only when a policy keeps every AI call of the card on this server (the group's setting or the batch's).
  * A local first reader alone doesn't: the card could fall back to a cloud provider, or be structured by one.
+ * `blocked` when such a policy applies but no AI provider on the network can read cards: every card would fail.
  */
-const kind = computed<"local" | "local-reader" | "ocr" | "cloud" | "none">(() => {
+const kind = computed<"local" | "blocked" | "local-reader" | "ocr" | "cloud" | "none">(() => {
   const reader = props.settings?.reader;
   if (props.settings?.localOnly || localOnly.value) {
-    return "local";
+    return props.settings && !props.settings.localOnlyAvailable ? "blocked" : "local";
   }
   if (!reader) {
     return "none";
@@ -92,6 +113,8 @@ const text = computed(() => {
   switch (kind.value) {
     case "local":
       return i18n.t("recipe-ingest.privacy.local");
+    case "blocked":
+      return i18n.t("recipe-ingest.privacy.local-blocked");
     case "local-reader":
       return i18n.t("recipe-ingest.privacy.local-reader", { name });
     case "ocr":
@@ -109,6 +132,7 @@ const icon = computed(() => {
       return mdiLock;
     case "local-reader":
       return mdiLan;
+    case "blocked":
     case "none":
       return mdiAlertCircleOutline;
     default:

@@ -91,7 +91,7 @@ describe("IngestCardViewer", () => {
   });
 
   test("on desktop, rotate, re-read and what the card says", async () => {
-    const wrapper = mountViewer({ mode: "panel", page: 1, transcription: "Banana Mug Cake\nMicrowave [blank] minutes" });
+    const wrapper = mountViewer({ mode: "panel", page: 1, canReread: true, transcription: "Banana Mug Cake\nMicrowave [blank] minutes" });
 
     expect(wrapper.classes()).toContain("ingest-card-panel");
     await button(wrapper, "Rotate").trigger("click");
@@ -110,5 +110,15 @@ describe("IngestCardViewer", () => {
     const wrapper = mountViewer({ mode: "panel", readonly: true });
     expect(button(wrapper, "Rotate").attributes("disabled")).toBeDefined();
     expect(button(wrapper, "Re-read an area").attributes("disabled")).toBeDefined();
+  });
+
+  test("a failed card can be turned, but has nothing to re-read an area of", async () => {
+    // the page passes readonly=false (rotate works on a failed card) and canReread=false (re-reads need a ready one)
+    const wrapper = mountViewer({ mode: "panel", readonly: false, canReread: false });
+
+    expect(button(wrapper, "Rotate").attributes("disabled")).toBeUndefined();
+    expect(button(wrapper, "Re-read an area").attributes("disabled")).toBeDefined();
+    await button(wrapper, "Re-read an area").trigger("click");
+    expect(wrapper.emitted("reread")).toBeUndefined();
   });
 });

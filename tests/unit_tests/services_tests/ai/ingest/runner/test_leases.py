@@ -7,6 +7,7 @@ import asyncio
 import math
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -422,7 +423,7 @@ def test_shutdown_during_a_claim_gives_back_what_it_claimed(
 ):
     """
     Shutdown cancels the dispatcher's loop while a claim is in flight (its `UPDATE` committed, the claim phase not yet
-    back): the claimed task is still started, stopped and released, not left `running` with an attempt used
+    back): the claimed task is given back without being started, not left `running` with an attempt used
     """
     monkeypatch.setattr(dispatcher_module, "STOP_WAIT", 0.05)
     claimed = threading.Event()
@@ -445,6 +446,7 @@ def test_shutdown_during_a_claim_gives_back_what_it_claimed(
 
     run(scenario())
     assert dispatcher.running_tasks == []
+    assert handlers.calls == []
     row = jobs.row(job_id)
     assert (row["status"], row["task_state"], row["lease_token"], row["attempts"]) == (
         IngestStatus.processing,
@@ -452,6 +454,150 @@ def test_shutdown_during_a_claim_gives_back_what_it_claimed(
         None,
         0,
     )
+
+
+def _wait_until(condition: Callable[[], bool], timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting"
+        time.sleep(0.01)
+
+
+def test_a_claim_that_ends_after_the_shutdown_grace_gives_back_what_it_claimed(
+    dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, db: Session, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A claim's `UPDATE` that only lands after shutdown gave up waiting for it (e.g. SQLite busy for longer than the
+    grace) is given back by the claim itself: queued, no lease, its attempt not used up, and never started. A task
+    another process holds is left alone.
+    """
+    monkeypatch.setattr(dispatcher_module, "STOP_WAIT", 0.05)
+    monkeypatch.setattr(limits, "SHUTDOWN_GRACE", 0.2)
+    elsewhere = jobs.create()
+    elsewhere_token = _claim(db, elsewhere)
+    job_id = jobs.create()
+    entered, landed = threading.Event(), threading.Event()
+    claim = IngestQueue.claim
+
+    def slow_claim(self: IngestQueue, claimed_id: UUID, **kwargs: Any) -> bool:
+        entered.set()
+        time.sleep(0.8)  # past the shutdown grace
+        won = claim(self, claimed_id, **kwargs)
+        landed.set()
+        return won
+
+    monkeypatch.setattr(IngestQueue, "claim", slow_claim)
+    handlers.default = blocking(threading.Event())
+
+    async def scenario() -> None:
+        await dispatcher.start()
+        await wait_for(entered.is_set)
+        await dispatcher.stop()
+        assert not landed.is_set()  # shutdown didn't wait for it
+
+    run(scenario())
+    assert landed.wait(10)
+    _wait_until(lambda: jobs.row(job_id)["task_state"] == IngestTaskState.queued)
+    row = jobs.row(job_id)
+    assert (row["status"], row["task_state"], row["lease_token"], row["lease_owner"], row["attempts"]) == (
+        IngestStatus.processing,
+        IngestTaskState.queued,
+        None,
+        None,
+        0,
+    )
+    assert handlers.calls == []
+    other = jobs.row(elsewhere)
+    assert (other["task_state"], other["lease_token"], other["lease_owner"], other["attempts"]) == (
+        IngestTaskState.running,
+        elsewhere_token,
+        "elsewhere",
+        1,
+    )
+
+
+def test_shutdown_stops_a_claim_in_flight_before_its_next_task(
+    dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, monkeypatch: pytest.MonkeyPatch
+):
+    """Shutdown during a claim: the claim takes no further task, and gives back the one it took"""
+    monkeypatch.setattr(dispatcher_module, "STOP_WAIT", 0.05)
+    job_ids = [jobs.create(), jobs.create()]
+    entered = threading.Event()
+    attempted: list[UUID] = []
+    claim = IngestQueue.claim
+
+    def slow_claim(self: IngestQueue, claimed_id: UUID, **kwargs: Any) -> bool:
+        attempted.append(claimed_id)
+        entered.set()
+        time.sleep(0.3)
+        return claim(self, claimed_id, **kwargs)
+
+    monkeypatch.setattr(IngestQueue, "claim", slow_claim)
+    handlers.default = blocking(threading.Event())
+
+    async def scenario() -> None:
+        await dispatcher.start()
+        await wait_for(entered.is_set)
+        await dispatcher.stop()
+
+    run(scenario())
+    assert len(attempted) == 1
+    assert handlers.calls == []
+    for job_id in job_ids:
+        row = jobs.row(job_id)
+        assert (row["task_state"], row["lease_token"], row["attempts"]) == (IngestTaskState.queued, None, 0)
+
+
+def test_shutdown_releases_every_lease_of_this_dispatcher_and_no_other(
+    dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, db: Session
+):
+    """A lease of this dispatcher's that no running task knows of (claimed, its thread never started) is released too"""
+    own, other = jobs.create(), jobs.create()
+    token = uuid4()
+    assert IngestQueue(db).claim(own, token=token, owner=dispatcher.owner, now=utcnow())
+    other_token = _claim(db, other)
+
+    run(dispatcher.stop())
+    row = jobs.row(own)
+    assert (row["task_state"], row["lease_token"], row["lease_owner"], row["attempts"]) == (
+        IngestTaskState.queued,
+        None,
+        None,
+        0,
+    )
+    assert (jobs.row(other)["task_state"], jobs.row(other)["lease_token"]) == (IngestTaskState.running, other_token)
+
+
+def test_a_long_host_name_never_makes_two_dispatchers_one_owner(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(dispatcher_module.socket, "gethostname", lambda: "h" * 64)
+    owners = {IngestDispatcher().owner, IngestDispatcher().owner}
+    assert len(owners) == 2
+    assert all(len(owner) == 64 and owner.startswith("h") for owner in owners)
+
+
+def test_releasing_by_owner_gives_back_only_that_owners_running_tasks(db: Session, jobs: Jobs):
+    mine = [jobs.create(), jobs.create()]
+    theirs = jobs.create()
+    queued = jobs.create()
+    queue = IngestQueue(db)
+    for job_id in mine:
+        assert queue.claim(job_id, token=uuid4(), owner="host:1:mine", now=utcnow())
+    their_token = uuid4()
+    assert queue.claim(theirs, token=their_token, owner="host:1:theirs", now=utcnow())
+
+    assert queue.release_owned("host:1:mine") == 2
+    for job_id in mine:
+        row = jobs.row(job_id)
+        assert (row["task_state"], row["lease_token"], row["lease_owner"], row["lease_expires_at"]) == (
+            IngestTaskState.queued,
+            None,
+            None,
+            None,
+        )
+        assert (row["attempts"], row["progress_key"], row["not_before"]) == (0, None, None)
+    assert (jobs.row(theirs)["task_state"], jobs.row(theirs)["lease_token"]) == (IngestTaskState.running, their_token)
+    assert jobs.row(queued)["task_state"] == IngestTaskState.queued
+    assert queue.release_owned("host:1:mine") == 0
 
 
 def test_a_cancellation_before_the_task_thread_attached_is_delivered_when_it_does():

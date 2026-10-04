@@ -1,21 +1,23 @@
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, describe, expect, test } from "vitest";
 import IngestReviewBar from "./IngestReviewBar.vue";
-import type { SaveState } from "~/composables/use-recipe-ingest-review";
+import type { ReviewNotice, SaveState } from "~/composables/use-recipe-ingest-review";
 
 const stubs = {
   VSpacer: { template: "<span />" },
+  VIcon: { props: ["icon", "color"], template: "<i class=\"icon\" :data-icon=\"icon\" :data-color=\"color\" />" },
   VBtn: {
     props: ["disabled", "loading", "color"],
     emits: ["click"],
-    template: "<button type=\"button\" :class=\"$attrs.class\" :data-color=\"color\" :data-loading=\"loading\" :disabled=\"disabled\" @click=\"$emit('click')\"><slot /></button>",
+    template: "<button type=\"button\" :class=\"$attrs.class\" :aria-label=\"$attrs['aria-label']\" :data-color=\"color\" :data-loading=\"loading\" :disabled=\"disabled\" @click=\"$emit('click')\"><slot /></button>",
   },
 };
 
+const icons = { check: "check-icon", alert: "warning-icon", alertCircle: "error-icon", informationOutline: "info-icon", close: "close-icon" };
 const wrappers: VueWrapper[] = [];
 
-function mountBar(props: { errorCount?: number; disabled?: boolean; committing?: boolean; saveState?: SaveState; fixed?: boolean } = {}) {
-  const wrapper = mount(IngestReviewBar, { props, global: { mocks: { $globals: { icons: {} } }, stubs } });
+function mountBar(props: { errorCount?: number; disabled?: boolean; committing?: boolean; saveState?: SaveState; fixed?: boolean; notice?: ReviewNotice | null; actions?: boolean } = {}) {
+  const wrapper = mount(IngestReviewBar, { props, global: { mocks: { $globals: { icons } }, stubs } });
   wrappers.push(wrapper);
   return wrapper;
 }
@@ -85,5 +87,52 @@ describe("IngestReviewBar", () => {
   test("is pinned to the bottom of a phone's screen", () => {
     expect(mountBar({ fixed: true }).classes()).toContain("ingest-review-bar--fixed");
     expect(mountBar().classes()).not.toContain("ingest-review-bar--fixed");
+  });
+
+  test("a notice shows inside the bar, above its buttons, in a live region", async () => {
+    const wrapper = mountBar({ notice: { id: 1, kind: "success", text: "Added Banana Mug Cake" } });
+
+    const region = wrapper.get("[role=status]");
+    expect(region.attributes("aria-live")).toBe("polite");
+    const notice = region.get(".ingest-review-bar__notice");
+    expect(notice.text()).toContain("Added Banana Mug Cake");
+    expect(notice.classes()).toContain("ingest-review-bar__notice--success");
+    expect(notice.get(".icon").attributes("data-icon")).toBe("check-icon");
+    // before Skip and Commit & next in the bar, so it takes its own room rather than covering what's above
+    const html = wrapper.html();
+    expect(html.indexOf("ingest-review-bar__notice")).toBeLessThan(html.indexOf("ingest-review-bar__skip"));
+
+    await wrapper.get(".ingest-review-bar__notice-close").trigger("click");
+    expect(wrapper.emitted("notice-dismiss")).toHaveLength(1);
+    expect(wrapper.get(".ingest-review-bar__notice-close").attributes("aria-label")).toBe("Close");
+  });
+
+  test("a notice's button and its second line", async () => {
+    const wrapper = mountBar({
+      notice: {
+        id: 2,
+        kind: "warning",
+        text: "Added Lemon Bars",
+        detail: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+        action: { label: "Read whole card again", run: () => undefined },
+      },
+    });
+
+    expect(wrapper.get(".ingest-review-bar__notice-detail").text()).toBe("The tag \"Desserts\" no longer exists, so it wasn't added.");
+    expect(wrapper.get(".ingest-review-bar__notice .icon").attributes("data-icon")).toBe("warning-icon");
+    await wrapper.get(".ingest-review-bar__notice-action").trigger("click");
+    expect(wrapper.emitted("notice-action")).toHaveLength(1);
+  });
+
+  test("without its actions (a card that isn't ready) the bar holds only the notice", () => {
+    const wrapper = mountBar({ actions: false, notice: { id: 3, kind: "error", text: "This card no longer exists." } });
+
+    expect(wrapper.get(".ingest-review-bar__notice").classes()).toContain("ingest-review-bar__notice--error");
+    expect(wrapper.find(".ingest-review-bar__skip").exists()).toBe(false);
+    expect(wrapper.find(".ingest-review-bar__primary").exists()).toBe(false);
+  });
+
+  test("no notice, no strip", () => {
+    expect(mountBar().find(".ingest-review-bar__notice").exists()).toBe(false);
   });
 });

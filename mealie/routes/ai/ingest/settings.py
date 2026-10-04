@@ -74,6 +74,7 @@ def _limits() -> IngestLimits:
         max_images_per_request=limits.MAX_IMAGES_PER_REQUEST,
         max_pages_per_card=limits.MAX_PAGES_PER_CARD,
         max_pixels=limits.MAX_PIXELS,
+        max_jpeg_pixels=limits.MAX_PIXELS,
     )
 
 

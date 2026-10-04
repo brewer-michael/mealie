@@ -14,7 +14,13 @@ dropped value.
   it, even when the reviewer has since filled it in, and is listed in `blanks`: the transcription still has the
   marker, and `restore_blanks` puts it back in the reviewed wording;
 - `origin` records the job, the provider and model that drafted it and the Mealie commit, so the report can mark runs
-  scored against a provider's own drafts.
+  scored against a provider's own drafts;
+- the reviewer's tags (`handwritten`, `printed`, `faded`) and notes go into the fixture, next to the tags found from
+  the card itself (`sideways`, `two-sided`, `blank`).
+
+**Managing cases:** `update_eval_case` changes a case's `verified_by_owner`, the reviewer's tags and its notes in
+place; `eval_case_archive` zips its JSON and photos for download (to move a redacted card into `tests/data/cards/` or
+run the eval elsewhere).
 """
 
 import io
@@ -25,6 +31,7 @@ import re
 import subprocess
 import tempfile
 import unicodedata
+import zipfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,6 +54,8 @@ from mealie.schema.recipe_ingest import (
     CardDraftIngredient,
     EvalCaseOut,
     EvalCaseSummary,
+    EvalCaseTag,
+    EvalCaseUpdate,
     ExtractionMeta,
     IngestStatus,
     PageMeta,
@@ -254,6 +263,10 @@ UNIT_ALIASES: dict[str, tuple[str, ...]] = {
     "pkg": ("package", "packages", "pkgs"),
     "clove": ("cloves",),
     "slice": ("slices",),
+    # the pipeline's other card abbreviations (`shorthand.ABBREVIATIONS`)
+    "dozen": ("dozens", "doz"),
+    "envelope": ("envelopes", "env"),
+    "square": ("squares", "sq"),
 }
 """Units an ingredient line may start with, after its quantity, and their other spellings, matched ignoring case"""
 
@@ -678,11 +691,23 @@ def _tags(pages: Sequence[PageMeta], expected: ExpectedRecipe) -> list[str]:
     return tags
 
 
-def build_eval_case(job: RecipeIngestionJob, slug: str, verified: bool, *, now: datetime | None = None) -> EvalCase:
+DEFAULT_CASE_NOTES = "Saved from the review page."
+
+
+def build_eval_case(
+    job: RecipeIngestionJob,
+    slug: str,
+    verified: bool,
+    *,
+    tags: Sequence[EvalCaseTag] = (),
+    notes: str | None = None,
+    now: datetime | None = None,
+) -> EvalCase:
     """
     A reviewed card as an eval case: its pages turned back by their recorded rotation (so orientation is still
     exercised) and free of metadata, and the fixture with the reviewed draft as the expected values, blanks kept,
-    `origin` and `verified_by_owner`. Reads the job's files, so callers hold the ingest write lock.
+    `origin`, `verified_by_owner`, the reviewer's `tags` with the ones found from the card, and `notes`. Reads the
+    job's files, so callers hold the ingest write lock.
 
     Raises `EvalCaseUnavailable` unless the job is `ready` or `committed` with its draft, and `EvalCaseFilesMissing`
     once its files are gone.
@@ -708,9 +733,9 @@ def build_eval_case(job: RecipeIngestionJob, slug: str, verified: bool, *, now: 
     fixture = CardFixture(
         schema_version=FIXTURE_SCHEMA_VERSION,
         source=names[0] if len(names) == 1 else names,
-        notes="Saved from the review page.",
+        notes=notes.strip() if notes and notes.strip() else DEFAULT_CASE_NOTES,
         verified_by_owner=verified,
-        tags=_tags(pages, expected),
+        tags=[*(tag.value for tag in dict.fromkeys(tags)), *_tags(pages, expected)],
         local_only=bool(job.local_only),
         origin=FixtureOrigin(
             job_id=str(job.id),
@@ -801,28 +826,88 @@ def _case_jsons(directory: Path) -> list[Path]:
     return sorted(paths, key=lambda path: path.stem)
 
 
+def _summary(path: Path, fixture: CardFixture | None) -> EvalCaseSummary:
+    created_at = fixture.origin.exported_at if fixture and fixture.origin else None
+    if created_at is None:
+        try:
+            created_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+        except OSError:
+            created_at = None
+    return EvalCaseSummary(
+        slug=path.stem,
+        name=fixture.expected.name if fixture else None,
+        page_count=len(fixture.sources) if fixture else 0,
+        verified=fixture.verified_by_owner if fixture else False,
+        tags=list(fixture.tags) if fixture else [],
+        notes=fixture.notes if fixture else "",
+        created_at=created_at,
+    )
+
+
 def list_eval_cases(group_id: UUID) -> list[EvalCaseSummary]:
     """The group's eval cases, by slug. A case whose JSON doesn't validate is listed without a name, so it can be
     deleted."""
-    summaries: list[EvalCaseSummary] = []
-    for path in _case_jsons(storage.eval_cards_dir(group_id)):
-        fixture = _read_fixture(path)
-        created_at = fixture.origin.exported_at if fixture and fixture.origin else None
-        if created_at is None:
-            try:
-                created_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-            except OSError:
-                created_at = None
-        summaries.append(
-            EvalCaseSummary(
-                slug=path.stem,
-                name=fixture.expected.name if fixture else None,
-                page_count=len(fixture.sources) if fixture else 0,
-                verified=fixture.verified_by_owner if fixture else False,
-                created_at=created_at,
-            )
-        )
-    return summaries
+    return [_summary(path, _read_fixture(path)) for path in _case_jsons(storage.eval_cards_dir(group_id))]
+
+
+def _case_json(group_id: UUID, slug: str) -> Path | None:
+    if not _SLUG_RE.match(slug):
+        return None
+    path = storage.eval_cards_dir(group_id) / f"{slug}.json"
+    return path if path.is_file() else None
+
+
+def update_eval_case(group_id: UUID, slug: str, update: EvalCaseUpdate) -> EvalCaseSummary | None:
+    """
+    Changes a saved case in place: `verified_by_owner`, the reviewer's tags (the ones found from the card stay) and
+    its notes; a field the update leaves out keeps its value. None when there's no such case. Raises `EvalCaseError`
+    for a case whose JSON doesn't validate. Callers hold the ingest write lock.
+    """
+    path = _case_json(group_id, slug)
+    if path is None:
+        return None
+    fixture = _read_fixture(path)
+    if fixture is None:
+        raise EvalCaseError()
+
+    changes: dict[str, Any] = {}
+    if update.verified is not None:
+        changes["verified_by_owner"] = update.verified
+    if update.tags is not None:
+        chosen = {tag.value for tag in EvalCaseTag}
+        found = [tag for tag in fixture.tags if tag not in chosen]
+        changes["tags"] = [*(tag.value for tag in update.tags), *found]
+    if update.notes is not None:
+        changes["notes"] = update.notes.strip()
+    if changes:
+        fixture = CardFixture.model_validate({**fixture.model_dump(), **changes})
+        storage.atomic_write_bytes(path, fixture_json(fixture))
+    return _summary(path, fixture)
+
+
+def eval_case_archive(group_id: UUID, slug: str) -> bytes | None:
+    """
+    A zip of a case's JSON and the photos it lists (only files next to it, by plain name), to download; None when
+    there's no such case. Callers hold the ingest write lock, so a restore can't replace the files mid-read.
+    """
+    path = _case_json(group_id, slug)
+    if path is None:
+        return None
+    fixture = _read_fixture(path)
+    names = [path.name]
+    if fixture:
+        directory = path.parent
+        names += [
+            name
+            for name in dict.fromkeys(fixture.sources)
+            if name == Path(name).name and not name.startswith(".") and (directory / name).is_file()
+        ]
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in names:
+            archive.writestr(name, (path.parent / name).read_bytes())
+    return buffer.getvalue()
 
 
 def _own_image_names(slug: str, names: Iterable[str]) -> set[str]:

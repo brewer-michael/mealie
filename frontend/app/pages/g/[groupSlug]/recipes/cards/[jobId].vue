@@ -1,16 +1,32 @@
 <template>
-  <div class="ingest-review" :class="{ 'ingest-review--phone': !$vuetify.display.mdAndUp }">
+  <div
+    class="ingest-review"
+    :class="{ 'ingest-review--phone': !$vuetify.display.mdAndUp }"
+    :style="barHeight ? { '--ingest-review-bar-height': `${barHeight}px` } : undefined"
+  >
     <div v-if="review.loadState.value === 'loading'" class="d-flex justify-center pa-8">
       <AppLoader />
     </div>
 
     <v-container v-else-if="review.loadState.value !== 'ready' || !job" class="ingest-review__missing">
       <v-alert type="warning" variant="tonal">
-        {{ review.loadState.value === "not-found" ? ingestErrorText("not_found") : $t("events.something-went-wrong") }}
+        {{ review.loadState.value === "not-found" ? ingestErrorText("not_found") : $t("recipe-ingest.review.load-failed") }}
       </v-alert>
-      <v-btn class="mt-4" variant="text" :to="queuePath">
-        {{ $t("recipe-ingest.queue.title") }}
-      </v-btn>
+      <div class="d-flex flex-wrap ga-2 mt-4">
+        <!-- a phone that lost its signal for a moment can load the card again where it is -->
+        <v-btn
+          v-if="review.loadState.value === 'failed'"
+          class="ingest-review__try-again"
+          color="primary"
+          :prepend-icon="$globals.icons.refresh"
+          @click="review.load()"
+        >
+          {{ $t("recipe-ingest.review.try-again") }}
+        </v-btn>
+        <v-btn variant="text" :to="queuePath">
+          {{ $t("recipe-ingest.queue.title") }}
+        </v-btn>
+      </div>
     </v-container>
 
     <template v-else>
@@ -73,6 +89,13 @@
               :disabled="!canReextract"
               @click="review.reextract()"
             />
+            <!-- phones have no toolbar: a line the reading missed, or a field with no flag, is re-read from here -->
+            <v-list-item
+              :prepend-icon="mdiCropFree"
+              :title="$t('recipe-ingest.review.reread-title')"
+              :disabled="!canReread"
+              @click="openReread()"
+            />
             <v-list-item
               :prepend-icon="mdiTextRecognition"
               :title="$t('recipe-ingest.review.what-the-card-says')"
@@ -105,6 +128,7 @@
             :pages="job.pages ?? []"
             :transcription="job.transcription"
             :readonly="!canRotate"
+            :can-reread="canReread"
             :rotating="review.pendingAction.value === 'rotate'"
             @rotate="pageNumber => review.rotate(pageNumber)"
             @reread="openReread()"
@@ -118,6 +142,17 @@
               <v-alert type="info" variant="tonal" class="ingest-review__status">
                 {{ progressLabel }}
                 <v-progress-linear indeterminate class="mt-2" />
+                <template v-if="canCancel" #append>
+                  <v-btn
+                    class="ingest-review__cancel"
+                    size="small"
+                    variant="text"
+                    :loading="review.pendingAction.value === 'cancel'"
+                    @click="review.cancelTask()"
+                  >
+                    {{ $t("general.cancel") }}
+                  </v-btn>
+                </template>
               </v-alert>
             </template>
             <template v-else-if="job.status === 'failed'">
@@ -219,6 +254,17 @@
                   {{ progressLabel }}
                 </div>
                 <v-progress-linear indeterminate class="mt-2" />
+                <template v-if="canCancel" #append>
+                  <v-btn
+                    class="ingest-review__cancel"
+                    size="small"
+                    variant="text"
+                    :loading="review.pendingAction.value === 'cancel'"
+                    @click="review.cancelTask()"
+                  >
+                    {{ $t("general.cancel") }}
+                  </v-btn>
+                </template>
               </v-alert>
               <v-alert
                 v-else-if="review.task.value?.kind === 'reread' || review.rereadQueue.value.length"
@@ -228,6 +274,17 @@
                 class="mb-3 ingest-review__rereading"
               >
                 {{ progressLabel }}
+                <template v-if="canCancel" #append>
+                  <v-btn
+                    class="ingest-review__cancel"
+                    size="small"
+                    variant="text"
+                    :loading="review.pendingAction.value === 'cancel'"
+                    @click="review.cancelTask()"
+                  >
+                    {{ $t("general.cancel") }}
+                  </v-btn>
+                </template>
               </v-alert>
               <v-alert
                 v-if="job.duplicateOf"
@@ -252,6 +309,7 @@
                 class="mb-3"
                 :items="review.needsALook.value"
                 :readonly="review.readOnly.value"
+                :can-reread="canReread"
                 @alternative="(flag, text) => review.applyFlagAlternative(flag, text)"
                 @fill="(flag, value) => review.fillFlagBlank(flag, value)"
                 @reread="flag => openReread(flag.field, flag.ref)"
@@ -299,6 +357,9 @@
                       :info-flags="review.infoFlags.value"
                       :readonly="review.readOnly.value"
                       :can-create-foods="!!job.permissions?.canCreateFoods"
+                      :can-reread="canReread"
+                      :draggable="$vuetify.display.mdAndUp"
+                      @reread="ref => openReread('ingredients', ref)"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -309,6 +370,9 @@
                       v-model="review.draft.value"
                       :flags="review.openFlags.value"
                       :readonly="review.readOnly.value"
+                      :can-reread="canReread"
+                      :draggable="$vuetify.display.mdAndUp"
+                      @reread="ref => openReread('steps', ref)"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -359,8 +423,11 @@
           </div>
 
           <IngestReviewBar
-            v-if="job.status === 'ready'"
+            v-if="job.status === 'ready' || review.notice.value"
+            ref="reviewBar"
             :fixed="!$vuetify.display.mdAndUp"
+            :actions="job.status === 'ready'"
+            :notice="review.notice.value"
             :error-count="review.openErrors.value.length"
             :disabled="review.readOnly.value"
             :committing="review.committing.value"
@@ -368,6 +435,8 @@
             @skip="review.skip()"
             @commit="commit"
             @fix="scrollToFirstError"
+            @notice-action="review.runNoticeAction()"
+            @notice-dismiss="review.dismissNotice()"
           />
         </v-col>
       </v-row>
@@ -433,32 +502,33 @@
       </BaseDialog>
     </template>
 
-    <!-- what the last card's Commit & next said, above the review bar (upstream's toast would cover the header) -->
-    <v-snackbar
-      v-model="noticeOpen"
-      class="ingest-review__notice"
-      location="bottom"
-      :color="notice?.warning ? 'warning' : 'success'"
-      :timeout="notice?.warning ? 6000 : 2000"
+    <!-- leaving while the last changes couldn't be saved (offline) -->
+    <BaseDialog
+      :model-value="!!leaveTo"
+      :title="$t('recipe-ingest.review.unsaved-title')"
+      :icon="$globals.icons.alert"
+      color="warning"
+      @update:model-value="value => !value && (leaveTo = null)"
     >
-      <div class="ingest-review__notice-text">
-        {{ notice?.text }}
-      </div>
-      <div v-if="notice?.warning" class="text-body-2 ingest-review__notice-warning">
-        {{ notice.warning }}
-      </div>
-      <template #actions>
-        <v-btn variant="text" @click="noticeOpen = false">
-          {{ $t("general.close") }}
+      <v-card-text>
+        {{ $t("recipe-ingest.review.unsaved-text") }}
+      </v-card-text>
+      <template #card-actions>
+        <v-btn variant="text" class="ingest-review__stay" @click="leaveTo = null">
+          {{ $t("recipe-ingest.review.stay") }}
+        </v-btn>
+        <v-spacer />
+        <v-btn color="warning" variant="flat" class="ingest-review__leave" @click="leaveAnyway">
+          {{ $t("recipe-ingest.review.leave") }}
         </v-btn>
       </template>
-    </v-snackbar>
+    </BaseDialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { mdiTextRecognition } from "@mdi/js";
-import { useActiveElement, useMagicKeys, whenever } from "@vueuse/core";
+import { mdiCropFree, mdiTextRecognition } from "@mdi/js";
+import { useActiveElement, useElementSize, useMagicKeys, whenever } from "@vueuse/core";
 import IngestCardViewer from "~/components/Domain/Ingest/IngestCardViewer.vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestIngredientList from "~/components/Domain/Ingest/IngestIngredientList.vue";
@@ -471,7 +541,7 @@ import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
 import RecipeNotes from "~/components/Domain/Recipe/RecipeNotes.vue";
-import { takeRecipeIngestCommitNotice, useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
+import { useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,
   fieldLabel,
@@ -500,9 +570,15 @@ const i18nT: TranslateFn = (key, named) => i18n.t(key, named ?? {});
 const groupSlug = computed(() => String(route.params.groupSlug ?? ""));
 const jobId = String(route.params.jobId ?? "");
 
+/** Where the review itself last went (Previous, Next, Commit & next): it replaces the route, so Back goes to the queue */
+let reviewNavigation: string | null = null;
+
 const review = useRecipeIngestReview(jobId, {
   groupSlug,
-  navigate: path => router.replace(path),
+  navigate: (path) => {
+    reviewNavigation = path;
+    return router.replace(path);
+  },
 });
 const job = review.job;
 const position = review.position;
@@ -517,9 +593,39 @@ onMounted(() => {
 
 const queuePath = computed(() => review.queuePath());
 
-/** "Added Banana Mug Cake" (and what the commit left out), when the last card's Commit & next opened this one */
-const notice = takeRecipeIngestCommitNotice();
-const noticeOpen = ref(!!notice);
+// ==========================================
+// Leaving: the last changes are saved first; if that fails, the page asks
+
+const leaveTo = ref<string | null>(null);
+let leaving = false;
+
+async function beforeLeaving(to: { fullPath: string }) {
+  if (leaving || (await review.saveBeforeLeaving())) {
+    return true;
+  }
+  leaveTo.value = to.fullPath;
+  return false;
+}
+
+// another page, or another card: the router counts a card's previous and next as the same page with a new id
+onBeforeRouteLeave(beforeLeaving);
+onBeforeRouteUpdate(beforeLeaving);
+
+async function leaveAnyway() {
+  const to = leaveTo.value;
+  leaveTo.value = null;
+  if (!to) {
+    return;
+  }
+  leaving = true;
+  await (to === reviewNavigation ? router.replace(to) : router.push(to));
+}
+
+// ==========================================
+// The review bar: on phones it's pinned, so the page leaves room for it as it grows with a notice
+
+const reviewBar = ref<{ $el: HTMLElement } | null>(null);
+const { height: barHeight } = useElementSize(() => reviewBar.value?.$el ?? null, undefined, { box: "border-box" });
 
 // ==========================================
 // Header and checks line
@@ -568,6 +674,9 @@ const progressLabel = computed(() => {
   if (!current) {
     return review.rereadQueue.value.length ? i18n.t("recipe-ingest.review.reread-queued") : i18n.t("recipe-ingest.progress.queued");
   }
+  if (current.cancelRequested) {
+    return i18n.t("recipe-ingest.review.stopping");
+  }
   if (current.state === "queued") {
     return i18n.t("recipe-ingest.progress.queued");
   }
@@ -592,6 +701,19 @@ const canRotate = computed(() =>
   && !review.pendingAction.value,
 );
 const canReextract = computed(() => job.value?.status === "ready" && !review.task.value && !review.pendingAction.value);
+/** An area can be re-read on a ready card the editor isn't locked on; while a re-read runs, more wait their turn */
+const canReread = computed(() =>
+  job.value?.status === "ready"
+  && !review.readOnly.value
+  && !review.pendingAction.value
+  && !!job.value.pages?.length,
+);
+/** What reads the card can be stopped: a card being read, a re-read or re-extract, or re-reads waiting their turn */
+const canCancel = computed(() =>
+  (!!review.task.value || review.rereadQueue.value.length > 0)
+  && !review.task.value?.cancelRequested
+  && (job.value?.status === "processing" || job.value?.status === "ready"),
+);
 const canExportEval = computed(() => job.value?.status === "ready" || job.value?.status === "committed");
 
 function rotateCurrent() {
@@ -627,9 +749,9 @@ const regionDialog = ref(false);
 const regionTargets = ref<RereadTargetOption[]>([]);
 const regionTarget = ref<string | null>(null);
 
-/** Opens the region dialog, aimed at a field (and line) when opened from a flag */
+/** Opens the region dialog, aimed at a field (and line) when opened from a flag or a line; else for the reviewer to say */
 function openReread(field?: string, ref?: string | null) {
-  if (job.value?.status !== "ready" || !job.value.pages?.length) {
+  if (!canReread.value) {
     return;
   }
   regionTargets.value = rereadTargets(review.draft.value);
@@ -706,7 +828,12 @@ const typing = computed(() => {
   return !!element && (["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName) || element.isContentEditable);
 });
 const dialogOpen = computed(() =>
-  regionDialog.value || evalDialog.value || discardDialog.value || transcriptionDialog.value || review.conflict.value,
+  regionDialog.value
+  || evalDialog.value
+  || discardDialog.value
+  || transcriptionDialog.value
+  || review.conflict.value
+  || !!leaveTo.value,
 );
 const plainKeys = computed(() => !typing.value && !dialogOpen.value && job.value?.status === "ready");
 const noModifier = () => !keys.ctrl!.value && !keys.meta!.value && !keys.alt!.value;
@@ -748,8 +875,8 @@ whenever(() => keys.Escape!.value && regionDialog.value, () => {
 
 <style scoped>
 .ingest-review--phone {
-  /* room for the fixed bottom bar */
-  padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  /* room for the fixed bottom bar, as tall as it is with its notice (measured), else its usual height */
+  padding-bottom: var(--ingest-review-bar-height, calc(72px + env(safe-area-inset-bottom)));
 }
 
 /* On phones the columns stack, so the strip's own column is only as tall as the strip: the column sticks instead */
@@ -769,10 +896,5 @@ whenever(() => keys.Escape!.value && regionDialog.value, () => {
 
 .ingest-review__editor {
   min-width: 0;
-}
-
-/* above the review bar, pinned (phones) or at the foot of the editor (desktop) */
-.ingest-review__notice {
-  margin-bottom: calc(64px + env(safe-area-inset-bottom));
 }
 </style>

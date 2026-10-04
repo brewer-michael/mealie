@@ -1,11 +1,14 @@
 """
 The job routes under `/api/ai/ingest/jobs` (docs/ai/PHASE2.md §14): review, re-read, rotate, page images, commit and
-discard. `/jobs/counts` is declared before `/jobs/{id}`.
+discard; reading a failed local-only card with cloud providers, adding a card to another as its back, undoing a
+commit, and committing a batch's clean cards (`/batches/{id}/commit-clean`). `/jobs/counts` is declared before
+`/jobs/{id}`.
 
 Every route is household-scoped (another household's job, images included, is a 404) and answers 503 while
-`AI_INGEST_ENABLED` is off. The routes that write files (rotate, commit, discard) also answer 503
-`paused_for_restore` while a backup restore pauses ingestion, both up front and when their write section can't start.
-The work is in `mealie.services.ai.ingest.review` and `.commit`; refusals come back as `{"detail": {"code", ...}}`.
+`AI_INGEST_ENABLED` is off. The routes that write files (rotate, commit, discard, merge, uncommit, the bulk commit)
+also answer 503 `paused_for_restore` while a backup restore pauses ingestion, both up front and when their write
+section can't start. The work is in `mealie.services.ai.ingest.review` and `.commit`; refusals come back as
+`{"detail": {"code", ...}}`.
 """
 
 from collections.abc import Iterator
@@ -19,11 +22,14 @@ from pydantic import UUID4
 
 from mealie.routes._base import controller
 from mealie.schema.recipe_ingest import (
+    BulkCommitOut,
+    BulkCommitRequest,
     CardDraftSaved,
     CardDraftUpdate,
     CommitOut,
     CommitRequest,
     IngestStatus,
+    MergeRequest,
     PageOut,
     RecipeIngestionJobCounts,
     RecipeIngestionJobOut,
@@ -31,9 +37,10 @@ from mealie.schema.recipe_ingest import (
     RecipeIngestionJobState,
     RereadRequest,
     RotateRequest,
+    UncommitRequest,
 )
 from mealie.services.ai.errors import IngestPaused
-from mealie.services.ai.ingest.commit import commit_job
+from mealie.services.ai.ingest.commit import commit_clean, commit_job, uncommit_job
 from mealie.services.ai.ingest.review import JobActionError, PageImage, ReviewService
 
 from ._deps import IngestController, ingest_error, paused_error, require_enabled, require_not_paused, write_section
@@ -161,10 +168,32 @@ class RecipeIngestJobsController(IngestController):
         with self._answer():
             return self.review.retry(job_id)
 
+    @router.post(
+        "/jobs/{job_id}/read-with-cloud", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState
+    )
+    def read_with_cloud(self, job_id: UUID4) -> RecipeIngestionJobState:
+        """
+        Reads a card that failed because it had to stay on this server again, with any of the group's providers: its
+        uploader or a household manager, while the group doesn't keep cards local (`409 {detail: {code:
+        "group_local_only"}}` otherwise)
+        """
+        with self._answer():
+            return self.review.read_with_cloud(job_id)
+
     @router.post("/jobs/{job_id}/cancel", response_model=RecipeIngestionJobState)
     def cancel_job(self, job_id: UUID4) -> RecipeIngestionJobState:
         with self._answer():
             return self.review.cancel(job_id)
+
+    @router.post("/jobs/{job_id}/merge", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
+    def merge_job(self, job_id: UUID4, data: MergeRequest) -> RecipeIngestionJobState:
+        """
+        Adds this card's photos to another card as its next pages (a back sent on its own), deletes this card and
+        reads the other again; answers the other card's state. `409 {detail: {code: "too_many_pages", max}}` when
+        they wouldn't fit in one card, `409 busy` while either has a task.
+        """
+        with self._answer(writes_files=True), write_section(self.translator):
+            return self.review.merge(job_id, data.into_job_id)
 
     # ==================================================================================================================
     # Pages
@@ -218,3 +247,42 @@ class RecipeIngestJobsController(IngestController):
         if not result.created:
             response.status_code = status.HTTP_200_OK
         return result.out
+
+    @router.post("/jobs/{job_id}/uncommit", response_model=RecipeIngestionJobState)
+    def uncommit(
+        self, job_id: UUID4, data: UncommitRequest, background_tasks: BackgroundTasks
+    ) -> RecipeIngestionJobState:
+        """
+        Back to review: deletes the recipe the card became and makes the card ready again with its draft (its
+        committer or a household manager allowed to delete the recipe). `409 {detail: {code: "recipe_edited"}}` when
+        the recipe was edited since, unless `force`; `409 purged` once the card's photos are gone.
+        """
+        with self._answer(writes_files=True), write_section(self.translator):
+            return uncommit_job(
+                self.ingest_repos,
+                self.user,
+                job_id,
+                data,
+                translator=self.translator,
+                integration_id=self.integration_id,
+                background=background_tasks,
+            )
+
+    @router.post("/batches/{batch_id}/commit-clean", response_model=BulkCommitOut)
+    def commit_clean_cards(
+        self, batch_id: UUID4, data: BulkCommitRequest, background_tasks: BackgroundTasks
+    ) -> BulkCommitOut:
+        """
+        Commits the listed cards of a batch that are ready at the version the page showed, with no unresolved error
+        or warning, one by one as Commit does; the rest are listed in `skipped` with the reason
+        """
+        with self._answer(writes_files=True):
+            return commit_clean(
+                self.ingest_repos,
+                self.user,
+                batch_id,
+                data,
+                translator=self.translator,
+                integration_id=self.integration_id,
+                background=background_tasks,
+            )

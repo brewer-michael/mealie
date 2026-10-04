@@ -3,7 +3,7 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from datetime import UTC, datetime
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from fastapi.encoders import jsonable_encoder
 from pydantic import UUID4
@@ -113,10 +113,14 @@ class AppriseEventListener(EventListenerBase):
     def merge_query_parameters(url: str, params: dict):
         scheme, netloc, path, query_string, fragment = urlsplit(url)
 
-        # merge query params
-        query_params = parse_qs(query_string)
-        query_params.update(params)
-        new_query_string = urlencode(query_params, doseq=True)
+        # fork hook (docs/ai/PHASE2.md §8): percent-encode only `params`, so they reach Apprise exactly, and keep the
+        # notifier's own query as written. Apprise reads `+` as itself, not a space, so `urlencode`'s `quote_plus` sent
+        # Home Assistant a `document_data` with `+` between its JSON tokens; and its json, form and xml notifiers
+        # decode a `:key` value twice, so a `%` is escaped once more. Re-encoding the user's query changed it too:
+        # `%20` became `+`, and keys without a value were dropped
+        own = [part for part in query_string.split("&") if part and unquote_plus(part.split("=", 1)[0]) not in params]
+        encoded = {key: str(value).replace("%", "%25") for key, value in params.items()}
+        new_query_string = "&".join([*own, urlencode(encoded, quote_via=quote)])
 
         return urlunsplit((scheme, netloc, path, new_query_string, fragment))
 

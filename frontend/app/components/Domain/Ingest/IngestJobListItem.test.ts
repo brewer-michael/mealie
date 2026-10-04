@@ -85,17 +85,20 @@ describe("IngestJobListItem", () => {
     expect(wrapper.get(".job-status").attributes("data-color")).toBe("warning");
   });
 
-  test("a card being read shows its progress; one waiting says so", () => {
-    expect(status(mountItem(job({
+  test("a card being read: a short chip, and what's being done under it; one waiting says so", () => {
+    const reading = mountItem(job({
       status: "processing",
       title: null,
       thumbUrl: null,
-      task: { kind: "extract", state: "running", progressKey: "recipe-ingest.progress.reading-card" },
-    })))).toBe("Reading the card");
+      task: { kind: "extract", state: "running", progressKey: "recipe-ingest.progress.suggesting-organizers" },
+    }));
+    expect(status(reading)).toBe("Reading");
+    expect(reading.get(".job-caption").text()).toBe("Suggesting tags and categories");
     expect(status(mountItem(job({ status: "processing", task: { kind: "extract", state: "queued" } }))))
       .toBe("Waiting to be read");
-    expect(status(mountItem(job({ status: "processing", task: { kind: "extract", state: "running" } }))))
-      .toBe("Reading");
+    const running = mountItem(job({ status: "processing", task: { kind: "extract", state: "running" } }));
+    expect(status(running)).toBe("Reading");
+    expect(running.find(".job-caption").exists()).toBe(false);
 
     // not read yet: no name, so its place in the batch
     const untitled = mountItem(job({ status: "processing", position: 2, title: null, thumbUrl: null }));
@@ -107,9 +110,11 @@ describe("IngestJobListItem", () => {
     expect(mountItem(job({ title: null })).get(".job-title").text()).toBe("Untitled card");
   });
 
-  test("a failed card says why, and offers Retry", async () => {
+  test("a failed card says why under a short chip, and offers Retry", async () => {
     const wrapper = mountItem(job({ status: "failed", error: { code: "no_recipe_found", params: {} } }));
-    expect(status(wrapper)).toBe("Failed: No recipe was found on this card.");
+    expect(status(wrapper)).toBe("Failed");
+    expect(wrapper.get(".job-caption").text()).toBe("No recipe was found on this card.");
+    expect(wrapper.get(".job-caption").classes()).toContain("text-error");
     expect(wrapper.get(".job-status").attributes("data-color")).toBe("error");
 
     await wrapper.get(".job-retry").trigger("click");
@@ -120,7 +125,7 @@ describe("IngestJobListItem", () => {
 
   test("a provider failure shows the detail it was stored with", () => {
     const wrapper = mountItem(job({ status: "failed", error: { code: "provider_failed", params: { detail: "HTTP 500" } } }));
-    expect(status(wrapper)).toBe("Failed: The AI provider couldn't read the card (HTTP 500).");
+    expect(wrapper.get(".job-caption").text()).toBe("The AI provider couldn't read the card (HTTP 500).");
   });
 
   test("an added card links to its recipe and can't be discarded", () => {
@@ -145,5 +150,59 @@ describe("IngestJobListItem", () => {
     expect(status(wrapper)).toBe("Adding");
     expect(wrapper.get(".job-local-only").text()).toBe("Local only");
     expect(wrapper.find(".job-discard").exists()).toBe(false);
+  });
+});
+
+describe("IngestJobListItem on a phone", () => {
+  test("the name and the reason are laid out to wrap, and the actions can go under them", () => {
+    const wrapper = mountItem(job({
+      status: "failed",
+      title: "Grandma's Famous Oatmeal Raisin Cookies with Brown Butter",
+      error: { code: "limit_reached", params: {} },
+    }));
+    // the title isn't a one-line list title, and the reason isn't inside the chip
+    expect(wrapper.get(".job-text .job-title").text()).toContain("Brown Butter");
+    expect(wrapper.get(".job-status").text()).toBe("Failed");
+    expect(wrapper.get(".job-text .job-caption").text())
+      .toBe("Every AI provider for this task has reached its monthly token limit.");
+    // actions follow the text in one wrapping row, not in the list item's append slot
+    const body = wrapper.get(".job-body");
+    expect(body.element.children[0]!.classList).toContain("job-text");
+    expect(body.element.children[1]!.classList).toContain("job-actions");
+    expect(body.find(".job-actions .job-retry").exists()).toBe(true);
+  });
+});
+
+describe("IngestJobListItem names", () => {
+  test("an inbox or API card not read yet is named by its file; an app card by its place", () => {
+    expect(mountItem(job({ status: "processing", title: null, source: "inbox", sourceName: "inbox/home/kitchen/scan 3.jpg" }))
+      .get(".job-title").text()).toBe("scan 3.jpg");
+    expect(mountItem(job({ status: "processing", title: null, source: "api", sourceName: "upload/snapshot.jpg" }))
+      .get(".job-title").text()).toBe("snapshot.jpg");
+    expect(mountItem(job({ status: "processing", title: null, source: "app", position: 1, sourceName: "upload/image.jpg" }))
+      .get(".job-title").text()).toBe("Card 2");
+    expect(mountItem(job({ status: "failed", title: null, source: "api", sourceName: null, position: 0 }))
+      .get(".job-title").text()).toBe("Card 1");
+  });
+
+  test("a failed card shows its file under its name", () => {
+    const named = mountItem(job({ status: "failed", title: "Pancakes", source: "app", sourceName: "upload/IMG_7.jpg" }));
+    expect(named.get(".job-source").text()).toBe("IMG_7.jpg");
+    // already its title
+    const inbox = mountItem(job({ status: "failed", title: null, source: "inbox", sourceName: "inbox/home/kitchen/a.jpg" }));
+    expect(inbox.find(".job-source").exists()).toBe(false);
+    expect(mountItem(job({ title: "Pancakes" })).find(".job-source").exists()).toBe(false);
+  });
+});
+
+describe("IngestJobListItem Cancel", () => {
+  test("a card being read, or waiting to be, can be cancelled", async () => {
+    const wrapper = mountItem(job({ status: "processing", task: { kind: "extract", state: "running" } }));
+    await wrapper.get(".job-cancel").trigger("click");
+    expect(wrapper.emitted("cancel")?.[0]?.[0]).toMatchObject({ id: "j1" });
+    expect(mountItem(job({ status: "processing", task: null })).find(".job-cancel").exists()).toBe(true);
+    for (const other of ["ready", "failed", "committing", "committed"] as const) {
+      expect(mountItem(job({ status: other })).find(".job-cancel").exists(), other).toBe(false);
+    }
   });
 });

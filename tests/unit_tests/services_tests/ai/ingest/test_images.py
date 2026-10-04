@@ -1,6 +1,8 @@
 """Turning uploads into card pages, rotating them and cropping regions (docs/ai/PHASE2.md §2, §4.4, §4.7)"""
 
+import hashlib
 import io
+import os
 import struct
 import tempfile
 import zlib
@@ -15,7 +17,18 @@ from PIL import Image, ImageCms
 
 from mealie.schema.recipe_ingest import IngestRejectReason, PageMeta, PageRotationSource
 from mealie.services.ai.ingest import images, limits
-from mealie.services.ai.ingest.images import PageRejected, Region, crop_region, normalize_page, rotate_page_files, sniff
+from mealie.services.ai.ingest.images import (
+    PageRejected,
+    Region,
+    apply_staged,
+    crop_region,
+    discard_staged,
+    normalize_page,
+    recover_staged,
+    rotate_page_files,
+    sniff,
+    stage_rotation,
+)
 
 RED = (255, 0, 0)
 WHITE = (255, 255, 255)
@@ -501,6 +514,146 @@ def test_rotations_add_up(page_dir: Path):
 def test_only_quarter_turns_are_allowed(page_dir: Path):
     with pytest.raises(ValueError):
         rotate_page_files(page_dir, _page(page_dir), 45, PageRotationSource.user)
+
+
+# ==========================================
+# Staged turns: a crash never leaves files and stored metadata disagreeing
+
+
+def _files(page_dir: Path) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in sorted(page_dir.iterdir())}
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _staged_names() -> set[str]:
+    return set(images.STAGED_FILES.values())
+
+
+def test_staging_a_turn_leaves_the_page_as_it_is(page_dir: Path):
+    before = _page(page_dir)
+    current = _files(page_dir)
+
+    staged = stage_rotation(page_dir, before, 90, PageRotationSource.ocr)
+
+    assert {name: data for name, data in _files(page_dir).items() if name in current} == current
+    assert set(_files(page_dir)) == set(current) | _staged_names()
+    assert staged.page_sha256 == _sha(page_dir / "page.next.jpg") != before.page_sha256
+    assert (staged.width, staged.height, staged.rotation, staged.oriented) == (300, 600, 90, True)
+    with Image.open(page_dir / "view.next.jpg") as view:
+        assert view.size == (staged.view_width, staged.view_height)
+
+
+def test_applying_a_staged_turn_swaps_every_file(page_dir: Path):
+    staged = stage_rotation(page_dir, _page(page_dir), 90, PageRotationSource.user)
+    next_files = {name: (page_dir / staged_name).read_bytes() for name, staged_name in images.STAGED_FILES.items()}
+
+    apply_staged(page_dir)
+
+    assert _files(page_dir) == next_files
+    assert _sha(page_dir / images.PAGE_FILE) == staged.page_sha256
+
+
+def test_discarding_a_staged_turn_keeps_the_page(page_dir: Path):
+    before = _page(page_dir)
+    current = _files(page_dir)
+    stage_rotation(page_dir, before, 180, PageRotationSource.user)
+    discard_staged(page_dir)
+    assert _files(page_dir) == current
+
+
+def test_a_staging_that_fails_leaves_nothing_staged(page_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    before = _page(page_dir)
+    current = _files(page_dir)
+
+    def full_disk(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(images, "atomic_save_image", full_disk)
+    with pytest.raises(OSError):
+        stage_rotation(page_dir, before, 90, PageRotationSource.user)
+    assert _files(page_dir) == current
+
+
+def test_recovery_with_nothing_staged_does_nothing(page_dir: Path):
+    before = _page(page_dir)
+    current = _files(page_dir)
+    assert recover_staged(page_dir, before) == "none"
+    assert _files(page_dir) == current
+
+
+def test_recovery_finishes_a_turn_whose_metadata_was_stored(page_dir: Path):
+    # the process died after storing the turned metadata, before the swap
+    staged = stage_rotation(page_dir, _page(page_dir), 270, PageRotationSource.ocr)
+    turned = {name: (page_dir / staged_name).read_bytes() for name, staged_name in images.STAGED_FILES.items()}
+
+    assert recover_staged(page_dir, staged) == "applied"
+    assert _files(page_dir) == turned
+    assert _sha(page_dir / images.PAGE_FILE) == staged.page_sha256
+
+
+def test_recovery_discards_a_turn_whose_metadata_wasnt_stored(page_dir: Path):
+    # the process died after staging, before the metadata was stored (or the update was refused)
+    before = _page(page_dir)
+    current = _files(page_dir)
+    stage_rotation(page_dir, before, 90, PageRotationSource.ocr)
+
+    assert recover_staged(page_dir, before) == "discarded"
+    assert _files(page_dir) == current
+    assert _sha(page_dir / images.PAGE_FILE) == before.page_sha256
+
+
+def test_recovery_finishes_a_swap_cut_short(page_dir: Path):
+    staged = stage_rotation(page_dir, _page(page_dir), 90, PageRotationSource.user)
+    turned = {name: (page_dir / staged_name).read_bytes() for name, staged_name in images.STAGED_FILES.items()}
+    os.replace(page_dir / "thumb.next.webp", page_dir / images.THUMB_FILE)  # the first of the three moves
+
+    assert recover_staged(page_dir, staged) == "applied"
+    assert _files(page_dir) == turned
+
+
+def test_recovery_finishes_once_the_page_itself_was_moved(page_dir: Path):
+    # page.jpg already holds the stored page: what's left staged belongs to it
+    staged = stage_rotation(page_dir, _page(page_dir), 90, PageRotationSource.user)
+    turned = {name: (page_dir / staged_name).read_bytes() for name, staged_name in images.STAGED_FILES.items()}
+    os.replace(page_dir / "page.next.jpg", page_dir / images.PAGE_FILE)
+
+    assert recover_staged(page_dir, staged) == "applied"
+    assert _files(page_dir) == turned
+
+
+@pytest.mark.parametrize("left", [["page.next.jpg"], ["page.next.jpg", "view.next.jpg"]], ids=["page", "page+view"])
+def test_recovery_discards_a_staging_or_a_discard_cut_short(page_dir: Path, left: list[str]):
+    # staging writes page.next.jpg first and a discard removes it last, so a cut-short one always has it
+    before = _page(page_dir)
+    current = _files(page_dir)
+    stage_rotation(page_dir, before, 90, PageRotationSource.user)
+    for name in _staged_names() - set(left):
+        (page_dir / name).unlink()
+
+    assert recover_staged(page_dir, before) == "discarded"
+    assert _files(page_dir) == current
+
+
+def test_a_new_turn_first_finishes_one_left_staged(page_dir: Path):
+    # a turn whose metadata was stored but whose swap a crash cut short is never overwritten by the next one
+    first = stage_rotation(page_dir, _page(page_dir), 90, PageRotationSource.ocr)
+    second = stage_rotation(page_dir, first, 90, PageRotationSource.user)
+    apply_staged(page_dir)
+    assert second.rotation == 180
+    assert _sha(page_dir / images.PAGE_FILE) == second.page_sha256
+    assert not _staged_names() & set(_files(page_dir))
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert page.size == (600, 300)
+        assert _close(page.getpixel((550, 150)), RED)  # red started on the left: two quarter turns put it right
+
+
+def test_rotating_at_once_leaves_nothing_staged(page_dir: Path):
+    after = rotate_page_files(page_dir, _page(page_dir), 90, PageRotationSource.user)
+    assert not _staged_names() & set(_files(page_dir))
+    assert _sha(page_dir / images.PAGE_FILE) == after.page_sha256
 
 
 def test_a_small_region_is_cropped_with_a_margin_and_upscaled_at_most_three_times(page_dir: Path):

@@ -1,12 +1,16 @@
 """
 "Recipe cards ready" notifications (docs/ai/PHASE2.md §8): one per finished batch, through the household's Apprise
 notifiers that opted in, never through `EventBusService.dispatch` (its listeners only know upstream's event types).
+The same notifiers get "Recipe cards not added" (`recipe_ingestion_rejected`): one per inbox scan burst that refused
+files.
 
 **Once per batch, at most once.** `maybe_notify_batch` claims the batch's notification with one conditional
-`UPDATE ... SET notified_at` (sealed, not yet notified, created in the last 24 hours, no card still processing) and
-publishes only when that update matched the row. Two processes finishing the last two cards at the same moment can't
-both win, and `notified_at` is written before anything is sent, so a crash loses a notification rather than doubling
-it. A batch created more than 24 hours ago never notifies, so restoring a backup doesn't replay old notifications.
+`UPDATE ... SET notified_at` (sealed, not yet notified, no card still processing, a card written in the last 24 hours)
+and publishes only when that update matched the row. Two processes finishing the last two cards at the same moment
+can't both win, and `notified_at` is written before anything is sent, so a crash loses a notification rather than
+doubling it. The 24 hours count from the cards' last activity, not the batch's creation: a batch read over days still
+notifies, while a batch whose cards were last written over 24 hours ago (a restored backup's) never does, and
+housekeeping settles it so a later edit doesn't either.
 
 **Counts and a link only:** no card names or text, since notifications leave the server.
 
@@ -14,6 +18,9 @@ Apprise blocks: everything here runs in the caller's thread (a task thread, the 
 route's threadpool), never on the event loop, and no database transaction stays open while Apprise sends.
 """
 
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from enum import Enum
 from urllib.parse import parse_qsl, quote, unquote_plus, urlencode, urlsplit, urlunsplit
@@ -32,7 +39,7 @@ from mealie.db.models.household.events import GroupEventNotifierModel
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.lang.providers import Translator
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
-from mealie.schema.recipe_ingest import IngestStatus, RecipeIngestionJobCounts
+from mealie.schema.recipe_ingest import IngestRejectReason, IngestStatus, RecipeIngestionJobCounts
 from mealie.services.event_bus_service.event_bus_listeners import AppriseEventListener
 from mealie.services.event_bus_service.event_types import (
     INTERNAL_INTEGRATION_ID,
@@ -58,6 +65,8 @@ TEST_INTEGRATION_ID = "test_event"
 
 class AIEventTypes(Enum):
     recipe_ingestion_ready = "recipe_ingestion_ready"
+    recipe_ingestion_rejected = "recipe_ingestion_rejected"
+    """Files in the household's inbox folder that weren't added"""
 
 
 class AIEvent(Event):
@@ -81,6 +90,21 @@ class EventIngestionReadyData(EventDocumentDataBase):
     """`BASE_URL/g/<group-slug>/recipes/cards/review?batch=<id>`: the batch's first card to review"""
 
 
+OTHER_REASON = "other"
+"""The reason code of a refusal that has none of its own (a link, an empty folder)"""
+
+
+class EventIngestionRejectedData(EventDocumentDataBase):
+    document_type: EventDocumentType = EventDocumentType.generic
+    operation: EventOperation = EventOperation.info
+    count: int
+    """Files (or card folders) of the scan burst that weren't added"""
+    reasons: dict[str, int]
+    """How many for each reason: an `IngestRejectReason` value, or `other`"""
+    review_url: str
+    """`BASE_URL/g/<group-slug>/recipes/cards`: the cards page"""
+
+
 class AIEventAppriseListener(AppriseEventListener):
     """
     Sends AI events to the household's enabled Apprise notifiers whose fork option for the event is on, with the
@@ -92,7 +116,8 @@ class AIEventAppriseListener(AppriseEventListener):
         self._session = session
 
     def get_subscribers(self, event: Event) -> list[str]:
-        if not isinstance(event, AIEvent) or event.event_type is not AIEventTypes.recipe_ingestion_ready:
+        # both events go to the notifiers with the recipe cards option on
+        if not isinstance(event, AIEvent):
             return []
 
         with self.ensure_session() as session:
@@ -137,6 +162,15 @@ _EVENT_KEYS = {":event_type", ":integration_id", ":document_data", ":event_id", 
 """The fields upstream's `AppriseEventListener.update_urls_with_event_data` adds to a custom (form, json, xml) URL"""
 
 
+def household_notifies(session: Session, group_id: UUID, household_id: UUID) -> bool:
+    """
+    Whether the household hears about its recipe cards: it has an enabled notifier, with a URL, that sends "recipe
+    cards ready"
+    """
+    notifier_ids = IngestRepos(session, group_id, household_id).notifier_options.enabled_notifier_ids()
+    return bool(notifier_urls(session, group_id, household_id, notifier_ids))
+
+
 def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier_ids: list[UUID]) -> list[str]:
     """The Apprise URLs of the household's notifiers among `notifier_ids`"""
     if not notifier_ids:
@@ -177,6 +211,29 @@ def ready_message(counts: RecipeIngestionJobCounts, translator: Translator) -> E
     return EventBusMessage(title=translator.t("recipe-ingest.notification-title"), body=body)
 
 
+def rejected_message(reasons: Mapping[str, int], translator: Translator) -> EventBusMessage:
+    """
+    'Recipe cards not added' / '3 recipe cards from the inbox weren't added (2 already scanned, 1 too large). They're
+    in the inbox's failed folder.' The most frequent reason first; a code without words of its own is another reason.
+    """
+    words = "recipe-ingest.notification-rejected"
+    details: list[str] = []
+    other = 0
+    for code, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0])):
+        key = f"{words}.reasons.{code}"
+        text = translator.t(key, count=count) if code != OTHER_REASON else key
+        if text == key:
+            other += count
+        else:
+            details.append(text)
+    if other:
+        details.append(translator.t(f"{words}.reasons.{OTHER_REASON}", count=other))
+
+    separator = translator.t("recipe-ingest.notification-details-separator")
+    body = translator.t(f"{words}.body", count=sum(reasons.values()), details=separator.join(details))
+    return EventBusMessage(title=translator.t(f"{words}.title"), body=body)
+
+
 def cards_url(slug: str, batch_id: UUID | None = None) -> str:
     """The review start of a batch (`…/recipes/cards/review?batch=<id>`), or the cards page without one"""
     base = f"{get_app_settings().BASE_URL.rstrip('/')}/g/{quote(slug, safe='')}/recipes/cards"
@@ -192,21 +249,31 @@ def group_slug(session: Session, group_id: UUID) -> str:
 # Sending
 
 
-def _due(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bool]]:
-    """
-    A batch whose notification is due: sealed, not yet notified, created in the last 24 hours and with no card still
-    processing. Every check is in the `WHERE` of the one statement that claims it (§3.3).
-    """
+def _finished(batch_id: UUID | None) -> list[sa.ColumnElement[bool]]:
+    """A batch that's sealed, not yet notified, and with no card still processing"""
     processing = sa.exists().where(Job.batch_id == Batch.id, Job.status == IngestStatus.processing.value)
-    conditions = [
-        Batch.sealed_at.is_not(None),
-        Batch.notified_at.is_(None),
-        Batch.created_at > now - timedelta(seconds=limits.NOTIFY_CUTOFF),
-        ~processing,
-    ]
+    conditions = [Batch.sealed_at.is_not(None), Batch.notified_at.is_(None), ~processing]
     if batch_id is not None:
         conditions.insert(0, Batch.id == batch_id)
     return conditions
+
+
+def _recently_active(now: datetime) -> sa.ColumnElement[bool]:
+    """
+    A card of the batch was written in the last 24 hours: read, failed, retried or edited. A batch read over days
+    (a slow reader, an outage, rate limits) is still new when its last card finishes, while a restored backup's
+    batch keeps its cards' old times.
+    """
+    cutoff = now - timedelta(seconds=limits.NOTIFY_CUTOFF)
+    return sa.exists().where(Job.batch_id == Batch.id, sa.func.coalesce(Job.update_at, Job.created_at) > cutoff)
+
+
+def _due(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bool]]:
+    """
+    A batch whose notification is due: finished (sealed, not yet notified, no card still processing) and with a card
+    written in the last 24 hours. Every check is in the `WHERE` of the one statement that claims it (§3.3).
+    """
+    return [*_finished(batch_id), _recently_active(now)]
 
 
 def _claim(session: Session, batch_id: UUID, now: datetime) -> bool:
@@ -251,8 +318,8 @@ def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
 
 def maybe_notify_batch(batch_id: UUID) -> bool:
     """
-    Sends the batch's notification if it's due: sealed, not yet notified, created in the last 24 hours, and none of
-    its cards still processing. The conditional `notified_at` update decides, so it's sent at most once across
+    Sends the batch's notification if it's due: sealed, not yet notified, none of its cards still processing, and one
+    written in the last 24 hours. The conditional `notified_at` update decides, so it's sent at most once across
     processes. Whether this call sent it (to every notifier that opted in, if any): False when it wasn't due, or when
     the finished batch has nothing to look at (every card committed or discarded already). Blocking (Apprise).
     """
@@ -282,10 +349,33 @@ def due_batches(session: Session, now: datetime) -> list[UUID]:
     return due
 
 
+def settle_stale_batches(session: Session, now: datetime) -> int:
+    """
+    Marks finished batches whose cards were last written over 24 hours ago (a restored backup's, or one that was
+    never due) as notified without sending anything, so a later edit of one of their cards doesn't make them due.
+    How many it settled.
+    """
+    stmt = sa.update(Batch).where(*_finished(None), ~_recently_active(now)).values(notified_at=now)
+    try:
+        result = session.execute(stmt, execution_options={"synchronize_session": False})
+        settled = result.rowcount if isinstance(result, CursorResult) else 0
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    if settled:
+        logger.info(f"Recipe card batches finished with no card activity in 24 hours, not notified: {settled}")
+    return settled
+
+
 def housekeeping(now: datetime) -> None:
-    """Seals idle batches and sends the notifications that became due (the dispatcher, every minute)"""
+    """
+    Seals idle batches, settles stale ones and sends the notifications that became due (the dispatcher, every
+    minute)
+    """
     with session_context() as session:
         seal_idle_batches(session, now)
+        settle_stale_batches(session, now)
         due = due_batches(session, now)
 
     for batch_id in due:
@@ -294,6 +384,57 @@ def housekeeping(now: datetime) -> None:
         except Exception as e:
             # one notifier's failure doesn't hold up the other batches; its message could hold an Apprise URL
             logger.error(f"Recipe card batch {batch_id}: its ready notification failed ({type(e).__qualname__})")
+
+
+def notify_inbox_rejections(
+    group_id: UUID,
+    household_id: UUID,
+    reasons: Iterable[IngestRejectReason | str | None],
+    *,
+    locale: str | None = None,
+    session: Session | None = None,
+) -> bool:
+    """
+    Tells the household that files of one inbox scan burst weren't added: one "Recipe cards not added" event for the
+    burst, with counts by reason (one entry of `reasons` per refused file or card folder; None for a refusal without a
+    code), in `locale` (the language the inbox's cards take; en-US for a text it doesn't have). Counts and a link only:
+    no file names, which can be card text too.
+
+    Sent to the household's notifiers with the recipe cards option on; whether it went to any. Never raises: the
+    refused files are in `failed/` with a note either way, and a failing notifier is logged without its URL. With
+    `session`, its transaction is ended before anything is sent. Blocking (Apprise).
+    """
+    counts = Counter(str(reason) if reason else OTHER_REASON for reason in reasons)
+    if not counts:
+        return False
+
+    try:
+        with session_context() if session is None else nullcontext(session) as db:
+            slug = group_slug(db, group_id)
+            event = AIEvent(
+                message=rejected_message(counts, translator_for(locale)),
+                event_type=AIEventTypes.recipe_ingestion_rejected,
+                integration_id=INTERNAL_INTEGRATION_ID,
+                document_data=EventIngestionRejectedData(
+                    count=counts.total(), reasons=dict(counts), review_url=cards_url(slug)
+                ),
+            )
+            listener = AIEventAppriseListener(group_id, household_id, db)
+            urls = listener.get_subscribers(event)  # ends the session's transaction before anything is sent
+
+        if not urls:
+            return False
+        listener.publish_to_subscribers(event, urls)
+        return True
+    except Exception as e:
+        if session is not None and session.in_transaction():
+            session.rollback()
+        # its message could hold an Apprise URL
+        logger.warning(
+            f"Recipe card inbox of household {household_id}: "
+            f"the 'not added' notification failed ({type(e).__qualname__})"
+        )
+        return False
 
 
 def send_test_notification(

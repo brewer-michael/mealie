@@ -67,6 +67,7 @@ def test_413_by_content_length_before_the_body_is_read(api_client: TestClient, r
     assert response.status_code == 413
     detail = response.json()["detail"]
     assert detail == {"code": "too_large", "message": "The upload is too large. The limit is 1 MB."}
+    assert response.json()["summary"] == detail["message"]  # what a Shortcut's notification shows
     assert consumed == []
 
 
@@ -78,6 +79,7 @@ def test_413_mid_stream_for_a_chunked_body(api_client: TestClient, reader: TestU
     )
     assert response.status_code == 413
     assert response.json()["detail"]["code"] == "too_large"
+    assert response.json()["summary"] == "The upload is too large. The limit is 1 MB."
     assert job_dirs(reader) == before
 
 

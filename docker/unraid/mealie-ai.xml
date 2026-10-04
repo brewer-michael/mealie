@@ -44,8 +44,8 @@ On a fresh install, sign in with Mealie's documented default admin account and c
   <Config Name="OCR_TIMEOUT" Target="OCR_TIMEOUT" Default="60" Mode="" Description="Seconds before an OCR run is abandoned" Type="Variable" Display="advanced" Required="false" Mask="false"/>
 
   <!-- Recipe cards: an optional inbox folder (docs/ai/CARDS.md) -->
-  <Config Name="Recipe card inbox" Target="/inbox" Default="" Mode="rw" Description="Optional. A share outside App Data, e.g. /mnt/user/mealie-inbox. Photos put in its group/household folders are read and queued for review. Also set AI_INGEST_INBOX_DIR to /inbox." Type="Path" Display="always" Required="false" Mask="false"/>
-  <Config Name="AI_INGEST_INBOX_DIR" Target="AI_INGEST_INBOX_DIR" Default="" Mode="" Description="Set to /inbox to turn on the recipe card inbox mounted above. Leave empty to keep it off." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Recipe card inbox" Target="/inbox" Default="" Mode="rw" Description="Optional. A share outside App Data, e.g. /mnt/user/mealie-inbox. Photos put in its group/household folders are read and queued for review. Mapping the folder turns the inbox on; leave it empty to keep the inbox off." Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="AI_INGEST_INBOX_DIR" Target="AI_INGEST_INBOX_DIR" Default="/inbox" Mode="" Description="Where the recipe card inbox is in the container: keep /inbox, the folder mapped above. With no folder mapped there the inbox stays off." Type="Variable" Display="always" Required="false" Mask="false"/>
 
   <!-- Email -->
   <Config Name="SMTP_HOST" Target="SMTP_HOST" Default="" Mode="" Description="SMTP server hostname (leave empty to disable email)" Type="Variable" Display="advanced" Required="false" Mask="false"/>

@@ -22,15 +22,23 @@ the previous one's.
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
 
 from mealie.services.openai import OpenAIService
 
 from .attachments import CardImage
-from .cardtext import BLANK, LIST_MARKER_RE, SalientToken, canonical_markers, letters_only, salient_tokens
-from .compilers import page_label
+from .cardtext import (
+    BLANK,
+    LIST_MARKER_RE,
+    SalientToken,
+    canonical_markers,
+    letters_only,
+    salient_token_spans,
+    salient_tokens,
+)
+from .compilers import may_take_fewer_images, page_label, reads_one_image_at_a_time
 from .llm_schemas import OpenAIRecipeCardTranscript
 from .models import CardPage
 
@@ -48,6 +56,14 @@ for a window of more than `STEP_MAX_LINES` lines); the best of those by `ratio` 
 """
 STEP_MAX_LINES = 4
 """A step's window has up to this many lines, or more while it's still shorter than the step"""
+SHORT_LINE = 20
+"""
+Transcript lines with fewer letters than this are short (a word or two: a narrow column, a page read one word per
+line); a run of more than `STEP_MAX_LINES` of them is windowed in pieces of `CHUNK_LENGTH` letters or more
+"""
+CHUNK_LENGTH = 40
+MAX_WINDOW_GROWTH = 1.5
+"""A window longer than `STEP_MAX_LINES` lines grows no further than this many times the step's length"""
 
 _AMOUNT_FIRST = re.compile(r"^\s*[-•*]?\s*[\d½⅓⅔¼¾⅛⅜⅝⅞\[]")
 
@@ -63,17 +79,51 @@ def transcript_lines(text: str) -> list[str]:
 
 async def read_transcript(pages: Sequence[CardPage], *, ai: OpenAIService) -> list[str]:
     """
-    Reads every line written on the card, on `ai`'s image slot, with `card-transcribe.txt`. Raises the provider's
-    error, or `CrossReadFailed` when the answer holds nothing to compare with.
+    Reads every line written on the card, on `ai`'s image slot, with `card-transcribe.txt`: all pages in one request,
+    or page by page for a provider that takes one image per request (as the main read does, `compilers`). Raises the
+    provider's error, or `CrossReadFailed` when the answer holds nothing to compare with.
     """
     count = len(pages)
+    if count > 1 and reads_one_image_at_a_time(ai):
+        return await _read_page_by_page(pages, ai=ai)
+
     labels = ", ".join(page_label(index, count) for index in range(count))
-    response = await ai.get_response(
-        ai.get_prompt(CARD_TRANSCRIBE_PROMPT),
-        f"Attached {'is' if count == 1 else 'are'} {labels} of one recipe card.",
-        response_schema=OpenAIRecipeCardTranscript,
-        attachments=[CardImage(path=page.view_path) for page in pages],
+    try:
+        response = await ai.get_response(
+            ai.get_prompt(CARD_TRANSCRIBE_PROMPT),
+            f"Attached {'is' if count == 1 else 'are'} {labels} of one recipe card.",
+            response_schema=OpenAIRecipeCardTranscript,
+            attachments=[CardImage(path=page.view_path) for page in pages],
+        )
+    except Exception as e:
+        if count == 1 or not may_take_fewer_images(e):
+            raise
+        return await _read_page_by_page(pages, ai=ai)
+    return _lines(response)
+
+
+async def _read_page_by_page(pages: Sequence[CardPage], *, ai: OpenAIService) -> list[str]:
+    """Each page's lines, read in a request of its own, in page order"""
+    count = len(pages)
+    responses: list[OpenAIRecipeCardTranscript | None] = []
+    for index, page in enumerate(pages):
+        responses.append(
+            await ai.get_response(
+                ai.get_prompt(CARD_TRANSCRIBE_PROMPT),
+                f"Attached is {page_label(index, count)} of one recipe card that has {count} images; the other "
+                "images are read on their own. Transcribe this image only.",
+                response_schema=OpenAIRecipeCardTranscript,
+                attachments=[CardImage(path=page.view_path)],
+            )
+        )
+    found = [response for response in responses if response is not None and response.contains_recipe]
+    joined = OpenAIRecipeCardTranscript(
+        contains_recipe=bool(found), text="\n".join(response.text for response in found)
     )
+    return _lines(joined)
+
+
+def _lines(response: OpenAIRecipeCardTranscript | None) -> list[str]:
     if response is None or not response.contains_recipe:
         raise CrossReadFailed("The second reading found no recipe on the card")
 
@@ -124,33 +174,65 @@ def align_ingredient(line: str, lines: Sequence[str], after: int = -1) -> int | 
     return None if best is None else -best[5]
 
 
+def _chunks(words: Sequence[str]) -> list[tuple[int, int]]:
+    """
+    The transcript's lines as the units a step's windows are made of, `(start, end)` in line indices: each line on its
+    own, but a run of more than `STEP_MAX_LINES` short lines (`SHORT_LINE`) in pieces of `CHUNK_LENGTH` letters or
+    more. A page read one word per line would otherwise give a step of 600 letters a hundred lines to grow its windows
+    over, from every one of its lines.
+    """
+    chunks: list[tuple[int, int]] = []
+    line = 0
+    while line < len(words):
+        run_end = line
+        while run_end < len(words) and len(words[run_end]) < SHORT_LINE:
+            run_end += 1
+        if run_end - line <= STEP_MAX_LINES:
+            chunks.extend((index, index + 1) for index in range(line, max(run_end, line + 1)))
+            line = max(run_end, line + 1)
+            continue
+        while line < run_end:
+            end, length = line + 1, len(words[line])
+            while end < run_end and length < CHUNK_LENGTH:
+                length += len(words[end]) + (1 if length and words[end] else 0)
+                end += 1
+            chunks.append((line, end))
+            line = end
+    return chunks
+
+
 def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     """
     The transcript lines a step reads as, `(start, end)`, or None. Windows of up to `STEP_MAX_LINES` lines whose
-    `partial_ratio` reaches `STEP_MIN_SCORE`, and longer ones (grown only while still shorter than the step) whose
-    `ratio` does, are candidates, and the one most like the whole step by `ratio` wins: by `partial_ratio` alone, any
-    one line of a wrapped step that both reads word for word scores 100, and beats the whole step's window when the
-    reads differ by a word elsewhere in it.
+    `partial_ratio` reaches `STEP_MIN_SCORE`, and longer ones (grown only while still shorter than the step, and never
+    past `MAX_WINDOW_GROWTH` times its length) whose `ratio` does, are candidates, and the one most like the whole step
+    by `ratio` wins: by `partial_ratio` alone, any one line of a wrapped step that both reads word for word scores 100,
+    and beats the whole step's window when the reads differ by a word elsewhere in it.
 
-    It runs on every save, so the work stays near linear in the transcript, however long the step: a longer window is
-    compared whole, by `ratio` alone (`partial_ratio` on strings that long takes far more than linear time), and a
-    window whose length alone keeps its `ratio` below what it needs (the best so far, or `STEP_MIN_SCORE`) is skipped.
+    It runs on every save, so the work stays near linear in the transcript, however long the step and however short
+    its lines: windows are made of whole lines, or of runs of short lines (`_chunks`); a longer window is compared
+    whole, by `ratio` alone (`partial_ratio` on strings that long takes far more than linear time), and a window whose
+    length alone keeps its `ratio` below what it needs (the best so far, or `STEP_MIN_SCORE`) is skipped.
     """
     target = letters_only(text)
     if not target:
         return None
 
     words = [letters_only(line) for line in lines]
+    chunks = _chunks(words)
     best: tuple[float, float, int, int] | None = None
     best_window: tuple[int, int] | None = None
-    for start in range(len(lines)):
+    for first, (start, _) in enumerate(chunks):
         length = 0  # of the window's text: its lines' words, joined by spaces
-        for end in range(start + 1, len(lines) + 1):
+        for chunk_start, end in chunks[first:]:
             longer = end - start > STEP_MAX_LINES
             if longer and length >= len(target):
                 break
-            if words[end - 1]:
-                length += len(words[end - 1]) + (1 if length else 0)
+            for word in words[chunk_start:end]:
+                if word:
+                    length += len(word) + (1 if length else 0)
+            if longer and length > MAX_WINDOW_GROWTH * len(target):
+                break
             if not length:
                 continue
             # candidates rank by `ratio` first, which is at most what the two lengths allow
@@ -182,16 +264,20 @@ class Disagreement:
     """The draft line's numbers, units and temperatures that the window lacks, in order"""
     window_blank: bool
     """The window has `[blank]`"""
+    spans: list[tuple[int, int]] = field(default_factory=list)
+    """Where each of `missing` is written in the draft's line"""
 
 
 def compare(line: str, window: str) -> Disagreement | None:
     """What the second reading's `window` says differently from the draft's `line`; None when it agrees"""
     window_tokens = set(salient_tokens(window))
     missing: list[SalientToken] = []
-    for token in salient_tokens(line):
+    spans: list[tuple[int, int]] = []
+    for token, span in salient_token_spans(line):
         if token[0] != "marker" and token not in window_tokens and token not in missing:
             missing.append(token)
+            spans.append(span)
 
     if not missing:
         return None
-    return Disagreement(window=window, missing=missing, window_blank=BLANK in window)
+    return Disagreement(window=window, missing=missing, window_blank=BLANK in window, spans=spans)

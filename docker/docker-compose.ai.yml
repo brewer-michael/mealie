@@ -24,7 +24,7 @@ services:
     volumes:
       - mealie-ai-data:/app/data/
       # Optional recipe card inbox (docs/ai/CARDS.md): photos put in <inbox>/<group-slug>/<household-slug>/ are
-      # read and queued for review. Use a host folder outside the data volume, and set AI_INGEST_INBOX_DIR below.
+      # read and queued for review. Use a host folder outside the data volume; mounting it at /inbox turns it on.
       # - /path/to/mealie-inbox:/inbox
     ports:
       - 9925:9000
@@ -40,7 +40,7 @@ services:
       # OCR_TIMEOUT: "60" # seconds
 
       # Recipe cards (docs/ai/CARDS.md). Tesseract above also turns sideways card photos upright.
-      # AI_INGEST_INBOX_DIR: "/inbox" # turns on the inbox mounted above
+      # AI_INGEST_INBOX_DIR: "/inbox" # optional: a folder mounted at /inbox is used without it
       # AI_INGEST_CONCURRENCY: "2" # cards read at once per worker process, plus one re-read
 
       # PUID: 99 # Unraid's nobody:users

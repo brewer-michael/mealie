@@ -16,6 +16,14 @@
       @keydown.enter.self.prevent="emit('toggle')"
       @keydown.space.self.prevent="emit('toggle')"
     >
+      <!-- desktop: drag the line by its handle (the list's sortable); the buttons below move it from the keyboard -->
+      <v-icon
+        v-if="draggable && !readonly"
+        class="ingest-ingredient__handle"
+        :icon="$globals.icons.arrowUpDown"
+        :title="$t('recipe-ingest.review.drag-to-move')"
+        @click.stop
+      />
       <v-icon
         v-if="severity"
         size="small"
@@ -126,13 +134,48 @@
       >
         {{ info.title }}: {{ info.explanation }}
       </div>
-      <div class="d-flex align-center mt-2">
-        <span v-if="model.originalText" class="text-caption text-medium-emphasis ingest-ingredient__original">
-          {{ $t("recipe-ingest.review.on-the-card", { text: model.originalText }) }}
-        </span>
+      <div v-if="model.originalText" class="text-caption text-medium-emphasis mt-2 ingest-ingredient__original">
+        {{ $t("recipe-ingest.review.on-the-card", { text: model.originalText }) }}
+      </div>
+      <div v-if="!readonly" class="d-flex flex-wrap align-center ga-1 mt-1">
+        <v-btn
+          ref="upButton"
+          class="ingest-ingredient__move-up"
+          icon
+          size="small"
+          variant="text"
+          :disabled="!canMoveUp"
+          :aria-label="$t('recipe-ingest.review.move-up')"
+          :title="$t('recipe-ingest.review.move-up')"
+          @click="move('move-up')"
+        >
+          <v-icon :icon="mdiArrowUp" />
+        </v-btn>
+        <v-btn
+          ref="downButton"
+          class="ingest-ingredient__move-down"
+          icon
+          size="small"
+          variant="text"
+          :disabled="!canMoveDown"
+          :aria-label="$t('recipe-ingest.review.move-down')"
+          :title="$t('recipe-ingest.review.move-down')"
+          @click="move('move-down')"
+        >
+          <v-icon :icon="mdiArrowDown" />
+        </v-btn>
+        <v-btn
+          v-if="canReread"
+          class="ingest-ingredient__reread"
+          size="small"
+          variant="text"
+          :prepend-icon="mdiCropFree"
+          @click="emit('reread')"
+        >
+          {{ $t("recipe-ingest.review.re-read") }}
+        </v-btn>
         <v-spacer />
         <v-btn
-          v-if="!readonly"
           size="small"
           variant="text"
           color="error"
@@ -147,6 +190,7 @@
 </template>
 
 <script setup lang="ts">
+import { mdiArrowDown, mdiArrowUp, mdiCropFree } from "@mdi/js";
 import { useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,
@@ -161,7 +205,8 @@ import type { CardDraftIngredient, CardDraftRef, CardFlag } from "~/lib/api/type
 /**
  * One ingredient line (docs/ai/PHASE2.md §6.2): it reads like the card ("1 tbsp coconut oil (melted)") with its link
  * status; tapped, it opens amount, unit and food autocompletes from the group's stores (with no "create": a name
- * that isn't linked becomes a New food, or Kept as text for members who can't add foods) and the card's line.
+ * that isn't linked becomes a New food, or Kept as text for members who can't add foods) and the card's line. The
+ * open line can be moved up or down (or dragged by its handle on desktop) and re-read from the card.
  */
 const props = withDefaults(defineProps<{
   /** This line's unresolved errors and warnings */
@@ -174,6 +219,12 @@ const props = withDefaults(defineProps<{
   canCreateFoods?: boolean;
   foodOptions?: IngestNamedOption[];
   unitOptions?: IngestNamedOption[];
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
+  /** Shows the drag handle (desktop) */
+  draggable?: boolean;
+  /** Offers Re-read for this line (a ready card) */
+  canReread?: boolean;
 }>(), {
   flags: () => [],
   infos: () => [],
@@ -182,10 +233,14 @@ const props = withDefaults(defineProps<{
   canCreateFoods: false,
   foodOptions: () => [],
   unitOptions: () => [],
+  canMoveUp: false,
+  canMoveDown: false,
+  draggable: false,
+  canReread: false,
 });
 
 const emit = defineEmits<{
-  (e: "toggle" | "remove"): void;
+  (e: "toggle" | "remove" | "move-up" | "move-down" | "reread"): void;
 }>();
 
 const model = defineModel<CardDraftIngredient>({ required: true });
@@ -255,6 +310,18 @@ function setNote(value: string | null) {
   model.value.note = value ?? "";
   refresh();
 }
+
+type FocusableButton = { $el: HTMLElement } | null;
+const upButton = ref<FocusableButton>(null);
+const downButton = ref<FocusableButton>(null);
+
+/** Moves the line; the focus stays on a move button, which the list's reordering of the rows would drop */
+async function move(direction: "move-up" | "move-down") {
+  emit(direction);
+  await nextTick();
+  const next = direction === "move-up" ? (props.canMoveUp ? upButton : downButton) : (props.canMoveDown ? downButton : upButton);
+  next.value?.$el?.focus?.();
+}
 </script>
 
 <style scoped>
@@ -304,5 +371,9 @@ function setNote(value: string | null) {
 
 .ingest-ingredient__original {
   overflow-wrap: anywhere;
+}
+
+.ingest-ingredient__handle {
+  cursor: grab;
 }
 </style>

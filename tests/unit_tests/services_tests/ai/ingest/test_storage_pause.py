@@ -2,12 +2,14 @@
 
 import errno
 import fcntl
+import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -360,15 +362,16 @@ def test_without_file_locks_the_marker_alone_applies(
 
 
 # ==========================================
-# Locks that belong to the process (NFS)
+# Locks that belong to the process
 
 
 @pytest.fixture()
 def process_locks(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    `flock` as Linux NFS clients emulate it: POSIX record locks (flock(2), "NFS details"). Those belong to the
-    process, not to the open file, so two threads never conflict, and closing any descriptor of the file drops every
-    lock the process holds on it. `lockf` gives exactly that on a local filesystem.
+    `flock` as platforms that build it on POSIX record locks provide it: those locks belong to the process, not to the
+    open file, so two threads never conflict, and closing any descriptor of the file drops every lock the process holds
+    on it. `lockf` gives exactly that on a local filesystem. (Linux's own NFS emulation of `flock` keeps the open file
+    description as the lock's owner, like a local `flock`; the in-process gate is defence in depth for the rest.)
     """
     monkeypatch.setattr(fcntl, "flock", fcntl.lockf)
 
@@ -431,3 +434,283 @@ def test_with_process_locks_a_section_ending_doesnt_drop_another_ones_lock(data_
 
 def test_lock_support_is_detected(data_dir: Path):
     assert storage.flock_supported()
+
+
+def test_the_restore_wait_ends_before_a_reverse_proxy_gives_up():
+    """A busy restore answers "try again" within the 60 s that reverse proxies commonly allow a request"""
+    assert limits.RESTORE_LOCK_WAIT < 60
+    assert limits.RESTORE_LOCK_WAIT >= 30  # write sections take seconds: a restore still waits for them
+
+
+# ==========================================
+# A marker whose restore is gone
+
+_RESTORE_IN_ANOTHER_PROCESS = """
+import sys, time
+from pathlib import Path
+from mealie.services.ai.ingest import storage
+
+storage._data_dir = lambda: Path(sys.argv[1])
+
+
+@storage.pauses_ingest
+def restore() -> None:
+    print("restoring", flush=True)
+    if sys.argv[2] == "check":
+        print("paused" if storage.is_paused() else "not paused", flush=True)
+    time.sleep(120)
+
+
+restore()
+"""
+
+
+@pytest.fixture()
+def restore_in_another_process(data_dir: Path) -> Iterator[Callable[..., subprocess.Popen[str]]]:
+    """Starts the real `pauses_ingest` in another process (a worker restoring), and waits until it's restoring"""
+    started: list[subprocess.Popen[str]] = []
+
+    def start(mode: str = "sleep") -> subprocess.Popen[str]:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _RESTORE_IN_ANOTHER_PROCESS, str(data_dir), mode],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        started.append(process)
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "restoring"
+        return process
+
+    yield start
+    for process in started:
+        process.kill()
+        process.wait(10)
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def _age_marker(path: Path, seconds: float) -> None:
+    """The marker as its restore last refreshed it `seconds` ago, its other fields kept"""
+    content = json.loads(path.read_text())
+    content["time"] = time.time() - seconds
+    path.write_text(json.dumps(content))
+
+
+def _finished_process_id() -> int:
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait(30)
+    return process.pid
+
+
+def _write_json_marker(path: Path, **fields: object) -> None:
+    content: dict[str, object] = {
+        "time": time.time(),
+        "pid": os.getpid(),
+        "host": storage._host_identity(),
+        "started": storage._process_started(os.getpid()),
+        "lock": None,
+    }
+    content.update(fields)
+    path.write_text(json.dumps(content))
+
+
+def test_a_restores_marker_names_its_process_and_its_lock(data_dir: Path, fast_pause: None):
+    seen: list[dict] = []
+
+    @storage.pauses_ingest
+    def restore() -> None:
+        seen.append(json.loads((data_dir / storage.PAUSE_MARKER_NAME).read_text()))
+        assert storage.is_paused()
+        assert not storage.clear_stale_pause()  # this process's own restore
+
+    restore()
+    (marker,) = seen
+    assert marker["pid"] == os.getpid() and marker["host"] == storage._host_identity()
+    assert marker["started"] == storage._process_started(os.getpid())
+    assert marker["lock"] == str(data_dir / f"{storage.LOCK_FILE_NAME}{storage.RESTORE_LOCK_SUFFIX}")
+    assert abs(marker["time"] - time.time()) < 5
+    assert not (data_dir / storage.PAUSE_MARKER_NAME).exists()
+
+
+def test_a_restore_in_another_process_pauses_however_old_its_marker(
+    data_dir: Path, restore_in_another_process: Callable[..., subprocess.Popen[str]]
+):
+    restore_in_another_process()
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    assert storage.is_paused()
+
+    _age_marker(marker, 3 * limits.PAUSE_REFRESH)  # its refresher stalled, but the restore holds its lock
+    assert storage.is_paused()
+    assert not storage.clear_stale_pause()
+    assert marker.exists()
+    with pytest.raises(IngestPaused), storage.ingest_write():
+        pass
+
+
+def test_the_marker_of_a_restore_that_crashed_is_removed_at_once(
+    data_dir: Path, restore_in_another_process: Callable[..., subprocess.Popen[str]], caplog: pytest.LogCaptureFixture
+):
+    process = restore_in_another_process()
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    assert storage.is_paused()
+
+    process.kill()  # a crash or a container stop mid-restore
+    process.wait(10)
+    assert marker.exists()  # fresh: written moments ago
+    with caplog.at_level(logging.INFO):
+        assert not storage.is_paused()
+    assert not marker.exists()
+    assert any("no longer running" in record.getMessage() for record in caplog.records)
+    with storage.ingest_write():
+        pass
+
+
+def test_a_restore_in_this_process_is_seen_from_another_one(data_dir: Path, fast_pause: None):
+    seen: list[str] = []
+
+    @storage.pauses_ingest
+    def restore() -> None:
+        checked = subprocess.run(
+            [sys.executable, "-c", _CHECK_IN_ANOTHER_PROCESS, str(data_dir)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        seen.append(checked.stdout.strip())
+        seen.append("marker" if (data_dir / storage.PAUSE_MARKER_NAME).exists() else "no marker")
+
+    restore()
+    assert seen == ["paused", "marker"]
+
+
+_CHECK_IN_ANOTHER_PROCESS = """
+import sys
+from pathlib import Path
+from mealie.services.ai.ingest import storage
+
+storage._data_dir = lambda: Path(sys.argv[1])
+print("paused" if storage.is_paused() else "not paused")
+"""
+
+
+def test_a_new_restore_waits_for_a_stale_check_and_keeps_its_own_marker(data_dir: Path, fast_pause: None):
+    """A stale-marker check holds the restore lock while it removes the old marker; a restore starting then waits"""
+    _write_json_marker(
+        data_dir / storage.PAUSE_MARKER_NAME, pid=_finished_process_id(), lock=str(storage.restore_lock_path())
+    )
+    state, fd = storage._probe_restore_lock()  # the check, holding the lock
+    assert state == storage._RestoreLock.free and fd is not None
+    seen: list[bool] = []
+
+    @storage.pauses_ingest
+    def restore() -> None:
+        seen.append(storage.is_paused())
+
+    restoring = threading.Thread(target=restore)
+    restoring.start()
+    time.sleep(0.2)
+    assert seen == []  # waiting for the restore lock, before writing its marker
+    (data_dir / storage.PAUSE_MARKER_NAME).unlink()  # the check removes the stale marker
+    storage._unlock(fd)
+    restoring.join(10)
+    assert seen == [True]
+
+
+# Where file locks don't work, the marker's process tells
+
+
+def test_without_locks_a_marker_whose_process_is_gone_is_removed(data_dir: Path):
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    _write_json_marker(marker, pid=_finished_process_id(), time=time.time() - 3 * limits.PAUSE_REFRESH)
+    assert not storage.is_paused()
+    assert not marker.exists()
+
+    _write_json_marker(marker, pid=_finished_process_id())  # fresh, but its process is gone too
+    assert storage.clear_stale_pause()
+    assert not marker.exists()
+
+
+def test_without_locks_a_marker_whose_process_id_was_reused_is_removed(data_dir: Path):
+    """A restarted container's new process can have the crashed one's id: the start time tells them apart"""
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    started = storage._process_started(os.getpid())
+    assert started is not None  # Linux
+    _write_json_marker(marker, started=started - 100)
+    assert not storage.is_paused()
+    assert not marker.exists()
+
+
+def test_without_locks_a_live_process_keeps_its_marker(data_dir: Path):
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _write_json_marker(marker, pid=process.pid, started=None, time=time.time() - 3 * limits.PAUSE_REFRESH)
+        assert storage.is_paused()
+        assert marker.exists()
+    finally:
+        process.kill()
+        process.wait(10)
+
+
+def test_a_marker_from_another_host_is_honoured_until_its_time_runs_out(data_dir: Path):
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    _write_json_marker(marker, pid=_finished_process_id(), host="another-host/boot/1")
+    assert storage.is_paused()
+    assert marker.exists()
+
+    _write_json_marker(marker, host="another-host/boot/1", time=time.time() - limits.PAUSE_TTL - 1)
+    assert not storage.is_paused()
+
+
+def test_an_older_versions_marker_is_honoured_until_its_time_runs_out(data_dir: Path):
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    marker.write_text(f"{time.time() - 3 * limits.PAUSE_REFRESH:.3f}")  # its time only, and nobody holds a lock
+    assert storage.is_paused()
+    assert not storage.clear_stale_pause()
+    assert marker.exists()
+
+    marker.write_text(f"{time.time() - limits.PAUSE_TTL - 1:.3f}")
+    assert not storage.is_paused()
+
+
+def test_a_stale_check_without_locks_doesnt_remove_a_marker_written_meanwhile(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    _write_json_marker(marker, pid=_finished_process_id())
+    process_gone = storage._process_gone
+
+    def a_restore_starts_meanwhile(pid: int, started: int | None) -> bool:
+        _write_json_marker(marker)  # a new restore of this process's
+        return process_gone(pid, started)
+
+    monkeypatch.setattr(storage, "_process_gone", a_restore_starts_meanwhile)
+    assert storage.is_paused()
+    assert json.loads(marker.read_text())["pid"] == os.getpid()
+
+
+def test_a_process_reading_its_own_old_marker_removes_it(data_dir: Path):
+    """This process wrote no marker (no restore runs here): one naming it with another start time is a crashed one's"""
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+    _write_json_marker(marker, started=-1)
+    assert not storage.is_paused()
+    assert not marker.exists()
+
+
+def test_a_restore_that_gives_up_leaves_the_marker_of_one_running_in_another_process(
+    data_dir: Path, fast_pause: None, restore_in_another_process: Callable[..., subprocess.Popen[str]]
+):
+    """Two restores at once in two workers: the second can't get the write lock and gives up; the first still runs"""
+    restore_in_another_process()
+    marker = data_dir / storage.PAUSE_MARKER_NAME
+
+    @storage.pauses_ingest
+    def second_restore() -> None:
+        raise AssertionError("the write lock is the first restore's")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(limits, "RESTORE_LOCK_WAIT", 0.1)
+        with pytest.raises(IngestBusyError):
+            second_restore()
+    assert marker.exists()
+    assert storage.is_paused()

@@ -37,8 +37,9 @@ class AIProviderRouter:
     - `planner`, `fast`: the slot's routes; if it has none, the `default` candidates
     - `embedding`: the slot's routes only
 
-    Duplicates are dropped, keeping the first, and providers at or over their monthly token limit
-    are skipped.
+    Duplicates are dropped, keeping the first (`resolve`), and providers at or over their monthly token
+    limit are skipped (`within_limits`). A caller that filters the providers further, as the call policy
+    does (`AIRuntime.candidates`), does so between the two, so that the limits apply to what's left.
     """
 
     def __init__(self, repos: AllRepositories, primaries: Mapping[AIProviderSlot, AIProviderOut | None]) -> None:
@@ -47,10 +48,17 @@ class AIProviderRouter:
 
     def candidates(self, slot: AIProviderSlot) -> list[AIProviderOut]:
         """
-        The providers to try for `slot`, in order.
+        The providers to try for `slot`, in order: `within_limits(resolve(slot), slot)`.
 
         Raises upstream's `OpenAINotEnabledException` if the slot has no providers at all, and
         `AIProviderLimitReachedError` if every one of them has reached its monthly token limit.
+        """
+        return self.within_limits(self.resolve(slot), slot)
+
+    def resolve(self, slot: AIProviderSlot) -> list[AIProviderOut]:
+        """
+        The slot's providers in order, whatever their monthly token limits. Raises upstream's
+        `OpenAINotEnabledException` if the slot has none.
         """
         routes = self._get_routes()
         if slot in DEFAULT_FALLBACK_SLOTS and not routes.get(slot):
@@ -59,9 +67,15 @@ class AIProviderRouter:
         providers = self._resolve(slot, routes)
         if not providers:
             raise _not_configured(slot)
+        return providers
 
+    def within_limits(self, providers: list[AIProviderOut], slot: AIProviderSlot) -> list[AIProviderOut]:
+        """
+        `providers` without those at or over their monthly token limit, in order. Raises
+        `AIProviderLimitReachedError`, naming them, if that leaves none.
+        """
         available = self._within_limits(providers)
-        if not available:
+        if providers and not available:
             names = ", ".join(provider.name for provider in providers)
             raise AIProviderLimitReachedError(
                 f"Every AI provider for {slot.value} tasks has reached its monthly token limit ({names})."

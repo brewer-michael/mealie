@@ -78,9 +78,9 @@ class IngestPaused(Exception):
 
 class IngestBusyError(Exception):
     """
-    A backup restore gave up waiting for recipe card ingestion to finish writing, before it changed anything.
-    The restore can be tried again in a moment.
+    A backup restore gave up waiting for writes to finish (recipe card ingestion's, or another change to Mealie that
+    holds the write section), before it changed anything. The restore can be tried again in a moment.
     """
 
-    def __init__(self, message: str = "Recipe card ingestion is busy writing files. Try the restore again.") -> None:
+    def __init__(self, message: str = "Mealie is still saving changes. Try the restore again.") -> None:
         super().__init__(message)

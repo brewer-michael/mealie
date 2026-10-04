@@ -83,8 +83,9 @@
           :key="job.id"
           :job="job"
           :group-slug="groupSlug"
-          :busy="retrying.has(job.id)"
+          :busy="busyJobs.has(job.id)"
           @retry="retryJob"
+          @cancel="cancelJob"
           @discard="askDiscard"
         />
       </v-list>
@@ -127,13 +128,19 @@ import { useUserApi } from "~/composables/api";
 import { errorCodeOf, errorStatusOf, useRecipeIngestCounts, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import { alert } from "~/composables/use-toast";
-import type { IngestSource, IngestStatus, RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
+import type {
+  IngestSource,
+  IngestStatus,
+  RecipeIngestionJobCounts,
+  RecipeIngestionJobSummary,
+} from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
 
 /**
  * The household's cards by batch, newest first (docs/ai/PHASE2.md §6.7), and the ones added in the last 7 days. It
  * polls the batches that are being read or uploaded every 3 s while the page is visible, and at once after an upload.
- * Fork-owned.
+ * Cards that arrive or change elsewhere (the inbox, a Shortcut, another device) show too: while the page is visible
+ * the shared counts are checked every 20 s and a change reloads the list, as does coming back to the page. Fork-owned.
  */
 const props = defineProps<{
   groupSlug: string;
@@ -155,6 +162,8 @@ interface BatchView {
 }
 
 const POLL_INTERVAL_MS = 3000;
+/** How often, while the page is visible, the counts are checked for changes made elsewhere */
+const COUNTS_INTERVAL_MS = 20_000;
 const PER_PAGE = 100;
 /** At most this many pages of a list (a household has at most 200 cards being read) */
 const MAX_PAGES = 10;
@@ -176,7 +185,8 @@ const recent = ref<Job[]>([]);
 const loading = ref(false);
 const loaded = ref(false);
 const loadFailed = ref(false);
-const retrying = ref(new Set<string>());
+/** Cards with a Retry or Cancel in flight */
+const busyJobs = ref(new Set<string>());
 const retryingBatch = ref<string | null>(null);
 const discardDialog = ref(false);
 const discardTarget = ref<Job | null>(null);
@@ -286,10 +296,12 @@ let polling = false;
 let pollAgain = false;
 /** Batches to poll once more whatever their state (the batch of an upload that just finished) */
 const extraBatchIds = new Set<string>();
+let countsTimer: ReturnType<typeof setTimeout> | null = null;
+/** The counts as of the list's last load or change: other counts mean something changed elsewhere */
+let seenCounts: string | null = null;
 
-const shouldPoll = computed(
-  () => visibility.value === "visible" && (jobs.value.some(isActive) || uploads.isUploading.value),
-);
+const isVisible = () => visibility.value === "visible";
+const shouldPoll = computed(() => jobs.value.some(isActive) || uploads.isUploading.value);
 
 function clearPollTimer() {
   if (pollTimer !== null) {
@@ -298,9 +310,50 @@ function clearPollTimer() {
   }
 }
 
+function countsKey(value: RecipeIngestionJobCounts | null | undefined): string | null {
+  return value ? [value.processing ?? 0, value.ready ?? 0, value.needsAttention ?? 0, value.failed ?? 0].join("/") : null;
+}
+
+/** Refreshes the shared counts (the sidebar's) after a change this list made or saw, and remembers them */
+async function refreshCounts() {
+  const fresh = await counts.refresh();
+  seenCounts = countsKey(fresh) ?? seenCounts;
+}
+
+function clearCountsTimer() {
+  if (countsTimer !== null) {
+    clearTimeout(countsTimer);
+    countsTimer = null;
+  }
+}
+
+function scheduleCountsCheck() {
+  clearCountsTimer();
+  if (!disposed && isVisible()) {
+    countsTimer = setTimeout(() => {
+      countsTimer = null;
+      void checkCounts();
+    }, COUNTS_INTERVAL_MS);
+  }
+}
+
+/** Counts that changed although this list did nothing: cards arrived, were read or added elsewhere. Reload. */
+async function checkCounts() {
+  const fresh = countsKey(await counts.refresh());
+  if (disposed) {
+    return;
+  }
+  if (fresh !== null && seenCounts !== null && fresh !== seenCounts) {
+    await load();
+    return;
+  }
+  seenCounts = fresh ?? seenCounts;
+  scheduleCountsCheck();
+}
+
 function schedulePoll() {
   clearPollTimer();
-  if (!disposed && shouldPoll.value) {
+  if (!disposed && shouldPoll.value && isVisible()) {
     pollTimer = setTimeout(() => {
       pollTimer = null;
       void pollNow();
@@ -336,7 +389,7 @@ async function poll() {
     }
   });
   if (changed) {
-    void counts.refresh();
+    void refreshCounts();
   }
 }
 
@@ -401,23 +454,37 @@ async function load() {
       loaded.value ||= !!open;
     }
     // The sidebar's count may be stale: cards were read while the user was elsewhere
-    void counts.refresh();
+    await refreshCounts();
   }
   finally {
     if (seq === loadSeq) {
       loading.value = false;
     }
   }
-  schedulePoll();
+  if (seq === loadSeq) {
+    schedulePoll();
+    scheduleCountsCheck();
+  }
 }
 
 watch(shouldPoll, (should) => {
   if (!should) {
     clearPollTimer();
   }
-  else if (loaded.value && pollTimer === null && !polling) {
-    // The page came back into view, or uploads started: catch up at once
+  else if (loaded.value && pollTimer === null && !polling && !loading.value && isVisible()) {
+    // Uploads started: catch up at once (a load in flight polls after it)
     void pollNow();
+  }
+});
+
+watch(visibility, (state) => {
+  if (state !== "visible") {
+    clearPollTimer();
+    clearCountsTimer();
+  }
+  else if (loaded.value) {
+    // Back on the page: whatever happened meanwhile, here or elsewhere, shows at once
+    void load();
   }
 });
 
@@ -441,43 +508,91 @@ onMounted(load);
 onBeforeUnmount(() => {
   disposed = true;
   clearPollTimer();
+  clearCountsTimer();
 });
 
 // ==========================================
 // Actions
 
-function markRetrying(jobId: string, on: boolean) {
-  const next = new Set(retrying.value);
+function markBusy(jobId: string, on: boolean) {
+  const next = new Set(busyJobs.value);
   if (on) {
     next.add(jobId);
   }
   else {
     next.delete(jobId);
   }
-  retrying.value = next;
+  busyJobs.value = next;
 }
 
-/** Retries a failed card; the server answers with its new state, so the list shows it as queued at once */
+/**
+ * Says why the server refused a card action. Errors with a message were already shown by the API client; the others
+ * say why by their code (`invalid_status`: retried or discarded elsewhere; `forbidden`: only the uploader, or a
+ * household manager, discards someone else's card).
+ */
+function notifyRefusal(error: unknown) {
+  if ((error as { response?: { data?: { detail?: { message?: unknown } } } } | null)?.response?.data?.detail?.message) {
+    return;
+  }
+  const code = errorCodeOf(error);
+  alert.error(code ? ingestErrorText(code) : i18n.t("recipe-ingest.error.unknown", { code: errorStatusOf(error) ?? "network" }));
+}
+
+/** Shows the card's state as the server answered it */
+function applyState(jobId: string, state: { status: IngestStatus; task?: Job["task"]; error?: Job["error"] }) {
+  jobs.value = jobs.value.map(j => (j.id === jobId
+    ? { ...j, status: state.status, task: state.task ?? null, error: state.error ?? null }
+    : j));
+}
+
+/**
+ * Retries a failed card; the server answers with its new state, so the list shows it as queued at once. A refusal
+ * says why, and the card's batch is polled so the row shows what the card is now.
+ */
 async function retryOne(job: Job): Promise<boolean> {
-  markRetrying(job.id, true);
+  markBusy(job.id, true);
   try {
-    const { data } = await api.recipeIngest.retry(job.id);
+    const { data, error } = await api.recipeIngest.retry(job.id);
     if (data) {
-      jobs.value = jobs.value.map(j => (j.id === job.id
-        ? { ...j, status: data.status, task: data.task ?? null, error: data.error ?? null }
-        : j));
-      extraBatchIds.add(job.batchId);
+      applyState(job.id, data);
     }
+    else {
+      notifyRefusal(error);
+    }
+    extraBatchIds.add(job.batchId);
     return !!data;
   }
   finally {
-    markRetrying(job.id, false);
+    markBusy(job.id, false);
   }
 }
 
 async function retryJob(job: Job) {
   await retryOne(job);
-  void counts.refresh();
+  void refreshCounts();
+  void pollNow();
+}
+
+/**
+ * Stops reading a card: a card still waiting fails as cancelled at once, one being read stops within moments (the
+ * poll shows it). It can be retried.
+ */
+async function cancelJob(job: Job) {
+  markBusy(job.id, true);
+  try {
+    const { data, error } = await api.recipeIngest.cancel(job.id);
+    if (data) {
+      applyState(job.id, data);
+    }
+    else {
+      notifyRefusal(error);
+    }
+    extraBatchIds.add(job.batchId);
+  }
+  finally {
+    markBusy(job.id, false);
+  }
+  void refreshCounts();
   void pollNow();
 }
 
@@ -489,7 +604,7 @@ async function retryFailed(batch: BatchView) {
   finally {
     retryingBatch.value = null;
   }
-  void counts.refresh();
+  void refreshCounts();
   void pollNow();
 }
 
@@ -509,13 +624,10 @@ async function confirmDiscard() {
   if (!error || errorStatusOf(error) === 404) {
     jobs.value = jobs.value.filter(j => j.id !== job.id);
     alert.success(i18n.t("recipe-ingest.queue.discarded"));
-    void counts.refresh();
+    void refreshCounts();
   }
-  else if (!(error as { response?: { data?: { detail?: { message?: unknown } } } }).response?.data?.detail?.message) {
-    // Errors with a message were already shown by the API client; the others say why by their code (`forbidden`:
-    // only the uploader, or a household manager, discards someone else's card)
-    const code = errorCodeOf(error);
-    alert.error(code ? ingestErrorText(code) : i18n.t("recipe-ingest.error.unknown", { code: errorStatusOf(error) ?? "network" }));
+  else {
+    notifyRefusal(error);
   }
 }
 </script>

@@ -66,6 +66,13 @@ class RecipeIngestionBatch(SqlAlchemyBase, BaseMixins):
     sealed_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
     """Set once; a sealed batch never gains a card"""
     notified_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """Set once the ready notification reached every notifier, or was given up on"""
+    notify_claimed_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """The lease of the process sending the ready notification; another may retry once it has passed"""
+    notify_attempts: orm.Mapped[int] = orm.mapped_column(sa.Integer, nullable=False, default=0, server_default="0")
+    """Claims of the ready notification so far"""
+    notify_delivered: orm.Mapped[Any] = orm.mapped_column(JsonText, nullable=True)
+    """`list[str]`: hashes of the notifier targets the ready notification already reached"""
 
     @auto_init()
     def __init__(self, **_) -> None:
@@ -84,6 +91,8 @@ class RecipeIngestionJob(SqlAlchemyBase, BaseMixins):
         sa.Index("ix_recipe_ingestion_jobs_household_status_created", "household_id", "status", "created_at"),
         sa.Index("ix_recipe_ingestion_jobs_household_source_sha256", "household_id", "source_sha256"),
         sa.Index("ix_recipe_ingestion_jobs_batch_position", "batch_id", "position"),
+        sa.Index("ix_recipe_ingestion_jobs_status_auto_retry", "status", "auto_retry_at"),
+        sa.Index("ix_recipe_ingestion_jobs_status_event_sent", "status", "recipe_event_sent_at"),
     )
 
     id: orm.Mapped[GUID] = orm.mapped_column(GUID, primary_key=True, default=GUID.generate)
@@ -163,6 +172,8 @@ class RecipeIngestionJob(SqlAlchemyBase, BaseMixins):
     error_code: orm.Mapped[str | None] = orm.mapped_column(sa.String(64), nullable=True)
     """`IngestErrorCode`"""
     error_params: orm.Mapped[Any] = orm.mapped_column(JsonText, nullable=True)
+    auto_retry_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """A card that failed `limit_reached` is read again from then (next month), or once the limit no longer applies"""
 
     commit_recipe_id: orm.Mapped[GUID | None] = orm.mapped_column(GUID, nullable=True)
     """The recipe id a commit reserved before creating anything (§7)"""
@@ -173,6 +184,10 @@ class RecipeIngestionJob(SqlAlchemyBase, BaseMixins):
     commit_started_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
     """The commit's lease"""
     committed_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    recipe_event_claimed_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """The lease of a process sending the committed recipe's `recipe_created` after the committer didn't"""
+    recipe_event_sent_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """When `recipe_created` was sent for the committed recipe; housekeeping sends it while it's unset"""
 
     @auto_init()
     def __init__(self, **_) -> None:

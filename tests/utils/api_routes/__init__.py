@@ -288,14 +288,29 @@ def ai_ingest_batches_batch_id(batch_id):
     return f"{prefix}/ai/ingest/batches/{batch_id}"
 
 
+def ai_ingest_batches_batch_id_commit_clean(batch_id):
+    """`/api/ai/ingest/batches/{batch_id}/commit-clean`"""
+    return f"{prefix}/ai/ingest/batches/{batch_id}/commit-clean"
+
+
 def ai_ingest_batches_batch_id_seal(batch_id):
     """`/api/ai/ingest/batches/{batch_id}/seal`"""
     return f"{prefix}/ai/ingest/batches/{batch_id}/seal"
 
 
+def ai_ingest_batches_batch_id_touch(batch_id):
+    """`/api/ai/ingest/batches/{batch_id}/touch`"""
+    return f"{prefix}/ai/ingest/batches/{batch_id}/touch"
+
+
 def ai_ingest_eval_cases_slug(slug):
     """`/api/ai/ingest/eval-cases/{slug}`"""
     return f"{prefix}/ai/ingest/eval-cases/{slug}"
+
+
+def ai_ingest_eval_cases_slug_download(slug):
+    """`/api/ai/ingest/eval-cases/{slug}/download`"""
+    return f"{prefix}/ai/ingest/eval-cases/{slug}/download"
 
 
 def ai_ingest_jobs_job_id(job_id):
@@ -318,6 +333,11 @@ def ai_ingest_jobs_job_id_eval_case(job_id):
     return f"{prefix}/ai/ingest/jobs/{job_id}/eval-case"
 
 
+def ai_ingest_jobs_job_id_merge(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/merge`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/merge"
+
+
 def ai_ingest_jobs_job_id_pages_index_kind(job_id, index, kind):
     """`/api/ai/ingest/jobs/{job_id}/pages/{index}/{kind}`"""
     return f"{prefix}/ai/ingest/jobs/{job_id}/pages/{index}/{kind}"
@@ -326,6 +346,11 @@ def ai_ingest_jobs_job_id_pages_index_kind(job_id, index, kind):
 def ai_ingest_jobs_job_id_pages_index_rotate(job_id, index):
     """`/api/ai/ingest/jobs/{job_id}/pages/{index}/rotate`"""
     return f"{prefix}/ai/ingest/jobs/{job_id}/pages/{index}/rotate"
+
+
+def ai_ingest_jobs_job_id_read_with_cloud(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/read-with-cloud`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/read-with-cloud"
 
 
 def ai_ingest_jobs_job_id_reextract(job_id):
@@ -346,6 +371,11 @@ def ai_ingest_jobs_job_id_retry(job_id):
 def ai_ingest_jobs_job_id_state(job_id):
     """`/api/ai/ingest/jobs/{job_id}/state`"""
     return f"{prefix}/ai/ingest/jobs/{job_id}/state"
+
+
+def ai_ingest_jobs_job_id_uncommit(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/uncommit`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/uncommit"
 
 
 def ai_notifiers_notifier_id_events(notifier_id):

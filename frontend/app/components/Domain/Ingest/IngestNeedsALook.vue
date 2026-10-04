@@ -21,6 +21,7 @@
         <IngestFlagItem
           :item="item"
           :readonly="readonly"
+          :can-reread="canReread"
           @alternative="(flag, alternative) => emit('alternative', flag, alternative)"
           @fill="(flag, value) => emit('fill', flag, value)"
           @reread="flag => emit('reread', flag)"
@@ -46,8 +47,11 @@ import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/rec
 const props = withDefaults(defineProps<{
   items: NeedsALookItem[];
   readonly?: boolean;
+  /** Whether Re-read works now */
+  canReread?: boolean;
 }>(), {
   readonly: false,
+  canReread: true,
 });
 
 const emit = defineEmits<{

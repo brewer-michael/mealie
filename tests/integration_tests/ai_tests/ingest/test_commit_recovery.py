@@ -1,7 +1,8 @@
 """
 Crash-safe commits (docs/ai/PHASE2.md §7, §18 Commit): a process dying after any step of a commit, then the commit
 resumed (by `resume_stale_commits`, as the dispatcher's housekeeping runs it, or by a later request), never makes a
-second recipe, food, unit or asset name, and `recipe_created` goes out exactly once. Runs on SQLite and PostgreSQL.
+second recipe, food, unit or asset name, and `recipe_created` goes out once, even when the process dies between the
+finish and the event. Runs on SQLite and PostgreSQL.
 """
 
 import fcntl
@@ -60,7 +61,7 @@ def published(monkeypatch: pytest.MonkeyPatch, unique_user_fn_scoped: TestUser) 
 
 
 def ready_job(user: TestUser, **kwargs: Any) -> UUID:
-    draft = banana_draft()
+    draft = banana_draft(attach_card_photo=True)
     flags: list[CardFlag] = [
         flag.model_copy(update={"resolution": FlagResolution.kept}) if flag.severity == "error" else flag
         for flag in fake_compute_flags(draft, None, {})
@@ -84,7 +85,7 @@ def after_the_lease() -> Any:
 
 def group_recipes(user: TestUser) -> list[Any]:
     with session_context() as session:
-        stmt = sa.select(RecipeModel.id, RecipeModel.slug, RecipeModel.image).where(
+        stmt = sa.select(RecipeModel.id, RecipeModel.slug, RecipeModel.image, RecipeModel.is_ocr_recipe).where(
             RecipeModel.group_id == UUID(user.group_id)
         )
         return list(session.execute(stmt).all())
@@ -173,6 +174,7 @@ def test_a_crash_after_each_step_is_resumed_without_duplicates(
     recipes = group_recipes(user)
     assert [(r.id, r.slug) for r in recipes] == [(recipe_id, "banana-mug-cake")]
     assert recipes[0].image  # the cover key
+    assert recipes[0].is_ocr_recipe is True  # upstream's provenance bit, set again by the resumed commit
     row_existed = point in ("inside create_one", "after create_one", "after the cover key")
     assert len(creates) == (0 if row_existed else 1)  # a recipe row is reused, never recreated
 
@@ -191,19 +193,32 @@ def test_a_crash_after_each_step_is_resumed_without_duplicates(
     assert len(group_recipes(user)) == 1
 
 
-def test_a_crash_after_the_finish_never_publishes_twice(
+def test_a_crash_after_the_finish_sends_the_event_later_once(
     unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str]
 ):
-    """At most once: a process dying right after the finish loses the event rather than doubling it"""
+    """At least once: a process dying between the finish and the event leaves it to housekeeping, which sends it once"""
     user = unique_user_fn_scoped
     job_id = ready_job(user)
-    monkeypatch.setattr(card_commit, "_publish_recipe_created", crash_once(lambda *a, **k: None, before=True))
+    real_publish = card_commit._publish_recipe_created
+    monkeypatch.setattr(card_commit, "_publish_recipe_created", crash_once(real_publish, before=True))
 
     with pytest.raises(Crash):
         run_commit(user, job_id)
-    assert job_row(job_id)["status"] == "committed"
+    row = job_row(job_id)
+    assert row["status"] == "committed"
+    assert (row["recipe_event_claimed_at"] is not None, row["recipe_event_sent_at"]) == (True, None)
+
+    # the dead committer's claim holds for its lease
     card_commit.resume_stale_commits(after_the_lease())
     assert published == []
+
+    # then housekeeping sends it, once
+    later = utcnow() + card_commit.RECIPE_EVENT_LEASE + timedelta(seconds=5)
+    card_commit.resume_stale_commits(later)
+    assert published == ["banana-mug-cake"]
+    assert job_row(job_id)["recipe_event_sent_at"] is not None
+    card_commit.resume_stale_commits(later + timedelta(minutes=10))
+    assert published == ["banana-mug-cake"]
     assert len(group_recipes(user)) == 1
 
 

@@ -18,13 +18,14 @@ from uuid import UUID
 import anyio
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy.orm import Session
 
 from mealie.core.exceptions import NoEntryFound
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import IngestJobsRepo, IngestRepos, utcnow
+from mealie.repos.repository_recipe_ingest import IngestBatchesRepo, IngestJobsRepo, IngestRepos, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
 from mealie.schema.recipe_ingest import (
@@ -244,7 +245,9 @@ def test_a_group_switched_to_local_only_during_the_upload_gets_a_local_only_job(
 # Duplicates
 
 
-def test_duplicates_are_found_by_the_ordered_page_hashes(db: Session, unique_user_fn_scoped: TestUser):
+def test_duplicates_are_found_by_the_ordered_page_hashes(
+    db: Session, unique_user_fn_scoped: TestUser, api_client: TestClient
+):
     user = unique_user_fn_scoped
     service = _service(db, user)
     front, back = _jpeg(), _jpeg()
@@ -260,11 +263,13 @@ def test_duplicates_are_found_by_the_ordered_page_hashes(db: Session, unique_use
     _accepted(service.ingest(_card(back, front), _options(user)))
     assert isinstance(service.ingest(_card(front, back), _options(user)), IntakeRejected)
 
-    # committed cards count; allowDuplicate skips the check
+    # committed cards count (while their recipe exists); allowDuplicate skips the check
+    slug = api_client.post("/api/recipes", json={"name": f"card {first.job_id}"}, headers=user.token).json()
+    recipe_id = api_client.get(f"/api/recipes/{slug}", headers=user.token).json()["id"]
     db.execute(
         sa.update(RecipeIngestionJob)
         .where(RecipeIngestionJob.id == first.job_id)
-        .values(status=IngestStatus.committed.value)
+        .values(status=IngestStatus.committed.value, recipe_id=UUID(recipe_id))
     )
     db.commit()
     assert isinstance(service.ingest(_card(front), _options(user)), IntakeRejected)
@@ -368,9 +373,12 @@ def test_a_seal_racing_an_insert_never_leaves_the_job_in_a_sealed_batch(
         assert len(IngestRepos(session, UUID(user.group_id), UUID(user.household_id)).batches.jobs(app_batch)) == 1
 
 
+@pytest.mark.parametrize("sealer", ["another_session", "same_transaction"])
 def test_a_batch_sealed_between_choosing_and_touching_is_replaced(
-    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, sealer: str
 ):
+    if sealer == "another_session" and db.get_bind().dialect.name != "postgresql":
+        pytest.skip("On SQLite intake holds the database's write lock before it chooses: no seal can come between")
     user = unique_user_fn_scoped
     repos = IngestRepos(db, UUID(user.group_id), UUID(user.household_id))
     app_batch = repos.batches.create(source=IngestSource.app, created_by=user.user_id)
@@ -378,15 +386,152 @@ def test_a_batch_sealed_between_choosing_and_touching_is_replaced(
 
     def select_then_seal(*args: Any, **kwargs: Any) -> UUID:
         chosen = real_select(*args, **kwargs)
-        if chosen == app_batch:
+        if chosen == app_batch and sealer == "another_session":
+            # the seal doesn't take the household's intake lock (PostgreSQL's is an advisory lock)
             with session_context() as other:
                 assert batches.seal(IngestRepos(other, UUID(user.group_id), UUID(user.household_id)), chosen, utcnow())
+        elif chosen == app_batch:
+            db.execute(
+                sa.update(RecipeIngestionBatch).where(RecipeIngestionBatch.id == chosen).values(sealed_at=utcnow())
+            )
         return chosen
 
     monkeypatch.setattr(batches, "select_batch", select_then_seal)
     outcome = _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user, batch_id=app_batch)))
     assert outcome.batch_id != app_batch
     assert repos.batches.jobs(app_batch) == []
+
+
+# ==========================================
+# Simultaneous uploads (one household's intakes take turns)
+
+
+def _race(user: TestUser, cards: list[IntakeCard], monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """
+    Ingests `cards` at the same moment from one thread and session each, none naming a batch. Choosing a batch is
+    slowed down, so without the household's intake lock both would look for an open batch before either made one.
+    """
+    barrier = threading.Barrier(len(cards))
+    real_insert = IntakeService._insert
+    real_find_open = IngestBatchesRepo.find_open
+
+    def insert_together(self: IntakeService, *args: Any) -> Any:
+        barrier.wait(10)
+        return real_insert(self, *args)
+
+    def slow_find_open(self: IngestBatchesRepo, **kwargs: Any) -> UUID | None:
+        found = real_find_open(self, **kwargs)
+        time.sleep(0.3)
+        return found
+
+    monkeypatch.setattr(IntakeService, "_insert", insert_together)
+    monkeypatch.setattr(IngestBatchesRepo, "find_open", slow_find_open)
+
+    outcomes: list[Any] = [None] * len(cards)
+
+    def upload(index: int) -> None:
+        with session_context() as session:
+            try:
+                outcomes[index] = _service(session, user).ingest(cards[index], _options(user))
+            except Exception as e:
+                outcomes[index] = e
+
+    threads = [threading.Thread(target=upload, args=(index,), daemon=True) for index in range(len(cards))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    return outcomes
+
+
+def test_the_same_card_sent_twice_at_once_is_one_job(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, woken: list[int]
+):
+    # a Shortcut retried on a timeout, or the phone and Home Assistant at once: on PostgreSQL both used to see no
+    # duplicate, each in a batch of its own
+    user = unique_user_fn_scoped
+    data = _jpeg()
+    outcomes = _race(user, [_card(data), _card(data)], monkeypatch)
+
+    accepted = [outcome for outcome in outcomes if isinstance(outcome, IntakeAccepted)]
+    rejected = [outcome for outcome in outcomes if isinstance(outcome, IntakeRejected)]
+    assert len(accepted) == 1, outcomes
+    assert len(rejected) == 1, outcomes
+    assert rejected[0].reason == IngestRejectReason.duplicate
+    assert rejected[0].duplicate_of == accepted[0].job_id
+    assert _counts(user) == (1, 1)
+
+
+def test_two_cards_sent_at_once_share_one_batch(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, woken: list[int]
+):
+    # two simultaneous first uploads used to start two batches, and so send two notifications
+    user = unique_user_fn_scoped
+    outcomes = _race(user, [_card(_jpeg()), _card(_jpeg())], monkeypatch)
+
+    accepted = [_accepted(outcome) for outcome in outcomes]
+    assert accepted[0].batch_id == accepted[1].batch_id
+    assert _counts(user) == (2, 1)
+    assert sorted(_job(outcome.job_id).position for outcome in accepted) == [0, 1]
+
+
+def test_duplicates_allowed_still_share_one_batch(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, woken: list[int]
+):
+    user = unique_user_fn_scoped
+    real_options = _options
+    monkeypatch.setattr(
+        f"{__name__}._options", lambda user, **values: real_options(user, **{"allow_duplicate": True, **values})
+    )
+    data = _jpeg()
+    outcomes = _race(user, [_card(data), _card(data)], monkeypatch)
+
+    accepted = [_accepted(outcome) for outcome in outcomes]
+    assert accepted[0].batch_id == accepted[1].batch_id
+    assert _counts(user) == (2, 1)
+
+
+def test_the_intake_lock_makes_a_second_transaction_wait(unique_user: TestUser, h2_user: TestUser):
+    # the database half of the lock, without the process's own: another worker process waits for the household's
+    # intake rather than failing (SQLite's busy timeout, PostgreSQL's advisory lock)
+    household = UUID(unique_user.household_id)
+    held, done = threading.Event(), threading.Event()
+    waited: dict[str, Any] = {}
+
+    def second() -> None:
+        assert held.wait(10)
+        with session_context() as session:
+            started = time.monotonic()
+            try:
+                intake.lock_household_intake(session, household)
+                waited["seconds"] = time.monotonic() - started
+                session.commit()
+            except Exception as e:
+                waited["error"] = e
+        done.set()
+
+    thread = threading.Thread(target=second, daemon=True)
+    thread.start()
+    with session_context() as session:
+        intake.lock_household_intake(session, household)
+        held.set()
+        assert not done.wait(0.6)  # still waiting while this transaction holds the lock
+        session.commit()
+    thread.join(10)
+    assert "error" not in waited, waited
+    assert waited["seconds"] >= 0.5
+
+
+def test_intake_locks_are_per_household_on_postgres(unique_user: TestUser, h2_user: TestUser):
+    with session_context() as session:
+        if session.get_bind().dialect.name != "postgresql":
+            pytest.skip("SQLite has one write lock for the whole database")
+        intake.lock_household_intake(session, UUID(unique_user.household_id))
+        with session_context() as other:
+            other.execute(sa.text("SET LOCAL lock_timeout = '2s'"))
+            intake.lock_household_intake(other, UUID(h2_user.household_id))  # doesn't wait
+            other.commit()
+        session.commit()
 
 
 # ==========================================

@@ -16,42 +16,52 @@
         <v-icon v-else :icon="mdiCardTextOutline" />
       </v-avatar>
     </template>
-    <v-list-item-title class="job-title">
-      <NuxtLink v-if="link" :to="link" class="text-decoration-none">
-        {{ title }}
-      </NuxtLink>
-      <template v-else>
-        {{ title }}
-      </template>
-    </v-list-item-title>
-    <div class="d-flex flex-wrap align-center ga-1 mt-1">
-      <v-chip
-        class="job-status"
-        size="small"
-        variant="tonal"
-        :color="chip.color"
-      >
-        <v-progress-circular
-          v-if="chip.busy"
-          indeterminate
-          size="12"
-          width="2"
-          class="mr-1"
-        />
-        {{ chip.text }}
-      </v-chip>
-      <v-chip
-        v-if="job.localOnly"
-        class="job-local-only"
-        size="small"
-        variant="text"
-        :prepend-icon="$globals.icons.lock"
-      >
-        {{ $t("recipe-ingest.queue.local-only") }}
-      </v-chip>
-    </div>
-    <template #append>
-      <div class="d-flex align-center ga-1">
+    <!-- text and actions wrap: on a phone the buttons go under the chips, so the name and the reason keep the width -->
+    <div class="job-body">
+      <div class="job-text">
+        <v-list-item-title class="job-title">
+          <NuxtLink v-if="link" :to="link" class="text-decoration-none">
+            {{ title }}
+          </NuxtLink>
+          <template v-else>
+            {{ title }}
+          </template>
+        </v-list-item-title>
+        <div v-if="subtitle" class="job-source text-caption text-medium-emphasis">
+          {{ subtitle }}
+        </div>
+        <div class="d-flex flex-wrap align-center ga-1 mt-1">
+          <v-chip
+            class="job-status"
+            size="small"
+            variant="tonal"
+            :color="chip.color"
+          >
+            <v-progress-circular
+              v-if="chip.busy"
+              indeterminate
+              size="12"
+              width="2"
+              class="mr-1"
+            />
+            {{ chip.text }}
+          </v-chip>
+          <v-chip
+            v-if="job.localOnly"
+            class="job-local-only"
+            size="small"
+            variant="text"
+            :prepend-icon="$globals.icons.lock"
+          >
+            {{ $t("recipe-ingest.queue.local-only") }}
+          </v-chip>
+        </div>
+        <!-- why it failed, or what's being done: wraps, where a chip would cut it -->
+        <div v-if="chip.caption" class="job-caption text-caption mt-1" :class="chip.color === 'error' ? 'text-error' : 'text-medium-emphasis'">
+          {{ chip.caption }}
+        </div>
+      </div>
+      <div class="job-actions d-flex align-center ga-1">
         <v-btn
           v-if="job.status === 'ready'"
           class="job-review"
@@ -71,6 +81,16 @@
           @click="emit('retry', job)"
         >
           {{ $t("recipe-ingest.queue.retry") }}
+        </v-btn>
+        <v-btn
+          v-if="job.status === 'processing'"
+          class="job-cancel"
+          size="small"
+          variant="text"
+          :loading="busy"
+          @click="emit('cancel', job)"
+        >
+          {{ $t("recipe-ingest.queue.cancel") }}
         </v-btn>
         <v-btn
           v-if="recipeLink"
@@ -94,39 +114,55 @@
           <v-icon :icon="$globals.icons.delete" />
         </v-btn>
       </div>
-    </template>
+    </div>
   </v-list-item>
 </template>
 
 <script setup lang="ts">
 import { mdiCardTextOutline } from "@mdi/js";
-import { useRecipeIngestText } from "~/composables/use-recipe-ingest";
+import { sourceFileName, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
-/** One card in the queue (docs/ai/PHASE2.md §6.7): thumbnail, name, a status chip, Retry, Discard or Review. Fork-owned. */
+/**
+ * One card in the queue (docs/ai/PHASE2.md §6.7): thumbnail, name (two lines at most), a short status chip with the
+ * reason or progress under it, and Review, Retry, Cancel or Discard. Fork-owned.
+ */
 const props = defineProps<{
   job: RecipeIngestionJobSummary;
   groupSlug: string;
-  /** A Retry for this card is in flight */
+  /** A Retry or Cancel for this card is in flight */
   busy?: boolean;
 }>();
 
 const emit = defineEmits<{
-  (e: "retry" | "discard", job: RecipeIngestionJobSummary): void;
+  (e: "retry" | "discard" | "cancel", job: RecipeIngestionJobSummary): void;
 }>();
 
 const i18n = useI18n();
 const { ingestErrorText, progressText } = useRecipeIngestText();
 
-/** A card not read yet (or that couldn't be) has no name: its place in the batch tells it apart */
+/** The file a card came from: shown for inbox and API cards, whose capture order means nothing to the user */
+const fileName = computed(() => sourceFileName(props.job.sourceName));
+
+/**
+ * The card's name; before it's read (or when it couldn't be), its file for inbox and API cards, else its place in the
+ * batch
+ */
 const title = computed(() => {
   if (props.job.title) {
     return props.job.title;
+  }
+  if (props.job.source !== "app" && fileName.value) {
+    return fileName.value;
   }
   return props.job.status === "processing" || props.job.status === "failed"
     ? i18n.t("recipe-ingest.capture.card-number", { number: props.job.position + 1 })
     : i18n.t("recipe-ingest.queue.untitled");
 });
+/** A failed card names its file, so it can be found and sent again */
+const subtitle = computed(() =>
+  props.job.status === "failed" && fileName.value && fileName.value !== title.value ? fileName.value : null,
+);
 const jobLink = computed(() => `/g/${props.groupSlug}/recipes/cards/${props.job.id}`);
 const recipeLink = computed(() => {
   const slug = props.job.status === "committed" ? props.job.recipe?.slug : null;
@@ -139,14 +175,25 @@ const canDiscard = computed(() =>
   props.job.canDiscard !== false && props.job.status !== "committing" && props.job.status !== "committed",
 );
 
-const chip = computed<{ text: string; color?: string; busy?: boolean }>(() => {
+interface Chip {
+  text: string;
+  color?: string;
+  busy?: boolean;
+  /** The reason or progress, under the chip */
+  caption?: string | null;
+}
+
+const chip = computed<Chip>(() => {
   const job = props.job;
   switch (job.status) {
-    case "processing":
+    case "processing": {
       if (!job.task || job.task.state === "queued") {
         return { text: progressText("queued") ?? i18n.t("recipe-ingest.queue.waiting"), color: "info", busy: true };
       }
-      return { text: progressText(job.task.progressKey) ?? i18n.t("recipe-ingest.queue.reading"), color: "info", busy: true };
+      const reading = i18n.t("recipe-ingest.queue.reading");
+      const progress = progressText(job.task.progressKey);
+      return { text: reading, color: "info", busy: true, caption: progress !== reading ? progress : null };
+    }
     case "ready": {
       const toCheck = (job.errorCount ?? 0) + (job.warningCount ?? 0);
       return toCheck
@@ -157,7 +204,7 @@ const chip = computed<{ text: string; color?: string; busy?: boolean }>(() => {
       const reason = job.error
         ? ingestErrorText(job.error.code, job.error.params)
         : ingestErrorText("internal_error");
-      return { text: i18n.t("recipe-ingest.queue.failed", { reason }), color: "error" };
+      return { text: i18n.t("recipe-ingest.queue.status-failed"), color: "error", caption: reason };
     }
     case "committing":
       return { text: i18n.t("recipe-ingest.queue.committing"), color: "info", busy: true };
@@ -166,3 +213,39 @@ const chip = computed<{ text: string; color?: string; busy?: boolean }>(() => {
   }
 });
 </script>
+
+<style scoped>
+.job-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+}
+
+/* at least 200 px of text before the actions wrap under it */
+.job-text {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.job-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.job-title {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.job-source,
+.job-caption {
+  overflow-wrap: anywhere;
+}
+</style>

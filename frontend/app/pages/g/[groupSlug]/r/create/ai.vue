@@ -79,8 +79,8 @@
             {{ $t('recipe.import-with-ai-images-ocr-hint') }}
           </v-alert>
           <RecipeImportImages v-model="uploadedImages" :disabled="state.loading" />
-          <!-- fork: recipe card batches (docs/ai/PHASE2.md §1.1) -->
-          <router-link :to="`/g/${groupSlug}/recipes/cards`" class="d-inline-block mt-3 text-primary">
+          <!-- fork: recipe card batches (docs/ai/PHASE2.md §1.1), when the group can read cards -->
+          <router-link v-if="canScanCards" :to="`/g/${groupSlug}/recipes/cards`" class="scan-cards d-inline-block mt-3 text-primary">
             {{ $t('recipe-ingest.nav.scan-a-stack') }}
           </router-link>
         </div>
@@ -183,6 +183,7 @@ import { useGroupSelf } from "~/composables/use-groups";
 import { useTagStore } from "~/composables/store/use-tag-store";
 import { useNewRecipeOptions } from "~/composables/use-new-recipe-options";
 import { validators } from "~/composables/use-validators";
+import { useRecipeIngestSettings } from "~/composables/use-recipe-ingest"; // fork: recipe cards
 import type { VForm } from "~/types/auto-forms";
 
 definePageMeta({
@@ -210,6 +211,14 @@ const aiEnabled = computed(() => !!group.value?.aiProviderSettings?.aiEnabled);
 const imageProviderEnabled = computed(() => !!group.value?.aiProviderSettings?.imageProviderEnabled);
 const imagesEnabled = computed(() => imageProviderEnabled.value || !!group.value?.aiProviderSettings?.ocrFallbackEnabled);
 const videosEnabled = computed(() => !!group.value?.aiProviderSettings?.audioProviderEnabled);
+// fork: recipe cards (docs/ai/PHASE2.md §1.1): the batch link shows only when the group can read cards
+const { settings: cardSettings, loaded: cardSettingsLoaded, load: loadCardSettings } = useRecipeIngestSettings();
+const canScanCards = computed(() => !!cardSettings.value?.canReadCards);
+onMounted(() => {
+  if (!cardSettingsLoaded.value) {
+    void loadCardSettings();
+  }
+});
 
 const domUrlForm = ref<VForm | null>(null);
 const recipeUrl = ref<string | null>(null);

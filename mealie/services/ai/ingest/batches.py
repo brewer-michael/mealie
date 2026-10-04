@@ -8,6 +8,9 @@ transaction, and picks another batch when that matches nothing.
   that saw an upload in the last `AUTO_BATCH_IDLE`; otherwise they start one. `batch_id="new"` always starts one.
 - **A sealed batch is never reopened.** A card sent to one goes where an upload without a batch would go, keeping the
   sealed batch's source (an app card joins the uploader's recent app batch or starts one), and the 202 says which.
+- **An open capture page keeps its batch open:** the page touches its batch every few minutes (`heartbeat`), which moves
+  `last_upload_at` like a card would, so the app's idle seal counts from the page's last sign of life. A sealed batch is
+  never touched again.
 - **Sealing can't race an insert.** Sealing is `UPDATE ... SET sealed_at=:now WHERE id=:b AND sealed_at IS NULL` (plus
   `AND last_upload_at < :cutoff` when idle). The insert's touch is `UPDATE ... SET last_upload_at=:now WHERE id=:b AND
   sealed_at IS NULL`, held until the insert commits: SQLite's write lock or PostgreSQL's row lock makes a waiting seal
@@ -86,6 +89,24 @@ def touch(repos: IngestRepos, batch_id: UUID, now: datetime) -> bool:
     whether it was. Until that transaction ends, a seal of the batch waits and then re-checks its `WHERE`.
     """
     return repos.batches.touch(batch_id, now, commit=False)
+
+
+def heartbeat(repos: IngestRepos, batch_id: UUID, user_id: UUID, now: datetime) -> Literal["open", "sealed"] | None:
+    """
+    The capture page's heartbeat for one of the user's own app batches: `last_upload_at = now`, only while the batch
+    is unsealed (`UPDATE ... WHERE sealed_at IS NULL`), committed. "open" when it was touched, "sealed" when it is
+    sealed (it stays so), None when it isn't an app batch the user started in this household.
+    """
+    try:
+        batch = repos.batches.get(batch_id)
+        if batch is None or batch.source != IngestSource.app.value or batch.created_by != user_id:
+            return None
+        if batch.sealed_at is not None:
+            return "sealed"
+    finally:
+        if repos.session.in_transaction():
+            repos.session.commit()
+    return "open" if repos.batches.touch(batch_id, now) else "sealed"  # sealed meanwhile: never reopened
 
 
 def batch_source(session: Session, batch_id: UUID) -> IngestSource:

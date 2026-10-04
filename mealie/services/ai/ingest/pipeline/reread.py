@@ -22,8 +22,15 @@ from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from .. import images, limits
 from ..images import RegionLike
 from .attachments import CardImage
-from .cardtext import canonical_markers
-from .flags import DRAFT_TEXT_FIELDS, FIELD_INGREDIENTS, FIELD_NOTES, FIELD_SERVINGS, FIELD_STEPS
+from .cardtext import canonical_markers, strip_from_prefix, without_list_marker
+from .flags import (
+    DRAFT_TEXT_FIELDS,
+    FIELD_ATTRIBUTION,
+    FIELD_INGREDIENTS,
+    FIELD_NOTES,
+    FIELD_SERVINGS,
+    FIELD_STEPS,
+)
 from .llm_schemas import OpenAIRecipeCardRegion
 from .models import CardPage
 from .service import end_transaction
@@ -53,6 +60,20 @@ _ATTRIBUTES = {attribute: field for field, attribute in DRAFT_TEXT_FIELDS.items(
 def field_name(field: str) -> str:
     """A target's field as flags name it (the draft's JSON name), whether it came as that or as the attribute name"""
     return _ATTRIBUTES.get(field, field)
+
+
+def as_field_text(target: ProposalTarget, text: str) -> str:
+    """
+    A reading as the target field holds it: markers written canonically; a step without its list number ("4. Cool"
+    is "Cool"); an attribution without its leading "From", which the field's label already says
+    """
+    text = canonical_markers(text.strip())
+    field = field_name(target.field)
+    if field == FIELD_STEPS:
+        text = without_list_marker(text)[0].strip()
+    elif field == FIELD_ATTRIBUTION:
+        text = strip_from_prefix(text)
+    return text
 
 
 def _message(target: ProposalTarget, previous_text: str | None) -> str:
@@ -104,21 +125,18 @@ async def reread_region(
         else:
             if response is None:
                 return CardProposal(kind=CardProposalKind.region, target=target, text="", readable=False)
-            text = canonical_markers(response.text.strip())
+            text = as_field_text(target, response.text)
+            alternatives = [as_field_text(target, alternative) for alternative in response.alternatives]
             return CardProposal(
                 kind=CardProposalKind.region,
                 target=target,
                 text=text,
                 readable=response.readable and bool(text),
-                alternatives=[
-                    canonical_markers(alternative.strip())
-                    for alternative in response.alternatives
-                    if alternative.strip() and alternative.strip() != text
-                ],
+                alternatives=list(dict.fromkeys(item for item in alternatives if item and item != text)),
             )
     elif not ocr.is_available():
         raise OpenAINotEnabledException("No image provider set, and OCR isn't available")
 
     end_transaction(ai.repos.session)
-    text = await asyncio.to_thread(_ocr_crop, crop)
+    text = as_field_text(target, await asyncio.to_thread(_ocr_crop, crop))
     return CardProposal(kind=CardProposalKind.region, target=target, text=text, readable=bool(text), via_ocr=True)

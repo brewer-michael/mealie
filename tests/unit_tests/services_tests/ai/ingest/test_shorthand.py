@@ -3,11 +3,14 @@
 import pytest
 
 from mealie.services.ai.ingest.shorthand import (
+    ABBREVIATIONS,
     SHORTHAND,
     UNITS,
+    PreparedLine,
+    extract_size_words,
     join_mixed_numbers,
     normalize_shorthand,
-    split_size,
+    prepare_line,
 )
 
 
@@ -43,6 +46,13 @@ from mealie.services.ai.ingest.shorthand import (
         ("• 1/4 t. pepper", "• 1/4 tsp pepper"),
         ("  3 T. cocoa", "  3 tbsp cocoa"),
         ("2 T", "2 tbsp"),
+        # other abbreviations the parser doesn't know, in any case
+        ("1 doz. eggs", "1 dozen eggs"),
+        ("2 Doz eggs", "2 dozen eggs"),
+        ("1 env. Dream Whip", "1 envelope Dream Whip"),
+        ("1 Env unflavored gelatin", "1 envelope unflavored gelatin"),
+        ("2 sq. chocolate", "2 square chocolate"),
+        ("1 sq unsweetened chocolate", "1 square unsweetened chocolate"),
     ],
 )
 def test_shorthand_after_the_quantity_is_written_out(line: str, normalized: str):
@@ -80,6 +90,7 @@ def test_only_the_token_after_the_leading_quantity_changes():
 @pytest.mark.parametrize(
     "line, plain, size",
     [
+        # after the quantity
         ("1 heaping T. flour", "1 T. flour", "heaping"),
         ("1 level t. soda", "1 t. soda", "level"),
         ("1 scant c. sugar", "1 c. sugar", "scant"),
@@ -94,25 +105,72 @@ def test_only_the_token_after_the_leading_quantity_changes():
         ("1 lge onion", "1 onion", "lge"),
         ("1 sml onion", "1 onion", "sml"),
         ("1 sm. pkg. instant pudding", "1 pkg. instant pudding", "sm."),
+        ("1 big onion", "1 onion", "big"),
         ("1 med", "1 med", None),
         ("1 medium onion", "1 medium onion", None),  # a word, which the parser reads as the note
         ("1 levelled t. salt", "1 levelled t. salt", None),
         ("2 large eggs", "2 large eggs", None),  # a size of the food, which the parser reads as the note
-        ("Salt, a scant pinch", "Salt, a scant pinch", None),
+        ("1 bigger onion", "1 bigger onion", None),
+        # anywhere else on the line: the parser would make "cup scant" a unit, or "scant sugar" a food
+        ("scant 1 c. sugar", "1 c. sugar", "scant"),
+        ("1 c. scant sugar", "1 c. sugar", "scant"),
+        ("1 T. heaping flour", "1 T. flour", "heaping"),
+        ("1 c. sugar scant", "1 c. sugar", "scant"),
+        ("1 c. sugar (scant)", "1 c. sugar", "scant"),
+        ("1 c. (scant) sugar", "1 c. sugar", "scant"),
+        ("1 c. sugar, scant", "1 c. sugar", "scant"),
+        ("1 c. sugar, scant, sifted", "1 c. sugar, sifted", "scant"),
+        ("1 c. flour (scant, sifted)", "1 c. flour (sifted)", "scant"),
+        ("1 heaping T. flour (level)", "1 T. flour", "heaping, level"),
+        ("Salt, a scant pinch", "Salt, a pinch", "scant"),
+        ("- 1 lg. onion, chopped", "- 1 onion, chopped", "lg."),
     ],
 )
-def test_a_size_word_after_the_quantity_is_taken_out(line: str, plain: str, size: str | None):
-    assert split_size(line) == (plain, size)
+def test_size_words_are_taken_out_wherever_they_stand(line: str, plain: str, size: str | None):
+    assert extract_size_words(line) == (plain, size)
 
 
-def test_the_pattern_finds_shorthand_after_a_size_word():
-    """`flags.shorthand_read` reads the card's line, size word and all"""
-    match = SHORTHAND.match("1 heaping T. flour")
-    assert match is not None and (match.group("unit"), match.group("size")) == ("T", "heaping ")
-    assert normalize_shorthand(split_size("1 heaping T. flour")[0]) == ("1 tbsp flour", True)
-    match = SHORTHAND.match("1 sm. pkg. instant pudding")
-    assert match is not None and (match.group("unit"), match.group("size")) == ("pkg", "sm. ")
-    assert normalize_shorthand(split_size("1 sm. pkg. instant pudding")[0]) == ("1 package instant pudding", True)
+def test_the_pattern_finds_shorthand_once_size_words_are_out():
+    """`flags.shorthand_read` reads the card's line as `prepare_line` gets it ready"""
+    assert prepare_line("1 heaping T. flour") == PreparedLine("1 tbsp flour", ("heaping",), ("T.", "tbsp"), None)
+    assert prepare_line("1 sm. pkg. instant pudding") == PreparedLine(
+        "1 package instant pudding", ("sm.",), ("pkg.", "package"), None
+    )
+    assert prepare_line("scant 1 c. sugar").text == "1 cup sugar"
+
+
+@pytest.mark.parametrize(
+    "line, text, notes",
+    [
+        # a package's size between the quantity and the unit leads the note, and the unit is read
+        ("1 (8 oz.) pkg. cream cheese", "1 package cream cheese", ("(8 oz.)",)),
+        ("1 (10 3/4 oz.) can soup", "1 can soup", ("(10 3/4 oz.)",)),
+        ("1 (10-3/4 oz.) can soup", "1 can soup", ("(10 3/4 oz.)",)),
+        ("2 (15 oz.) cans black beans", "2 cans black beans", ("(15 oz.)",)),
+        # a can's number
+        ("1 #2 can pineapple", "1 can pineapple", ("#2",)),
+        ("1 #10 can tomatoes", "1 can tomatoes", ("#10",)),
+        ("2 #303 cans corn", "2 cans corn", ("#303",)),
+        # both kinds of note, in the order they're written
+        ("1 med. (8 oz.) pkg. cream cheese", "1 package cream cheese", ("med.", "(8 oz.)")),
+        # parentheses that aren't a size, or come after the unit, stay for the parser
+        ("1 can (10 3/4 oz.) soup", "1 can (10 3/4 oz.) soup", ()),
+        ("2 (large) eggs", "2 (large) eggs", ()),
+        ("1 #2 pencil", "1 #2 pencil", ()),
+    ],
+)
+def test_a_package_size_and_a_can_number_go_to_the_note(line: str, text: str, notes: tuple[str, ...]):
+    prepared = prepare_line(line)
+    assert (prepared.text, prepared.notes) == (text, notes)
+
+
+@pytest.mark.parametrize(
+    "line, unit",
+    [("1 doz. eggs", "dozen"), ("1 dozen eggs", "dozen"), ("2 Dozen rolls", "dozen"), ("1 c. sugar", None)],
+)
+def test_a_dozen_is_kept_as_the_unit(line: str, unit: str | None):
+    """The parser reads "1 dozen eggs" as 1 egg; the unit is set after parsing"""
+    assert prepare_line(line).unit == unit
 
 
 @pytest.mark.parametrize(
@@ -141,5 +199,7 @@ def test_a_mixed_number_written_with_a_dash_is_written_with_a_space(line: str, j
 
 
 def test_every_unit_the_pattern_matches_has_a_name():
-    alternatives = SHORTHAND.pattern.split("(?P<unit>")[1].split(")")[0].split("|")
+    alternatives = SHORTHAND.pattern.split("(?P<unit>")[1].split("|(?i:")[0].split("|")
     assert set(alternatives) == set(UNITS)
+    abbreviations = SHORTHAND.pattern.split("|(?i:")[1].split(")")[0].split("|")
+    assert set(abbreviations) == set(ABBREVIATIONS)

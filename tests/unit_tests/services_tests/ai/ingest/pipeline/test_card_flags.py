@@ -19,9 +19,16 @@ from mealie.schema.recipe_ingest import (
     ExtractionUnsure,
     FlagResolution,
     IngestReadPath,
+    PageOCR,
 )
 from mealie.services.ai.ingest.flag_rules import count_unresolved, is_clean
-from mealie.services.ai.ingest.pipeline.flags import compute_flags, flag_id, ingredient_hash, ingredient_line
+from mealie.services.ai.ingest.pipeline.flags import (
+    compute_flags,
+    flag_id,
+    ingredient_hash,
+    ingredient_line,
+    ocr_check_lines,
+)
 
 
 def ingredient(
@@ -99,7 +106,8 @@ def scenarios() -> list[tuple[CardDraft, ExtractionMeta | None, str | None]]:
             transcription,
         ),
         (draft(ingredients=[], steps=[]), ExtractionMeta(language="French"), None),
-        (draft(ingredients=[ingredient("pain", food="pain")]), ExtractionMeta(language="fr"), None),
+        # a card in another language whose line the AI parser didn't parse
+        (draft(ingredients=[ingredient("pain", confidence=None)]), ExtractionMeta(language="fr"), None),
     ]
 
 
@@ -129,22 +137,35 @@ def test_each_kind_says_what_it_found():
     check(CardFlagKind.missing_name, "name", None, error, S.validator)
     check(CardFlagKind.illegible, "ingredients", marked, error, S.marker)
     check(CardFlagKind.blank, "steps", gap, error, S.marker)
-    assert check(CardFlagKind.blank, "steps", more, error, S.cross_read).params == {"value": "2"}
+    # where each value is in the text the flag was computed on ("Microwave for 2 minutes more.")
+    assert check(CardFlagKind.blank, "steps", more, error, S.cross_read).params == {
+        "value": "2",
+        "start": 14,
+        "end": 15,
+    }
     unsure = check(CardFlagKind.unsure, "ingredients", chocolate, warning, S.model)
     assert (unsure.params["text"], unsure.alternatives) == ("1 sq chocolate", ["1 oz chocolate"])
-    assert check(CardFlagKind.not_on_card, "steps", bake, warning, S.validator).params == {"value": "20"}
+    not_on_card = check(CardFlagKind.not_on_card, "steps", bake, warning, S.validator)
+    assert not_on_card.params == {"value": "20", "start": 18, "end": 20}
     check(CardFlagKind.marker_dropped, "card", None, warning, S.validator)
     disagreement = check(CardFlagKind.read_disagreement, "ingredients", sugar, warning, S.cross_read)
-    assert disagreement.params == {"text": "1 t. sugar", "value": "tbsp"}
+    assert disagreement.params == {"text": "1 t. sugar", "value": "tbsp", "start": 2, "end": 3}
     assert disagreement.alternatives == ["1 t. sugar"]
     assert check(CardFlagKind.check_parse, "ingredients", chocolate, warning, S.parser).params == {"confidence": 60}
-    assert check(CardFlagKind.unit_unclear, "ingredients", chocolate, warning, S.parser).params == {"token": "sq"}
+    unclear = check(CardFlagKind.unit_unclear, "ingredients", chocolate, warning, S.parser)
+    assert unclear.params == {"token": "sq", "start": 2, "end": 4}
     typo = check(CardFlagKind.implausible_amount, "ingredients", flour, warning, S.validator)
-    assert (typo.params, typo.alternatives) == ({"value": "11/2", "suggestion": "1 1/2"}, ["1 1/2"])
+    assert (typo.params, typo.alternatives) == (
+        {"value": "11/2", "suggestion": "1 1/2", "start": 0, "end": 4},
+        ["1 1/2"],
+    )
     assert check(CardFlagKind.implausible_amount, "ingredients", milk, warning, S.validator).params == {
-        "value": "25 cup"
+        "value": "25 cup",
+        "start": 0,
+        "end": 2,
     }
-    assert check(CardFlagKind.implausible_temperature, "steps", bake, warning, S.validator).params == {"value": "600°F"}
+    temperature = check(CardFlagKind.implausible_temperature, "steps", bake, warning, S.validator)
+    assert temperature.params == {"value": "600°F", "start": 8, "end": 13}
     assert check(CardFlagKind.read_by_ocr, "card", None, warning, S.ocr).params == {"confidence": 49}
     check(CardFlagKind.cross_read_failed, "card", None, info, S.cross_read)
     assert check(CardFlagKind.shorthand_read, "ingredients", sugar, info, S.parser).params == {
@@ -268,11 +289,55 @@ def test_shorthand_read_only_when_the_unit_was_written_differently(text: str, fl
         (ingredient("1 sq chocolate", quantity=1, food="chocolate", note="sq"), True),
         (ingredient("1 sq chocolate", quantity=1, food="sq chocolate", linked=False), True),
         (ingredient("1 egg. yolk", quantity=1, food="egg. yolk", linked=False), True),  # an abbreviation's dot
+        (ingredient("1 Tb. butter", quantity=1, food="Tb. butter", linked=False), True),
+        (ingredient("2 pk yeast", quantity=2, food="pk yeast", linked=False), True),
+        (ingredient("2 tbl butter", quantity=2, food="tbl butter", linked=False), True),  # a letter from "tbs"
+        (ingredient("2 lbs beef", quantity=2, food="lbs beef", linked=False), True),  # a letter from "lb"
+        (ingredient("2 TB butter", quantity=2, food="TB butter", linked=False), True),  # capitals, but a unit
+        # short words that aren't units are part of the food, however unusual
+        (ingredient("2 TV dinners", quantity=2, food="TV dinners", linked=False), False),
+        (ingredient("2 new potatoes", quantity=2, food="new potatoes", linked=False), False),
+        (ingredient("2 dry figs", quantity=2, food="dry figs", linked=False), False),
+        (ingredient("1 wax bean", quantity=1, food="wax bean", linked=False), False),
+        (ingredient("1 big onion", quantity=1, food="big onion", linked=False), False),
+        (ingredient("2 ripe bananas", quantity=2, food="ripe bananas", linked=False), False),
     ],
 )
 def test_unit_unclear(line: CardDraftIngredient, flagged: bool):
     flags = compute_flags(draft(ingredients=[line]), None, {})
     assert (CardFlagKind.unit_unclear in kinds(flags)) is flagged
+
+
+def test_unit_unclear_knows_the_groups_own_units():
+    """A short word that is one of the group's units ("stk" for its "stick") is a lost unit; extraction passes them"""
+    line = ingredient("2 stk butter", quantity=2, food="stk butter", linked=False)
+    card = draft(ingredients=[line])
+    assert CardFlagKind.unit_unclear not in kinds(compute_flags(card, None, {}))
+
+    extracted = compute_flags(card, None, {}, units=["stick", "sticks", "stk"])
+    assert only(extracted, CardFlagKind.unit_unclear).params == {"token": "stk", "start": 2, "end": 5}
+
+    # a save doesn't know the group's units: the flag stays while the line is as the parser read it
+    resolutions = {only(extracted, CardFlagKind.unit_unclear).id: FlagResolution.dismissed}
+    saved = compute_flags(card, None, resolutions, previous=extracted)
+    assert only(saved, CardFlagKind.unit_unclear).resolution == FlagResolution.dismissed
+    line.food = CardDraftRef(name="butter")
+    assert CardFlagKind.unit_unclear not in kinds(compute_flags(card, None, {}, previous=saved))
+
+
+@pytest.mark.parametrize(
+    ("line", "word"),
+    [
+        (ingredient("1 c. sugar (scant)", quantity=1, unit="cup scant", food="sugar", linked=False), "scant"),
+        (ingredient("1 c. heaping flour", quantity=1, unit="cup", food="heaping flour", linked=False), "heaping"),
+        (ingredient("1 med. onion", quantity=1, food="med. onion", linked=False), "med."),
+    ],
+)
+def test_a_size_word_in_a_unit_or_food_is_checked(line: CardDraftIngredient, word: str):
+    """A parsed unit "cup scant" or food "heaping flour" would be created at commit: the line is checked"""
+    flag = only(compute_flags(draft(ingredients=[line]), None, {}), CardFlagKind.check_parse)
+    start = line.original_text.index(word)
+    assert flag.params == {"value": word, "start": start, "end": start + len(word)}
 
 
 BANANA_LINES = [
@@ -284,6 +349,25 @@ BANANA_LINES = [
     ingredient("1 egg", quantity=1, food="egg"),
     ingredient("Cinnamon to taste", food="Cinnamon", note="to taste", linked=False),
 ]
+
+
+LOST_AT = {
+    "2-3 T. milk": 0,
+    "1 to 2 c. water": 0,
+    "3-4 apples": 0,
+    "1/2 - 3/4 c. sugar": 0,
+    "2 or 3 eggs": 5,
+    "1 dozen eggs": 0,
+    "1 (16 oz.) can tomatoes": 3,
+    "1 (8 oz) pkg cream cheese": 3,
+    "2 T. butter + 1 T. oil": 14,
+    "2 c. flour (or 1 1/2 c. bread flour)": 15,
+    "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)": 20,
+    "1 c. sugar, 1 c. flour": 12,
+    "1 c. sugar, 1 c. brown sugar": 12,
+    "1 t. salt, 1 t. soda": 11,
+}
+"""Where each line's lost amount is written"""
 
 
 @pytest.mark.parametrize(
@@ -350,10 +434,11 @@ def test_an_amount_the_parsed_fields_lost_is_flagged(line: CardDraftIngredient, 
     flags = compute_flags(draft(ingredients=[*BANANA_LINES, line]), None, {})
 
     flag = only(flags, CardFlagKind.check_parse)
+    start = LOST_AT[line.original_text]  # the amount that was lost, not another one written the same
     assert (flag.ref, flag.severity, flag.params) == (
         str(line.reference_id),
         CardFlagSeverity.warning,
-        {"value": dropped},
+        {"value": dropped, "start": start, "end": start + len(dropped)},
     )
     assert not is_clean(flags)
 
@@ -520,7 +605,14 @@ def test_reading_flags_stay_while_they_hold():
 
     # without the transcription, a not-on-card flag carries over while its number is still there
     carried = compute_flags(card, extraction, {}, previous=extracted)
-    assert only(carried, CardFlagKind.not_on_card).params == {"value": "2"}
+    assert only(carried, CardFlagKind.not_on_card).params == {"value": "2", "start": 14, "end": 15}
+    # where the number is now, after an edit before it
+    card.steps[1].text = "Then microwave for 2 minutes."
+    assert only(compute_flags(card, extraction, {}, previous=extracted), CardFlagKind.not_on_card).params == {
+        "value": "2",
+        "start": 19,
+        "end": 20,
+    }
 
     card.steps[1].text = "Microwave for a few minutes."
     assert CardFlagKind.not_on_card not in kinds(compute_flags(card, extraction, {}, previous=extracted))
@@ -595,6 +687,47 @@ def test_a_note_keeps_its_unsure_flag_when_a_note_above_it_is_deleted():
     assert CardFlagKind.unsure not in kinds(compute_flags(card, extraction, {}, previous=saved))
 
 
+def test_a_steps_own_list_number_is_never_not_on_card():
+    """The build step or a re-read may leave "3." on a step: it's the step's number, not an amount"""
+    transcription = "1 banana\nMash and mix.\nBake 20 minutes."
+    card = draft(steps=[CardDraftStep(text="Mash and mix."), CardDraftStep(text="3. Bake 20 minutes.")])
+
+    flags = compute_flags(card, ExtractionMeta(language="English"), {}, transcription=transcription)
+
+    assert CardFlagKind.not_on_card not in kinds(flags)
+    # a number after it still counts
+    card.steps[1].text = "3. Bake 25 minutes."
+    flag = only(compute_flags(card, ExtractionMeta(), {}, transcription=transcription), CardFlagKind.not_on_card)
+    assert flag.params == {"value": "25", "start": 8, "end": 10}
+
+
+def test_a_flag_points_at_the_occurrence_it_means():
+    """Two "2"s in a step, or two "1"s on a line: the flag's position is the one its rule matched"""
+    step = CardDraftStep(text="Add 1/2 c. milk. Microwave 2 minutes.")
+    card = draft(steps=[step])
+    second = ["Add 1/2 c. milk. Microwave [blank] minutes."]
+
+    flags = compute_flags(card, ExtractionMeta(cross_read_lines=second), {})
+
+    blank = only(flags, CardFlagKind.blank)
+    assert blank.params == {"value": "2", "start": 27, "end": 28}
+    assert step.text[27:28] == "2" and step.text.index("2") != 27  # the "2" of "1/2" comes first
+
+    line = ingredient("1 c. sugar, 1 c. flour", quantity=1, unit="cup", food="sugar flour", linked=False)
+    flag = only(compute_flags(draft(ingredients=[line]), None, {}), CardFlagKind.check_parse)
+    assert flag.params["value"] == "1" and (flag.params["start"], flag.params["end"]) == (12, 13)
+
+    unsure = ExtractionUnsure(text="350", alternatives=["380"])
+    card = draft(steps=[CardDraftStep(text="Bake 35 minutes at 350.")])
+    flag = only(compute_flags(card, ExtractionMeta(unsure=[unsure]), {}), CardFlagKind.unsure)
+    assert (flag.params["start"], flag.params["end"]) == (19, 22)
+
+    card = draft(steps=[CardDraftStep(text="Mix [blank] cups, then [illegible].")])
+    flags = compute_flags(card, None, {})
+    assert only(flags, CardFlagKind.blank).params == {"start": 4, "end": 11}
+    assert only(flags, CardFlagKind.illegible).params == {"start": 23, "end": 34}
+
+
 def test_a_numbered_list_in_the_transcription_puts_no_number_on_the_card():
     """The transcription numbers the steps in markdown; the "2" invented for the card's gap is still not on it"""
     transcription = "\n".join(
@@ -617,7 +750,7 @@ def test_a_numbered_list_in_the_transcription_puts_no_number_on_the_card():
 
     flags = compute_flags(card, ExtractionMeta(language="English"), {}, transcription=transcription)
 
-    assert only(flags, CardFlagKind.not_on_card).params == {"value": "2"}
+    assert only(flags, CardFlagKind.not_on_card).params == {"value": "2", "start": 35, "end": 36}
     assert only(flags, CardFlagKind.not_on_card).ref == str(card.steps[1].id)
     # numbers that are on the card aren't flagged, list or not
     card.steps[1].text = "Microwave in bowl or large mug for [blank] minutes or until firm in center."
@@ -641,6 +774,78 @@ def test_the_cross_read_catches_a_number_in_a_gap_when_a_word_reads_differently(
     flags = compute_flags(card, ExtractionMeta(cross_read_lines=second), {})
 
     blank = only(flags, CardFlagKind.blank)
-    assert (blank.source, blank.field, blank.params) == (CardFlagSource.cross_read, "steps", {"value": "2"})
+    assert (blank.source, blank.field, blank.params) == (
+        CardFlagSource.cross_read,
+        "steps",
+        {"value": "2", "start": 35, "end": 36},
+    )
     # the ingredients agree with their own lines: "C." and "c." are both cups, and "Add eggs" is a step
     assert CardFlagKind.read_disagreement not in kinds(flags)
+
+
+# ==========================================
+# The OCR check of a printed card's numbers
+
+PRINTED_STEP = "Bake at 375° for 1 hour, then cool 10 minutes."
+
+
+def test_the_ocr_check_flags_a_clearly_different_number_only():
+    card = draft(steps=[CardDraftStep(text=PRINTED_STEP)])
+    read = ["Bake at 350° for 1 hour, then cool 10 minutes."]
+
+    flags = compute_flags(card, ExtractionMeta(), {}, ocr_lines=read)
+
+    flag = only(flags, CardFlagKind.read_disagreement)
+    assert (flag.source, flag.severity, flag.params["value"], flag.params["read"]) == (
+        CardFlagSource.ocr,
+        CardFlagSeverity.warning,
+        "375",
+        "350",
+    )
+    assert flag.alternatives == ["Bake at 350° for 1 hour, then cool 10 minutes."]
+
+    # numbers Tesseract may have misread, a number it missed, or fractions: no flag
+    for unclear in (
+        "Bake at 3S0° for 1 hour, then cool 10 minutes.",
+        "Bake at 350° for 1 hour, then cool minutes.",
+        "Bake at 375° for l hour, then cool 10 minutes.",
+    ):
+        assert CardFlagKind.read_disagreement not in kinds(
+            compute_flags(card, ExtractionMeta(), {}, ocr_lines=[unclear])
+        )
+    half = draft(steps=[CardDraftStep(text="Add 1/2 c. milk.")])
+    assert kinds(compute_flags(half, ExtractionMeta(), {}, ocr_lines=["Add 1/3 c. milk."])) == set()
+
+
+def test_the_ocr_checks_flags_stay_while_they_hold_on_a_save():
+    """A save has no Tesseract text: the flag stays while the number is still there, then goes"""
+    card = draft(steps=[CardDraftStep(text=PRINTED_STEP)])
+    extracted = compute_flags(card, ExtractionMeta(), {}, ocr_lines=["Bake at 350° for 1 hour, then cool 10 minutes."])
+    flag = only(extracted, CardFlagKind.read_disagreement)
+
+    saved = compute_flags(card, ExtractionMeta(), {flag.id: FlagResolution.dismissed}, previous=extracted)
+    assert only(saved, CardFlagKind.read_disagreement).resolution == FlagResolution.dismissed
+
+    card.steps[0].text = "Preheat. " + PRINTED_STEP  # moved along: its position follows
+    moved = only(compute_flags(card, ExtractionMeta(), {}, previous=extracted), CardFlagKind.read_disagreement)
+    assert (moved.params["start"], moved.params["end"]) == (17, 20)
+
+    card.steps[0].text = PRINTED_STEP.replace("375", "350")  # the reviewer took Tesseract's reading
+    assert CardFlagKind.read_disagreement not in kinds(compute_flags(card, ExtractionMeta(), {}, previous=extracted))
+
+
+def test_the_ocr_check_runs_only_on_a_clear_printed_reading():
+    transcription = "# Pound Cake\n- 2 c. flour\nBake at 375° for 1 hour."
+    printed = PageOCR(text="Pound Cake\n2 c. flour\nBake at 350° for 1 hour.", confidence=88.0)
+    lines = ["Pound Cake", "2 c. flour", "Bake at 350° for 1 hour."]
+
+    assert ocr_check_lines([printed], IngestReadPath.image, transcription) == lines
+    assert ocr_check_lines([printed, printed], IngestReadPath.image, transcription) == lines + lines
+    # read with OCR already, handwriting on any page, a page Tesseract didn't read, or a corner of the card
+    assert ocr_check_lines([printed], IngestReadPath.ocr, transcription) is None
+    assert (
+        ocr_check_lines([printed, printed.model_copy(update={"confidence": 60.0})], IngestReadPath.image, transcription)
+        is None
+    )
+    assert ocr_check_lines([printed, None], IngestReadPath.image, transcription) is None
+    assert ocr_check_lines([PageOCR(text="Pound Cake", confidence=95.0)], IngestReadPath.image, transcription) is None

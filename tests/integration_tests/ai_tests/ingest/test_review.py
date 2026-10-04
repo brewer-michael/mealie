@@ -14,6 +14,7 @@ from test_jobs_api import assert_code, banana_draft, job_row, job_url, seed_job,
 from mealie.db.db_setup import session_context
 from mealie.repos.repository_recipe_ingest import update_job_json
 from mealie.schema.recipe_ingest import (
+    CardDraftNote,
     CardDraftStep,
     CardProposal,
     CardProposalKind,
@@ -266,3 +267,80 @@ def test_ready_only_while_not_committing(api_client: TestClient, unique_user_fn_
     job_id = seed_job(user)
     set_columns(job_id, status=IngestStatus.committing.value)
     assert_code(_put(api_client, user, job_id, 1), 409, "invalid_status")
+
+
+# ==================================================================================================================
+# Note ids (flags on notes are keyed to them)
+
+
+def _notes(job_id: UUID) -> list[dict[str, Any]]:
+    return job_row(job_id)["draft"]["notes"]
+
+
+def test_notes_keep_their_ids_through_saves(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    job_id = seed_job(user, draft=banana_draft(notes=[CardDraftNote(text="Grandma's favourite")]))
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    note_id = draft["notes"][0]["id"]
+    assert note_id == _notes(job_id)[0]["id"]
+
+    # the text is edited and a note is added without an id: the first keeps its id, the new one gets one
+    draft["notes"][0]["text"] = "Grandma's favourite, every Sunday"
+    draft["notes"].append({"title": "Tip", "text": "Use a big mug"})
+    assert _put(api_client, user, job_id, 1, draft=draft).status_code == 200
+    stored = _notes(job_id)
+    assert stored[0]["id"] == note_id
+    assert stored[1]["id"] and stored[1]["id"] != note_id
+
+    # what the page reads back is what it saves next, and the ids stay
+    again = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    assert [note["id"] for note in again["notes"]] == [note["id"] for note in stored]
+    assert _put(api_client, user, job_id, 2, draft=again).status_code == 200
+    assert [note["id"] for note in _notes(job_id)] == [note["id"] for note in stored]
+
+
+def test_a_pasted_note_gets_a_fresh_id(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    job_id = seed_job(user, draft=banana_draft(notes=[CardDraftNote(text="Tip")]))
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    pasted = draft["notes"][0]["id"]
+    draft["notes"].append(dict(draft["notes"][0]))  # the same id twice
+
+    assert _put(api_client, user, job_id, 1, draft=draft).status_code == 200
+    stored = job_row(job_id)["draft"]
+    assert stored["notes"][0]["id"] == pasted  # the first keeps it
+    assert stored["notes"][1]["id"] not in (pasted, None)
+
+    # ids are unique across ingredients, steps and notes: a step's id on a note is replaced on the note
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    draft["notes"][1]["id"] = draft["steps"][0]["id"]
+    assert _put(api_client, user, job_id, 2, draft=draft).status_code == 200
+    stored = job_row(job_id)["draft"]
+    ids = [line["reference_id"] for line in stored["ingredients"]]
+    ids += [step["id"] for step in stored["steps"]] + [note["id"] for note in stored["notes"]]
+    assert len(set(ids)) == len(ids) == 6
+    assert stored["steps"][0]["id"] == draft["steps"][0]["id"]
+
+
+def test_a_draft_stored_before_notes_had_ids(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """A version 1 draft reads with the same note ids every time; its first save keeps them, and isn't an edit"""
+    user = unique_user_fn_scoped
+    job_id = seed_job(user, draft=banana_draft(notes=[CardDraftNote(text="Tip"), CardDraftNote(text="Tip")]))
+    stored = job_row(job_id)["draft"]
+    stored["schema_version"] = 1
+    for note in stored["notes"]:
+        del note["id"]
+    set_columns(job_id, draft=stored)
+
+    first = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    second = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    ids = [note["id"] for note in first["notes"]]
+    assert ids == [note["id"] for note in second["notes"]]
+    assert len(set(ids)) == 2
+
+    saved = _put(api_client, user, job_id, 1, draft=first)
+    assert saved.status_code == 200
+    assert saved.json()["draftVersion"] == 1  # nothing was edited: the card still counts as unedited
+    row = job_row(job_id)
+    assert row["draft"]["schema_version"] == 2
+    assert [note["id"] for note in row["draft"]["notes"]] == ids

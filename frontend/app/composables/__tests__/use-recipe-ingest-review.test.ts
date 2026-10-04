@@ -16,15 +16,21 @@ import {
   formatQuantity,
   highlightSegments,
   ingredientDisplay,
+  nextBatchCard,
   nextCardInBatch,
   normalizeDraft,
+  nudgeRegion,
   parseQuantity,
   regionFromCropResult,
   rereadTargets,
   rereadTargetValue,
   sortFlags,
   suggestEvalSlug,
+  carryReviewNotice,
+  resetCarriedReviewNotice,
+  takeCarriedReviewNotice,
   useRecipeIngestReview,
+  NOTICE_MS,
   type RecipeIngestReview,
 } from "../use-recipe-ingest-review";
 import { resetRecipeIngestCounts, resetRecipeIngestReviewState, takeRecipeIngestCommitNotice } from "../use-recipe-ingest";
@@ -37,6 +43,7 @@ import type {
   RecipeIngestionJobError,
   RecipeIngestionJobOut,
   RecipeIngestionJobState,
+  RecipeIngestionJobSummary,
   RereadRequest,
 } from "~/lib/api/types/recipe-ingest";
 
@@ -53,6 +60,8 @@ const api = vi.hoisted(() => ({
   discard: vi.fn(),
   saveEvalCase: vi.fn(),
   getCounts: vi.fn(),
+  getJobs: vi.fn(),
+  cancel: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }));
 
@@ -205,6 +214,25 @@ describe("batches", () => {
     expect(nextCardInBatch([batchJob("b", 1, "ready")], "b")).toBeNull();
     // a card that isn't in the list (just committed elsewhere) starts from the top
     expect(nextCardInBatch(jobs, "zz")).toBe("b");
+  });
+
+  function summary(id: string, batchId: string, position: number, createdAt: string, errorCount = 0): RecipeIngestionJobSummary {
+    return { id, batchId, position, status: "ready", source: "app", pageCount: 1, createdAt, errorCount, warningCount: 0 };
+  }
+
+  test("after a batch's last card, the review goes on to the batch whose ready cards waited longest", () => {
+    const ready = [
+      summary("n1", "newer", 0, "2026-10-04T09:00:00Z"),
+      summary("o2", "older", 1, "2026-10-03T08:01:00Z", 1),
+      summary("o1", "older", 0, "2026-10-03T08:00:00Z"),
+      summary("s1", "same", 1, "2026-10-01T08:00:00Z"),
+    ];
+    // where that batch's review starts: its first card with something to check
+    expect(nextBatchCard(ready, "same", "s0")).toBe("o2");
+    // never this batch, nor this card, nor a card that isn't ready
+    expect(nextBatchCard([summary("s1", "same", 1, "2026-10-01T08:00:00Z")], "same", "s0")).toBeNull();
+    expect(nextBatchCard([{ ...summary("x", "other", 0, "2026-10-01T08:00:00Z"), status: "processing" }], "same", "s0")).toBeNull();
+    expect(nextBatchCard([], "same", "s0")).toBeNull();
   });
 });
 
@@ -465,6 +493,28 @@ describe("crop regions", () => {
     expect(regionFromCropResult({ coordinates: { left: 0, top: 0, width: 20, height: 20 }, image: { width: 0, height: 0 } })).toBeNull();
     expect(regionFromCropResult(null)).toBeNull();
   });
+
+  test("an arrow key moves the selection by 2% of the page, and Shift with it resizes it", () => {
+    const image = { width: 1000, height: 2000 };
+    const band = { left: 100, top: 1000, width: 800, height: 200 };
+    expect(nudgeRegion(band, image, "ArrowRight", false)).toEqual({ ...band, left: 120 });
+    expect(nudgeRegion(band, image, "ArrowUp", false)).toEqual({ ...band, top: 960 });
+    expect(nudgeRegion(band, image, "ArrowRight", true)).toEqual({ ...band, width: 820 });
+    expect(nudgeRegion(band, image, "ArrowLeft", true)).toEqual({ ...band, width: 780 });
+    expect(nudgeRegion(band, image, "ArrowDown", true)).toEqual({ ...band, height: 240 });
+    expect(nudgeRegion(band, image, "Enter", false)).toBeNull();
+  });
+
+  test("a selection moved or resized by key stays on the page and never shrinks to a sliver", () => {
+    const image = { width: 1000, height: 2000 };
+    expect(nudgeRegion({ left: 5, top: 0, width: 800, height: 200 }, image, "ArrowLeft", false)).toMatchObject({ left: 0 });
+    expect(nudgeRegion({ left: 195, top: 0, width: 800, height: 200 }, image, "ArrowRight", false)).toMatchObject({ left: 200 });
+    expect(nudgeRegion({ left: 0, top: 1850, width: 800, height: 200 }, image, "ArrowDown", false)).toMatchObject({ top: 1800 });
+    expect(nudgeRegion({ left: 190, top: 0, width: 800, height: 200 }, image, "ArrowRight", true)).toMatchObject({ width: 810 });
+    // twice the smallest region the server reads (4% of each side)
+    expect(nudgeRegion({ left: 0, top: 0, width: 45, height: 200 }, image, "ArrowLeft", true)).toMatchObject({ width: 40 });
+    expect(nudgeRegion({ left: 0, top: 0, width: 800, height: 90 }, image, "ArrowUp", true)).toMatchObject({ height: 80 });
+  });
 });
 
 // ==========================================
@@ -503,7 +553,9 @@ describe("useRecipeIngestReview", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     resetRecipeIngestCounts();
     resetRecipeIngestReviewState();
+    resetCarriedReviewNotice();
     api.getJob.mockResolvedValue(ok(job()));
+    api.getJobs.mockResolvedValue(ok({ page: 1, per_page: -1, total: 0, total_pages: 0, items: [] }));
     api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "ready", 1, 1), batchJob("j2", 1, "ready")] }));
     api.getJobState.mockResolvedValue(ok(state()));
     api.updateJob.mockImplementation((_id: string, payload: { draftVersion: number }) =>
@@ -639,7 +691,9 @@ describe("useRecipeIngestReview", () => {
     await review.requestReread(region);
     expect(api.reread).toHaveBeenCalledOnce();
     expect(review.rereadQueue.value).toEqual([region]);
-    expect(toast.info).toHaveBeenCalledWith("This card is being read. Your re-read starts when it's done.");
+    // said in the review bar, not by a toast over the header
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "This card is being read. Your re-read starts when it's done." });
+    expect(toast.info).not.toHaveBeenCalled();
     expect(toast.error).not.toHaveBeenCalled();
 
     // still busy: the queue waits
@@ -667,7 +721,7 @@ describe("useRecipeIngestReview", () => {
     await review.requestReread(otherRegion);
     expect(api.reread).not.toHaveBeenCalled();
     expect(review.rereadQueue.value).toEqual([region, otherRegion]);
-    expect(toast.info).toHaveBeenCalledWith("Re-read queued");
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "Re-read queued" });
 
     api.reread.mockResolvedValue(ok(state({ task: { kind: "reread", state: "queued" } })));
     api.getJobState.mockResolvedValueOnce(ok(state()));
@@ -739,13 +793,14 @@ describe("useRecipeIngestReview", () => {
     expect(api.updateJob.mock.invocationCallOrder[0]).toBeLessThan(api.commit.mock.invocationCallOrder[0]!);
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j2");
     expect(api.getCounts).toHaveBeenCalled();
-    // the next card's page says it above its review bar: upstream's toast would cover that page's header on phones
+    // the next card's page says it in its review bar: upstream's toast would cover that page's header on phones
     expect(toast.success).not.toHaveBeenCalled();
-    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake", warning: null });
     expect(takeRecipeIngestCommitNotice()).toBeNull();
+    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null });
+    expect(takeCarriedReviewNotice("j2")).toBeNull();
   });
 
-  test("after the batch's last card, the queue opens on the batch, which sums it up: no summary toast", async () => {
+  test("after the batch's last card, the queue opens on the batch, which sums it up and says what was added", async () => {
     api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
     api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: null, warnings: [] }));
     api.getBatch.mockResolvedValue(ok({
@@ -757,10 +812,80 @@ describe("useRecipeIngestReview", () => {
 
     expect(await review.commit()).toBe("committed");
 
+    // no other batch has a card ready
+    expect(api.getJobs).toHaveBeenCalledExactlyOnceWith({ status: "ready", perPage: -1 });
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
-    // the queue has no review bar: the toast says it there
-    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Added Banana Mug Cake");
+    // left for the queue, which says it beside its summary line: a toast would cover the page's title
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake", warning: null });
+  });
+
+  test("after the last ready card, while cards of the batch are still being read, the queue opens on the batch", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: null, warnings: [] }));
+    api.getBatch.mockResolvedValue(ok({
+      id: "b1",
+      source: "app",
+      jobs: [batchJob("j1", 0, "committed"), batchJob("j2", 1, "processing"), batchJob("j3", 2, "processing")],
+    }));
+    // another batch has a card ready, but this one isn't done
+    api.getJobs.mockResolvedValue(ok({ items: [{ id: "x1", batchId: "b2", position: 0, status: "ready", source: "api", pageCount: 1 }] }));
+    const { review, navigate } = await loaded();
+
+    expect(await review.commit()).toBe("committed");
+
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
+    expect(api.getJobs).not.toHaveBeenCalled();
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake · 2 cards are still being read", warning: null });
+  });
+
+  test("after a batch's last card, Commit & next goes on to another batch's ready card", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: null, warnings: ["tag_dropped:Desserts"] }));
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "committed"), batchJob("j2", 1, "failed")] }));
+    api.getJobs.mockResolvedValue(ok({
+      items: [
+        { id: "x2", batchId: "b2", position: 1, status: "ready", source: "inbox", pageCount: 1, createdAt: "2026-10-04T08:00:00Z" },
+        { id: "x1", batchId: "b2", position: 0, status: "ready", source: "inbox", pageCount: 1, createdAt: "2026-10-04T08:00:00Z" },
+      ],
+    }));
+    const { review, navigate } = await loaded();
+
+    expect(await review.commit()).toBe("committed");
+
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/x1");
     expect(takeRecipeIngestCommitNotice()).toBeNull();
+    expect(takeCarriedReviewNotice("x1")).toEqual({
+      kind: "warning",
+      text: "Added Banana Mug Cake · Next batch",
+      detail: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+    });
+  });
+
+  test("Skip on the batch's last card says so only when nothing in the batch is still being read", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "ready"), batchJob("j2", 1, "processing")] }));
+    const { review, navigate } = await loaded();
+
+    await review.skip();
+    expect(navigate).toHaveBeenLastCalledWith("/g/home/recipes/cards?batch=b1");
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "1 card is still being read", warning: null });
+
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "ready"), batchJob("j2", 1, "failed")] }));
+    await review.skip();
+    expect(navigate).toHaveBeenLastCalledWith("/g/home/recipes/cards?batch=b1");
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "That was the last card to review in this batch.", warning: null });
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  test("Skip on the batch's last card goes on to another batch's ready card", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "ready")] }));
+    api.getJobs.mockResolvedValue(ok({ items: [{ id: "x1", batchId: "b2", position: 0, status: "ready", source: "app", pageCount: 1 }] }));
+    const { review, navigate } = await loaded();
+
+    await review.skip();
+
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/x1");
+    expect(takeCarriedReviewNotice("x1")).toEqual({ kind: "info", text: "Next batch", detail: null });
   });
 
   test("errors block commit: nothing is sent, and the page is told to show them", async () => {
@@ -810,7 +935,8 @@ describe("useRecipeIngestReview", () => {
 
     expect(await review.commit()).toBe("failed");
 
-    expect(toast.error).toHaveBeenCalledWith("This recipe couldn't be added. Check the card's fields and try again.");
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "This recipe couldn't be added. Check the card's fields and try again." });
+    expect(toast.error).not.toHaveBeenCalled();
     expect(review.job.value?.error?.code).toBe("commit_invalid");
   });
 
@@ -826,11 +952,12 @@ describe("useRecipeIngestReview", () => {
     const { review } = await loaded();
 
     await review.rotate(0);
-    expect(toast.error).not.toHaveBeenCalled();
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(review.notice.value).toBeNull();
 
     await review.reextract();
-    expect(toast.info).toHaveBeenCalledWith("This card is being read. Try again when it's done.");
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "This card is being read. Try again when it's done." });
+    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   test("a refresh that already sees this page's save in flight raises no conflict (§6.6)", async () => {
@@ -999,17 +1126,19 @@ describe("useRecipeIngestReview", () => {
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "eval_case_exists" }));
     expect(await review.saveEvalCase("banana-mug-cake", true)).toBe("exists");
-    expect(toast.error).not.toHaveBeenCalled();
+    expect(review.notice.value).toBeNull();
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "not_exportable" }));
     expect(await review.saveEvalCase("banana-mug-cake-2", true)).toBe("failed");
-    expect(toast.error).toHaveBeenCalledWith(
-      "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
-    );
+    expect(review.notice.value).toMatchObject({
+      kind: "error",
+      text: "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
+    });
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "files_missing" }));
     expect(await review.saveEvalCase("banana-mug-cake-3", true)).toBe("failed");
-    expect(toast.error).toHaveBeenLastCalledWith("The card's photos are missing. Scan it again.");
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "The card's photos are missing. Scan it again." });
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   test("what commit left out (an organizer deleted since) is said with the Added notice", async () => {
@@ -1023,28 +1152,29 @@ describe("useRecipeIngestReview", () => {
     const { review, navigate } = await loaded();
 
     expect(await review.commit()).toBe("committed");
-    expect(takeRecipeIngestCommitNotice()).toEqual({
+    expect(takeCarriedReviewNotice("j2")).toEqual({
+      kind: "warning",
       text: "Added Banana Mug Cake",
-      warning: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+      detail: "The tag \"Desserts\" no longer exists, so it wasn't added.",
     });
     expect(toast.success).not.toHaveBeenCalled();
     expect(toast.warning).not.toHaveBeenCalled();
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j2");
   });
 
-  test("after the last card, what commit left out is said with the Added toast on the queue", async () => {
+  test("after the last card, what commit left out is said with Added beside the queue's summary", async () => {
     api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
     api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: null, warnings: ["tag_dropped:Desserts"] }));
     api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j1", 0, "committed")] }));
     const { review, navigate } = await loaded();
 
     expect(await review.commit()).toBe("committed");
-    expect(toast.warning).toHaveBeenCalledExactlyOnceWith(
-      "The tag \"Desserts\" no longer exists, so it wasn't added.",
-      "Added Banana Mug Cake",
-    );
+    expect(toast.warning).not.toHaveBeenCalled();
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
-    expect(takeRecipeIngestCommitNotice()).toBeNull();
+    expect(takeRecipeIngestCommitNotice()).toEqual({
+      text: "Added Banana Mug Cake",
+      warning: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+    });
   });
 
   test("the next card shows its place in the batch at once, before its own fetch of the batch answers", async () => {
@@ -1142,5 +1272,283 @@ describe("useRecipeIngestReview", () => {
     const { review } = mountReview();
     await review.load();
     expect(review.loadState.value).toBe("not-found");
+  });
+
+  test("a card that failed to load (no signal) loads again on Try again", async () => {
+    api.getJob.mockResolvedValueOnce({ data: null, response: null, error: { message: "Network Error" } });
+    const { review } = mountReview();
+    await review.load();
+    expect(review.loadState.value).toBe("failed");
+
+    await review.load();
+    expect(review.loadState.value).toBe("ready");
+    expect(review.draft.value.name).toBe("Banana Mug Cake");
+  });
+
+  // ==========================================
+  // Notices (docs/ai/PHASE2.md §6.2: in the review bar, never a toast over the page)
+
+  test("the card Commit & next opened says what was added, once, in its review bar", async () => {
+    carryReviewNotice("j1", { kind: "success", text: "Added Lemon Bars" });
+    const { review } = await loaded();
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "Added Lemon Bars", detail: null, action: null });
+
+    // it goes by itself
+    await vi.advanceTimersByTimeAsync(NOTICE_MS);
+    expect(review.notice.value).toBeNull();
+
+    // once only, and only on the card it was left for
+    carryReviewNotice("j9", { kind: "success", text: "Added Lemon Bars" });
+    const { review: other } = await loaded();
+    expect(other.notice.value).toBeNull();
+  });
+
+  test("a warning stays until it's dismissed", async () => {
+    carryReviewNotice("j1", { kind: "warning", text: "Added Lemon Bars", detail: "The tag \"Desserts\" no longer exists, so it wasn't added." });
+    const { review } = await loaded();
+
+    await vi.advanceTimersByTimeAsync(NOTICE_MS * 3);
+    expect(review.notice.value).toMatchObject({ kind: "warning", detail: "The tag \"Desserts\" no longer exists, so it wasn't added." });
+
+    review.dismissNotice();
+    expect(review.notice.value).toBeNull();
+  });
+
+  test("a notice left a minute ago is about another visit", async () => {
+    carryReviewNotice("j1", { kind: "success", text: "Added Lemon Bars" });
+    const later = Date.now() + 60_000;
+    vi.spyOn(Date, "now").mockReturnValue(later);
+    try {
+      const { review } = await loaded();
+      expect(review.notice.value).toBeNull();
+    }
+    finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("after turning a page the review bar offers to read the card again, and stays until used", async () => {
+    api.rotatePage.mockResolvedValueOnce(ok({ index: 0, width: 2048, height: 1536, rotation: 90, rotationSource: "user", oriented: true }));
+    api.reextract.mockResolvedValueOnce(ok(state({ task: { kind: "extract", state: "queued" } })));
+    const { review } = await loaded();
+
+    await review.rotate(0);
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "Turn the card upright, then read it again." });
+    // short, so the hint and its button fit in the bar on a phone
+    expect(review.notice.value!.action!.label).toBe("Read again");
+    await vi.advanceTimersByTimeAsync(NOTICE_MS * 2);
+    expect(review.notice.value).not.toBeNull();
+
+    await review.runNoticeAction();
+    expect(api.reextract).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(review.notice.value).toBeNull();
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  test("a failed card, once turned, is offered Retry (it has nothing to read again)", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ status: "failed", draft: null, flags: [], error: { code: "no_recipe_found", params: {} } })));
+    api.rotatePage.mockResolvedValueOnce(ok({ index: 0, width: 2048, height: 1536, rotation: 90, rotationSource: "user", oriented: true }));
+    api.retry.mockResolvedValueOnce(ok(state({ status: "processing", task: { kind: "extract", state: "queued" } })));
+    const { review } = await loaded();
+
+    await review.rotate(0);
+    expect(review.notice.value!.action!.label).toBe("Retry");
+    await review.runNoticeAction();
+    expect(api.retry).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(api.reextract).not.toHaveBeenCalled();
+  });
+
+  test("Discard goes on to the next card, which says the card was discarded", async () => {
+    api.discard.mockResolvedValueOnce(ok(null));
+    const { review, navigate } = await loaded();
+
+    await review.discard();
+
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j2");
+    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Card discarded", detail: null });
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  // ==========================================
+  // Autosave that fails (docs/ai/PHASE2.md §6.6)
+
+  const offline = { data: null, response: null, error: { message: "Network Error" } };
+
+  test("a save with no answer is tried again: after 2 s, 4 s, 8 s ... and the edits go once it works", async () => {
+    const { review } = await loaded();
+    api.updateJob.mockResolvedValueOnce(offline).mockResolvedValueOnce(offline).mockResolvedValueOnce(apiError(502, "Bad gateway"));
+
+    review.draft.value.name = "Banana Mug Cake for One";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(1);
+    expect(review.saveState.value).toBe("error");
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(api.updateJob).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(4000);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(3);
+
+    // a server error is tried again too; this time it works
+    await vi.advanceTimersByTimeAsync(8000);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(4);
+    expect(api.updateJob.mock.calls[3]![1]).toMatchObject({ draftVersion: 3, draft: { name: "Banana Mug Cake for One" } });
+    expect(review.saveState.value).toBe("saved");
+    expect(review.isDirty.value).toBe(false);
+
+    // nothing more is sent, and the next failure starts again at 2 s
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.updateJob).toHaveBeenCalledTimes(4);
+    api.updateJob.mockResolvedValueOnce(offline);
+    review.draft.value.name = "Banana Mug Cake";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(6);
+  });
+
+  test("retries wait at most a minute apart, and stop when the page closes", async () => {
+    const { review } = await loaded();
+    api.updateJob.mockResolvedValue(offline);
+    review.draft.value.name = "Offline";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    // 2 + 4 + 8 + 16 + 32 s, then every 60 s
+    await vi.advanceTimersByTimeAsync(62_000);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(6);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(api.updateJob).toHaveBeenCalledTimes(6);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(7);
+
+    wrappers.forEach(wrapper => wrapper.unmount());
+    wrappers.length = 0;
+    await flushPromises();
+    const sent = api.updateJob.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(api.updateJob).toHaveBeenCalledTimes(sent);
+  });
+
+  test("a save refused for what it holds isn't sent again, and says so", async () => {
+    const { review } = await loaded();
+    api.updateJob.mockResolvedValueOnce(apiError(422, [{ loc: ["body", "draft"], msg: "bad" }]));
+
+    review.draft.value.name = "Bad";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(review.saveState.value).toBe("error");
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "Couldn't save your last change. Check what you just typed." });
+  });
+
+  test("a save refused because the card was added on another device shows the card as it is now", async () => {
+    const { review } = await loaded();
+    api.updateJob.mockResolvedValueOnce(apiError(409, { code: "invalid_status", status: "committed" }));
+    api.getJob.mockResolvedValueOnce(ok(job({ status: "committed", recipe: { id: "r1", slug: "banana-mug-cake" } })));
+
+    review.draft.value.name = "Too late";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+
+    expect(review.job.value?.status).toBe("committed");
+    expect(review.notice.value).toMatchObject({ kind: "warning", text: "This card was already added. Your last changes weren't saved." });
+    expect(review.saveState.value).toBe("idle");
+    // nothing is left to save, try again or ask about when leaving
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(await review.saveBeforeLeaving()).toBe(true);
+  });
+
+  test("a save refused because the card was discarded elsewhere shows that it's gone", async () => {
+    const { review } = await loaded();
+    api.updateJob.mockResolvedValueOnce(apiError(404, { code: "not_found" }));
+    api.getJob.mockResolvedValueOnce(apiError(404, { code: "not_found" }));
+
+    review.draft.value.name = "Too late";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+
+    expect(review.loadState.value).toBe("not-found");
+    expect(await review.saveBeforeLeaving()).toBe(true);
+  });
+
+  test("leaving saves what's pending first; only a save that still fails keeps the page", async () => {
+    const { review } = await loaded();
+    review.draft.value.name = "Typed just now";
+    await nextTick();
+
+    // the debounce hasn't fired: leaving sends it now
+    expect(await review.saveBeforeLeaving()).toBe(true);
+    expect(api.updateJob).toHaveBeenCalledOnce();
+
+    api.updateJob.mockResolvedValueOnce(offline);
+    review.draft.value.name = "Typed offline";
+    await nextTick();
+    expect(await review.saveBeforeLeaving()).toBe(false);
+    expect(review.isDirty.value).toBe(true);
+  });
+
+  // ==========================================
+  // Cancel (docs/ai/PHASE2.md §3.5)
+
+  test("Cancel asks a running re-read to stop, and drops the re-reads waiting", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ task: { kind: "reread", state: "running" } })));
+    const { review } = await loaded();
+    await review.requestReread(region);
+    expect(review.rereadQueue.value).toHaveLength(1);
+
+    api.cancel.mockResolvedValueOnce(ok(state({ task: { kind: "reread", state: "running", cancelRequested: true } })));
+    expect(await review.cancelTask()).toBe(true);
+
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(review.rereadQueue.value).toEqual([]);
+    expect(review.task.value).toMatchObject({ cancelRequested: true });
+
+    // it stops within a heartbeat; the waiting re-read never goes
+    api.getJobState.mockResolvedValueOnce(ok(state()));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(review.task.value).toBeNull();
+    expect(api.reread).not.toHaveBeenCalled();
+  });
+
+  test("Cancel clears a queued re-extract at once and says so", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ task: { kind: "extract", state: "queued" } })));
+    const { review } = await loaded();
+    expect(review.readOnly.value).toBe(true);
+
+    api.cancel.mockResolvedValueOnce(ok(state()));
+    api.getJob.mockResolvedValueOnce(ok(job()));
+    await review.cancelTask();
+
+    expect(review.task.value).toBeNull();
+    expect(review.readOnly.value).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "Reading stopped" });
+  });
+
+  test("a refused cancel says why", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ task: { kind: "reread", state: "running" } })));
+    const { review } = await loaded();
+    api.cancel.mockResolvedValueOnce(apiError(404, { code: "not_found" }));
+
+    expect(await review.cancelTask()).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "This card no longer exists." });
   });
 });

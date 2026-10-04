@@ -45,7 +45,8 @@
           :label="$t('recipe-ingest.review.reread-for')"
         />
       </div>
-      <div ref="frame" class="ingest-region-dialog__frame">
+      <!-- arrow keys on the focused selection move it, Shift and arrow keys resize it -->
+      <div ref="frame" class="ingest-region-dialog__frame" @keydown="onKeydown">
         <Cropper
           v-if="current"
           :key="current.viewUrl"
@@ -55,10 +56,18 @@
           :canvas="false"
           :check-orientation="false"
           :default-size="defaultSize"
+          :stencil-component="IngestRegionStencil"
+          :stencil-props="stencilProps"
           @ready="tooSmall = false"
-          @change="tooSmall = false"
+          @change="onChange"
         />
       </div>
+      <p :id="keysHintId" class="d-sr-only">
+        {{ $t("recipe-ingest.review.region-keys") }}
+      </p>
+      <p class="d-sr-only ingest-region-dialog__position" aria-live="polite">
+        {{ positionText }}
+      </p>
       <p
         v-if="tooSmall"
         class="text-error text-body-2 mt-2 mb-0 ingest-region-dialog__error"
@@ -73,11 +82,15 @@
 <script setup lang="ts">
 import { mdiCropFree, mdiTextRecognition } from "@mdi/js";
 import { useResizeObserver } from "@vueuse/core";
+import { useId } from "vue";
 import { Cropper } from "vue-advanced-cropper";
 import "vue-advanced-cropper/dist/style.css";
+import IngestRegionStencil from "./IngestRegionStencil.vue";
 import {
+  nudgeRegion,
   regionFromCropResult,
   type CropResultLike,
+  type RegionCoordinates,
   type RereadTargetOption,
 } from "~/composables/use-recipe-ingest-review";
 import type { PageOut, RereadRequest } from "~/lib/api/types/recipe-ingest";
@@ -86,6 +99,8 @@ import type { PageOut, RereadRequest } from "~/lib/api/types/recipe-ingest";
  * "Re-read an area" (docs/ai/PHASE2.md §4.7, §6.5): the reviewer drags over part of an upright page and picks what
  * it's for; the selection goes to `POST …/reread` as fractions of that page. The pages are already upright and
  * EXIF-free, so the cropper neither reads orientation nor draws a canvas. Full screen on phones (BaseDialog).
+ * The selection (`IngestRegionStencil`) follows a finger from the first pixel, and takes the keyboard focus: arrow
+ * keys move it, Shift and arrow keys resize it, and a screen reader hears where it is.
  */
 const props = withDefaults(defineProps<{
   pages?: PageOut[];
@@ -110,12 +125,21 @@ const dialog = defineModel<boolean>({ required: true });
 
 const i18n = useI18n();
 
-type CropperInstance = { getResult: () => CropResultLike; refresh: () => void };
+type CropperTransform = (params: { coordinates: RegionCoordinates; imageSize: { width: number; height: number } }) => RegionCoordinates;
+type CropperInstance = {
+  getResult: () => CropResultLike;
+  refresh: () => void;
+  setCoordinates: (transform: CropperTransform, options?: { transitions?: boolean }) => void;
+};
 const cropper = ref<CropperInstance | null>(null);
 const frame = ref<HTMLElement | null>(null);
 const selected = ref(props.initialPage);
 const targetValue = ref<string | null>(props.initialTarget);
 const tooSmall = ref(false);
+/** Where the selection is, said after each arrow key (an `aria-live` line) */
+const positionText = ref("");
+const keysHintId = `ingest-region-keys-${useId()}`;
+const stencilProps = computed(() => ({ label: i18n.t("recipe-ingest.review.region-selection"), describedBy: keysHintId }));
 
 const current = computed(() => props.pages[Math.min(selected.value, props.pages.length - 1)] ?? null);
 
@@ -178,8 +202,10 @@ function refreshCropper() {
 watch(dialog, async (open) => {
   if (open) {
     selected.value = Math.min(props.initialPage, Math.max(0, props.pages.length - 1));
-    targetValue.value = props.initialTarget ?? props.targets[0]?.value ?? null;
+    // opened from a flag or a line, it's for that line; otherwise the reviewer picks what it's for
+    targetValue.value = props.initialTarget ?? null;
     tooSmall.value = false;
+    positionText.value = "";
     await nextTick();
     if (refreshTimer) {
       clearTimeout(refreshTimer);
@@ -195,6 +221,46 @@ onBeforeUnmount(() => {
     clearTimeout(refreshTimer);
   }
 });
+
+/** Whether the next change comes from an arrow key, and so is said aloud */
+let keyboardChange = false;
+const ARROW_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
+
+function onKeydown(event: KeyboardEvent) {
+  if (!ARROW_KEYS.includes(event.key) || event.altKey || event.ctrlKey || event.metaKey) {
+    return;
+  }
+  if (!(event.target as HTMLElement | null)?.closest?.(".ingest-region-stencil")) {
+    return;
+  }
+  // the dialog doesn't scroll, whether or not the selection can go further
+  event.preventDefault();
+  keyboardChange = true;
+  const resize = event.shiftKey;
+  // without transitions: while one runs the cropper ignores new coordinates, which would drop held-down keys
+  cropper.value?.setCoordinates(
+    ({ coordinates, imageSize }) => nudgeRegion(coordinates, imageSize, event.key, resize) ?? coordinates,
+    { transitions: false },
+  );
+}
+
+function onChange(result: CropResultLike) {
+  tooSmall.value = false;
+  if (!keyboardChange) {
+    return;
+  }
+  keyboardChange = false;
+  const region = regionFromCropResult(result, 0);
+  if (region) {
+    const percent = (value: number) => Math.round(value * 100);
+    positionText.value = i18n.t("recipe-ingest.review.region-position", {
+      left: percent(region.x),
+      top: percent(region.y),
+      width: percent(region.width),
+      height: percent(region.height),
+    });
+  }
+}
 
 function submit() {
   const page = current.value;

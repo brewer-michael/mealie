@@ -9,7 +9,6 @@ import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,7 +19,7 @@ from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.household.group_events import GroupEventNotifierSave
-from mealie.schema.recipe_ingest import IngestSource, IngestStatus
+from mealie.schema.recipe_ingest import IngestRejectReason, IngestSource, IngestStatus
 from mealie.services.ai.ingest import events, limits
 from mealie.services.event_bus_service.event_bus_service import EventBusService
 from mealie.services.event_bus_service.publisher import ApprisePublisher
@@ -62,7 +61,11 @@ def published(monkeypatch: pytest.MonkeyPatch) -> list[Published]:
 
 def for_batch(sent: list[Published], batch_id: UUID) -> list[Published]:
     """Only this batch's notifications (housekeeping also finds other tests' due batches)"""
-    return [p for p in sent if p.data.batch_id == batch_id]
+    return [
+        p
+        for p in sent
+        if isinstance(p.event.document_data, events.EventIngestionReadyData) and p.data.batch_id == batch_id
+    ]
 
 
 def notifier(user: TestUser, url: str, *, ready: bool = True, enabled: bool = True) -> UUID:
@@ -86,13 +89,15 @@ def make_batch(
     *cards: str,
     sealed: bool = True,
     age: timedelta = timedelta(0),
+    active: timedelta = timedelta(0),
     idle: timedelta | None = None,
     source: IngestSource = IngestSource.app,
     locale: str | None = "en-US",
 ) -> UUID:
     """
     A batch created `age` ago with one job per card: a status (`ready`, `failed`, `processing`, `committed`), or
-    `ready!` for a ready card with something to check. Every card carries `CARD_TITLE`.
+    `ready!` for a ready card with something to check. Every card carries `CARD_TITLE`. Its cards were last written
+    `active` ago, when it was also sealed.
     """
     now = utcnow()
     with session_context() as session:
@@ -109,12 +114,14 @@ def make_batch(
                     "title": CARD_TITLE,
                     "source_sha256": uuid4().hex * 2,
                     "warning_count": 1 if needs_attention else 0,
+                    "created_at": now - age,
+                    "update_at": now - active,
                 }
             )
 
         values: dict[str, Any] = {}
         if sealed:
-            values["sealed_at"] = now
+            values["sealed_at"] = now - active
         if idle is not None:
             values["last_upload_at"] = now - idle
         if values:
@@ -146,7 +153,12 @@ def group_slug(api_client: TestClient, user: TestUser) -> str:
 
 
 def custom_params(url: str) -> dict[str, str]:
-    return {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
+    """The event's `:field` values as Apprise's json notifier reads them back, and so as Home Assistant gets them"""
+    import apprise
+
+    plugin = apprise.Apprise.instantiate(url)
+    assert plugin is not None
+    return {f":{key}": value for key, value in plugin.payload_extras.items()}
 
 
 # ==================================================================================================================
@@ -314,17 +326,73 @@ def test_one_notification_when_two_cards_finish_together(unique_user_fn_scoped: 
         assert len(for_batch(published, batch_id)) == 1
 
 
-def test_batches_created_over_24_hours_ago_never_notify(unique_user_fn_scoped: TestUser, published: list[Published]):
-    notifier(unique_user_fn_scoped, "json://ha.local/hook")
-    old = make_batch(unique_user_fn_scoped, "ready", age=timedelta(seconds=limits.NOTIFY_CUTOFF + 3600))
-    recent = make_batch(unique_user_fn_scoped, "ready", age=timedelta(seconds=limits.NOTIFY_CUTOFF - 3600))
+CUTOFF = timedelta(seconds=limits.NOTIFY_CUTOFF)
 
-    assert events.maybe_notify_batch(old) is False
+
+def test_a_batch_read_over_days_notifies_when_its_last_card_finishes(
+    unique_user_fn_scoped: TestUser, published: list[Published]
+):
+    """A slow reader, a long outage or rate limits: what counts is when its cards were last read, not its age"""
+    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    three_days = timedelta(days=3)
+    by_task = make_batch(unique_user_fn_scoped, "ready", "processing", age=three_days, active=three_days)
+    by_housekeeping = make_batch(unique_user_fn_scoped, "ready", "processing", age=three_days, active=three_days)
+
+    events.housekeeping(utcnow())
+    assert events.maybe_notify_batch(by_task) is False  # its last card is still being read
+    assert batch_row(by_task)["notified_at"] is None
+    assert batch_row(by_housekeeping)["notified_at"] is None
+
+    # the last cards finish now: a plain status update, as the runner writes it, records when (`update_at`)
+    set_status(by_task, IngestStatus.ready)
+    set_status(by_housekeeping, IngestStatus.ready)
+
+    assert events.maybe_notify_batch(by_task) is True
+    events.housekeeping(utcnow())
+    for batch_id in (by_task, by_housekeeping):
+        [sent] = for_batch(published, batch_id)
+        assert sent.data.ready_count == 2
+
+
+def test_a_batch_whose_cards_were_last_active_over_24_hours_ago_never_notifies(
+    unique_user_fn_scoped: TestUser, published: list[Published]
+):
+    """A restored backup's batch, finished long ago but never notified, doesn't send old news"""
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    restored = make_batch(user, "ready", "failed", age=CUTOFF * 3, active=CUTOFF + timedelta(hours=1))
+    recent = make_batch(user, "ready", age=CUTOFF * 3, active=CUTOFF - timedelta(hours=1))
+
+    assert events.maybe_notify_batch(restored) is False
     events.housekeeping(utcnow())
 
-    assert batch_row(old)["notified_at"] is None
-    assert for_batch(published, old) == []
+    assert for_batch(published, restored) == []
     assert len(for_batch(published, recent)) == 1
+    # settled, so opening and editing one of its cards later doesn't make it due
+    assert batch_row(restored)["notified_at"] is not None
+    with session_context() as session:
+        session.execute(
+            sa.update(RecipeIngestionJob).where(RecipeIngestionJob.batch_id == restored).values(title="Edited")
+        )
+        session.commit()
+    assert events.maybe_notify_batch(restored) is False
+    events.housekeeping(utcnow())
+    assert for_batch(published, restored) == []
+
+
+def test_housekeeping_leaves_old_batches_that_are_still_being_read(
+    unique_user_fn_scoped: TestUser, published: list[Published]
+):
+    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    waiting = make_batch(unique_user_fn_scoped, "processing", age=CUTOFF * 2, active=CUTOFF * 2)
+
+    events.housekeeping(utcnow())
+    assert batch_row(waiting)["notified_at"] is None  # not settled: its card may still be read
+
+    set_status(waiting, IngestStatus.failed)
+    events.housekeeping(utcnow())
+    [sent] = for_batch(published, waiting)
+    assert sent.event.message.body == "No cards are ready to review (1 failed)."
 
 
 def test_a_batch_with_nothing_to_look_at_isnt_sent(unique_user_fn_scoped: TestUser, published: list[Published]):
@@ -334,9 +402,11 @@ def test_a_batch_with_nothing_to_look_at_isnt_sent(unique_user_fn_scoped: TestUs
 
     assert events.maybe_notify_batch(reviewed) is False
     assert events.maybe_notify_batch(empty) is False
-    assert published == []
-    # both are finished: housekeeping doesn't look at them again
     assert batch_row(reviewed)["notified_at"] is not None
+    # a batch without cards (Done before any capture) has no card activity: housekeeping settles it
+    events.housekeeping(utcnow())
+    assert for_batch(published, reviewed) == [] and for_batch(published, empty) == []
+    # both are finished: housekeeping doesn't look at them again
     assert batch_row(empty)["notified_at"] is not None
 
 
@@ -423,3 +493,134 @@ def test_apprise_reads_the_event_data_and_the_notifiers_own_fields_back():
     assert extras["token"] == "a+b+c"
     assert extras["room"] == "living room"
     assert notifier.headers["X-Key"] == "d+e"
+
+
+# ==================================================================================================================
+# Inbox files that weren't added
+
+
+def test_inbox_rejections_send_one_notification_with_counts_by_reason(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, h2_user: TestUser, published: list[Published]
+):
+    user = unique_user_fn_scoped
+    home_assistant = "jsons://homeassistant.local:8123/api/webhook/mealie_cards?:room=living%20room"
+    notifier(user, home_assistant)
+    notifier(user, "pover://user@token")
+    notifier(user, "json://not-opted-in.local/hook", ready=False)
+    notifier(h2_user, "json://other-household.local/hook")
+    reasons = [
+        IngestRejectReason.duplicate,
+        IngestRejectReason.too_large,
+        IngestRejectReason.duplicate,
+        None,  # refused for a reason without a code: a link, an empty folder
+    ]
+
+    assert events.notify_inbox_rejections(UUID(user.group_id), UUID(user.household_id), reasons) is True
+
+    [sent] = published  # one notification for the whole scan burst
+    assert sent.event.event_type is events.AIEventTypes.recipe_ingestion_rejected
+    assert sent.event.integration_id == events.INTERNAL_INTEGRATION_ID
+    assert sent.event.message.title == "Recipe cards not added"
+    assert sent.event.message.body == (
+        "4 recipe cards from the inbox weren't added (2 already scanned, 1 too large, 1 for another reason). "
+        "They're in the inbox's failed folder."
+    )
+    assert sorted(url.split(":", 1)[0] for url in sent.urls) == ["jsons", "pover"]
+
+    # what Home Assistant gets, after Apprise has decoded the URL
+    params = custom_params(next(url for url in sent.urls if url.startswith("jsons://")))
+    assert params[":event_type"] == "recipe_ingestion_rejected"
+    assert params[":room"] == "living room"
+    assert json.loads(params[":document_data"]) == {
+        "documentType": "generic",
+        "operation": "info",
+        "count": 4,
+        "reasons": {"duplicate": 2, "too_large": 1, "other": 1},
+        "reviewUrl": f"http://localhost:8080/g/{group_slug(api_client, user)}/recipes/cards",
+    }
+
+
+def test_inbox_rejections_in_one_word(unique_user_fn_scoped: TestUser, published: list[Published]):
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+
+    events.notify_inbox_rejections(UUID(user.group_id), UUID(user.household_id), [IngestRejectReason.unreadable_image])
+    events.notify_inbox_rejections(
+        UUID(user.group_id), UUID(user.household_id), [IngestRejectReason.too_many_pixels], locale="de-DE"
+    )
+
+    first, second = (p.event.message.body for p in published)
+    assert first == "1 recipe card from the inbox wasn't added (1 unreadable). It's in the inbox's failed folder."
+    # a language without the texts yet gets English, never the texts' keys
+    assert second == (
+        "1 recipe card from the inbox wasn't added (1 with too many pixels). It's in the inbox's failed folder."
+    )
+
+
+@pytest.mark.parametrize("reason", list(IngestRejectReason))
+def test_every_reject_reason_has_its_words(reason: IngestRejectReason):
+    message = events.rejected_message({reason.value: 2}, events.translator_for(None))
+    assert "recipe-ingest" not in message.body
+    assert "another reason" not in message.body
+    assert "2 " in message.body
+
+
+def test_an_unknown_reason_code_is_another_reason():
+    message = events.rejected_message({"made_up": 1}, events.translator_for("en-US"))
+    assert "(1 for another reason)" in message.body
+
+
+def test_inbox_rejections_without_a_notifier_send_nothing(unique_user_fn_scoped: TestUser, published: list[Published]):
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook", ready=False)
+    notifier(user, "json://disabled.local/hook", enabled=False)
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+
+    assert events.notify_inbox_rejections(group_id, household_id, [IngestRejectReason.duplicate]) is False
+    assert published == []
+
+    notifier(user, "json://ha.local/hook")
+    assert events.notify_inbox_rejections(group_id, household_id, []) is False  # nothing refused
+    assert published == []
+
+
+def test_inbox_rejections_never_raise_when_sending_fails(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    user = unique_user_fn_scoped
+    notifier(user, "json://secret-token@ha.local/hook")
+
+    def publish(self: ApprisePublisher, event: Any, notification_urls: list[str]) -> None:
+        raise RuntimeError("json://secret-token@ha.local is down")
+
+    monkeypatch.setattr(ApprisePublisher, "publish", publish)
+    with caplog.at_level("WARNING"):
+        sent = events.notify_inbox_rejections(
+            UUID(user.group_id), UUID(user.household_id), [IngestRejectReason.duplicate]
+        )
+
+    assert sent is False
+    assert "not added" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+# ==================================================================================================================
+# Whether the household hears about its cards
+
+
+def test_household_notifies(unique_user_fn_scoped: TestUser, h2_user: TestUser):
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+
+    def notifies() -> bool:
+        with session_context() as session:
+            return events.household_notifies(session, group_id, household_id)
+
+    assert notifies() is False  # no notifier at all
+    notifier(user, "json://ha.local/hook", ready=False)
+    notifier(user, "json://disabled.local/hook", enabled=False)
+    notifier(h2_user, "json://other-household.local/hook")
+    assert notifies() is False  # not opted in, switched off, or another household's
+
+    notifier(user, "pover://user@token")
+    assert notifies() is True

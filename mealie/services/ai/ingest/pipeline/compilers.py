@@ -4,30 +4,69 @@ letting the compile step log its traceback (which could hold a provider's respon
 
 Both compilers read the card with upstream's compile prompt plus `card-compile-rules.txt` into
 `OpenAIRecipeCardTranscription`, and return a plain `OpenAICompiledSource`: the compile step's `_merge` reads
-`image_url` and `language` off every document. The card's attribution, the reader's `unsure` list and which reader read
-it go on the `CardWorkflowContext`.
+`image_url` and `language` off every document. The card's attribution (without a leading "From", which the review
+page's field and the commit's note title already say), the reader's `unsure` list, which reader read it and how far
+the image reader says each page must turn go on the `CardWorkflowContext`.
+
+A two-sided card is one request with both pages. Some local vision models take one image per request and fail it; then
+each page is read on its own and the readings are joined (`ONE_IMAGE_PROVIDERS` remembers such a provider, so its
+later cards are read page by page at once).
 """
 
 import asyncio
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
 
 from mealie.core import exceptions
+from mealie.core.root_logger import get_logger
+from mealie.schema.group.ai_providers import AIProviderOut
 from mealie.schema.openai.compiled_source import OpenAICompiledSource
 from mealie.schema.recipe_ingest import ExtractionUnsure, IngestReadPath
 from mealie.services import ocr
-from mealie.services.ai.errors import describe_provider_error
+from mealie.services.ai.errors import (
+    AIProviderLimitReachedError,
+    AIProviderLocalOnlyError,
+    IngestBusyError,
+    IngestPaused,
+    describe_provider_error,
+    is_rate_limit_error,
+)
+from mealie.services.openai import OpenAINotEnabledException, OpenAIService
 from mealie.services.openai.content import truncate_source_content
 from mealie.services.recipe.import_workflow.compilers import COMPILE_SOURCE_PROMPT, ImageCompiler, OCRImageCompiler
 from mealie.services.recipe.import_workflow.compilers.base import SourceCompiler
 from mealie.services.recipe.import_workflow.context import WorkflowContext
 
 from .attachments import CardImage
-from .cardtext import canonical_markers
+from .cardtext import canonical_markers, strip_from_prefix
 from .context import CardWorkflowContext
-from .llm_schemas import OpenAIRecipeCardTranscription
+from .llm_schemas import VALID_ROTATIONS, OpenAIRecipeCardTranscription
+from .models import CardPage
 from .service import end_transaction
 
 CARD_COMPILE_RULES_PROMPT = "recipes.card-compile-rules"
+NOTE_FROM_KEY = "recipe-ingest.note-from"
+
+logger = get_logger(__name__)
+
+ONE_IMAGE_PROVIDERS: set[tuple[UUID, str]] = set()
+"""
+Providers (by id and model) that failed a request with several images and then read each one on its own: this
+process reads their cards page by page from then on
+"""
+
+NOT_ABOUT_IMAGES: tuple[type[BaseException], ...] = (
+    exceptions.RateLimitError,
+    AIProviderLimitReachedError,
+    AIProviderLocalOnlyError,
+    OpenAINotEnabledException,
+    IngestPaused,
+    IngestBusyError,
+)
+"""Failures that reading the pages one by one can't help: the card waits, or the error is reported as it is"""
 
 
 @dataclass
@@ -96,6 +135,15 @@ def page_label(index: int, page_count: int) -> str:
     return f"Image {index + 1}"
 
 
+def attribution_text(ctx: CardWorkflowContext, attribution: str | None) -> str | None:
+    """
+    A reader's attribution as the draft keeps it: markers written as the review page and commit look for them, and
+    without its own leading "From" (in English or the job's language), which the field's label already says
+    """
+    text = canonical_markers((attribution or "").strip())
+    return strip_from_prefix(text, ctx.translator.t(NOTE_FROM_KEY)) or None
+
+
 def _compiled(
     ctx: CardWorkflowContext, response: OpenAIRecipeCardTranscription | None, read_path: IngestReadPath
 ) -> OpenAICompiledSource | None:
@@ -103,8 +151,7 @@ def _compiled(
         return None
 
     ctx.read_path = read_path
-    # markers written exactly as the review page and commit look for them, as in every other field of the draft
-    ctx.attribution = canonical_markers((response.attribution or "").strip()) or None
+    ctx.attribution = attribution_text(ctx, response.attribution)
     ctx.unsure = [
         ExtractionUnsure(
             text=entry.text.strip(),
@@ -119,25 +166,136 @@ def _compiled(
     )
 
 
+def may_take_fewer_images(error: BaseException) -> bool:
+    """Whether a failed request with several images may succeed with one: a provider error, not a limit or a policy"""
+    if not isinstance(error, Exception) or isinstance(error, NOT_ABOUT_IMAGES):
+        return False
+    return not is_rate_limit_error(error.__cause__ or error)
+
+
+@contextmanager
+def answered_attempts(ai: OpenAIService, feature: str) -> Iterator[list[tuple[AIProviderOut, bool]]]:
+    """
+    Every provider attempt for `feature` (a response schema's name) on `ai`'s runtime meanwhile, as `(provider,
+    answered)`: watched where the runtime logs each attempt, so routing, fallbacks and the usage log run as they are
+    """
+    runtime = ai.runtime
+    attempts: list[tuple[AIProviderOut, bool]] = []
+    record = runtime.record_attempt
+
+    def watch(provider: AIProviderOut, **kwargs: Any) -> None:
+        record(provider, **kwargs)
+        if kwargs.get("feature") == feature:
+            attempts.append((provider, kwargs.get("error") is None and kwargs.get("error_type") is None))
+
+    runtime.record_attempt = watch  # type: ignore[method-assign]
+    try:
+        yield attempts
+    finally:
+        del runtime.record_attempt  # the class's method again
+
+
+def reads_one_image_at_a_time(ai: OpenAIService) -> bool:
+    """Whether the image slot's own provider is one this process saw take only one image per request"""
+    provider = ai.image_provider
+    return provider is not None and (provider.id, provider.model) in ONE_IMAGE_PROVIDERS
+
+
+def _page_word(index: int, count: int) -> str:
+    """How a page read on its own is named in the joined reading: a word, never a number the flags would count"""
+    if index == 0:
+        return "Front"
+    if index == 1 and count == 2:
+        return "Back"
+    return "Next page"
+
+
+def _rotations(pages: Sequence[CardPage], rotations: Sequence[int]) -> dict[int, int]:
+    """The turns a reader asked for, by page index, for pages not yet oriented; odd values are ignored"""
+    return {
+        page.meta.index: rotation
+        for page, rotation in zip(pages, rotations, strict=False)
+        if not page.meta.oriented and rotation in VALID_ROTATIONS
+    }
+
+
 class CardImageCompiler(ImageCompiler):
-    """Reads the card's `view.jpg`s on the image slot"""
+    """Reads the card's `view.jpg`s on the image slot: all pages in one request, or page by page (see above)"""
 
     async def compile(self) -> OpenAICompiledSource | None:
         ctx = _card_context(self.ctx)
         count = len(ctx.pages)
+        if count > 1 and reads_one_image_at_a_time(ctx.ai):
+            return await self._compile_page_by_page(ctx)
+
         labels = ", ".join(page_label(index, count) for index in range(count))
         if count == 1:
             message = f"Attached is {labels}: one recipe card."
         else:
             message = f"Attached are {count} images of one recipe card, in order: {labels}."
 
-        response = await ctx.ai.get_response(
-            _card_prompt(ctx),
-            message,
-            response_schema=OpenAIRecipeCardTranscription,
-            attachments=[CardImage(path=page.view_path) for page in ctx.pages],
-        )
+        feature = OpenAIRecipeCardTranscription.__name__
+        try:
+            with answered_attempts(ctx.ai, feature) as multi:
+                response = await ctx.ai.get_response(
+                    _card_prompt(ctx),
+                    message,
+                    response_schema=OpenAIRecipeCardTranscription,
+                    attachments=[CardImage(path=page.view_path) for page in ctx.pages],
+                )
+        except Exception as e:
+            if count == 1 or not may_take_fewer_images(e):
+                raise
+            reason = describe_provider_error(e)
+            logger.info(f"Reading a {count}-page card in one request failed ({reason}); reading each page on its own")
+            with answered_attempts(ctx.ai, feature) as single:
+                compiled = await self._compile_page_by_page(ctx)
+            failed = {(provider.id, provider.model) for provider, answered in multi if not answered}
+            ONE_IMAGE_PROVIDERS.update(
+                key for provider, answered in single if answered and (key := (provider.id, provider.model)) in failed
+            )
+            return compiled
+
+        if response is not None:
+            ctx.rotations = _rotations(ctx.pages, response.rotation_clockwise)
         return _compiled(ctx, response, IngestReadPath.image)
+
+    async def _compile_page_by_page(self, ctx: CardWorkflowContext) -> OpenAICompiledSource | None:
+        """
+        Each page read in a request of its own, the readings joined under the page's name (a word: a number in the
+        transcription would count as on the card). The first page's language and attribution, every page's `unsure`.
+        """
+        count = len(ctx.pages)
+        responses: list[OpenAIRecipeCardTranscription] = []
+        for index, page in enumerate(ctx.pages):
+            message = (
+                f"Attached is {page_label(index, count)} of one recipe card that has {count} images; the other images "
+                "are read on their own. Transcribe this image only."
+            )
+            response = await ctx.ai.get_response(
+                _card_prompt(ctx),
+                message,
+                response_schema=OpenAIRecipeCardTranscription,
+                attachments=[CardImage(path=page.view_path)],
+            )
+            if response is None:
+                return None
+            responses.append(response)
+
+        rotations = [response.rotation_clockwise[0] if response.rotation_clockwise else 0 for response in responses]
+        ctx.rotations = _rotations(ctx.pages, rotations)
+        joined = OpenAIRecipeCardTranscription(
+            contains_recipe=any(response.contains_recipe for response in responses),
+            content="\n\n".join(
+                f"{_page_word(index, count)}:\n{response.content.strip()}"
+                for index, response in enumerate(responses)
+                if response.content.strip()
+            ),
+            language=next((response.language for response in responses if response.language), None),
+            attribution=next((response.attribution for response in responses if response.attribution), None),
+            unsure=[entry for response in responses for entry in response.unsure],
+        )
+        return _compiled(ctx, joined, IngestReadPath.image)
 
 
 OCR_MESSAGE = (

@@ -60,10 +60,19 @@ def track_usage() -> Iterator[AITokenUsage]:
 
 
 def capture_openai_usage(completion: ChatCompletion) -> None:
-    """Called by `OpenAIService._get_raw_response` with each completion, before its finish reason is checked"""
-    if (usage := _tracked_usage.get()) is not None and completion.usage:
+    """
+    Called by `OpenAIService._get_raw_response` with each completion, before its finish reason is checked: the
+    tokens it reports, and the model that answered (e.g. the dated snapshot behind an alias, or the model an
+    OpenRouter route picked). Without one, the usage log names the configured model.
+    """
+    if (usage := _tracked_usage.get()) is None:
+        return
+
+    if completion.usage:
         usage.prompt_tokens = completion.usage.prompt_tokens
         usage.completion_tokens = completion.usage.completion_tokens
+    if isinstance(model := completion.model, str) and model.strip():
+        usage.model = model.strip()
 
 
 async def close_client(client: object) -> None:
@@ -130,15 +139,19 @@ class AIRuntime:
         """
         The providers to try for `slot`, in order (see `mealie.services.ai.routing`), as the current call policy
         allows (`mealie.services.ai.policy`). Raises upstream's `OpenAINotEnabledException` if the slot has none,
-        `AIProviderLimitReachedError` if all of them are over their monthly token limit, and
-        `AIProviderLocalOnlyError` if the policy is "local only" and none of them is local.
+        `AIProviderLocalOnlyError` if the policy is "local only" and none of them is local, and
+        `AIProviderLimitReachedError` if all those the policy allows are over their monthly token limit.
+
+        The policy filters before the limits do: a local-only card whose local provider is over its limit fails
+        `limit_reached`, not "no local provider", whatever cloud fallback still has tokens left.
         """
         primaries = {
             AIProviderSlot.default: self.service.default_provider,
             AIProviderSlot.image: self.service.image_provider,
             AIProviderSlot.audio: self.service.audio_provider,
         }
-        return apply_policy(slot, AIProviderRouter(self.service.repos, primaries).candidates(slot))
+        router = AIProviderRouter(self.service.repos, primaries)
+        return router.within_limits(apply_policy(slot, router.resolve(slot)), slot)
 
     def record_attempt(
         self,

@@ -2,6 +2,7 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { ref } from "vue";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import GroupRecipeCardSettings from "./GroupRecipeCardSettings.vue";
+import { resetRecipeIngestSettings, useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
 import type { EvalCaseSummary, RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
@@ -46,6 +47,7 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
       maxImagesPerRequest: 20,
       maxPagesPerCard: 4,
       maxPixels: 100000000,
+      maxJpegPixels: 256000000,
     },
     inbox: { enabled: true, folder: "home/family" },
     ...overrides,
@@ -146,6 +148,7 @@ function button(wrapper: VueWrapper, text: string, within?: string) {
 describe("GroupRecipeCardSettings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRecipeIngestSettings();
     state.user = ref({ canManage: true, advanced: true });
     state.group = ref({ aiProviderSettings: { defaultProviderId: "a" } });
     api.getSettings.mockResolvedValue({ data: settings(), error: null });
@@ -362,5 +365,17 @@ describe("GroupRecipeCardSettings", () => {
     await flushPromises();
 
     expect(api.getSettings).toHaveBeenCalledTimes(2);
+  });
+
+  test("its reloads reach the rest of the app (the sidebar's entries, the cards page)", async () => {
+    const shared = useRecipeIngestSettings();
+    api.getSettings.mockResolvedValueOnce({ data: settings({ canReadCards: false }), error: null });
+    await mountSettings();
+    expect(shared.settings.value?.canReadCards).toBe(false);
+
+    api.getSettings.mockResolvedValueOnce({ data: settings({ canReadCards: true }), error: null });
+    state.group.value = { aiProviderSettings: { defaultProviderId: "b" } };
+    await flushPromises();
+    expect(shared.settings.value?.canReadCards).toBe(true);
   });
 });

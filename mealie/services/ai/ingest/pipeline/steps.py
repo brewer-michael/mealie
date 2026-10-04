@@ -3,6 +3,7 @@ The card workflow's steps (docs/ai/PHASE2.md §4.1): upstream's import workflow 
 no translation or `finalize_scraped_recipe`.
 """
 
+from mealie.schema.openai.compiled_source import OpenAICompiledSource
 from mealie.schema.openai.recipe import OpenAIRecipe
 from mealie.services.ai.errors import describe_provider_error
 from mealie.services.recipe.import_workflow.base import WorkflowStep
@@ -55,6 +56,34 @@ class CardResolveOrganizersStep(ResolveOrganizersStep):
             await super().run(ctx)
         except Exception as e:
             raise OrganizerSuggestionFailed(describe_provider_error(e)) from None
+
+
+class TranscriptionStep(WorkflowStep):
+    """
+    Takes a transcription as it is (the reviewer's edit of the card's), in place of reading the card: the build step
+    then structures it. Its name is the extraction's record of where the draft came from.
+    """
+
+    name = "transcription"
+
+    def __init__(self, transcription: str, language: str | None) -> None:
+        self.transcription = transcription
+        self.language = language
+
+    async def run(self, ctx: WorkflowContext) -> None:
+        if not self.transcription.strip():
+            raise NoRecipeDataError(ctx.translator.t("recipe.import-errors.no-recipe-found"))
+        ctx.compiled_source = OpenAICompiledSource(
+            contains_recipe=True, content=self.transcription, language=self.language
+        )
+
+
+def card_rebuild_steps(options: CardPipelineOptions, transcription: str, language: str | None) -> list[WorkflowStep]:
+    """`TranscriptionStep`, then the card build step, then `ResolveOrganizersStep` when `options.suggest_organizers`"""
+    steps: list[WorkflowStep] = [TranscriptionStep(transcription, language), CardBuildRecipeStep()]
+    if options.suggest_organizers:
+        steps.append(CardResolveOrganizersStep())
+    return steps
 
 
 def card_workflow_steps(options: CardPipelineOptions, errors: list[CapturedError]) -> list[WorkflowStep]:

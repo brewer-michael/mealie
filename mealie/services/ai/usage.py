@@ -20,7 +20,7 @@ class AITokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     model: str | None = None
-    """The model that answered, if the provider reports one other than the configured model (e.g. a fallback)"""
+    """The model that answered, as the provider reports it (e.g. Claude's refusal fallback); else the configured one"""
 
 
 def record_ai_usage(

@@ -24,6 +24,7 @@ from mealie.schema.group.ai_providers import AIProviderOut, AIProviderProtocol, 
 from mealie.schema.group.ai_routing import AIProviderModelInfo
 from mealie.schema.openai._base import OpenAIBase
 from mealie.schema.openai.general import OpenAIText
+from mealie.services.ai.local import local_only_http_client
 from mealie.services.ai.runtime import AIRuntime, capture_openai_usage, close_client, get_claude_response
 
 from .._base_service import BaseService
@@ -159,6 +160,7 @@ class OpenAIService(BaseService):
             timeout=provider.timeout,
             default_headers=provider.request_headers or None,
             default_query=provider.request_params or None,
+            http_client=local_only_http_client(provider),  # Fork: local-only calls connect to checked addresses only
         )
 
     @cached_property

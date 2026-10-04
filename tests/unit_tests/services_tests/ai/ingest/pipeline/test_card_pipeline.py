@@ -221,7 +221,7 @@ async def test_card_compilers_return_a_plain_compiled_source(
             assert (compiled.contains_recipe, compiled.content, compiled.language) == (True, BANANA_CONTENT, "English")
             assert compiled.image_url is None
             assert ctx.read_path == read_path
-            assert ctx.attribution == "From Grandma Jo"
+            assert ctx.attribution == "Grandma Jo"  # the field is labelled "From" already
             assert [entry.alternatives for entry in ctx.unsure] == [["1/2 C."]]
 
     image_read, ocr_read = fake.calls
@@ -283,7 +283,7 @@ async def test_the_attribution_s_markers_are_written_as_everywhere_else(
 
     result = await _extract(user, make_pages(tmp_path), CardPipelineOptions(suggest_organizers=False))
 
-    assert result.draft.attribution == result.extraction.attribution == "From [illegible]"
+    assert result.draft.attribution == result.extraction.attribution == "[illegible]"
     assert any(flag.kind == CardFlagKind.illegible and flag.field == "attribution" for flag in result.flags)
 
 
@@ -532,7 +532,7 @@ async def test_the_cross_read_flags_an_invented_number_and_runs_alongside_on_the
         f"blank:steps:{step.id}",
         CardFlagSeverity.error,
         CardFlagSource.cross_read,
-        {"value": "2"},
+        {"value": "2", "start": 35, "end": 36},  # the invented "2", where the step has it
     )
     assert result.extraction.cross_read_lines == BANANA_TRANSCRIPT["text"].splitlines()
     assert result.extraction.read_info().cross_read is True

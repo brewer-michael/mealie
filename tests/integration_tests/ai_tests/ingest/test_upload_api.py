@@ -503,12 +503,14 @@ def test_duplicates_are_found_by_the_ordered_page_hashes(api_client: TestClient,
     # the same front sent again with its back is a new card, and so is the other way round
     assert post_card(api_client, reader, front, back).status_code == 202
     assert post_card(api_client, reader, back, front).status_code == 202
-    # unless asked, a committed card counts too
+    # unless asked, a committed card counts too (while its recipe exists)
+    slug = api_client.post("/api/recipes", json={"name": f"card {first_id}"}, headers=reader.token).json()
+    recipe_id = api_client.get(f"/api/recipes/{slug}", headers=reader.token).json()["id"]
     with session_context() as session:
         session.execute(
             sa.update(RecipeIngestionJob)
             .where(RecipeIngestionJob.id == UUID(first_id))
-            .values(status=IngestStatus.committed.value)
+            .values(status=IngestStatus.committed.value, recipe_id=UUID(recipe_id))
         )
         session.commit()
     assert post_card(api_client, reader, front).status_code == 400
@@ -722,6 +724,115 @@ def test_error_bodies_carry_a_code_and_a_message_only_where_the_page_doesnt_hand
     assert set(handled.json()["detail"]) == {"code", "batchId", "jobs", "rejected", "summary"}
 
     assert json.dumps(post_card(api_client, reader, jpeg()).json()).count('"message"') == 0
+
+
+# ==================================================================================================================
+# Every refusal has a top-level summary, as a Shortcut's notification reads it
+
+
+def assert_summary(response: Any, status: int, summary: str | None = None) -> dict[str, Any]:
+    """
+    The refusal's status, its usual `detail`, and a top-level `summary`: the detail's own summary or message when it
+    has one, else `summary`. Returns the detail.
+    """
+    assert response.status_code == status
+    body = response.json()
+    assert set(body) == {"detail", "summary"}
+    detail = body["detail"]
+    if isinstance(detail, dict) and (detail.get("summary") or detail.get("message")):
+        assert body["summary"] == (detail.get("summary") or detail["message"])
+    assert body["summary"]
+    if summary is not None:
+        assert body["summary"] == summary
+    return detail
+
+
+def test_no_token_at_all_is_401_with_a_summary(api_client: TestClient):
+    response = api_client.post(INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg"})
+    detail = assert_summary(response, 401, "Mealie didn't accept the API token. Check it and try again.")
+    assert detail == "Could not validate credentials"  # the auth dependency's own detail, unchanged
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_a_bad_token_is_401_with_a_summary(api_client: TestClient):
+    response = api_client.post(
+        INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg", "Authorization": "Bearer not-a-token"}
+    )
+    assert_summary(response, 401, "Mealie didn't accept the API token. Check it and try again.")
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_a_cookie_without_the_header_is_401_with_a_summary(api_client: TestClient, reader: TestUser):
+    token = reader.token["Authorization"].removeprefix("Bearer ")
+    api_client.cookies.set("mealie.access_token", token)
+    try:
+        response = api_client.post(INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg"})
+    finally:
+        api_client.cookies.clear()
+    detail = assert_summary(response, 401)
+    assert detail["code"] == "authorization_required"
+
+
+def test_refusals_before_the_body_have_a_summary(
+    api_client: TestClient, reader: TestUser, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    detail = assert_summary(post_card(api_client, unique_user_fn_scoped, jpeg()), 400)
+    assert detail["code"] == "ai_not_enabled"
+
+    response = api_client.post(INGEST, content=b"hello", headers={**reader.token, "Content-Type": "text/plain"})
+    assert assert_summary(response, 415)["code"] == "unsupported_media_type"
+
+    with session_context() as session:
+        processing = IngestRepos(session, UUID(reader.group_id), None).processing_jobs_in_group()
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", processing)
+    response = post_card(api_client, reader, jpeg())
+    assert assert_summary(response, 429)["code"] == "too_many_jobs"
+    assert response.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
+
+
+def test_503s_have_a_summary_and_keep_retry_after(
+    api_client: TestClient, reader: TestUser, paused: Path, monkeypatch: pytest.MonkeyPatch
+):
+    response = post_card(api_client, reader, jpeg())
+    detail = assert_summary(
+        response, 503, "Recipe card uploads are paused while a backup is restored. Try again in a minute."
+    )
+    assert detail["code"] == "paused_for_restore"
+    assert response.headers["Retry-After"] == str(limits.PAUSED_RETRY_AFTER)
+
+    paused.unlink()
+    monkeypatch.setattr(upload_service, "get_ingest_settings", lambda: IngestSettings(ENABLED=False, WORKER=False))
+    assert assert_summary(post_card(api_client, reader, jpeg()), 503)["code"] == "ingest_disabled"
+
+
+def test_refusals_after_the_body_have_a_summary(api_client: TestClient, reader: TestUser, h2_user: TestUser):
+    response = api_client.post(
+        INGEST, content=b"{not json", headers={**reader.token, "Content-Type": "application/json"}
+    )
+    assert assert_summary(response, 400)["code"] == "invalid_body"
+
+    theirs = api_client.post(f"{INGEST}/batches", headers=h2_user.token).json()["id"]
+    assert assert_summary(post_card(api_client, reader, jpeg(), batchId=theirs), 404)["code"] == "not_found"
+
+    response = post_card(api_client, reader, b"not an image")
+    detail = assert_summary(response, 400, "No recipe cards were queued. 1 card couldn't be used.")
+    assert detail["code"] == "nothing_accepted"
+    assert "message" not in detail
+
+
+def test_the_fallback_summary_is_in_the_requests_language(api_client: TestClient):
+    # only en-US has the fork's texts so far: any other language falls back to it rather than showing a key
+    response = api_client.post(
+        INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg", "Accept-Language": "de-DE"}
+    )
+    assert_summary(response, 401, "Mealie didn't accept the API token. Check it and try again.")
+
+
+def test_other_routes_keep_the_usual_error_body(api_client: TestClient, reader: TestUser, paused: Path):
+    response = api_client.post(f"{INGEST}/batches", headers=reader.token)
+    assert response.status_code == 503
+    assert set(response.json()) == {"detail"}
+    assert set(api_client.get(f"{INGEST}/batches/{UUID(int=0)}", headers=reader.token).json()) == {"detail"}
 
 
 # ==================================================================================================================

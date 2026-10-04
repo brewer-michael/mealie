@@ -106,7 +106,7 @@
           size="small"
           variant="text"
           :prepend-icon="mdiCropFree"
-          :disabled="readonly || !current"
+          :disabled="!canReread || !current"
           @click="emit('reread')"
         >
           {{ $t("recipe-ingest.review.reread-title") }}
@@ -172,19 +172,23 @@ import type { PageOut } from "~/lib/api/types/recipe-ingest";
  * The card's pages (docs/ai/PHASE2.md §6.2, §6.3). On phones (`strip`) a sticky strip about a third of the screen
  * high: tap for full screen, swipe down to fold it to a 56 px bar, Front/Back. On desktop (`panel`) a sticky column
  * with Front/Back, Rotate, Re-read an area and the transcription toggle. Images load through the authenticated page
- * routes (`<img>` sends the session cookie); their URLs change when a page is rotated.
+ * routes (`<img>` sends the session cookie); their URLs change when a page is rotated. Rotate follows `readonly`
+ * (a failed card can be turned before it's read again); Re-read an area follows `canReread` (only a ready card).
  */
 const props = withDefaults(defineProps<{
   pages?: PageOut[];
   mode?: "strip" | "panel";
   transcription?: string | null;
   readonly?: boolean;
+  /** Whether Re-read an area works now: the card is ready and its editor isn't locked */
+  canReread?: boolean;
   rotating?: boolean;
 }>(), {
   pages: () => [],
   mode: "panel",
   transcription: null,
   readonly: false,
+  canReread: false,
   rotating: false,
 });
 

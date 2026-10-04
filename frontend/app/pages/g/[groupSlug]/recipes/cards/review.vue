@@ -12,6 +12,7 @@ import { firstCardToReview } from "~/composables/use-recipe-ingest-review";
 /**
  * The start of a batch's review (docs/ai/PHASE2.md §6.1), which notifications open: the batch's first ready card, in
  * capture order, with an unresolved error or warning, else its first ready card, else the queue filtered to the batch.
+ * A batch that can't be opened sends the user to the queue, which says so. Fork-owned.
  */
 definePageMeta({
   middleware: ["group-only"],
@@ -36,8 +37,8 @@ onMounted(async () => {
 
   const { data } = await api.recipeIngest.getBatch(batchId);
   if (!data) {
-    // an unknown batch, or another household's
-    await router.replace(queue);
+    // purged, discarded, another household's, or the request failed: the queue says the batch can't be opened
+    await router.replace(`${queue}?unavailable=1`);
     return;
   }
   // the card opens showing its place in the batch at once

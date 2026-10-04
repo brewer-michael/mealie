@@ -1,7 +1,8 @@
 /**
  * The recipe card review page (docs/ai/PHASE2.md §6): pure helpers for batches, flags, drafts and crop regions, and
- * `useRecipeIngestReview`, the page's state: autosave carrying the draft version, the version conflict, state polling
- * while a task runs, the client-side re-read queue, commit and the ⋯ menu's actions. Fork-owned.
+ * `useRecipeIngestReview`, the page's state: autosave carrying the draft version (retried while the page is open),
+ * the version conflict, state polling while a task runs, the client-side re-read queue, commit, where the review goes
+ * next, the ⋯ menu's actions and the notices the review bar shows. Fork-owned.
  */
 import { useDebounceFn, useEventListener, useIntervalFn } from "@vueuse/core";
 import { computed, onBeforeUnmount, readonly, ref, toValue, watch, type MaybeRefOrGetter } from "vue";
@@ -17,7 +18,6 @@ import {
   useRecipeIngestText,
 } from "~/composables/use-recipe-ingest";
 import type { TranslateFn } from "~/composables/use-recipe-ingest";
-import { alert } from "~/composables/use-toast";
 import { uuid4 } from "~/composables/use-utils";
 import type {
   CardDraft,
@@ -36,6 +36,7 @@ import type {
   RecipeIngestionBatchOut,
   RecipeIngestionJobOut,
   RecipeIngestionJobState,
+  RecipeIngestionJobSummary,
   RereadRequest,
   RotateRequest,
 } from "~/lib/api/types/recipe-ingest";
@@ -44,6 +45,10 @@ import type {
 export const AUTOSAVE_DELAY_MS = 1500;
 /** How often the page asks for the job's state while a task runs */
 export const STATE_POLL_MS = 2000;
+/** How long a failed save waits before it's tried again: 2 s, doubling up to a minute, while the page is open */
+export const SAVE_RETRY_MS: readonly number[] = [2000, 4000, 8000, 16000, 32000, 60000];
+/** How long a notice without an action stays; warnings, errors and notices with an action stay until dismissed */
+export const NOTICE_MS = 6000;
 /** A re-read region's smallest side, as a fraction of the page (the server's `MIN_REGION_SIDE`) */
 export const MIN_REGION_SIDE = 0.02;
 /** What the page highlights (the server's `flag_rules.HIGHLIGHTED_SEVERITIES`) */
@@ -805,6 +810,48 @@ export function regionFromCropResult(result: CropResultLike | null | undefined, 
   return region.width >= minSide && region.height >= minSide ? region : null;
 }
 
+/** How far an arrow key moves or resizes the re-read selection, as a fraction of the page */
+export const REGION_KEY_STEP = 0.02;
+
+/** A cropper selection in the page's pixels */
+export type RegionCoordinates = CropResultLike["coordinates"];
+
+/**
+ * The selection after an arrow key (docs/ai/PHASE2.md §6.5), in the page's pixels: the arrows move it by
+ * `REGION_KEY_STEP` of the page; with `resize`, Right and Down make it wider and taller, Left and Up narrower and
+ * shorter, never under twice the smallest region. It stays on the page. None for any other key.
+ */
+export function nudgeRegion(
+  coordinates: RegionCoordinates,
+  image: { width: number; height: number },
+  key: string,
+  resize: boolean,
+): RegionCoordinates | null {
+  const dx = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
+  const dy = key === "ArrowUp" ? -1 : key === "ArrowDown" ? 1 : 0;
+  if ((!dx && !dy) || image.width <= 0 || image.height <= 0) {
+    return null;
+  }
+  const between = (value: number, low: number, high: number) => Math.min(Math.max(value, low), Math.max(low, high));
+  const { left, top, width, height } = coordinates;
+  if (resize) {
+    const minWidth = Math.min(image.width, image.width * MIN_REGION_SIDE * 2);
+    const minHeight = Math.min(image.height, image.height * MIN_REGION_SIDE * 2);
+    return {
+      left,
+      top,
+      width: between(width + dx * image.width * REGION_KEY_STEP, minWidth, image.width - left),
+      height: between(height + dy * image.height * REGION_KEY_STEP, minHeight, image.height - top),
+    };
+  }
+  return {
+    left: between(left + dx * image.width * REGION_KEY_STEP, 0, image.width - width),
+    top: between(top + dy * image.height * REGION_KEY_STEP, 0, image.height - height),
+    width,
+    height,
+  };
+}
+
 // ==========================================
 // Batches
 
@@ -828,6 +875,96 @@ export function nextCardInBatch(jobs: readonly RecipeIngestionBatchJob[], curren
   const index = ordered.findIndex(job => job.id === currentId);
   const rotated = index < 0 ? ordered : [...ordered.slice(index + 1), ...ordered.slice(0, index)];
   return rotated.find(job => job.status === "ready" && job.id !== currentId)?.id ?? null;
+}
+
+/**
+ * Where the review goes once a batch has no ready card left: the batch, among the others with ready cards, whose
+ * oldest ready card came first, starting at the card its review would start at. None when no other batch has one.
+ */
+export function nextBatchCard(
+  jobs: readonly RecipeIngestionJobSummary[],
+  batchId: string | null | undefined,
+  currentId: string,
+): string | null {
+  const batches = new Map<string, RecipeIngestionJobSummary[]>();
+  for (const job of jobs) {
+    if (job.status === "ready" && job.batchId !== batchId && job.id !== currentId) {
+      batches.set(job.batchId, [...(batches.get(job.batchId) ?? []), job]);
+    }
+  }
+  const arrived = (job: RecipeIngestionJobSummary) => {
+    const time = Date.parse(job.createdAt ?? "");
+    return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
+  };
+  const oldest = (list: RecipeIngestionJobSummary[]) => Math.min(...list.map(arrived));
+  const [first] = [...batches.values()].sort((a, b) => {
+    const [x, y] = [oldest(a), oldest(b)];
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
+  return first ? firstCardToReview(first) : null;
+}
+
+/** A card the review opens next: the batch's next ready card, or another batch's ("next-batch") */
+interface CardStop {
+  kind: "card" | "next-batch";
+  id: string;
+}
+
+/** The queue filtered to the batch, with how many of its cards are still being read */
+interface QueueStop {
+  kind: "queue";
+  processing: number;
+}
+
+/**
+ * Where the review goes after a card (docs/ai/PHASE2.md §6.1): the batch's next ready card; else, while cards of
+ * the batch are still being read, the queue filtered to the batch; else another batch's ready card; else the queue.
+ */
+export type NextStop = CardStop | QueueStop;
+
+// ==========================================
+// Notices
+
+export type ReviewNoticeKind = "success" | "info" | "warning" | "error";
+
+/** What a notice says: all of it but its action, which is what can be carried to the next card's page */
+export interface ReviewNoticeText {
+  kind: ReviewNoticeKind;
+  text: string;
+  /** A second line: what commit left out */
+  detail?: string | null;
+}
+
+/** A notice in the review bar (docs/ai/PHASE2.md §6.2), in place of a toast that would cover the page */
+export interface ReviewNotice extends ReviewNoticeText {
+  /** New for every notice, so the same words said twice start their time again */
+  id: number;
+  /** One button beside the notice ("Read whole card again") */
+  action?: { label: string; run: () => unknown } | null;
+}
+
+/** A notice carried to the next card's page is about that visit only */
+const CARRIED_NOTICE_MAX_AGE_MS = 10_000;
+let carriedNotice: { jobId: string; notice: ReviewNoticeText; at: number } | null = null;
+
+/** Leaves a notice for the card the review opens next ("Added Banana Mug Cake"), which shows it in its review bar */
+export function carryReviewNotice(jobId: string, notice: ReviewNoticeText) {
+  carriedNotice = { jobId, notice: { ...notice }, at: Date.now() };
+}
+
+/** The notice left for this card, once, while it's fresh */
+export function takeCarriedReviewNotice(jobId: string): ReviewNoticeText | null {
+  const left = carriedNotice;
+  if (!left || left.jobId !== jobId) {
+    return null;
+  }
+  carriedNotice = null;
+  return Date.now() - left.at <= CARRIED_NOTICE_MAX_AGE_MS ? left.notice : null;
+}
+
+/** Forgets a carried notice (on logout, through `resetRecipeIngestState`, and between tests) */
+export function resetCarriedReviewNotice() {
+  carriedNotice = null;
 }
 
 // ==========================================
@@ -868,11 +1005,16 @@ function alreadyToasted(error: unknown): boolean {
   return typeof (detail as { message?: unknown } | null | undefined)?.message === "string";
 }
 
+/** How a save ended: `retry` (no answer, or the server failed) is tried again later; `refused` means the card was
+ * committed, discarded or taken back somewhere else */
+type SaveOutcome = "saved" | "conflict" | "refused" | "retry" | "failed";
+
 /**
  * The review page's state for one job. Edits to `draft` autosave after `AUTOSAVE_DELAY_MS` with the draft version;
- * a stale version sets `conflict` (the page's "Reload this card" dialog). While a task runs the page polls the
- * job's state every `STATE_POLL_MS`, picks up proposals and a replaced draft, and sends queued re-reads one at a
- * time once the job is idle.
+ * a save that gets no answer (or a server error) is tried again after `SAVE_RETRY_MS` while the page is open; a
+ * stale version sets `conflict` (the page's "Reload this card" dialog). While a task runs the page polls the job's
+ * state every `STATE_POLL_MS`, picks up proposals and a replaced draft, and sends queued re-reads one at a time
+ * once the job is idle. What the page has to say goes to `notice`, which the review bar shows.
  */
 export function useRecipeIngestReview(jobId: string, options: RecipeIngestReviewOptions) {
   const api = useUserApi();
@@ -894,6 +1036,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const pendingAction = ref<string | null>(null);
   /** Re-reads waiting for the job to be idle, sent one at a time */
   const rereadQueue = ref<RereadRequest[]>([]);
+  /** What the review bar says ("Re-read queued", "Added Banana Mug Cake" from the last card) */
+  const notice = ref<ReviewNotice | null>(null);
+  let unmounted = false;
 
   /** What the server last stored, so only real changes are saved */
   const savedDraft = ref(stableStringify(draft.value));
@@ -962,6 +1107,53 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const openFlags = computed(() => openItems.value.map(item => item.flag));
   /** Flags that only inform ("Abbreviation written out", "New food"): shown quietly, never counted */
   const infoFlags = computed(() => flags.value.filter(flag => flag.severity === "info"));
+
+  // ==========================================
+  // Notices
+
+  let noticeCount = 0;
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearNoticeTimer() {
+    if (noticeTimer) {
+      clearTimeout(noticeTimer);
+      noticeTimer = null;
+    }
+  }
+
+  /** Shows a notice in the review bar in place of the last one; a success or info without an action goes by itself */
+  function notify(kind: ReviewNoticeKind, text: string, extra: { detail?: string | null; action?: ReviewNotice["action"] } = {}) {
+    noticeCount += 1;
+    const id = noticeCount;
+    notice.value = { id, kind, text, detail: extra.detail ?? null, action: extra.action ?? null };
+    clearNoticeTimer();
+    if (!extra.action && (kind === "success" || kind === "info")) {
+      noticeTimer = setTimeout(() => {
+        noticeTimer = null;
+        if (notice.value?.id === id) {
+          notice.value = null;
+        }
+      }, NOTICE_MS);
+    }
+  }
+
+  function dismissNotice() {
+    clearNoticeTimer();
+    notice.value = null;
+  }
+
+  /** The notice's button: it does its thing, and the notice goes */
+  function runNoticeAction() {
+    const action = notice.value?.action;
+    dismissNotice();
+    return action?.run();
+  }
+
+  // what the last card's Commit & next (or Skip, or Discard) said about it and where the review went
+  const carried = takeCarriedReviewNotice(jobId);
+  if (carried) {
+    notify(carried.kind, carried.text, { detail: carried.detail });
+  }
 
   // ==========================================
   // Loading
@@ -1086,7 +1278,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   // ==========================================
   // Saving
 
-  async function sendSave() {
+  async function sendSave(): Promise<SaveOutcome> {
     saveSeq += 1;
     const seq = saveSeq;
     const sentDraft = cloneDraft(draft.value);
@@ -1125,7 +1317,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       }
       setFlags(data.flags ?? [], sentFixes);
       saveState.value = "saved";
-      return;
+      return "saved";
     }
 
     // keep what wasn't saved for the next try, unless it changed since
@@ -1137,13 +1329,65 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     proposalIds.forEach(id => pendingProposalIds.add(id));
     pendingClearError ||= clearError;
 
-    if (errorCodeOf(error) === "version_conflict") {
+    const code = errorCodeOf(error);
+    const status = errorStatusOf(error);
+    if (code === "version_conflict") {
       // the 409 has no message, so nothing was toasted: the page shows its "Reload this card" dialog
       conflict.value = true;
       saveState.value = "idle";
-      return;
+      return "conflict";
     }
     saveState.value = "error";
+    if (code === "invalid_status" || status === 404) {
+      return "refused";
+    }
+    // no answer (offline), the server failing or busy: the same save can work later
+    return status === null || status >= 500 || status === 429 ? "retry" : "failed";
+  }
+
+  // a save that got no answer is tried again: 2 s, 4 s, 8 s ... up to a minute apart, while the page is open
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let retries = 0;
+
+  function cancelRetry() {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  function scheduleRetry() {
+    if (unmounted || retryTimer) {
+      return;
+    }
+    const delay = SAVE_RETRY_MS[Math.min(retries, SAVE_RETRY_MS.length - 1)]!;
+    retries += 1;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      void save();
+    }, delay);
+  }
+
+  /** Forgets the edits waiting to be saved: they can't be (the card is gone or moved on) */
+  function dropPendingChanges() {
+    savedDraft.value = stableStringify(draft.value);
+    pendingResolutions.clear();
+    pendingProposalIds.clear();
+    pendingClearError = false;
+    cancelRetry();
+  }
+
+  /** A save refused because the card was committed, discarded or read again elsewhere: show the card as it is now */
+  async function settleRefusedSave() {
+    dropPendingChanges();
+    saveState.value = "idle";
+    await refresh();
+    if (loadState.value === "not-found") {
+      // the page says the card no longer exists
+      return;
+    }
+    const added = job.value?.status === "committed" || job.value?.status === "committing";
+    notify("warning", i18n.t(added ? "recipe-ingest.review.save-refused-added" : "recipe-ingest.review.save-refused-changed"));
   }
 
   /** Saves pending changes now; waits for a save in flight first. Does nothing in a conflict or when nothing changed. */
@@ -1154,10 +1398,26 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     if (conflict.value || job.value?.status !== "ready" || !hasPendingChanges()) {
       return;
     }
-    saving = sendSave().finally(() => {
+    const sending = sendSave();
+    saving = sending.then(() => undefined).finally(() => {
       saving = null;
     });
     await saving;
+    const outcome = await sending;
+    if (outcome === "saved") {
+      cancelRetry();
+      retries = 0;
+    }
+    else if (outcome === "retry") {
+      scheduleRetry();
+    }
+    else if (outcome === "refused") {
+      await settleRefusedSave();
+    }
+    else if (outcome === "failed") {
+      // refused for what it holds (a 422): sending it again won't help, the next edit will
+      notify("error", i18n.t("recipe-ingest.review.save-rejected"));
+    }
   }
 
   const scheduleSave = useDebounceFn(() => save(), AUTOSAVE_DELAY_MS);
@@ -1257,7 +1517,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       return;
     }
     const code = errorCodeOf(error);
-    alert.error(code ? text.ingestErrorText(code) : i18n.t("events.something-went-wrong"));
+    notify("error", code ? text.ingestErrorText(code) : i18n.t("events.something-went-wrong"));
   }
 
   function applyState(state: RecipeIngestionJobState) {
@@ -1279,7 +1539,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     if (errorCodeOf(error) === "busy") {
       // another task is running: wait for it, then send this one (the poll keeps going while the queue isn't empty)
       rereadQueue.value = [request, ...rereadQueue.value];
-      alert.info(i18n.t("recipe-ingest.review.busy"));
+      notify("info", i18n.t("recipe-ingest.review.busy"));
       return false;
     }
     notifyError(error);
@@ -1290,7 +1550,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   async function requestReread(request: RereadRequest) {
     if (task.value || rereadQueue.value.length > 0) {
       rereadQueue.value = [...rereadQueue.value, request];
-      alert.info(i18n.t("recipe-ingest.review.reread-queued"));
+      notify("info", i18n.t("recipe-ingest.review.reread-queued"));
       return;
     }
     await sendReread(request);
@@ -1374,7 +1634,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         return true;
       }
       if (!alreadyToasted(error) && errorCodeOf(error) === "busy") {
-        alert.info(text.ingestErrorText("busy"));
+        notify("info", text.ingestErrorText("busy"));
       }
       else {
         notifyError(error);
@@ -1383,7 +1643,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     });
   }
 
-  /** Turns a page clockwise, then offers to read the card again */
+  /** Turns a page clockwise, then offers to read the card again (a failed card from the start) */
   async function rotate(pageIndex: number, degrees: RotateRequest["degrees"] = 90) {
     return await runAction("rotate", async () => {
       const { data, error } = await api.recipeIngest.rotatePage(jobId, pageIndex, { degrees });
@@ -1394,14 +1654,17 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
           pages.splice(position, 1, data);
         }
         job.value.pages = pages;
-        alert.info(i18n.t("recipe-ingest.review.rotate-hint"), null, {
-          action: { message: i18n.t("recipe-ingest.review.read-again"), onClick: () => void reextract() },
+        const failed = job.value.status === "failed";
+        notify("info", i18n.t("recipe-ingest.review.rotate-hint"), {
+          action: failed
+            ? { label: i18n.t("recipe-ingest.queue.retry"), run: () => retry() }
+            : { label: i18n.t("recipe-ingest.review.read-again-short"), run: () => reextract() },
         });
         return true;
       }
       if (!alreadyToasted(error) && errorStatusOf(error) === 409) {
         // a task is running: the page can't turn it under the reader
-        alert.info(text.ingestErrorText("busy"));
+        notify("info", text.ingestErrorText("busy"));
       }
       else {
         notifyError(error);
@@ -1426,6 +1689,30 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     });
   }
 
+  /**
+   * Stops what's reading the card (a re-read, a re-extract, or a card still being read) and drops the re-reads
+   * waiting. A running task stops within a heartbeat (`task.cancelRequested` until then); a queued one at once.
+   */
+  async function cancelTask() {
+    rereadQueue.value = [];
+    if (!task.value) {
+      return true;
+    }
+    return await runAction("cancel", async () => {
+      const { data, error } = await api.recipeIngest.cancel(jobId);
+      if (!data) {
+        notifyError(error);
+        return false;
+      }
+      applyState(data);
+      if (!data.task) {
+        await refresh();
+        notify("info", i18n.t("recipe-ingest.review.read-cancelled"));
+      }
+      return true;
+    });
+  }
+
   function groupPath(path = "") {
     return `/g/${toValue(options.groupSlug)}/recipes/cards${path}`;
   }
@@ -1440,21 +1727,52 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     return groupPath(`/${id}`);
   }
 
-  /** The batch's next ready card (wrapping round), fresh from the server; else the queue */
-  async function nextPath(preferred?: string | null): Promise<{ path: string; last: boolean }> {
+  /**
+   * Where the review goes after this card (`NextStop`), from the batch fresh from the server: `preferred` is the
+   * commit's own answer for the batch's next ready card
+   */
+  async function nextStop(preferred?: string | null): Promise<NextStop> {
     const fresh = await loadBatch();
-    const next = preferred && preferred !== jobId ? preferred : nextCardInBatch(fresh?.jobs ?? batch.value?.jobs ?? [], jobId);
-    return next ? { path: cardPath(next), last: false } : { path: queuePath(), last: true };
+    const jobs = fresh?.jobs ?? batch.value?.jobs ?? [];
+    const next = preferred && preferred !== jobId ? preferred : nextCardInBatch(jobs, jobId);
+    if (next) {
+      return { kind: "card", id: next };
+    }
+    const processing = jobs.filter(item => item.id !== jobId && item.status === "processing").length;
+    if (processing > 0) {
+      return { kind: "queue", processing };
+    }
+    const { data } = await api.recipeIngest.getJobs({ status: "ready", perPage: -1 });
+    const other = nextBatchCard(data?.items ?? [], job.value?.batchId, jobId);
+    return other ? { kind: "next-batch", id: other } : { kind: "queue", processing: 0 };
+  }
+
+  /**
+   * Leaves for the next stop. What there is to say about this card (`said`: "Added …") goes with it: to the next
+   * card's review bar, with "Next batch" when that card is in another batch; or to the queue, with how many cards
+   * are still being read, else `lastWords` ("That was the last card …").
+   */
+  async function goOn(stop: NextStop, said: ReviewNoticeText | null, lastWords: string | null = null) {
+    if (stop.kind === "queue") {
+      const still = stop.processing > 0 ? i18n.t("recipe-ingest.review.still-reading", stop.processing) : lastWords;
+      const words = [said?.text, still].filter((part): part is string => !!part);
+      if (words.length) {
+        leaveRecipeIngestCommitNotice({ text: words.join(" · "), warning: said?.detail ?? null });
+      }
+      return await options.navigate(queuePath());
+    }
+    const words = [said?.text, stop.kind === "next-batch" ? i18n.t("recipe-ingest.review.next-batch") : null]
+      .filter((part): part is string => !!part);
+    if (words.length) {
+      carryReviewNotice(stop.id, { kind: said?.kind ?? "info", text: words.join(" · "), detail: said?.detail ?? null });
+    }
+    return await options.navigate(cardPath(stop.id));
   }
 
   /** "Skip": the next card to review, keeping this one for later */
   async function skip() {
     await save();
-    const { path, last } = await nextPath();
-    if (last) {
-      alert.info(i18n.t("recipe-ingest.review.last-card"));
-    }
-    await options.navigate(path);
+    await goOn(await nextStop(), null, i18n.t("recipe-ingest.review.last-card"));
   }
 
   function goTo(id: string) {
@@ -1469,14 +1787,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         return false;
       }
       // nothing is left to save
-      savedDraft.value = stableStringify(draft.value);
-      pendingResolutions.clear();
-      pendingProposalIds.clear();
-      pendingClearError = false;
-      alert.success(i18n.t("recipe-ingest.queue.discarded"));
+      dropPendingChanges();
       void counts.refresh();
-      const { path } = await nextPath();
-      await options.navigate(path);
+      await goOn(await nextStop(), { kind: "success", text: i18n.t("recipe-ingest.queue.discarded") });
       return true;
     });
   }
@@ -1487,7 +1800,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       await save();
       const { data, error } = await api.recipeIngest.saveEvalCase(jobId, { slug, verified });
       if (data) {
-        alert.success(i18n.t("recipe-ingest.eval.saved", { slug: data.slug }));
+        notify("success", i18n.t("recipe-ingest.eval.saved", { slug: data.slug }));
         return "saved" as const;
       }
       // the dialog says so for a name that's taken; the other refusals (not_exportable, files_missing) are toasted
@@ -1503,9 +1816,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const firstErrorAnchor = computed(() => openErrors.value[0]?.anchor ?? null);
 
   /**
-   * "Commit & next": waits for the pending save, commits with the version it returned, then goes to the batch's next
-   * ready card, or after the last one to the queue filtered to the batch, which sums it up. Unresolved errors don't
-   * commit: the result is `"fix"` and the page scrolls to the first.
+   * "Commit & next": waits for the pending save, commits with the version it returned, then goes on (`nextStop`):
+   * to the batch's next ready card, which says "Added …"; while cards of the batch are still being read, to the
+   * queue filtered to the batch; else to another batch's ready card; else to the queue, which sums the batch up.
+   * Unresolved errors don't commit: the result is `"fix"` and the page scrolls to the first.
    */
   async function commit(): Promise<"committed" | "fix" | "conflict" | "failed"> {
     if (committing.value || !job.value || job.value.status !== "ready") {
@@ -1520,8 +1834,12 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       if (conflict.value) {
         return "conflict";
       }
+      if (job.value?.status !== "ready") {
+        // the save found the card committed, discarded or read again elsewhere: the page shows it as it is now
+        return "failed";
+      }
       if (hasPendingChanges() && saveState.value === "error") {
-        alert.error(i18n.t("recipe-ingest.review.save-failed"));
+        notify("error", i18n.t("recipe-ingest.review.commit-unsaved"));
         return "failed";
       }
       const name = draft.value.name;
@@ -1557,19 +1875,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         .map(warning => text.commitWarningText(warning))
         .filter((warning): warning is string => !!warning);
       const warning = warnings.length ? warnings.join(" ") : null;
-      // after the batch's last card the queue opens on the batch, whose own line sums it up
-      const { path, last } = await nextPath(data.nextJobId);
-      if (!last) {
-        // the next card's page says it above its review bar: a toast would cover that page's header on phones
-        leaveRecipeIngestCommitNotice({ text: added, warning });
-      }
-      else if (warning) {
-        alert.warning(warning, added);
-      }
-      else {
-        alert.success(added);
-      }
-      await options.navigate(path);
+      // said in the next card's review bar, or beside the queue's summary of the batch: a toast would cover the
+      // header of either page on phones
+      await goOn(await nextStop(data.nextJobId), { kind: warning ? "warning" : "success", text: added, detail: warning });
       return "committed";
     }
     finally {
@@ -1587,7 +1895,19 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     }
   });
 
+  /**
+   * Before leaving the page in the app: saves what's pending now. Whether nothing is left unsaved; when the save
+   * fails, the page asks before leaving.
+   */
+  async function saveBeforeLeaving(): Promise<boolean> {
+    await save();
+    return job.value?.status !== "ready" || !hasPendingChanges();
+  }
+
   onBeforeUnmount(() => {
+    unmounted = true;
+    cancelRetry();
+    clearNoticeTimer();
     // the debounced save would never run: send what's pending now
     if (hasPendingChanges()) {
       void save();
@@ -1624,6 +1944,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     committing: readonly(committing),
     pendingAction: readonly(pendingAction),
     rereadQueue: readonly(rereadQueue),
+    notice: readonly(notice),
     task,
     readOnly,
     position,
@@ -1640,6 +1961,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     refresh,
     reload,
     save,
+    saveBeforeLeaving,
+    dismissNotice,
+    runNoticeAction,
     pollState,
     resolveFlag,
     applyFlagAlternative,
@@ -1651,6 +1975,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     reextract,
     rotate,
     retry,
+    cancelTask,
     discard,
     saveEvalCase,
     commit,

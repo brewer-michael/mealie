@@ -1,6 +1,9 @@
 import asyncio
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,6 +259,12 @@ def test_match_lines_empty_extraction():
         ("1 heaping T. sugar", (1.0,), "tbsp"),
         ("1 TB. honey", (1.0,), "tbsp"),  # the pipeline's shorthand table: "TB." isn't terabytes
         ("1 pkg. yeast", (1.0,), "pkg"),
+        # the pipeline's other abbreviations (`shorthand.ABBREVIATIONS`), scored like the units it writes for them
+        ("1 doz. eggs", (1.0,), "dozen"),
+        ("1 dozen eggs", (1.0,), "dozen"),
+        ("1 env. Dream Whip", (1.0,), "envelope"),
+        ("2 sq. chocolate", (2.0,), "square"),
+        ("2 squares chocolate", (2.0,), "square"),
         ("1 banana", (1.0,), None),
         ("2 eggs", (2.0,), None),
         ("1 tomato", (1.0,), None),
@@ -277,6 +286,13 @@ def test_card_shorthand_comes_from_the_pipelines_table():
     assert set(ev.CASE_SENSITIVE_UNITS) == set(UNITS)
     assert ev.CASE_SENSITIVE_UNITS["T"] == "tbsp"
     assert ev.CASE_SENSITIVE_UNITS["t"] == "tsp"
+
+
+def test_the_pipelines_abbreviations_are_units_the_eval_knows():
+    from mealie.services.ai.ingest.shorthand import ABBREVIATIONS
+
+    for token, unit in ABBREVIATIONS.items():
+        assert ev.canonical_unit(token) == ev.canonical_unit(unit) == unit
 
 
 def test_parse_amount_writes_amounts_the_same_way():
@@ -734,6 +750,9 @@ def test_attribution_yield_and_times():
     scores = ev.score_card(expected, make_extraction(draft))
 
     assert scores.attribution == 1.0
+    # the draft keeps the attribution without its "From" now, as the review page labels it
+    stripped = make_extraction(draft.model_copy(update={"attribution": "Grandma Jo"}))
+    assert ev.score_card(expected, stripped).attribution == 1.0
     assert scores.recipe_yield == 1.0
     assert scores.times == 1.0
     assert ev.score_card(expected, make_extraction(make_draft(name="Pancakes", recipe_yield="6"))).recipe_yield == 0.0
@@ -1923,3 +1942,168 @@ def test_main_runs_the_card_pipeline_and_writes_the_report(
     # the mixed config read the card with the vision provider (no cross-read: the group's setting is off)
     assert calls == [vision] * 4
     assert [options.read_path for options in card_pipeline.options] == ["image"] * 4
+
+
+# ================================================================
+# Before spending: --check offline, secrets from files, --dry-run, and the ranking and cost columns
+
+
+def test_check_needs_no_production_setting(tmp_path: Path):
+    """`--check` imports no settings or database, so it runs from a checkout with nothing set"""
+    env = {key: value for key, value in os.environ.items() if key not in ("PRODUCTION", "TESTING", "DATA_DIR")}
+    run = subprocess.run(
+        [sys.executable, "-m", "mealie.scripts.eval_recipe_cards", "--check", "--cards", str(CARDS_DIR)],
+        cwd=Path(__file__).parents[2],
+        env={**env, "DATA_DIR": str(tmp_path / "data")},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert "1 card(s)" in run.stdout and "are valid" in run.stdout
+    assert "PRODUCTION" not in run.stderr
+
+
+def test_secrets_are_read_from_their_files_before_the_settings(tmp_path: Path):
+    """`docker exec` skips entry.sh: the eval reads `NAME_FILE` itself, unless `NAME` is set"""
+    password = tmp_path / "postgres_password"
+    password.write_text("s3cret\n")
+    user = tmp_path / "postgres_user"
+    user.write_text("mealie")
+    env = {
+        "POSTGRES_PASSWORD_FILE": str(password),
+        "POSTGRES_USER_FILE": str(user),
+        "POSTGRES_USER": "given",
+        "UNRELATED_FILE": str(user),
+    }
+
+    assert ev.load_secret_files(env) == ["POSTGRES_PASSWORD"]
+    assert (env["POSTGRES_PASSWORD"], env["POSTGRES_USER"]) == ("s3cret", "given")
+    assert "UNRELATED" not in env
+
+    with pytest.raises(ev.EvalSetupError, match="POSTGRES_DB_FILE"):
+        ev.load_secret_files({"POSTGRES_DB_FILE": str(tmp_path / "missing")})
+
+    # run as a script, before anything else: a secret that can't be read stops it at once
+    env = {key: value for key, value in os.environ.items() if key not in ("PRODUCTION", "POSTGRES_DB")}
+    run = subprocess.run(
+        [sys.executable, "-m", "mealie.scripts.eval_recipe_cards", "--check", "--cards", str(CARDS_DIR)],
+        cwd=Path(__file__).parents[2],
+        env={**env, "POSTGRES_DB_FILE": str(tmp_path / "missing")},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 2 and "POSTGRES_DB_FILE" in run.stderr + run.stdout
+
+
+def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def get_response(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a dry run calls no provider")
+
+    async def run_eval(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a dry run runs nothing")
+
+    monkeypatch.setattr(OpenAIService, "get_response", get_response)
+    monkeypatch.setattr(ev, "run_eval", run_eval)
+
+
+def test_a_dry_run_checks_everything_and_calls_no_provider(
+    unique_user: TestUser,
+    providers: dict[str, AIProviderOut],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    _no_provider_calls(monkeypatch)
+    group = unique_user.repos.groups.get_one(unique_user.group_id)
+    assert group
+    vision, text = providers["vision"].name, providers["text"].name
+
+    ev.main(
+        [
+            *("--group", group.slug, "--provider", vision, "--cards", str(CARDS_DIR), "--dry-run"),
+            *("--price", f"{vision}=1,2", "--price", f"{text}=0.5,1"),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert f"Dry run: 1 card(s), 1 config(s) ({vision})" in out
+    assert "No problems found" in out
+
+
+def test_a_dry_run_lists_every_problem_and_exits_1(
+    unique_user: TestUser,
+    providers: dict[str, AIProviderOut],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    _no_provider_calls(monkeypatch)
+    group = unique_user.repos.groups.get_one(unique_user.group_id)
+    assert group
+    vision = providers["vision"].name
+
+    with pytest.raises(SystemExit) as exit_info:
+        ev.main(
+            [
+                *("--group", group.slug, "--cards", str(CARDS_DIR), "--dry-run"),
+                *("--provider", "No Such Vision", "--provider", vision, "--price", "Elsewhere=1,1"),
+            ]
+        )
+
+    assert exit_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "No AI provider named 'No Such Vision'" in out
+    assert f"No --price for {vision}" in out
+    assert "--price for Elsewhere, which no config uses" in out
+
+
+def test_the_dry_run_checks_each_slot_under_the_local_only_policy(
+    unique_user: TestUser, providers: dict[str, AIProviderOut], monkeypatch: pytest.MonkeyPatch
+):
+    """A config whose provider the run's policy refuses is reported before anything is spent"""
+    _no_provider_calls(monkeypatch)
+    group = unique_user.repos.groups.get_one(unique_user.group_id)
+    assert group
+    config = ev.EvalConfig(label="V", image_provider=providers["vision"], text_provider=providers["text"])
+    monkeypatch.setattr(ev, "build_configs", lambda *args, **kwargs: [config])
+    args = ev.parse_args(["--group", group.slug, "--cards", str(CARDS_DIR), "--dry-run", "--local-only"])
+
+    problems, _ = ev.dry_run(args)
+
+    assert [problem.split(":")[0] for problem in problems] == ["V", "V", "V"]
+    assert all("can't be asked" in problem for problem in problems)
+
+
+def test_flag_auroc_ranks_wrong_items_by_their_highest_flag():
+    def item(correct: bool, severity: int) -> ev.CalibrationItem:
+        return ev.CalibrationItem(kind="ingredient", correct=correct, flagged=severity >= 2, severity=severity)
+
+    # every wrong item flagged above every right one
+    assert ev.flag_auroc([item(False, 3), item(False, 2), item(True, 0), item(True, 1)]) == 1.0
+    # no better than chance: the same scores
+    assert ev.flag_auroc([item(False, 2), item(True, 2)]) == 0.5
+    # one of two wrong items silent among right ones: half the pairs above, the rest tied
+    assert ev.flag_auroc([item(False, 3), item(False, 0), item(True, 0), item(True, 0)]) == 0.75
+    # both classes are needed
+    assert ev.flag_auroc([item(True, 0)]) is None and ev.flag_auroc([item(False, 3)]) is None
+
+
+def test_the_summary_has_the_auroc_and_the_cost_per_caught_error():
+    expected = banana_expected()
+    wrong = make_draft(ingredients=[*expected.ingredient_lines[:6], "2 t. cinnamon"])
+    flag = make_flag(CardFlagKind.not_on_card, "ingredients", wrong.ingredients[6].reference_id)
+    runs = [
+        run_with(ev.score_card(expected, make_extraction(wrong, [flag])), card="a", label="V", cost_usd=0.02),
+        run_with(ev.score_card(expected, make_extraction(wrong)), card="b", label="V", cost_usd=0.04),
+    ]
+
+    summary = ev.summarize_runs("V", "v", runs)
+
+    # each run has a wrong line and a missing one; only the first run's wrong line is flagged (a warning)
+    assert (summary.cards, summary.auroc_items, summary.auroc_wrong, summary.caught) == (2, 22, 4, 1)
+    assert summary.auroc == pytest.approx((18 + 0.5 * 3 * 18) / (4 * 18))
+    assert summary.cost_per_caught == pytest.approx(0.06)
+    # a run without a price: no cost per caught error
+    runs[1].cost_usd = None
+    assert ev.summarize_runs("V", "v", runs).cost_per_caught is None

@@ -33,6 +33,17 @@ class IngestTaskKind(StrEnum):
     """Re-read one region of a page"""
 
 
+class IngestTaskMode(StrEnum):
+    """What an `extract` task does (its `task_payload.mode`; a task without one re-reads the card)"""
+
+    reextract = "reextract"
+    """Read the whole card again"""
+    rebuild = "rebuild"
+    """Build the recipe again from the reviewer's edited transcription, with no image read"""
+    parse_lines = "parse_lines"
+    """Parse chosen ingredient lines with the AI ingredient parser"""
+
+
 class IngestTaskState(StrEnum):
     """A job's pending task; a job without one has `task_state` unset"""
 
@@ -69,6 +80,10 @@ class IngestRejectReason(StrEnum):
     unreadable_image = "unreadable_image"
     too_many_pages = "too_many_pages"
     duplicate = "duplicate"
+    url_not_allowed = "url_not_allowed"
+    """An image URL while URL fetching is off, or one pointing somewhere it may not go"""
+    url_fetch_failed = "url_fetch_failed"
+    """An image URL that couldn't be fetched (network error, timeout, HTTP error)"""
 
 
 class IngestReadPath(StrEnum):
@@ -101,6 +116,10 @@ class CardFlagKind(StrEnum):
     not_parsed = "not_parsed"
     new_food = "new_food"
     new_unit = "new_unit"
+    linked_fuzzy = "linked_fuzzy"
+    """A food or unit was linked although no name, plural or alias of it is on the line"""
+    organizers_skipped = "organizers_skipped"
+    """Tag, category and tool suggestions were skipped (`params.reason`)"""
 
 
 class CardFlagSeverity(StrEnum):
@@ -137,9 +156,57 @@ class CardProposalKind(StrEnum):
     """A whole new draft from re-extracting an edited card"""
 
 
+class CardProposalOrigin(StrEnum):
+    """What made a whole-card proposal"""
+
+    reextract = "reextract"
+    """The card was read again"""
+    rebuild = "rebuild"
+    """The recipe was built again from the edited transcription"""
+
+
 class PageRotationSource(StrEnum):
     """What last turned a page"""
 
     none = "none"
     ocr = "ocr"
     user = "user"
+    model = "model"
+    """The image reader said how far the page had to turn"""
+
+
+class EvalCaseTag(StrEnum):
+    """What a reviewer says about a card saved as an eval case; `sideways`, `two-sided` and `blank` are found"""
+
+    handwritten = "handwritten"
+    printed = "printed"
+    faded = "faded"
+
+
+class RegionHintSource(StrEnum):
+    """Where a region hint came from"""
+
+    ocr = "ocr"
+    """A line Tesseract found on the page"""
+    position = "position"
+    """The line's position in the transcription"""
+
+
+class IngestLimitedFeature(StrEnum):
+    """An optional part of reading a card that is off because its providers are over their monthly limit"""
+
+    suggestions = "suggestions"
+    """Tag, category and tool suggestions"""
+    cross_read = "cross_read"
+    """The second, independent reading"""
+
+
+class InboxWaitingReason(StrEnum):
+    """Why photos wait in a household's inbox folder"""
+
+    cannot_read = "cannot_read"
+    """The group has no provider that can read cards"""
+    local_only_unavailable = "local_only_unavailable"
+    """The group keeps cards local and nothing local can read them"""
+    quota = "quota"
+    """Too many of the group's cards are being read"""
