@@ -56,7 +56,10 @@ class IngestLimits(MealieModel):
 
 
 class IngestInboxRejection(MealieModel):
-    """A photo the inbox couldn't add, kept in the household folder's `failed/`"""
+    """
+    A photo the inbox couldn't add, kept in the household folder's `failed/`; or one it may not move, left where it is
+    (`no_permission`)
+    """
 
     name: str
     """The file's name"""
@@ -74,7 +77,7 @@ class IngestInboxInfo(MealieModel):
     waiting_reason: InboxWaitingReason | None = None
     """Why they wait, when they can't be added now"""
     rejections: list[IngestInboxRejection] = Field(default_factory=list)
-    """The newest photos the inbox refused, newest first"""
+    """The photos the inbox may not move (`no_permission`), then the newest it refused, newest first"""
 
 
 class RecipeIngestionSettingsOut(MealieModel):

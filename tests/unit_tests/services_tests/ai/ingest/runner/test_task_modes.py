@@ -32,7 +32,7 @@ from mealie.schema.recipe_ingest import (
     IngestTaskState,
 )
 from mealie.services import ocr
-from mealie.services.ai.ingest import images, limits, storage, tasks
+from mealie.services.ai.ingest import images, limits, review, storage, tasks
 from mealie.services.ai.ingest.pipeline.flags import ingredient_hash
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import (
@@ -301,6 +301,74 @@ def test_parse_with_ai_judges_the_lines_it_parsed_as_new_readings(
     again = fuzzy[str(one.reference_id)]
     assert (again.params["name"], again.resolution) == ("red shallot", None)
     assert row["warning_count"] >= 1
+
+
+def test_parse_with_ai_parses_a_line_kept_with_a_marker_around_it(
+    dispatcher: IngestDispatcher, jobs: Jobs, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    As a save parses it (`review.KeptLine`): the parser reads the line without its markers ("[blank]" standing for the
+    amount reads as "1"), and they go back into the parsed line's note, still kept
+    """
+    answer = {
+        "ingredients": [
+            {"quantity": 1, "unit": "cup", "food": "sugar", "note": "", "substitutes": []},
+            {"quantity": 1, "unit": "cup", "food": "", "note": "", "substitutes": []},
+        ]
+    }
+    fake = FakeCardAI(banana_answers(OpenAIIngredients=answer)).install(monkeypatch)
+    sugar, flour = _line("[blank] C. sugar"), _line("1 C. [illegible]")
+    draft = CardDraft(name="Sugar Cookies", ingredients=[sugar, flour])
+    flags = [
+        CardFlag(
+            id=f"{kind.value}:ingredients:{line.reference_id}",
+            kind=kind,
+            severity=CardFlagSeverity.error,
+            source=CardFlagSource.marker,
+            field="ingredients",
+            ref=str(line.reference_id),
+            resolution=FlagResolution.kept,
+        )
+        for kind, line in ((CardFlagKind.blank, sugar), (CardFlagKind.illegible, flour))
+    ]
+    kept_ids = review.kept_flag_ids(flags)
+    marked = {line.reference_id: kept for line in draft.ingredients if (kept := review.kept_line(line, kept_ids))}
+    job_id = jobs.ready(
+        draft=draft,
+        flags=flags,
+        extraction=ExtractionMeta(read_path=IngestReadPath.image, language="English"),
+        transcription="# Sugar Cookies\n\n- [blank] C. sugar\n- 1 C. [illegible]",
+        kind=IngestTaskKind.extract,
+        state=IngestTaskState.queued,
+        priority=limits.PRIORITY_REREAD,
+        task_payload=tasks.parse_lines_payload(draft, [sugar.reference_id, flour.reference_id], marked),
+    )
+
+    _read(dispatcher)
+
+    assert fake.schemas() == ["OpenAIIngredients"]
+    assert "[blank]" not in fake.calls[0].message and "[illegible]" not in fake.calls[0].message
+    row = jobs.row(job_id)
+    assert (row["status"], row["task_state"], row["error_code"]) == (IngestStatus.ready, None, None)
+    first, second = CardDraft.model_validate(row["draft"]).ingredients
+    assert (first.quantity, first.unit and first.unit.name, first.food and first.food.name, first.note) == (
+        None,  # the blank was the amount
+        "cup",
+        "sugar",
+        "[blank]",
+    )
+    assert first.original_text == "[blank] C. sugar"  # the card's reading of the line stays
+    assert (second.quantity, second.unit and second.unit.name, second.food, second.note) == (
+        1,
+        "cup",
+        None,
+        "[illegible]",
+    )
+    # the markers stay kept: nothing to fill in again
+    resolutions = {flag["id"]: flag["resolution"] for flag in row["flags"]}
+    assert resolutions[f"blank:ingredients:{sugar.reference_id}"] == FlagResolution.kept
+    assert resolutions[f"illegible:ingredients:{flour.reference_id}"] == FlagResolution.kept
+    assert row["error_count"] == 0
 
 
 def test_parse_with_ai_sends_the_lines_as_they_read_now():

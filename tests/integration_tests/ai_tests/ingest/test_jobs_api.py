@@ -10,6 +10,7 @@ import io
 import re
 import time
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -20,7 +21,7 @@ from PIL import ExifTags, Image, ImageDraw
 
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import IngestRepos
+from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
@@ -337,6 +338,50 @@ def test_jobs_list_newest_first_with_filters_and_pagination(api_client: TestClie
 
     everything = api_client.get(JOBS, params={"perPage": -1}, headers=user.token).json()
     assert len(everything["items"]) == 3
+
+
+def test_cards_added_since_a_time_newest_commit_first(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """
+    The cards page's "added in the last 7 days" asks by commit time: a card uploaded 8 days ago and added today is in
+    it, newest commit first, and one added 10 days ago isn't
+    """
+    user = unique_user_fn_scoped
+    now = utcnow()
+    committed = IngestStatus.committed
+    old_upload = seed_job(
+        user, status=committed, created_at=now - timedelta(days=8), committed_at=now - timedelta(hours=1)
+    )
+    new_upload = seed_job(
+        user, status=committed, created_at=now - timedelta(hours=5), committed_at=now - timedelta(hours=2)
+    )
+    long_ago = seed_job(
+        user, status=committed, created_at=now - timedelta(days=12), committed_at=now - timedelta(days=10)
+    )
+    ready = seed_job(user)
+
+    since = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+    query = {"status": "committed", "committedSince": since, "orderBy": "committedAt"}
+    response = api_client.get(JOBS, params=query, headers=user.token)
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert [item["id"] for item in items] == [str(old_upload), str(new_upload)]
+    assert items[0]["committedAt"].startswith((now - timedelta(hours=1)).isoformat()[:16])
+
+    # a time without a zone is UTC, and the filter alone leaves out every card not added
+    naive = (now - timedelta(days=7)).isoformat()
+    alone = api_client.get(JOBS, params={"committedSince": naive}, headers=user.token).json()
+    assert {item["id"] for item in alone["items"]} == {str(old_upload), str(new_upload)}
+
+    # by commit time alone: the added cards, latest commit first, then the others newest first
+    ordered = api_client.get(JOBS, params={"orderBy": "committedAt"}, headers=user.token).json()
+    assert [item["id"] for item in ordered["items"]] == [str(old_upload), str(new_upload), str(long_ago), str(ready)]
+
+    # pages keep the query
+    paged = api_client.get(JOBS, params={**query, "perPage": 1}, headers=user.token).json()
+    assert [item["id"] for item in paged["items"]] == [str(old_upload)]
+    assert "orderBy=committedAt" in paged["next"] and "committedSince=" in paged["next"]
+
+    assert api_client.get(JOBS, params={"orderBy": "title"}, headers=user.token).status_code == 422
 
 
 def test_counts(api_client: TestClient, unique_user_fn_scoped: TestUser):

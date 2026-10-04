@@ -206,7 +206,31 @@
                 "duplicate": "{count} already scanned",
                 "url_not_allowed": "{count} from an address that isn't allowed | {count} from addresses that aren't allowed",
                 "url_fetch_failed": "{count} couldn't be downloaded",
+                "no_permission": "{count} Mealie may not move",
                 "other": "{count} for another reason | {count} for other reasons"
+            }
+        },
+        "inbox-rejected": {
+            "prefix": "Not added ({code}):",
+            "prefix-other": "Not added:",
+            "too_large": "The file is larger than {mib} MB.",
+            "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF.",
+            "pdf_not_supported": "This PDF can't be opened. It may need a password or be damaged.",
+            "too_many_pixels": "The photo has too many pixels. The most is {megapixels} megapixels, or {jpeg_megapixels} megapixels for a JPEG.",
+            "unreadable_image": "The image couldn't be read. It may be damaged or incomplete.",
+            "too_many_pages": "A card can have at most {pages} pages.",
+            "duplicate": "This card was already scanned.",
+            "duplicate-of": "This card was already scanned (recipe card job {job}).",
+            "url_not_allowed": "Mealie may not download images from that address.",
+            "url_fetch_failed": "The image couldn't be downloaded.",
+            "no_permission": "Mealie may not move this out of the inbox folder. Its group needs write access to the household folder, and to a card folder itself (umask 002).",
+            "other": {
+                "symbolic-link": "It's a symbolic link, which is never followed.",
+                "unreadable": "It couldn't be opened ({error}).",
+                "not-a-file": "It isn't a regular file.",
+                "outside-inbox": "It's outside the inbox folder.",
+                "not-a-file-or-folder": "It isn't a regular file or folder.",
+                "empty-folder": "The folder has no pages."
             }
         },
         "errors": {
@@ -214,6 +238,7 @@
             "paused-for-restore": "Recipe card uploads are paused while a backup is restored. Try again in a minute.",
             "ingest-disabled": "Recipe card scanning is turned off on this server.",
             "too-many-jobs": "Too many recipe cards are waiting to be read. Try again when some have finished.",
+            "user-quota": "You can have at most {count} recipe card being read at once. Try again when it's done. | You can have at most {count} recipe cards being read at once. Try again when some are done.",
             "too-large": "The upload is too large. The limit is {max} MB.",
             "unsupported-media-type": "Send recipe cards as images, a multipart form or JSON.",
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",

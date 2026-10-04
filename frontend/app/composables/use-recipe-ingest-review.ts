@@ -15,9 +15,10 @@ import {
   rememberedRecipeIngestBatch,
   rememberRecipeIngestBatch,
   useRecipeIngestCounts,
+  useRecipeIngestSettings,
   useRecipeIngestText,
 } from "~/composables/use-recipe-ingest";
-import type { TranslateFn } from "~/composables/use-recipe-ingest";
+import type { RecipeIngestCommitNotice, TranslateFn } from "~/composables/use-recipe-ingest";
 import { uuid4 } from "~/composables/use-utils";
 import type {
   CardDraft,
@@ -29,6 +30,8 @@ import type {
   CardFlagKind,
   CardFlagSeverity,
   CardProposal,
+  EvalCaseRequest,
+  EvalCaseTag,
   FlagResolution,
   IngestStatus,
   ProposalTarget,
@@ -70,7 +73,7 @@ export type ReviewDraft = CardDraft & {
   useCardAsCover: boolean;
   ingredients: CardDraftIngredient[];
   steps: CardDraftStep[];
-  notes: (CardDraftNote & { title: string; text: string })[];
+  notes: (CardDraftNote & { id: string; title: string; text: string })[];
   tags: CardDraftRef[];
   categories: CardDraftRef[];
   tools: CardDraftRef[];
@@ -81,7 +84,7 @@ export function cloneDraft<T>(draft: T): T {
   return JSON.parse(JSON.stringify(draft)) as T;
 }
 
-/** A copy of the draft with its defaults filled in; ingredients and steps without an id get one */
+/** A copy of the draft with its defaults filled in; ingredients, steps and notes without an id get one */
 export function normalizeDraft(draft: CardDraft | null | undefined): ReviewDraft {
   const source = cloneDraft(draft ?? {});
   return {
@@ -97,7 +100,8 @@ export function normalizeDraft(draft: CardDraft | null | undefined): ReviewDraft
       display: ingredient.display ?? "",
     })),
     steps: (source.steps ?? []).map(step => ({ ...step, id: step.id || uuid4(), text: step.text ?? "" })),
-    notes: (source.notes ?? []).map(note => ({ ...note, title: note.title ?? "", text: note.text ?? "" })),
+    // the server keys a note's flags (and their resolutions) to its id, so the id goes back with every save
+    notes: (source.notes ?? []).map(note => ({ ...note, id: note.id || uuid4(), title: note.title ?? "", text: note.text ?? "" })),
     tags: source.tags ?? [],
     categories: source.categories ?? [],
     tools: source.tools ?? [],
@@ -276,18 +280,26 @@ const FIELD_LABELS: Record<string, string> = {
   tools: "tool.tools",
 };
 
-/** A field's label ("Name", "Step: 2"); none for the card as a whole */
+/** A field's label ("Name", "Step: 2", "Note 1", as the editor numbers them); none for the card as a whole */
 export function fieldLabel(t: TranslateFn, field: string, line?: number | null): string | null {
   const key = normalizeField(field);
   if (key === "steps" && line !== null && line !== undefined) {
     return t("recipe.step-index", { step: line + 1 });
   }
+  if (key === "notes" && line !== null && line !== undefined) {
+    return t("recipe-ingest.review.note-number", { number: line + 1 });
+  }
   return FIELD_LABELS[key] ? t(FIELD_LABELS[key]) : null;
 }
 
-/** A note's position from a flag's or proposal's `ref` (the server keys notes by index); null without one */
-export function noteIndex(ref: string | null | undefined): number | null {
-  return ref && /^\d+$/.test(ref) ? Number(ref) : null;
+/** A note's position in the draft by its id (a flag's or proposal's `ref`: the server keys notes by id); -1 when gone */
+export function notePosition(draft: CardDraft, ref: string | null | undefined): number {
+  return ref ? (draft.notes ?? []).findIndex(note => note.id === ref) : -1;
+}
+
+/** A note's text as one line of the "Needs a look" list and the re-read targets show it: its title above its text */
+function noteText(note: CardDraftNote): string {
+  return [note.title, note.text].filter(Boolean).join("\n");
 }
 
 /** The text a field (or one ingredient, step or note) holds now, as the "Needs a look" item shows it */
@@ -306,9 +318,9 @@ export function fieldText(draft: CardDraft, field: string, ref?: string | null):
     return draft.steps?.find(step => step.id === ref)?.text ?? "";
   }
   if (key === "notes") {
-    const index = noteIndex(ref);
-    const notes = index === null ? draft.notes ?? [] : (draft.notes ?? []).slice(index, index + 1);
-    return notes.map(note => [note.title, note.text].filter(Boolean).join("\n")).join("\n");
+    // a note by its id; without one, every note (a flag on the notes as a whole)
+    const notes = ref ? (draft.notes ?? []).filter(note => note.id === ref) : draft.notes ?? [];
+    return notes.map(noteText).join("\n");
   }
   if (isTextField(key)) {
     const value = draft[key];
@@ -693,11 +705,10 @@ export function editFlaggedText(
     return changed;
   }
   if (field === "notes") {
-    // the flag's note by its index; without one, the first note holding the flagged part
-    const index = noteIndex(flag.ref);
-    const note = index === null
-      ? draft.notes.find(item => findFragment(item.text ?? "", fragment) || findFragment(item.title ?? "", fragment))
-      : draft.notes[index];
+    // the flag's note by its id, wherever it is now; without one, the first note holding the flagged part
+    const note = flag.ref
+      ? draft.notes.find(item => item.id === flag.ref)
+      : draft.notes.find(item => findFragment(item.text ?? "", fragment) || findFragment(item.title ?? "", fragment));
     if (!note) {
       return false;
     }
@@ -736,7 +747,7 @@ function readingOrderKey(flag: CardFlag, draft: CardDraft): [number, number, num
     line = draft.steps?.findIndex(item => item.id === flag.ref) ?? -1;
   }
   else if (field === "notes") {
-    line = noteIndex(flag.ref) ?? 0;
+    line = flag.ref ? notePosition(draft, flag.ref) : 0;
   }
   const severity = flag.severity === "error" ? 0 : flag.severity === "warning" ? 1 : 2;
   return [fieldIndex < 0 ? FIELD_ORDER.length : fieldIndex, line < 0 ? Number.MAX_SAFE_INTEGER : line, severity];
@@ -787,8 +798,7 @@ function spanInFieldText(draft: CardDraft, field: string, flag: CardFlag): TextS
   if (!span || field !== "notes") {
     return span;
   }
-  const index = noteIndex(flag.ref);
-  const note = index === null ? undefined : draft.notes?.[index];
+  const note = flag.ref ? draft.notes?.find(item => item.id === flag.ref) : undefined;
   if (!note?.text) {
     return null;
   }
@@ -827,8 +837,7 @@ export function buildNeedsALook(
       line = draft.steps?.findIndex(item => item.id === flag.ref) ?? -1;
     }
     else if (field === "notes") {
-      const index = noteIndex(flag.ref);
-      line = index !== null && index < (draft.notes?.length ?? 0) ? index : null;
+      line = flag.ref ? notePosition(draft, flag.ref) : null;
     }
     const ingredient = field === "ingredients" && line !== null && line >= 0 ? draft.ingredients![line]! : null;
     const text = fieldText(draft, field, flag.ref);
@@ -915,7 +924,13 @@ export function applyProposal(draft: ReviewDraft, proposal: CardProposal, mode: 
     }
   }
   else if (field === "notes") {
-    draft.notes.push({ title: "", text });
+    const note = target.ref ? draft.notes.find(item => item.id === target.ref) : undefined;
+    if (note) {
+      note.text = join(note.text);
+    }
+    else {
+      draft.notes.push({ id: uuid4(), title: "", text });
+    }
   }
   else if (field === "recipeServings") {
     draft.recipeServings = parseQuantity(text) ?? draft.recipeServings ?? null;
@@ -931,15 +946,28 @@ export interface RereadTargetOption {
   /** A key unique among the options */
   value: string;
   target: ProposalTarget;
-  /** "name", "ingredient", "step", "new-ingredient", ...: which label the dialog shows */
-  kind: TextField | "ingredient" | "step" | "new-ingredient" | "new-step" | "note";
-  /** The line's text, or the step's number (from 1) */
+  /** "name", "ingredient", "step", "note", "new-ingredient", ...: which label the dialog shows */
+  kind: TextField | "ingredient" | "step" | "note" | "new-ingredient" | "new-step" | "new-note";
+  /** The line's text, the step's number (from 1), or the note's title (else its first words) */
   text: string;
 }
 
+/** How much of a note's text names it among the re-read targets, when it has no title */
+const NOTE_LABEL_LENGTH = 36;
+
+/** A note as the region dialog names it: its title, else the start of its text */
+function noteLabel(note: CardDraftNote): string {
+  const title = (note.title ?? "").trim();
+  if (title) {
+    return title;
+  }
+  const text = (note.text ?? "").trim().replace(/\s+/g, " ");
+  return text.length > NOTE_LABEL_LENGTH ? `${text.slice(0, NOTE_LABEL_LENGTH).trimEnd()}…` : text;
+}
+
 /**
- * Every line a re-read can be for: each field, each ingredient and step by its `ref`, and a new ingredient, step or
- * note (a target without a `ref`, for a line the reading missed), which `applyProposal` adds.
+ * Every line a re-read can be for: each field, each ingredient, step and note by its `ref`, and a new ingredient,
+ * step or note (a target without a `ref`, for a line the reading missed), which `applyProposal` adds.
  */
 export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
   const options: RereadTargetOption[] = TEXT_FIELDS.filter(field => field !== "recipeServings").map(field => ({
@@ -966,7 +994,15 @@ export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
     });
   });
   options.push({ value: "steps:new", target: { field: "steps", ref: null }, kind: "new-step", text: "" });
-  options.push({ value: "notes:new", target: { field: "notes", ref: null }, kind: "note", text: "" });
+  draft.notes.forEach((note) => {
+    options.push({
+      value: `notes:${note.id}`,
+      target: { field: "notes", ref: note.id ?? null },
+      kind: "note",
+      text: noteLabel(note),
+    });
+  });
+  options.push({ value: "notes:new", target: { field: "notes", ref: null }, kind: "new-note", text: "" });
   return options;
 }
 
@@ -1112,6 +1148,56 @@ export function nextBatchCard(
   return first ? firstCardToReview(first) : null;
 }
 
+// ==========================================
+// Merging a card into the previous one
+
+/** The server's `MAX_PAGES_PER_CARD`, until the group's card settings (which carry it) have loaded */
+const DEFAULT_MAX_PAGES_PER_CARD = 4;
+
+/**
+ * Why a card can't become the back of the previous card of its batch ("Add as back of previous card"): `busy` while
+ * the card itself is being read, `checking` while the previous card isn't known yet, `no-previous` for a batch's
+ * first card, `previous-added` once it was added as a recipe, `previous-busy` while it's being read,
+ * `previous-not-allowed` when the user may not change it (another member's card), `too-many-pages` when the two
+ * together have more photos than a card takes.
+ */
+export type MergeBlock
+  = | "busy"
+    | "checking"
+    | "no-previous"
+    | "previous-added"
+    | "previous-busy"
+    | "previous-not-allowed"
+    | "too-many-pages";
+
+/**
+ * Whether this card can be added to the previous one as its back, as the server's merge checks it: the previous card
+ * (`undefined` while unknown, `null` when there is none) ready or failed with nothing reading it, one the user may
+ * change (its `canMerge`), and the photos of both fitting one card. Null when it can.
+ */
+export function mergeBlockOf(
+  card: Pick<RecipeIngestionJobOut, "pageCount">,
+  previous: Pick<RecipeIngestionJobOut, "status" | "task" | "pageCount" | "permissions"> | null | undefined,
+  maxPages: number,
+): MergeBlock | null {
+  if (previous === undefined) {
+    return "checking";
+  }
+  if (previous === null) {
+    return "no-previous";
+  }
+  if (previous.status === "committed" || previous.status === "committing") {
+    return "previous-added";
+  }
+  if (previous.status === "processing" || previous.task) {
+    return "previous-busy";
+  }
+  if (previous.pageCount + card.pageCount > maxPages) {
+    return "too-many-pages";
+  }
+  return previous.permissions?.canMerge ? null : "previous-not-allowed";
+}
+
 /** A card the review opens next: the batch's next ready card, or another batch's ("next-batch") */
 interface CardStop {
   kind: "card" | "next-batch";
@@ -1141,6 +1227,8 @@ export interface ReviewNoticeText {
   text: string;
   /** A second line: what commit left out */
   detail?: string | null;
+  /** The card this notice says was added: the page that shows it offers Undo, which takes it back to review */
+  undoJobId?: string | null;
 }
 
 /** A notice in the review bar (docs/ai/PHASE2.md §6.2), in place of a toast that would cover the page */
@@ -1180,6 +1268,10 @@ export function resetCarriedReviewNotice() {
 
 /** An eval case's name (the server's `EVAL_CASE_SLUG_PATTERN`) */
 export const EVAL_CASE_SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** What a reviewer can say the card is like, in the order the dialog offers them (the server's `EvalCaseTag`) */
+export const EVAL_CASE_TAGS: readonly EvalCaseTag[] = ["handwritten", "printed", "faded"];
+/** The longest eval case notes (the server's `MAX_EVAL_NOTES`) */
+export const MAX_EVAL_NOTES = 2000;
 
 /** An eval case name made from the recipe's name: "Banana Mug Cake" → "banana-mug-cake" */
 export function suggestEvalSlug(name: string | null | undefined): string {
@@ -1213,6 +1305,9 @@ function alreadyToasted(error: unknown): boolean {
   return typeof (detail as { message?: unknown } | null | undefined)?.message === "string";
 }
 
+/** How a Back to review ended: `edited` asks first, as the recipe was edited after the commit */
+export type UncommitOutcome = "done" | "edited" | "failed";
+
 /** How a save ended: `retry` (no answer, or the server failed) is tried again later; `refused` means the card was
  * committed, discarded or taken back somewhere else */
 type SaveOutcome = "saved" | "conflict" | "refused" | "retry" | "failed";
@@ -1229,6 +1324,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const i18n = useI18n();
   const text = useRecipeIngestText();
   const counts = useRecipeIngestCounts();
+  const ingestSettings = useRecipeIngestSettings();
 
   const job = ref<RecipeIngestionJobOut | null>(null);
   const batch = ref<RecipeIngestionBatchOut | null>(null);
@@ -1240,7 +1336,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const saveState = ref<SaveState>("idle");
   const conflict = ref(false);
   const committing = ref(false);
-  /** The ⋯ menu action in flight (`rotate`, `reextract`, `retry`, `discard`, `eval`), so its button can spin */
+  /** The action in flight (`rotate`, `reextract`, `retry`, `cloud`, `discard`, `eval`, ...), so its button can spin */
   const pendingAction = ref<string | null>(null);
   /** Re-reads waiting for the job to be idle, sent one at a time */
   const rereadQueue = ref<RereadRequest[]>([]);
@@ -1374,10 +1470,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     return action?.run();
   }
 
-  // what the last card's Commit & next (or Skip, or Discard) said about it and where the review went
+  // what the last card's Commit & next (or Skip, or Discard) said about it and where the review went; "Added …"
+  // offers Undo for the card just added (`undoCommit`, defined below with the other card actions)
   const carried = takeCarriedReviewNotice(jobId);
   if (carried) {
-    notify(carried.kind, carried.text, { detail: carried.detail });
+    const undoJobId = carried.undoJobId;
+    notify(carried.kind, carried.text, {
+      detail: carried.detail,
+      action: undoJobId ? { label: i18n.t("recipe-ingest.review.undo"), run: () => undoCommit(undoJobId) } : null,
+    });
   }
 
   // ==========================================
@@ -1757,7 +1858,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       return;
     }
     const code = errorCodeOf(error);
-    notify("error", code ? text.ingestErrorText(code) : i18n.t("events.something-went-wrong"));
+    // the refusal's own values fill its text ("A card can have at most {max} photos.")
+    const detail = (error as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail;
+    const params = detail && typeof detail === "object" ? detail as Record<string, unknown> : null;
+    notify("error", code ? text.ingestErrorText(code, params) : i18n.t("events.something-went-wrong"));
   }
 
   function applyState(state: RecipeIngestionJobState) {
@@ -1913,6 +2017,129 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     });
   }
 
+  /** `POST …/uncommit` for a card, telling a recipe edited since (`recipe_edited`) from the other refusals */
+  async function sendUncommit(id: string, force: boolean): Promise<{ outcome: UncommitOutcome; error: unknown }> {
+    const { data, error } = await api.recipeIngest.uncommit(id, force ? { force: true } : {});
+    if (data) {
+      void counts.refresh();
+      return { outcome: "done", error: null };
+    }
+    return { outcome: errorCodeOf(error) === "recipe_edited" ? "edited" : "failed", error };
+  }
+
+  /**
+   * "Back to review" on an added card: deletes the recipe it became and makes the card ready again with its draft.
+   * `edited`: the recipe was changed after the commit, so the page asks before sending it again with `force`.
+   * Otherwise refused, it says why and shows the card as it is now.
+   */
+  async function uncommit(force = false): Promise<UncommitOutcome> {
+    return (await runAction("uncommit", async () => {
+      const { outcome, error } = await sendUncommit(jobId, force);
+      if (outcome === "done") {
+        await refresh();
+        notify("success", i18n.t("recipe-ingest.review.back-to-review-done"));
+      }
+      else if (outcome === "failed") {
+        notifyError(error);
+        await refresh();
+      }
+      return outcome;
+    })) ?? "failed";
+  }
+
+  /**
+   * Undo on "Added …": takes the card just added (another card) back to review and opens it there. A recipe edited
+   * since isn't deleted from here: the notice says so and opens that card, whose Back to review asks first.
+   */
+  async function undoCommit(id: string) {
+    return await runAction("undo", async () => {
+      const { outcome, error } = await sendUncommit(id, false);
+      if (outcome === "done") {
+        carryReviewNotice(id, { kind: "success", text: i18n.t("recipe-ingest.review.back-to-review-done"), detail: null });
+        await options.navigate(cardPath(id));
+        return true;
+      }
+      if (outcome === "edited") {
+        notify("warning", text.ingestErrorText("recipe_edited"), {
+          action: { label: i18n.t("recipe-ingest.review.open-card"), run: () => goTo(id) },
+        });
+      }
+      else {
+        notifyError(error);
+      }
+      return false;
+    });
+  }
+
+  /** Whether "Add as back of previous card" is offered: a ready or failed card the user uploaded or manages */
+  const canMerge = computed(() => !!job.value?.permissions?.canMerge);
+  /** The card before this one in its batch, as last fetched: `undefined` until then, `null` when there's none */
+  const previousCard = ref<RecipeIngestionJobOut | null | undefined>(undefined);
+  /** The most photos a card takes (the group's card settings, loaded by the layout) */
+  const maxPagesPerCard = computed(() => ingestSettings.settings.value?.limits?.maxPagesPerCard || DEFAULT_MAX_PAGES_PER_CARD);
+  /** Why this card can't be added to the previous one now (`MergeBlock`); null when it can, or isn't offered */
+  const mergeBlock = computed<MergeBlock | null>(() => {
+    if (!canMerge.value || !job.value) {
+      return null;
+    }
+    if (task.value) {
+      return "busy";
+    }
+    return mergeBlockOf(job.value, previousCard.value, maxPagesPerCard.value);
+  });
+
+  /**
+   * Fetches the card before this one in its batch (by capture position), whose state, pages and permissions say
+   * whether this card can become its back. The ⋯ menu calls it as it opens.
+   */
+  async function checkPreviousCard() {
+    if (!batch.value) {
+      await loadBatch();
+    }
+    const previousId = position.value?.previous ?? null;
+    if (!batch.value) {
+      previousCard.value = undefined;
+      return;
+    }
+    if (!previousId) {
+      previousCard.value = null;
+      return;
+    }
+    const { data, error } = await api.recipeIngest.getJob(previousId);
+    if (data) {
+      previousCard.value = data;
+    }
+    else {
+      // gone since the batch was read: none to add to; otherwise not known (the menu says it's checking)
+      previousCard.value = errorStatusOf(error) === 404 ? null : undefined;
+    }
+  }
+
+  /**
+   * "Add as back of previous card": this card's photos become the previous card's next pages, this card is deleted,
+   * and the previous card is read again; the review opens it. Refused, it says why and checks that card again.
+   */
+  async function mergeIntoPrevious() {
+    const into = previousCard.value;
+    if (!into || mergeBlock.value) {
+      return false;
+    }
+    return (await runAction("merge", async () => {
+      const { data, error } = await api.recipeIngest.merge(jobId, { intoJobId: into.id });
+      if (data) {
+        // this card is gone: its edits can't be saved any more
+        dropPendingChanges();
+        void counts.refresh();
+        carryReviewNotice(into.id, { kind: "info", text: i18n.t("recipe-ingest.review.merged"), detail: null });
+        await options.navigate(cardPath(into.id));
+        return true;
+      }
+      notifyError(error);
+      await checkPreviousCard();
+      return false;
+    })) ?? false;
+  }
+
   /** Reads a failed card again */
   async function retry() {
     return await runAction("retry", async () => {
@@ -1925,6 +2152,31 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         return true;
       }
       notifyError(error);
+      return false;
+    });
+  }
+
+  /**
+   * Reads a card that failed because it had to stay on this server (`local_only_unavailable`) again, with any of the
+   * group's providers, cloud ones included: the card is no longer kept local. Refused (the group now keeps every card
+   * local, or the card changed), it says why and shows the card as it is now.
+   */
+  async function readWithCloud() {
+    return await runAction("cloud", async () => {
+      const { data, error } = await api.recipeIngest.readWithCloud(jobId);
+      if (data) {
+        applyState(data);
+        if (job.value) {
+          job.value.error = null;
+          job.value.localOnly = false;
+          job.value.permissions = { ...job.value.permissions, canReadWithCloud: false };
+        }
+        return true;
+      }
+      notifyError(error);
+      if (errorStatusOf(error) === 409 || errorStatusOf(error) === 403) {
+        await refresh();
+      }
       return false;
     });
   }
@@ -1997,14 +2249,25 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       const still = stop.processing > 0 ? i18n.t("recipe-ingest.review.still-reading", stop.processing) : lastWords;
       const words = [said?.text, still].filter((part): part is string => !!part);
       if (words.length) {
-        leaveRecipeIngestCommitNotice({ text: words.join(" · "), warning: said?.detail ?? null });
+        // the card just added goes with it, for the queue's Undo (`RecipeIngestCommitNotice` gains `undoJobId`)
+        const left: RecipeIngestCommitNotice & { undoJobId?: string | null } = {
+          text: words.join(" · "),
+          warning: said?.detail ?? null,
+          ...(said?.undoJobId ? { undoJobId: said.undoJobId } : {}),
+        };
+        leaveRecipeIngestCommitNotice(left);
       }
       return await options.navigate(queuePath());
     }
     const words = [said?.text, stop.kind === "next-batch" ? i18n.t("recipe-ingest.review.next-batch") : null]
       .filter((part): part is string => !!part);
     if (words.length) {
-      carryReviewNotice(stop.id, { kind: said?.kind ?? "info", text: words.join(" · "), detail: said?.detail ?? null });
+      carryReviewNotice(stop.id, {
+        kind: said?.kind ?? "info",
+        text: words.join(" · "),
+        detail: said?.detail ?? null,
+        ...(said?.undoJobId ? { undoJobId: said.undoJobId } : {}),
+      });
     }
     return await options.navigate(cardPath(stop.id));
   }
@@ -2034,11 +2297,11 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     });
   }
 
-  /** Saves the reviewed card to the group's eval set (managers) */
-  async function saveEvalCase(slug: string, verified: boolean): Promise<"saved" | "exists" | "failed"> {
+  /** Saves the reviewed card to the group's eval set (managers), with what the reviewer says the card is like */
+  async function saveEvalCase(request: EvalCaseRequest): Promise<"saved" | "exists" | "failed"> {
     return (await runAction("eval", async () => {
       await save();
-      const { data, error } = await api.recipeIngest.saveEvalCase(jobId, { slug, verified });
+      const { data, error } = await api.recipeIngest.saveEvalCase(jobId, request);
       if (data) {
         notify("success", i18n.t("recipe-ingest.eval.saved", { slug: data.slug }));
         return "saved" as const;
@@ -2117,7 +2380,12 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       const warning = warnings.length ? warnings.join(" ") : null;
       // said in the next card's review bar, or beside the queue's summary of the batch: a toast would cover the
       // header of either page on phones
-      await goOn(await nextStop(data.nextJobId), { kind: warning ? "warning" : "success", text: added, detail: warning });
+      await goOn(await nextStop(data.nextJobId), {
+        kind: warning ? "warning" : "success",
+        text: added,
+        detail: warning,
+        undoJobId: jobId,
+      });
       return "committed";
     }
     finally {
@@ -2190,6 +2458,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     position,
     attachCardPhoto,
     cardPhotoPublic,
+    canMerge,
+    previousCard: readonly(previousCard),
+    mergeBlock,
+    maxPagesPerCard,
     // flags
     needsALook,
     otherProposals,
@@ -2218,6 +2490,11 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     reextract,
     rotate,
     retry,
+    readWithCloud,
+    uncommit,
+    undoCommit,
+    checkPreviousCard,
+    mergeIntoPrevious,
     cancelTask,
     discard,
     saveEvalCase,

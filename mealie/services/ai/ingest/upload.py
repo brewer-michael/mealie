@@ -6,8 +6,10 @@ byte-capped body stream, and the three body shapes (multipart, a raw image, JSON
 1. the controller's auth; then the `Authorization` header must carry a Bearer token: a cookie alone is `401`, even
    beside a header of another scheme (F18);
 2. `503 paused_for_restore` (with `Retry-After`) while a restore pauses ingestion; `503 ingest_disabled`;
-3. `400 ai_not_enabled` / `local_only_unavailable`, and 4. `429` at 200 processing jobs: one worker-thread call
-   (`intake.reading_readiness`), so provider settings, address lookups and the count never block the event loop;
+3. `400 ai_not_enabled` / `local_only_unavailable`, and 4. `429 too_many_jobs` at 200 processing jobs in the group,
+   then `429 user_quota` at `AI_INGEST_MAX_PROCESSING_PER_USER` of the uploader's own (when that's set; inbox cards
+   have no uploader): one worker-thread call (`intake.reading_readiness`), so provider settings, address lookups and
+   the counts never block the event loop. Both gate new uploads: a request that passes them queues all its cards;
 5. `413` by `Content-Length` (45 MiB for JSON), and `415` for any other content type;
 6. the body, through a byte counter that also stops chunked bodies at the same caps.
 
@@ -91,6 +93,7 @@ INGEST_DISABLED = "ingest_disabled"
 AI_NOT_ENABLED = "ai_not_enabled"
 LOCAL_ONLY_UNAVAILABLE = "local_only_unavailable"
 TOO_MANY_JOBS = "too_many_jobs"
+USER_QUOTA = "user_quota"
 TOO_LARGE = "too_large"
 UNSUPPORTED_MEDIA_TYPE = "unsupported_media_type"
 INVALID_BODY = "invalid_body"
@@ -561,8 +564,8 @@ class UploadHandler:
         )
 
     @staticmethod
-    def _check_readiness(readiness: ReadingReadiness) -> None:
-        """Checks 3 and 4, from `reading_readiness`"""
+    def _check_readiness(readiness: ReadingReadiness, user_cap: int = 0) -> None:
+        """Checks 3 and 4, from `reading_readiness`; `user_cap` is `AI_INGEST_MAX_PROCESSING_PER_USER` (0: off)"""
         if not readiness.can_read:
             raise UploadRefused(400, AI_NOT_ENABLED, message_key="recipe-ingest.errors.ai-not-enabled")
         if readiness.group_local_only and not readiness.local_ready:
@@ -572,6 +575,14 @@ class UploadHandler:
                 429,
                 TOO_MANY_JOBS,
                 message_key="recipe-ingest.errors.too-many-jobs",
+                headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
+            )
+        if user_cap and readiness.user_processing is not None and readiness.user_processing >= user_cap:
+            raise UploadRefused(
+                429,
+                USER_QUOTA,
+                message_key="recipe-ingest.errors.user-quota",
+                message_params={"count": user_cap},
                 headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
             )
 
@@ -638,8 +649,11 @@ class UploadHandler:
     async def handle(self) -> IngestResponse:
         """The whole request; raises `UploadRefused` for every refusal"""
         self._check_before_body()
-        readiness = await anyio.to_thread.run_sync(reading_readiness, self.session, self.group_id, self.household_id)
-        self._check_readiness(readiness)
+        user_cap = get_ingest_settings().MAX_PROCESSING_PER_USER
+        readiness = await anyio.to_thread.run_sync(
+            reading_readiness, self.session, self.group_id, self.household_id, self.user.id if user_cap else None
+        )
+        self._check_readiness(readiness, user_cap)
 
         kind = body_kind(self.request.headers.get("content-type"))
         cap = self._check_length(kind)

@@ -24,6 +24,37 @@ const stubs = {
       </label>
     `,
   },
+  VChipGroup: {
+    props: ["modelValue"],
+    emits: ["update:modelValue"],
+    provide() {
+      return { chipGroup: this };
+    },
+    template: "<div class=\"tags\" :data-selected=\"(modelValue ?? []).join(',')\"><slot /></div>",
+  },
+  VChip: {
+    props: ["value"],
+    inject: ["chipGroup"],
+    template: `
+      <button type="button" class="tag" :data-tag="value" @click="toggle"><slot /></button>
+    `,
+    methods: {
+      toggle(this: { value: string; chipGroup: { modelValue?: string[]; $emit: (event: string, value: string[]) => void } }) {
+        const selected = this.chipGroup.modelValue ?? [];
+        this.chipGroup.$emit("update:modelValue", selected.includes(this.value) ? selected.filter(tag => tag !== this.value) : [...selected, this.value]);
+      },
+    },
+  },
+  VTextarea: {
+    props: ["modelValue", "label", "errorMessages"],
+    emits: ["update:modelValue"],
+    template: `
+      <label class="notes">{{ label }}
+        <textarea :value="modelValue" @input="$emit('update:modelValue', $event.target.value)" />
+        <span class="notes-error">{{ errorMessages }}</span>
+      </label>
+    `,
+  },
   VCheckbox: {
     props: ["modelValue", "label"],
     emits: ["update:modelValue"],
@@ -57,7 +88,52 @@ describe("IngestEvalCaseDialog", () => {
     await wrapper.get(".verified input").setValue(true);
     await wrapper.get(".submit").trigger("click");
 
-    expect(wrapper.emitted("save")).toEqual([[{ slug: "banana-mug-cake", verified: true }]]);
+    expect(wrapper.emitted("save")).toEqual([[{ slug: "banana-mug-cake", verified: true, tags: [], notes: "" }]]);
+  });
+
+  test("the card can be described with tags and notes, which are saved with it", async () => {
+    const wrapper = mountDialog();
+
+    expect(wrapper.findAll(".tag").map(tag => tag.text())).toEqual(["Handwritten", "Printed", "Faded"]);
+    await wrapper.get("[data-tag=faded]").trigger("click");
+    await wrapper.get("[data-tag=handwritten]").trigger("click");
+    await wrapper.get("[data-tag=faded]").trigger("click");
+    await wrapper.get("[data-tag=faded]").trigger("click");
+    expect(wrapper.get(".tags").attributes("data-selected")).toBe("handwritten,faded");
+    expect(wrapper.get(".notes").text()).toContain("Notes");
+    await wrapper.get(".notes textarea").setValue("  Pencil, water-stained at the bottom  ");
+    await wrapper.get(".submit").trigger("click");
+
+    // in the order the chips show, and the notes without the spaces around them
+    expect(wrapper.emitted("save")).toEqual([[{
+      slug: "banana-mug-cake",
+      verified: false,
+      tags: ["handwritten", "faded"],
+      notes: "Pencil, water-stained at the bottom",
+    }]]);
+  });
+
+  test("notes longer than the server keeps can't be saved", async () => {
+    const wrapper = mountDialog();
+
+    await wrapper.get(".notes textarea").setValue("x".repeat(2001));
+    expect(wrapper.get(".submit").attributes("disabled")).toBeDefined();
+    expect(wrapper.get(".notes-error").text()).toBe("At most 2000 characters");
+    await wrapper.get(".notes textarea").setValue("x".repeat(2000));
+    expect(wrapper.get(".submit").attributes("disabled")).toBeUndefined();
+  });
+
+  test("opening it again starts afresh", async () => {
+    const wrapper = mountDialog();
+    await wrapper.get("[data-tag=printed]").trigger("click");
+    await wrapper.get(".notes textarea").setValue("Typed card");
+
+    await wrapper.setProps({ modelValue: false });
+    await wrapper.setProps({ modelValue: true, recipeName: "Lemon Bars" });
+
+    expect((wrapper.get(".slug input").element as HTMLInputElement).value).toBe("lemon-bars");
+    expect(wrapper.get(".tags").attributes("data-selected")).toBe("");
+    expect((wrapper.get(".notes textarea").element as HTMLTextAreaElement).value).toBe("");
   });
 
   test("a name the server wouldn't take can't be saved", async () => {

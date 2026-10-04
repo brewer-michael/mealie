@@ -8,22 +8,27 @@ import {
   INGEST_API_ERROR_CODES,
   INGEST_ERROR_CODES,
   INGEST_REJECT_REASONS,
+  DEFAULT_INGEST_LIMITS,
   cardTitle,
   commitWarningText,
   errorCodeOf,
   errorMessageOf,
   errorStatusOf,
   flagText,
+  formatIngestDate,
   ingestErrorText,
+  nextLimitReset,
   progressText,
   rejectReasonText,
   resetRecipeIngestCounts,
   resetRecipeIngestSettings,
+  serverDate,
   sourceFileName,
   useRecipeIngestCounts,
   useRecipeIngestSettings,
 } from "../use-recipe-ingest";
 import type { TranslateFn } from "../use-recipe-ingest";
+import { CANNOT_SHRINK } from "~/composables/use-recipe-ingest-uploads";
 import { RecipeIngestAPI, buildIngestForm } from "~/lib/api/user/recipe-ingest";
 import type { ApiRequestInstance } from "~/lib/api/types/non-generated";
 import type { CardFlag, RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
@@ -309,6 +314,47 @@ describe("text", () => {
     }
   });
 
+  test("a rejection names the limit the file went over: the server's, or its defaults before they load", () => {
+    expect(rejectReasonText("too_large", t)).toBe("This file is larger than 30 MB.");
+    expect(rejectReasonText("too_many_pages", t)).toBe("A card can have at most 4 pages.");
+    expect(rejectReasonText("too_many_pixels", t)).toBe("This photo has more than 100 megapixels.");
+    expect(rejectReasonText("too_many_pixels", t, { jpeg: true })).toBe("This photo has more than 260 megapixels.");
+
+    const limits = { ...DEFAULT_INGEST_LIMITS, maxFileBytes: 20 * 1024 * 1024, maxPagesPerCard: 6, maxJpegPixels: 200_000_000 };
+    expect(rejectReasonText("too_large", t, { limits })).toBe("This file is larger than 20 MB.");
+    expect(rejectReasonText("too_many_pages", t, { limits })).toBe("A card can have at most 6 pages.");
+    expect(rejectReasonText("too_many_pixels", t, { limits, jpeg: true })).toBe("This photo has more than 200 megapixels.");
+    expect(rejectReasonText("pdf_not_supported", t, { limits })).toBe("This PDF can't be opened. It may need a password or be damaged.");
+  });
+
+  test("the error texts end with a period, and the ones a user can act on say what to do", () => {
+    for (const code of [...INGEST_ERROR_CODES, ...INGEST_API_ERROR_CODES]) {
+      expect(ingestErrorText(code, null, t), code).toMatch(/[.?!]$/);
+    }
+    expect(ingestErrorText("local_only_unavailable", null, t)).toContain("A group manager can add one");
+    expect(ingestErrorText("limit_reached", null, t)).toContain("resets at the start of next month");
+    expect(t("recipe-ingest.error.network")).toBe("The server couldn't be reached. Check your connection and try again.");
+  });
+
+  test("dates the server sends are UTC, with or without an offset; limits reset on the 1st of the next UTC month", () => {
+    expect(serverDate("2026-11-01T00:00:00Z")?.toISOString()).toBe("2026-11-01T00:00:00.000Z");
+    expect(serverDate("2026-11-01T00:00:00+00:00")?.toISOString()).toBe("2026-11-01T00:00:00.000Z");
+    expect(serverDate("2026-11-01T00:00:00")?.toISOString()).toBe("2026-11-01T00:00:00.000Z");
+    expect(serverDate("2026-11-01T02:00:00+02:00")?.toISOString()).toBe("2026-11-01T00:00:00.000Z");
+    expect(serverDate(null)).toBeNull();
+    expect(serverDate("soon")).toBeNull();
+
+    expect(nextLimitReset(new Date("2026-10-04T15:00:00Z")).toISOString()).toBe("2026-11-01T00:00:00.000Z");
+    expect(nextLimitReset(new Date("2026-12-31T23:59:59Z")).toISOString()).toBe("2027-01-01T00:00:00.000Z");
+    expect(nextLimitReset(new Date("2026-10-01T00:00:00Z")).toISOString()).toBe("2026-11-01T00:00:00.000Z");
+
+    const noon = new Date("2026-11-14T12:00:00Z");
+    expect(formatIngestDate(noon, "en-US")).toBe("Nov 14, 2026");
+    expect(formatIngestDate(noon, "en-US", true)).toBe(
+      new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(noon),
+    );
+  });
+
   test("an error's params fill its text, and an unknown code is named", () => {
     expect(ingestErrorText("provider_failed", { detail: "AuthenticationError (HTTP 401)" }, t)).toBe(
       "The AI provider couldn't read the card (AuthenticationError (HTTP 401)).",
@@ -395,6 +441,52 @@ describe("text", () => {
     }
     expect(keys.size).toBeGreaterThan(100);
     expect([...keys].filter(key => !i18n.global.te(key, "en-US"))).toEqual([]);
+  });
+
+  test("every en-US recipe-ingest text is used by the app", () => {
+    const app = resolve(__dirname, "../..");
+    const code = (readdirSync(app, { recursive: true }) as string[])
+      .filter(file => /\.(vue|ts)$/.test(file) && !/\.test\.ts$|__tests__|lib[\\/]api[\\/]types/.test(file))
+      .map(file => readFileSync(join(app, file), "utf8"))
+      .join("\n");
+    // named in full
+    const named = new Set([...code.matchAll(/["'`](recipe-ingest\.[\w.-]+[\w-])["'`]/g)].map(match => match[1]!));
+    // the server's progress keys (`pipeline/context.py`), and the bare steps the app names (`progressText("queued")`)
+    const backend = resolve(app, "../../mealie/services/ai/ingest");
+    const python = (readdirSync(backend, { recursive: true }) as string[])
+      .filter(file => file.endsWith(".py"))
+      .map(file => readFileSync(join(backend, file), "utf8"))
+      .join("\n");
+    const steps = [
+      ...[...python.matchAll(/\{PROGRESS_PREFIX\}([\w-]+)"/g)].map(match => match[1]!),
+      ...[...code.matchAll(/progressText\("([\w-]+)"\)/g)].map(match => match[1]!),
+    ];
+    expect(steps).toContain("reading-card");
+    // texts chosen by a code from the code lists: only the codes the app knows have one
+    const byCode: [string, readonly string[]][] = [
+      ["recipe-ingest.error.", [...INGEST_ERROR_CODES, ...INGEST_API_ERROR_CODES]],
+      ["recipe-ingest.reject.", [...INGEST_REJECT_REASONS, CANNOT_SHRINK]],
+      ["recipe-ingest.flag.", CARD_FLAG_KINDS],
+      ["recipe-ingest.commit-warning.", COMMIT_WARNING_KINDS],
+      ["recipe-ingest.progress.", steps],
+    ];
+    const chosenByCode = (key: string) => byCode.some(([prefix, codes]) => key.startsWith(prefix) && codes.some(
+      known => [`${prefix}${known}`, `${prefix}${known}-detail`].includes(key) || key.startsWith(`${prefix}${known}.`),
+    ));
+    // other keys built in a template (`recipe-ingest.queue.source-${source}`): any key it can build
+    const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const templates = [...code.matchAll(/`(recipe-ingest\.[^`]*?\$\{[^`]*)`/g)]
+      .map(match => match[1]!)
+      .filter(template => !byCode.some(([prefix]) => template.startsWith(prefix)))
+      .map(template => new RegExp(`^${template.split(/\$\{[^}]*\}/).map(escape).join("[\\w-]+")}$`));
+
+    const leaves = (node: unknown, prefix: string): string[] => typeof node === "object" && node
+      ? Object.entries(node).flatMap(([key, value]) => leaves(value, `${prefix}.${key}`))
+      : [prefix];
+    const messages = (i18n.global.getLocaleMessage("en-US") as Record<string, unknown>)["recipe-ingest"];
+    const unused = leaves(messages, "recipe-ingest")
+      .filter(key => !named.has(key) && !chosenByCode(key) && !templates.some(template => template.test(key)));
+    expect(unused).toEqual([]);
   });
 
   test("progress keys are translated whether full or bare", () => {

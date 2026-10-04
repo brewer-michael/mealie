@@ -12,6 +12,7 @@ import type {
   CardFlag,
   CardFlagKind,
   IngestErrorCode,
+  IngestLimits,
   IngestRejectReason,
   RecipeIngestionBatchOut,
   RecipeIngestionJobCounts,
@@ -68,6 +69,7 @@ export const INGEST_API_ERROR_CODES = [
   "recipe_edited",
   "not_clean",
   "notification_failed",
+  "user_quota",
 ] as const;
 
 /** Kinds of the warnings a commit answers with (`tag_dropped:<name>`: an organizer that no longer exists) */
@@ -106,9 +108,19 @@ export const INGEST_REJECT_REASONS = [
   "duplicate",
   "url_not_allowed",
   "url_fetch_failed",
+  "no_permission",
 ] as const satisfies readonly IngestRejectReason[];
 
 const PROGRESS_PREFIX = "recipe-ingest.progress.";
+const MIB = 1024 * 1024;
+
+/** The server's limits (`limits.py`, `images.MAX_JPEG_SOURCE_PIXELS`), for texts shown before the settings load */
+export const DEFAULT_INGEST_LIMITS: Pick<IngestLimits, "maxFileBytes" | "maxPagesPerCard" | "maxPixels" | "maxJpegPixels"> = {
+  maxFileBytes: 30 * MIB,
+  maxPagesPerCard: 4,
+  maxPixels: 100_000_000,
+  maxJpegPixels: 260_000_000,
+};
 
 function globalT(key: string, named?: Record<string, unknown>): string {
   return useGlobalI18n().t(key, named ?? {});
@@ -194,9 +206,45 @@ export function ingestErrorText(
   return translated(t, `recipe-ingest.error.${code}`, named) ?? t("recipe-ingest.error.unknown", { code });
 }
 
-/** Why an uploaded photo wasn't used */
-export function rejectReasonText(reason: string, t: TranslateFn = globalT): string {
-  return translated(t, `recipe-ingest.reject.${reason}`) ?? t("recipe-ingest.error.unknown", { code: reason });
+/** What a rejection's text says about the limit the file went over */
+export interface RejectTextOptions {
+  /** The server's limits (`settings.limits`); the defaults until they've loaded */
+  limits?: Partial<IngestLimits> | null;
+  /** The file is a JPEG, which may have more pixels (it's decoded at a reduced size) */
+  jpeg?: boolean;
+}
+
+/** Why an uploaded photo wasn't used, with the limit it went over (`{mib}`, `{megapixels}`, `{pages}`) */
+export function rejectReasonText(reason: string, t: TranslateFn = globalT, options: RejectTextOptions = {}): string {
+  const limits = { ...DEFAULT_INGEST_LIMITS, ...options.limits };
+  const named = {
+    mib: Math.round(limits.maxFileBytes / MIB),
+    megapixels: Math.round((options.jpeg ? limits.maxJpegPixels : limits.maxPixels) / 1_000_000),
+    pages: limits.maxPagesPerCard,
+  };
+  return translated(t, `recipe-ingest.reject.${reason}`, named) ?? t("recipe-ingest.error.unknown", { code: reason });
+}
+
+/** A date-time the server sent: UTC, also when it has no offset; null for none, or one that isn't a date */
+export function serverDate(value: string | Date | null | undefined): Date | null {
+  if (!value) {
+    return null;
+  }
+  const date = value instanceof Date
+    ? value
+    : new Date(/(Z|[+-]\d\d:?\d\d)$/i.test(value) || !value.includes("T") ? value : `${value}Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** When monthly token limits next reset: the first instant of the next UTC month (`finalize.next_limit_reset`) */
+export function nextLimitReset(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+}
+
+/** A date in the reader's locale and time zone ("Nov 1, 2026"), with the time when `withTime` ("…, 1:00 AM") */
+export function formatIngestDate(date: Date, locale: string, withTime = false): string {
+  return new Intl.DateTimeFormat(locale, withTime ? { dateStyle: "medium", timeStyle: "short" } : { dateStyle: "medium" })
+    .format(date);
 }
 
 /**
@@ -609,10 +657,11 @@ export function useRecipeIngestText() {
   const t: TranslateFn = (key, named) => i18n.t(key, named ?? {});
   return {
     ingestErrorText: (code: string, params?: Record<string, unknown> | null) => ingestErrorText(code, params, t),
-    rejectReasonText: (reason: string) => rejectReasonText(reason, t),
+    rejectReasonText: (reason: string, options?: RejectTextOptions) => rejectReasonText(reason, t, options),
     progressText: (key: string | null | undefined) => progressText(key, t),
     flagText: (flag: CardFlag, context?: FlagTextContext) => flagText(flag, t, context),
     commitWarningText: (warning: string) => commitWarningText(warning, t),
     cardTitle: (job: CardTitleFields) => cardTitle(job, t),
+    dateText: (date: Date, withTime = false) => formatIngestDate(date, i18n.locale.value, withTime),
   };
 }

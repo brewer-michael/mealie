@@ -1,7 +1,8 @@
 """
 The job routes under `/api/ai/ingest/jobs` (docs/ai/PHASE2.md §14): review, re-read, rotate, page images, commit and
-discard; reading a failed local-only card with cloud providers, adding a card to another as its back, undoing a
-commit, and committing a batch's clean cards (`/batches/{id}/commit-clean`). `/jobs/counts` is declared before
+discard; rebuilding a card from its corrected text, parsing chosen lines with the AI parser, where on the card a field's
+text is (`region-hint`), reading a failed local-only card with cloud providers, adding a card to another as its back,
+undoing a commit, and committing a batch's clean cards (`/batches/{id}/commit-clean`). `/jobs/counts` is declared before
 `/jobs/{id}`.
 
 Every route is household-scoped (another household's job, images included, is a 404) and answers 503 while
@@ -13,6 +14,7 @@ section can't start. The work is in `mealie.services.ai.ingest.review` and `.com
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from functools import cached_property
 from typing import Literal
 
@@ -31,10 +33,14 @@ from mealie.schema.recipe_ingest import (
     IngestStatus,
     MergeRequest,
     PageOut,
+    ParseLinesRequest,
+    ProposalTarget,
+    RebuildRequest,
     RecipeIngestionJobCounts,
     RecipeIngestionJobOut,
     RecipeIngestionJobPagination,
     RecipeIngestionJobState,
+    RegionHintOut,
     RereadRequest,
     RotateRequest,
     UncommitRequest,
@@ -48,6 +54,9 @@ from ._deps import IngestController, ingest_error, paused_error, require_enabled
 router = APIRouter(prefix="/ai/ingest", tags=["AI: Recipe Cards"])
 
 PageImageKind = Literal["page", "view", "thumb"]
+
+JobsOrder = Literal["committedAt"]
+"""`GET /jobs?orderBy=`: the latest added as a recipe first (by default the newest card first)"""
 
 MAX_PER_PAGE = 500
 
@@ -97,15 +106,33 @@ class RecipeIngestJobsController(IngestController):
         self,
         status_filter: list[IngestStatus] | None = Query(None, alias="status"),
         batch_id: UUID4 | None = Query(None, alias="batchId"),
+        committed_since: datetime | None = Query(None, alias="committedSince"),
+        order_by: JobsOrder | None = Query(None, alias="orderBy"),
         page: int = Query(1, ge=1),
         per_page: int = Query(50, alias="perPage", ge=-1, le=MAX_PER_PAGE),
     ) -> RecipeIngestionJobPagination:
-        """The household's recipe cards, newest first; `perPage=-1` returns them all"""
+        """
+        The household's recipe cards, newest first, or the latest added first with `orderBy=committedAt`;
+        `committedSince` keeps the cards added as recipes since then (a time without a zone is UTC); `perPage=-1`
+        returns them all
+        """
         with self._answer():
             result = self.review.list_jobs(
-                statuses=status_filter, batch_id=batch_id, page=page, per_page=per_page if per_page != 0 else 50
+                statuses=status_filter,
+                batch_id=batch_id,
+                committed_since=committed_since,
+                order="committed" if order_by == "committedAt" else "created",
+                page=page,
+                per_page=per_page if per_page != 0 else 50,
             )
-            query = {"status": status_filter, "batchId": batch_id, "page": result.page, "perPage": per_page}
+            query = {
+                "status": status_filter,
+                "batchId": batch_id,
+                "committedSince": committed_since.isoformat() if committed_since else None,
+                "orderBy": order_by,
+                "page": result.page,
+                "perPage": per_page,
+            }
             result.set_pagination_guides(router.url_path_for("get_jobs"), {k: v for k, v in query.items() if v})
             return result
 
@@ -165,6 +192,27 @@ class RecipeIngestJobsController(IngestController):
         with self._answer():
             return self.review.reread(job_id, data)
 
+    @router.post("/jobs/{job_id}/rebuild", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
+    def rebuild_job(self, job_id: UUID4, data: RebuildRequest) -> RecipeIngestionJobState:
+        """
+        Builds the recipe again from the card's text as corrected (no photo is read): it replaces a draft nobody
+        edited, else arrives as a whole-card proposal. `409 {detail: {code: "busy"}}` while a task is active.
+        """
+        with self._answer():
+            return self.review.rebuild(job_id, data.transcription)
+
+    @router.post(
+        "/jobs/{job_id}/parse-lines", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState
+    )
+    def parse_lines(self, job_id: UUID4, data: ParseLinesRequest) -> RecipeIngestionJobState:
+        """
+        Parses the chosen ingredient lines (`refs`) with the AI ingredient parser; the result is written into the
+        lines nobody changed meanwhile. `409 busy` while a task is active, `422 unknown_target` for a line the draft
+        hasn't.
+        """
+        with self._answer():
+            return self.review.parse_lines(job_id, data.refs)
+
     @router.post("/jobs/{job_id}/retry", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
     def retry_job(self, job_id: UUID4) -> RecipeIngestionJobState:
         """A failed card is read again from the start"""
@@ -206,6 +254,21 @@ class RecipeIngestJobsController(IngestController):
         """Turns a page clockwise; `409 {detail: {code: "busy"}}` while a task is active"""
         with self._answer(writes_files=True), write_section(self.translator):
             return self.review.rotate(job_id, index, data.degrees)
+
+    @router.get("/jobs/{job_id}/region-hint", response_model=RegionHintOut)
+    def get_region_hint(
+        self,
+        job_id: UUID4,
+        field: str = Query(..., min_length=1, max_length=64),
+        ref: str | None = Query(None, max_length=64),
+    ) -> RegionHintOut:
+        """
+        Where on an upright page a field's text probably is (fractions of its width and height), to start a re-read
+        selection there: by Tesseract's lines, else by the text's line in the transcription. `ref` names the
+        ingredient, step or note. `404 {detail: {code: "not_found"}}` when nothing says where.
+        """
+        with self._answer():
+            return self.review.region_hint(job_id, ProposalTarget(field=field, ref=ref))
 
     @router.get(
         "/jobs/{job_id}/pages/{index}/{kind}",

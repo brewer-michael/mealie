@@ -2,6 +2,7 @@ import { flushPromises, mount, type DOMWrapper, type VueWrapper } from "@vue/tes
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { nextTick } from "vue";
 import IngestCapture from "./IngestCapture.vue";
+import { classicPdf, file, ftypHead, JPEG_HEAD, objectStreamPdf } from "~/composables/__tests__/use-recipe-ingest-files.fixtures";
 import { resetRecipeIngestCounts } from "~/composables/use-recipe-ingest";
 import {
   BATCH_HEARTBEAT_MS,
@@ -75,7 +76,18 @@ function mountCapture(props: { maxPagesPerCard?: number } = {}) {
 let photoCount = 0;
 function photo(): File {
   photoCount += 1;
-  return new File([`photo ${photoCount}`], `IMG_${photoCount}.jpg`, { type: "image/jpeg" });
+  return new File([JPEG_HEAD, `photo ${photoCount}`], `IMG_${photoCount}.jpg`, { type: "image/jpeg" });
+}
+
+/** Drops files on the drop zone, as the browser does */
+async function dropFiles(wrapper: VueWrapper, files: File[]) {
+  const drop = new Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(drop, "dataTransfer", {
+    value: { items: files.map(file => ({ kind: "file", type: file.type })), files, dropEffect: "none" },
+  });
+  wrapper.get(".drop-zone").element.dispatchEvent(drop);
+  await flushPromises();
+  return drop;
 }
 
 /** Picks files in an input; returns what its value was set to afterwards */
@@ -202,6 +214,7 @@ describe("IngestCapture", () => {
     const [a1, a2, b1, c1, c2] = [photo(), photo(), photo(), photo(), photo()];
 
     const reset = await pick(wrapper.get<HTMLInputElement>(".choose-input"), [a1, a2, b1, c1, c2]);
+    await flushPromises();
     expect(reset).toEqual([""]);
     expect(wrapper.get<HTMLInputElement>(".choose-input").attributes("multiple")).toBeDefined();
     expect(wrapper.get<HTMLInputElement>(".choose-input").attributes("capture")).toBeUndefined();
@@ -232,6 +245,7 @@ describe("IngestCapture", () => {
   test("Join is offered up to the page limit", async () => {
     const wrapper = mountCapture({ maxPagesPerCard: 2 });
     await pick(wrapper.get<HTMLInputElement>(".choose-input"), [photo(), photo(), photo()]);
+    await flushPromises();
     const cards = () => wrapper.findAll(".draft-card");
     expect(cards()).toHaveLength(3);
 
@@ -272,16 +286,117 @@ describe("IngestCapture", () => {
   test("photos dropped on the drop zone become cards", async () => {
     const wrapper = mountCapture();
     await nextTick();
-    const files = [photo(), photo()];
-    const drop = new Event("drop", { bubbles: true, cancelable: true });
-    Object.defineProperty(drop, "dataTransfer", {
-      value: { items: files.map(file => ({ kind: "file", type: file.type })), files, dropEffect: "none" },
-    });
-    wrapper.get(".drop-zone").element.dispatchEvent(drop);
-    await nextTick();
+    const drop = await dropFiles(wrapper, [photo(), photo()]);
 
+    expect(drop.defaultPrevented).toBe(true);
     expect(wrapper.findAll(".draft-card")).toHaveLength(2);
-    expect(wrapper.get(".drop-zone").text()).toContain("Drop photos here");
+    expect(wrapper.get(".drop-zone").text()).toContain("Drop photos or PDFs here");
+    expect(wrapper.find(".skipped-files").exists()).toBe(false);
+  });
+});
+
+describe("IngestCapture: photos and PDFs only", () => {
+  const SKIPPED_ONE = "Skipped 1 file: only photos (JPEG, PNG, WebP, HEIC, AVIF, TIFF) and PDFs can be scanned.";
+
+  test("Choose offers photos and PDFs; the camera, photos", () => {
+    const wrapper = mountCapture();
+    expect(wrapper.get(".choose-input").attributes("accept")).toBe("image/*,application/pdf");
+    expect(wrapper.get(".camera-input").attributes("accept")).toBe("image/*");
+  });
+
+  test("a dropped text file is skipped, and the panel says so; the browser doesn't open it", async () => {
+    const wrapper = mountCapture();
+    await nextTick();
+    const drop = await dropFiles(wrapper, [file(["2 cups flour"], "notes.txt", "text/plain")]);
+
+    expect(drop.defaultPrevented).toBe(true);
+    expect(wrapper.find(".drafts").exists()).toBe(false);
+    expect(wrapper.get(".skipped-unsupported").text()).toBe(`${SKIPPED_ONE} notes.txt`);
+    expect(wrapper.find(".skipped-too-many-pages").exists()).toBe(false);
+    // under the buttons, so the shutter doesn't move
+    const children = Array.from(wrapper.get(".ingest-capture").element.children);
+    expect(children.indexOf(wrapper.get(".skipped-files").element))
+      .toBeGreaterThan(children.indexOf(wrapper.get(".capture-actions").element));
+
+    await wrapper.get(".skipped-files .alert-close").trigger("click");
+    expect(wrapper.find(".skipped-files").exists()).toBe(false);
+    expect(api.upload).not.toHaveBeenCalled();
+  });
+
+  test("a mixed drop keeps the photos and the PDF, and names what it skipped", async () => {
+    useRecipeIngestUploads().mode.value = "front-and-back";
+    const wrapper = mountCapture();
+    await nextTick();
+    const [a, b] = [photo(), photo()];
+    const scan = objectStreamPdf(2, { name: "scan.pdf" });
+    await dropFiles(wrapper, [
+      a,
+      file(["2 cups flour"], "notes.txt", "text/plain"),
+      file(["PK\u0003\u0004"], "recipe.docx"),
+      scan,
+      b,
+    ]);
+    // a compressed PDF takes a few more turns to read
+    await vi.waitFor(() => expect(wrapper.findAll(".draft-card")).toHaveLength(3));
+
+    expect(wrapper.get(".skipped-unsupported").text())
+      .toBe("Skipped 2 files: only photos (JPEG, PNG, WebP, HEIC, AVIF, TIFF) and PDFs can be scanned. notes.txt, recipe.docx");
+    const cards = wrapper.findAll(".draft-card");
+    expect(cards.map(card => card.get("h4").text())).toEqual(["Card 1", "Card 2 · 2 pages", "Card 3"]);
+    // the PDF: a placeholder with its name, never decoded
+    expect(cards[1]!.get(".photo-placeholder").text()).toBe("scan.pdf");
+
+    await button(wrapper, ".upload-drafts").trigger("click");
+    await flushPromises();
+    expect(photosSent()).toEqual([[a], [scan], [b]]);
+  });
+
+  test("Join counts a PDF's pages against the limit", async () => {
+    const wrapper = mountCapture({ maxPagesPerCard: 3 });
+    await pick(wrapper.get<HTMLInputElement>(".choose-input"), [classicPdf(2), photo(), photo()]);
+    await flushPromises();
+    const cards = () => wrapper.findAll(".draft-card");
+    expect(cards()).toHaveLength(3);
+
+    await cards()[0]!.get(".draft-join").trigger("click");
+    expect(cards().map(card => card.get("h4").text())).toEqual(["Card 1 · 3 pages", "Card 2"]);
+    expect(cards()[0]!.find(".draft-join").exists()).toBe(false);
+  });
+
+  test("a PDF with more pages than a card can have is skipped, and the panel says so", async () => {
+    const wrapper = mountCapture({ maxPagesPerCard: 4 });
+    await pick(wrapper.get<HTMLInputElement>(".choose-input"), [objectStreamPdf(6, { name: "booklet.pdf" }), photo()]);
+    await vi.waitFor(() => expect(wrapper.find(".skipped-files").exists()).toBe(true));
+
+    expect(wrapper.findAll(".draft-card")).toHaveLength(1);
+    expect(wrapper.get(".skipped-too-many-pages").text())
+      .toBe("Skipped 1 file with more than 4 pages: a card can have at most 4. booklet.pdf");
+    expect(wrapper.find(".skipped-unsupported").exists()).toBe(false);
+
+    // the next files replace the notice
+    await pick(wrapper.get<HTMLInputElement>(".choose-input"), [photo()]);
+    await flushPromises();
+    expect(wrapper.find(".skipped-files").exists()).toBe(false);
+  });
+
+  test("a long list of skipped files names the first five", async () => {
+    const wrapper = mountCapture();
+    const texts = Array.from({ length: 7 }, (_, index) => file(["x"], `note-${index + 1}.txt`, "text/plain"));
+    await pick(wrapper.get<HTMLInputElement>(".choose-input"), texts);
+    await flushPromises();
+
+    expect(wrapper.get(".skipped-names").text()).toBe("note-1.txt, note-2.txt, note-3.txt, note-4.txt, note-5.txt and 2 more");
+  });
+
+  test("a PDF given to the camera button (a computer's file picker) goes to the tray as a card of its own", async () => {
+    useRecipeIngestUploads().mode.value = "front-and-back";
+    const wrapper = mountCapture();
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [classicPdf(1, "front.pdf")]);
+    await flushPromises();
+
+    expect(wrapper.find(".pending-front").exists()).toBe(false);
+    expect(wrapper.findAll(".draft-card")).toHaveLength(1);
+    expect(api.upload).not.toHaveBeenCalled();
   });
 });
 
@@ -316,8 +431,8 @@ describe("IngestCapture thumbnails", () => {
       const wrapper = mountCapture();
       useRecipeIngestUploads().mode.value = "front-and-back";
       await pick(wrapper.get<HTMLInputElement>(".choose-input"), [
-        new File(["a"], "IMG_0001.HEIC", { type: "image/heic" }),
-        new File(["b"], "IMG_0002.HEIC", { type: "image/heic" }),
+        new File([ftypHead("heic"), "a"], "IMG_0001.HEIC", { type: "image/heic" }),
+        new File([ftypHead("heic"), "b"], "IMG_0002.HEIC", { type: "image/heic" }),
       ]);
       await flushPromises();
 

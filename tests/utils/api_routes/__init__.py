@@ -348,14 +348,29 @@ def ai_ingest_jobs_job_id_pages_index_rotate(job_id, index):
     return f"{prefix}/ai/ingest/jobs/{job_id}/pages/{index}/rotate"
 
 
+def ai_ingest_jobs_job_id_parse_lines(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/parse-lines`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/parse-lines"
+
+
 def ai_ingest_jobs_job_id_read_with_cloud(job_id):
     """`/api/ai/ingest/jobs/{job_id}/read-with-cloud`"""
     return f"{prefix}/ai/ingest/jobs/{job_id}/read-with-cloud"
 
 
+def ai_ingest_jobs_job_id_rebuild(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/rebuild`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/rebuild"
+
+
 def ai_ingest_jobs_job_id_reextract(job_id):
     """`/api/ai/ingest/jobs/{job_id}/reextract`"""
     return f"{prefix}/ai/ingest/jobs/{job_id}/reextract"
+
+
+def ai_ingest_jobs_job_id_region_hint(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/region-hint`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/region-hint"
 
 
 def ai_ingest_jobs_job_id_reread(job_id):

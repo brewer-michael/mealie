@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from test_jobs_api import banana_draft, job_row, job_url, seed_job
 
 from mealie.schema.recipe.recipe_ingredient import SaveIngredientFood
-from mealie.schema.recipe_ingest import CardDraftIngredient, ExtractionMeta
+from mealie.schema.recipe_ingest import CardDraftIngredient, CardDraftStep, ExtractionMeta, FlagResolution
 from mealie.schema.response.pagination import PaginationQuery
 from mealie.services.ai.ingest import review
 from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
@@ -83,6 +83,12 @@ def test_a_filled_blank_is_parsed_like_a_freshly_read_line(api_client: TestClien
     assert line["parse_confidence"] is not None
     assert line["display"].startswith("1 cup brown sugar")
 
+    # the save's answer carries the line as it was stored, so the page shows the amount, unit and food at once
+    assert [line["referenceId"] for line in saved["ingredients"]] == [ref]
+    answered = saved["ingredients"][0]
+    assert (answered["quantity"], answered["unit"]["name"], answered["food"]["name"]) == (1, "cup", "brown sugar")
+    assert answered["originalText"] == "1 C. brown sugar"
+
     # the line's flags are a freshly read line's: the marker's gone, and "C." was read as a cup
     flags = _flags_of(saved, ref)
     assert "blank" not in flags
@@ -123,6 +129,11 @@ def test_the_pages_unparsed_copy_of_the_line_changes_nothing(api_client: TestCli
     again = _put(api_client, user, job_id, draft)
     assert again["draftVersion"] == first["draftVersion"]  # the same draft: not an edit
     assert job_row(job_id)["draft"]["ingredients"][2] == parsed
+    assert [line["referenceId"] for line in again["ingredients"]] == [parsed["reference_id"]]
+
+    # a save of the parsed line as answered parses nothing
+    current = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    assert _put(api_client, user, job_id, current)["ingredients"] is None
 
     # an edit of it in that copy is parsed again
     draft["ingredients"][2] = _fill(draft["ingredients"][2], "2 C. packed brown sugar")
@@ -228,6 +239,7 @@ def test_a_parser_failure_never_loses_the_edit(
     saved = _put(api_client, user, job_id, draft)
 
     assert saved["draftVersion"] == 2
+    assert saved["ingredients"] is None
     line = job_row(job_id)["draft"]["ingredients"][2]
     assert (line["quantity"], line["unit"], line["food"], line["note"]) == (None, None, None, "1 C. brown sugar")
 
@@ -258,3 +270,161 @@ def test_a_failed_parse_logs_no_card_text(
     assert "(ValueError)" in records[0].getMessage()
     assert "brown" not in caplog.text and "sugar" not in caplog.text
     assert "Traceback" not in caplog.text
+
+
+# ==================================================================================================================
+# Lines kept as written with a marker
+
+
+MARKED_CARD = (
+    "Sugar Cookies\n1/4 t. salt\n1 C. [illegible]\n[blank] C. sugar\n[illegible]\n1/2 t. [illegible], sifted\n"
+    "Mix everything and bake for 10 minutes."
+)
+MARKED_LINES = ["1 C. [illegible]", "[blank] C. sugar", "[illegible]", "1/2 t. [illegible], sifted"]
+
+
+def _marked_card(user: TestUser, *, kept: bool = False) -> UUID:
+    """A card whose last four lines hold markers, as extraction keeps them (text); `kept` stores them kept already"""
+    banana = banana_draft()
+    draft = banana.model_copy(
+        update={
+            "name": "Sugar Cookies",
+            "ingredients": [banana.ingredients[1], *(_text_line(text) for text in MARKED_LINES)],
+            "steps": [CardDraftStep(text="Mix everything and bake for 10 minutes.")],
+        }
+    )
+    extraction = ExtractionMeta(read_path="image", provider="Claude", model="claude-sonnet", language="en")
+    resolutions = {}
+    if kept:
+        resolutions = {
+            f"{kind}:ingredients:{line.reference_id}": FlagResolution.kept
+            for line in draft.ingredients[1:]
+            for kind in ("illegible", "blank")
+        }
+    flags = compute_flags(draft, extraction, resolutions, transcription=MARKED_CARD)
+    return seed_job(user, draft=draft, flags=flags, transcription=MARKED_CARD, extraction=extraction)
+
+
+def _keep_every_marker(api_client: TestClient, user: TestUser, job_id: UUID) -> dict[str, Any]:
+    job = api_client.get(job_url(job_id), headers=user.token).json()
+    markers = {flag["id"]: "kept" for flag in job["flags"] if flag["kind"] in ("illegible", "blank")}
+    assert len(markers) == 4
+    return _put(api_client, user, job_id, job["draft"], flagResolutions=markers)
+
+
+def _commit(api_client: TestClient, user: TestUser, job_id: UUID) -> list[dict[str, Any]]:
+    response = api_client.post(
+        job_url(job_id, "commit"), json={"draftVersion": job_row(job_id)["draft_version"]}, headers=user.token
+    )
+    assert response.status_code == 201, response.text
+    recipe = api_client.get(api_routes.recipes_slug(response.json()["slug"]), headers=user.token).json()
+    return recipe["recipeIngredient"]
+
+
+def _fields(line: dict[str, Any]) -> tuple[Any, ...]:
+    """quantity, unit, food and note of a line in a save's answer or a recipe"""
+    unit, food = line.get("unit"), line.get("food")
+    return line["quantity"] or None, unit["name"] if unit else None, food["name"] if food else None, line["note"]
+
+
+def test_a_line_kept_with_a_marker_is_parsed_around_it_on_the_save_that_keeps_it(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    job_id = _marked_card(user)
+    refs = [line["reference_id"] for line in job_row(job_id)["draft"]["ingredients"][1:]]
+
+    saved = _keep_every_marker(api_client, user, job_id)
+
+    # the amount and unit are read; the marker stays in the note, kept, and commit writes it out
+    answered = {line["referenceId"]: line for line in saved["ingredients"]}
+    assert set(answered) == {refs[0], refs[1], refs[3]}  # "[illegible]" alone has nothing else to read
+    assert _fields(answered[refs[0]]) == (1, "cup", None, "[illegible]")
+    assert _fields(answered[refs[1]]) == (None, "cup", "sugar", "[blank]")  # the blank was the amount
+    assert answered[refs[1]]["display"] == "sugar [blank] cup"  # as the recipe will read: its unit isn't lost
+    assert _fields(answered[refs[3]]) == (0.5, "teaspoon", None, "[illegible], sifted")
+    assert answered[refs[0]]["originalText"] == "1 C. [illegible]"
+
+    stored = job_row(job_id)["draft"]["ingredients"]
+    assert [line["reference_id"] for line in stored[1:]] == refs
+    assert (stored[3]["quantity"], stored[3]["unit"], stored[3]["note"]) == (None, None, "[illegible]")
+    kept = {flag["ref"]: flag["resolution"] for flag in saved["flags"] if flag["kind"] in ("illegible", "blank")}
+    assert kept == dict.fromkeys(refs, "kept")
+    assert saved["errorCount"] == 0
+    assert "marker_dropped" not in {flag["kind"] for flag in saved["flags"]}
+
+    ingredients = _commit(api_client, user, job_id)
+    assert [_fields(line) for line in ingredients[1:]] == [
+        (1, "cup", None, "(unreadable)"),
+        # the recipe page shows a unit only with an amount: one whose amount is the marker is named after it
+        (None, None, "sugar", "___ cup"),
+        (None, None, None, "(unreadable)"),
+        (0.5, "teaspoon", None, "(unreadable), sifted"),
+    ]
+    assert ingredients[1]["originalText"] == "1 C. (unreadable)"
+    # the recipe page's text for each line (upstream's display: amount, unit with an amount, food, then note)
+    assert [line["display"] for line in ingredients[1:]] == [
+        "1 cup (unreadable)",
+        "sugar ___ cup",
+        "(unreadable)",
+        "¹/₂ teaspoon (unreadable), sifted",
+    ]
+
+
+def test_a_kept_line_taken_back_keeps_its_reading_and_its_flag(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    job_id = _marked_card(user)
+    saved = _keep_every_marker(api_client, user, job_id)
+    ref = job_row(job_id)["draft"]["ingredients"][1]["reference_id"]
+    flag = next(flag["id"] for flag in saved["flags"] if flag["ref"] == ref)
+
+    current = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    again = _put(api_client, user, job_id, current, flagResolutions={flag: None})
+    assert again["ingredients"] is None
+    line = next(line for line in job_row(job_id)["draft"]["ingredients"] if line["reference_id"] == ref)
+    assert (line["quantity"], line["unit"]["name"], line["note"]) == (1, "cup", "[illegible]")
+    assert _flags_of(again, ref)["illegible"]["resolution"] is None  # to fill in again, or keep
+    assert again["errorCount"] == 1
+
+
+def test_a_line_kept_before_the_parse_on_save_is_parsed_at_commit(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    # a draft whose markers were kept before lines kept with a marker were parsed: commit parses them
+    user = unique_user_fn_scoped
+    job_id = _marked_card(user, kept=True)
+    assert job_row(job_id)["error_count"] == 0
+    assert job_row(job_id)["draft"]["ingredients"][1]["unit"] is None
+
+    ingredients = _commit(api_client, user, job_id)
+    assert [_fields(line) for line in ingredients[1:]] == [
+        (1, "cup", None, "(unreadable)"),
+        (None, None, "sugar", "___ cup"),
+        (None, None, None, "(unreadable)"),
+        (0.5, "teaspoon", None, "(unreadable), sifted"),
+    ]
+    assert ingredients[2]["display"] == "sugar ___ cup"
+
+
+def test_a_kept_line_on_a_card_in_another_language_stays_as_written(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    user = unique_user_fn_scoped
+    banana = banana_draft()
+    line = _text_line("1 Tasse [illegible]")
+    draft = banana.model_copy(update={"ingredients": [line], "steps": [CardDraftStep(text="Backen.")]})
+    extraction = ExtractionMeta(read_path="image", provider="Claude", model="claude-sonnet", language="de")
+    flags = compute_flags(draft, extraction, {}, transcription="Kuchen\n1 Tasse [illegible]\nBacken.")
+    job_id = seed_job(
+        user, draft=draft, flags=flags, transcription="Kuchen\n1 Tasse [illegible]\nBacken.", extraction=extraction
+    )
+
+    saved = _keep_every_marker_of(api_client, user, job_id)
+    assert saved["ingredients"] is None
+    assert [_fields(line) for line in _commit(api_client, user, job_id)] == [(None, None, None, "1 Tasse (unreadable)")]
+
+
+def _keep_every_marker_of(api_client: TestClient, user: TestUser, job_id: UUID) -> dict[str, Any]:
+    job = api_client.get(job_url(job_id), headers=user.token).json()
+    markers = {flag["id"]: "kept" for flag in job["flags"] if flag["kind"] in ("illegible", "blank")}
+    return _put(api_client, user, job_id, job["draft"], flagResolutions=markers)

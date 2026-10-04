@@ -43,7 +43,8 @@ export type IngestRejectReason =
   | "too_many_pages"
   | "duplicate"
   | "url_not_allowed"
-  | "url_fetch_failed";
+  | "url_fetch_failed"
+  | "no_permission";
 export type IngestStatus = "processing" | "ready" | "failed" | "committing" | "committed";
 export type PageRotationSource = "none" | "ocr" | "user" | "model";
 export type IngestSource = "app" | "api" | "inbox";

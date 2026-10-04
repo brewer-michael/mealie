@@ -64,7 +64,7 @@
         >
           <v-icon :icon="$globals.icons.chevronRight" />
         </v-btn>
-        <v-menu location="bottom end">
+        <v-menu location="bottom end" @update:model-value="open => open && review.canMerge.value && review.checkPreviousCard()">
           <template #activator="{ props: menuProps }">
             <v-btn
               v-bind="menuProps"
@@ -107,6 +107,16 @@
               :title="$t('recipe-ingest.review.save-eval')"
               :disabled="!canExportEval"
               @click="evalDialog = true"
+            />
+            <!-- a back sent as a card of its own: its photos join the card before it in the batch -->
+            <v-list-item
+              v-if="review.canMerge.value"
+              class="ingest-review__merge"
+              :prepend-icon="mdiCardMultipleOutline"
+              :title="$t('recipe-ingest.review.merge')"
+              :subtitle="mergeReason ?? undefined"
+              :disabled="!!review.mergeBlock.value || !!review.pendingAction.value"
+              @click="mergeDialog = true"
             />
             <v-list-item
               v-if="job.permissions?.canDiscard"
@@ -159,13 +169,24 @@
               <v-alert type="error" variant="tonal" class="ingest-review__status">
                 {{ $t("recipe-ingest.queue.failed", { reason: job.error ? ingestErrorText(job.error.code, job.error.params) : "" }) }}
               </v-alert>
-              <div class="d-flex ga-2 mt-3">
+              <div class="d-flex flex-wrap ga-2 mt-3">
                 <v-btn
                   color="primary"
                   :loading="review.pendingAction.value === 'retry'"
                   @click="review.retry()"
                 >
                   {{ $t("recipe-ingest.queue.retry") }}
+                </v-btn>
+                <!-- a card sent to stay local that nothing local could read: its uploader or a manager may send it out -->
+                <v-btn
+                  v-if="job.permissions?.canReadWithCloud"
+                  class="ingest-review__cloud"
+                  variant="tonal"
+                  :prepend-icon="mdiCloudUploadOutline"
+                  :loading="review.pendingAction.value === 'cloud'"
+                  @click="cloudDialog = true"
+                >
+                  {{ $t("recipe-ingest.review.read-with-cloud") }}
                 </v-btn>
                 <v-btn
                   v-if="job.permissions?.canDiscard"
@@ -187,13 +208,24 @@
               <v-alert type="success" variant="tonal" class="ingest-review__status">
                 {{ $t("recipe-ingest.queue.committed") }}
               </v-alert>
-              <div class="d-flex ga-2 mt-3">
+              <div class="d-flex flex-wrap ga-2 mt-3">
                 <v-btn
                   v-if="job.recipe?.slug"
                   color="primary"
                   :to="`/g/${groupSlug}/r/${job.recipe.slug}`"
                 >
                   {{ $t("recipe-ingest.queue.view-recipe") }}
+                </v-btn>
+                <!-- a mistaken commit: the recipe goes and the card comes back to review -->
+                <v-btn
+                  v-if="job.permissions?.canUncommit"
+                  class="ingest-review__uncommit"
+                  variant="tonal"
+                  :prepend-icon="$globals.icons.undo"
+                  :loading="review.pendingAction.value === 'uncommit'"
+                  @click="uncommitDialog = true"
+                >
+                  {{ $t("recipe-ingest.review.back-to-review") }}
                 </v-btn>
                 <v-btn variant="text" @click="review.skip()">
                   {{ $t("recipe-ingest.review.next") }}
@@ -403,9 +435,12 @@
                 <v-expansion-panel value="notes">
                   <v-expansion-panel-title>{{ $t("recipe-ingest.review.notes") }}</v-expansion-panel-title>
                   <v-expansion-panel-text :id="fieldAnchorId('notes')">
-                    <RecipeNotes
-                      v-model="review.draft.value.notes"
-                      :edit="!review.readOnly.value"
+                    <IngestNoteList
+                      v-model="review.draft.value"
+                      :flags="review.openFlags.value"
+                      :readonly="review.readOnly.value"
+                      :can-reread="canReread"
+                      @reread="ref => openReread('notes', ref)"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -497,6 +532,88 @@
         </v-card-text>
       </BaseDialog>
       <BaseDialog
+        v-model="cloudDialog"
+        :title="$t('recipe-ingest.review.read-with-cloud')"
+        :icon="mdiCloudUploadOutline"
+        color="warning"
+      >
+        <v-card-text>
+          {{ $t("recipe-ingest.review.read-with-cloud-text") }}
+        </v-card-text>
+        <template #card-actions>
+          <v-btn variant="text" class="ingest-review__cloud-cancel" @click="cloudDialog = false">
+            {{ $t("general.cancel") }}
+          </v-btn>
+          <v-spacer />
+          <v-btn color="warning" variant="flat" class="ingest-review__cloud-confirm" @click="readWithCloud">
+            {{ $t("recipe-ingest.review.read-with-cloud") }}
+          </v-btn>
+        </template>
+      </BaseDialog>
+      <BaseDialog
+        v-model="mergeDialog"
+        :title="$t('recipe-ingest.review.merge')"
+        :icon="mdiCardMultipleOutline"
+      >
+        <v-card-text>
+          {{ $t("recipe-ingest.review.merge-text", { number: previousNumber }) }}
+        </v-card-text>
+        <template #card-actions>
+          <v-btn variant="text" class="ingest-review__merge-cancel" @click="mergeDialog = false">
+            {{ $t("general.cancel") }}
+          </v-btn>
+          <v-spacer />
+          <v-btn
+            color="primary"
+            variant="flat"
+            class="ingest-review__merge-confirm"
+            :disabled="!!review.mergeBlock.value"
+            @click="mergeIntoPrevious"
+          >
+            {{ $t("recipe-ingest.review.merge-confirm") }}
+          </v-btn>
+        </template>
+      </BaseDialog>
+      <BaseDialog
+        v-model="uncommitDialog"
+        :title="$t('recipe-ingest.review.back-to-review')"
+        :icon="$globals.icons.undo"
+        color="warning"
+      >
+        <v-card-text>
+          {{ $t("recipe-ingest.review.back-to-review-text", { name: recipeName }) }}
+        </v-card-text>
+        <template #card-actions>
+          <v-btn variant="text" class="ingest-review__uncommit-cancel" @click="uncommitDialog = false">
+            {{ $t("general.cancel") }}
+          </v-btn>
+          <v-spacer />
+          <v-btn color="warning" variant="flat" class="ingest-review__uncommit-confirm" @click="uncommit(false)">
+            {{ $t("recipe-ingest.review.back-to-review") }}
+          </v-btn>
+        </template>
+      </BaseDialog>
+      <!-- the recipe was edited after the commit: going back would delete those edits too -->
+      <BaseDialog
+        v-model="uncommitEditedDialog"
+        :title="$t('recipe-ingest.review.recipe-edited-title')"
+        :icon="$globals.icons.alert"
+        color="error"
+      >
+        <v-card-text>
+          {{ ingestErrorText("recipe_edited") }}
+        </v-card-text>
+        <template #card-actions>
+          <v-btn variant="text" class="ingest-review__uncommit-keep" @click="uncommitEditedDialog = false">
+            {{ $t("recipe-ingest.review.keep-recipe") }}
+          </v-btn>
+          <v-spacer />
+          <v-btn color="error" variant="flat" class="ingest-review__uncommit-force" @click="uncommit(true)">
+            {{ $t("recipe-ingest.review.delete-anyway") }}
+          </v-btn>
+        </template>
+      </BaseDialog>
+      <BaseDialog
         :model-value="review.conflict.value && conflictDialog"
         :title="$t('recipe-ingest.review.reload-title')"
         :icon="$globals.icons.alert"
@@ -545,12 +662,13 @@
 </template>
 
 <script setup lang="ts">
-import { mdiCropFree, mdiTextRecognition } from "@mdi/js";
+import { mdiCardMultipleOutline, mdiCloudUploadOutline, mdiCropFree, mdiTextRecognition } from "@mdi/js";
 import { useActiveElement, useElementSize, useMagicKeys, whenever } from "@vueuse/core";
 import IngestCardViewer from "~/components/Domain/Ingest/IngestCardViewer.vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestIngredientList from "~/components/Domain/Ingest/IngestIngredientList.vue";
 import IngestNeedsALook from "~/components/Domain/Ingest/IngestNeedsALook.vue";
+import IngestNoteList from "~/components/Domain/Ingest/IngestNoteList.vue";
 import IngestOrganizerSelector from "~/components/Domain/Ingest/IngestOrganizerSelector.vue";
 import IngestProposalBanner from "~/components/Domain/Ingest/IngestProposalBanner.vue";
 import IngestRecipeFields from "~/components/Domain/Ingest/IngestRecipeFields.vue";
@@ -558,7 +676,6 @@ import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vu
 import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
-import RecipeNotes from "~/components/Domain/Recipe/RecipeNotes.vue";
 import { useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,
@@ -569,6 +686,7 @@ import {
   type RereadTargetOption,
 } from "~/composables/use-recipe-ingest-review";
 import { useRecipeIngestReview } from "~/composables/use-recipe-ingest-review";
+import type { EvalCaseRequest } from "~/lib/api/types/recipe-ingest";
 
 /**
  * Reviewing one recipe card (docs/ai/PHASE2.md §6): the card beside (desktop) or above (phone) its draft, what needs a
@@ -712,6 +830,24 @@ const discardDialog = ref(false);
 const evalDialog = ref(false);
 const evalExists = ref(false);
 const conflictDialog = ref(true);
+const cloudDialog = ref(false);
+const uncommitDialog = ref(false);
+const uncommitEditedDialog = ref(false);
+const mergeDialog = ref(false);
+
+/** Why this card can't be added to the previous one now, under the menu item */
+const mergeReason = computed(() => {
+  const block = review.mergeBlock.value;
+  if (!block) {
+    return null;
+  }
+  return i18n.t(`recipe-ingest.review.merge-${block}`, { max: review.maxPagesPerCard.value });
+});
+/** The previous card's number in its batch ("card 2"), as the merge dialog names it */
+const previousNumber = computed(() => Math.max(1, (position.value?.number ?? 2) - 1));
+
+/** The recipe an added card became, as Back to review names it */
+const recipeName = computed(() => job.value?.recipe?.name || job.value?.title || review.draft.value.name);
 
 const canRotate = computed(() =>
   (job.value?.status === "ready" || job.value?.status === "failed")
@@ -741,8 +877,26 @@ function rotateCurrent() {
   }
 }
 
-async function saveEvalCase(value: { slug: string; verified: boolean }) {
-  const result = await review.saveEvalCase(value.slug, value.verified);
+async function readWithCloud() {
+  cloudDialog.value = false;
+  await review.readWithCloud();
+}
+
+/** Back to review; a recipe edited since asks again, and only that dialog sends it with `force` */
+async function uncommit(force: boolean) {
+  uncommitDialog.value = false;
+  uncommitEditedDialog.value = false;
+  const outcome = await review.uncommit(force);
+  uncommitEditedDialog.value = outcome === "edited" && !force;
+}
+
+async function mergeIntoPrevious() {
+  mergeDialog.value = false;
+  await review.mergeIntoPrevious();
+}
+
+async function saveEvalCase(request: EvalCaseRequest) {
+  const result = await review.saveEvalCase(request);
   if (result === "saved") {
     evalDialog.value = false;
   }
@@ -850,6 +1004,10 @@ const dialogOpen = computed(() =>
   || evalDialog.value
   || discardDialog.value
   || transcriptionDialog.value
+  || cloudDialog.value
+  || uncommitDialog.value
+  || uncommitEditedDialog.value
+  || mergeDialog.value
   || review.conflict.value
   || !!leaveTo.value,
 );
@@ -914,5 +1072,16 @@ whenever(() => keys.Escape!.value && regionDialog.value, () => {
 
 .ingest-review__editor {
   min-width: 0;
+}
+
+/* the ⋯ menu's reason why a card can't be added to the previous one, said in full rather than cut off */
+.ingest-review__menu {
+  max-width: 360px;
+}
+
+.ingest-review__merge :deep(.v-list-item-subtitle) {
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  white-space: normal;
 }
 </style>

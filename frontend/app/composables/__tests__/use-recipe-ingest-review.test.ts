@@ -5,6 +5,7 @@ import {
   applyAlternative,
   applyProposal,
   buildNeedsALook,
+  cloneDraft,
   draftsEqual,
   editFlaggedText,
   fieldText,
@@ -17,6 +18,7 @@ import {
   formatQuantity,
   highlightSegments,
   ingredientAsText,
+  mergeBlockOf,
   ingredientDisplay,
   nextBatchCard,
   nextCardInBatch,
@@ -60,7 +62,10 @@ const api = vi.hoisted(() => ({
   reextract: vi.fn(),
   rotatePage: vi.fn(),
   retry: vi.fn(),
+  readWithCloud: vi.fn(),
   commit: vi.fn(),
+  uncommit: vi.fn(),
+  merge: vi.fn(),
   discard: vi.fn(),
   saveEvalCase: vi.fn(),
   getCounts: vi.fn(),
@@ -334,39 +339,69 @@ describe("flags", () => {
     expect(fieldText({ ...draft, prepTime: "5 minutes" }, "prep_time")).toBe("5 minutes");
   });
 
-  test("a flag on a note is about the note its ref names, not the first one holding the marker", () => {
-    // the server keys notes by index: two notes with a blank raise blank:notes:0 and blank:notes:1
+  test("a flag on a note is about the note its id names, wherever that note is now", () => {
+    // the server keys notes by their ids: two notes with a blank raise blank:notes:n1 and blank:notes:n2
     const draft = normalizeDraft(bananaDraft({
-      notes: [{ title: "", text: "Bake [blank] min if doubled" }, { title: "", text: "Cool [blank] min" }],
+      notes: [{ id: "n1", title: "", text: "Bake [blank] min if doubled" }, { id: "n2", title: "", text: "Cool [blank] min" }],
     }));
-    const second = flag({ id: "blank:notes:1", field: "notes", ref: "1" });
-    const first = flag({ id: "blank:notes:0", field: "notes", ref: "0" });
+    const second = flag({ id: "blank:notes:n2", field: "notes", ref: "n2" });
+    const first = flag({ id: "blank:notes:n1", field: "notes", ref: "n1" });
 
-    expect(fieldText(draft, "notes", "1")).toBe("Cool [blank] min");
+    expect(fieldText(draft, "notes", "n2")).toBe("Cool [blank] min");
     const { items } = buildNeedsALook([second, first], [second, first], new Set(), draft, []);
     expect(items.map(item => [item.flag.id, item.line, item.text])).toEqual([
-      ["blank:notes:0", 0, "Bake [blank] min if doubled"],
-      ["blank:notes:1", 1, "Cool [blank] min"],
+      ["blank:notes:n1", 0, "Bake [blank] min if doubled"],
+      ["blank:notes:n2", 1, "Cool [blank] min"],
     ]);
 
+    // moved up, the second note keeps its flag: the item follows it, in its new place
+    draft.notes.reverse();
+    expect(fieldText(draft, "notes", "n2")).toBe("Cool [blank] min");
+    expect(buildNeedsALook([second, first], [second, first], new Set(), draft, []).items.map(item => [item.flag.id, item.line]))
+      .toEqual([["blank:notes:n2", 0], ["blank:notes:n1", 1]]);
+
     expect(editFlaggedText(draft, second, "5", "fill")).toBe(true);
-    expect(draft.notes.map(note => note.text)).toEqual(["Bake [blank] min if doubled", "Cool 5 min"]);
+    expect(draft.notes.map(note => note.text)).toEqual(["Cool 5 min", "Bake [blank] min if doubled"]);
     expect(editFlaggedText(draft, first, "20", "fill")).toBe(true);
-    expect(draft.notes.map(note => note.text)).toEqual(["Bake 20 min if doubled", "Cool 5 min"]);
+    expect(draft.notes.map(note => note.text)).toEqual(["Cool 5 min", "Bake 20 min if doubled"]);
+    expect(draft.notes.map(note => note.id)).toEqual(["n2", "n1"]);
   });
 
   test("a marker in a note's title is filled there", () => {
     const draft = normalizeDraft(bananaDraft({
-      notes: [{ title: "", text: "Grandma Jo's, 1962" }, { title: "From [blank]", text: "Can double for a 9x13 pan" }],
+      notes: [{ id: "n1", title: "", text: "Grandma Jo's, 1962" }, { id: "n2", title: "From [blank]", text: "Can double for a 9x13 pan" }],
     }));
-    const titleFlag = flag({ id: "blank:notes:1", field: "notes", ref: "1" });
+    const titleFlag = flag({ id: "blank:notes:n2", field: "notes", ref: "n2" });
 
-    expect(fieldText(draft, "notes", "1")).toBe("From [blank]\nCan double for a 9x13 pan");
+    expect(fieldText(draft, "notes", "n2")).toBe("From [blank]\nCan double for a 9x13 pan");
     expect(editFlaggedText(draft, titleFlag, "Aunt May", "fill")).toBe(true);
-    expect(draft.notes[1]).toMatchObject({ title: "From Aunt May", text: "Can double for a 9x13 pan" });
+    expect(draft.notes[1]).toMatchObject({ id: "n2", title: "From Aunt May", text: "Can double for a 9x13 pan" });
     expect(draft.notes[0]!.text).toBe("Grandma Jo's, 1962");
-    // a note that's gone points at nothing
-    expect(editFlaggedText(draft, flag({ id: "blank:notes:5", field: "notes", ref: "5" }), "x", "fill")).toBe(false);
+    // a note that's gone points at nothing, and a position is no note's id
+    expect(editFlaggedText(draft, flag({ id: "blank:notes:gone", field: "notes", ref: "gone" }), "x", "fill")).toBe(false);
+    expect(editFlaggedText(draft, flag({ id: "blank:notes:0", field: "notes", ref: "0" }), "x", "fill")).toBe(false);
+    expect(fieldText(draft, "notes", "0")).toBe("");
+  });
+
+  test("notes keep their ids, and a note without one gets one", () => {
+    const draft = normalizeDraft(bananaDraft({ notes: [{ id: "n1", title: "From", text: "Grandma Jo" }, { title: "", text: "Doubles well" }] }));
+    expect(draft.notes[0]).toEqual({ id: "n1", title: "From", text: "Grandma Jo" });
+    expect(draft.notes[1]!.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    // the ids go out with the draft, so the server keys the note's flags (and their resolutions) to them
+    expect(cloneDraft(draft).notes!.map(note => note.id)).toEqual(["n1", draft.notes[1]!.id]);
+  });
+
+  test("a re-read of a note goes into that note; one for a new note adds it, with an id", () => {
+    const draft = normalizeDraft(bananaDraft({ notes: [{ id: "n1", title: "Tip", text: "Use a big mug" }, { id: "n2", title: "", text: "Doubles [illegible]" }] }));
+    applyProposal(draft, { id: "p1", kind: "region", target: { field: "notes", ref: "n2" }, text: "Doubles well", readable: true }, "replace");
+    expect(draft.notes.map(note => [note.id, note.title, note.text])).toEqual([["n1", "Tip", "Use a big mug"], ["n2", "", "Doubles well"]]);
+    applyProposal(draft, { id: "p2", kind: "region", target: { field: "notes", ref: "n1" }, text: "or a ramekin", readable: true }, "append");
+    expect(draft.notes[0]!.text).toBe("Use a big mug or a ramekin");
+    applyProposal(draft, { id: "p3", kind: "region", target: { field: "notes", ref: null }, text: "Freezes well", readable: true }, "replace");
+    expect(draft.notes).toHaveLength(3);
+    expect(draft.notes[2]).toMatchObject({ title: "", text: "Freezes well" });
+    expect(draft.notes[2]!.id).toBeTruthy();
+    expect(new Set(draft.notes.map(note => note.id)).size).toBe(3);
   });
 });
 
@@ -452,14 +487,14 @@ describe("flag positions", () => {
   });
 
   test("a position in a note's text is shifted past its title in the item's text", () => {
-    const draft = normalizeDraft(bananaDraft({ notes: [{ title: "Doubled 2x", text: "Bake 2 hours at 2 racks" }] }));
+    const draft = normalizeDraft(bananaDraft({ notes: [{ id: "n1", title: "Doubled 2x", text: "Bake 2 hours at 2 racks" }] }));
     const noteFlag = flag({
-      id: "not_on_card:notes:0#abc",
+      id: "not_on_card:notes:n1",
       kind: "not_on_card",
       severity: "warning",
       source: "validator",
       field: "notes",
-      ref: "0",
+      ref: "n1",
       params: { value: "2", start: 16, end: 17 },
     });
     const { items } = buildNeedsALook([noteFlag], [noteFlag], new Set(), draft, []);
@@ -648,13 +683,45 @@ describe("drafts and proposals", () => {
     expect(lines.every(option => option.target.ref)).toBe(true);
     expect(options.find(option => option.kind === "new-ingredient")!.target).toEqual({ field: "ingredients", ref: null });
     expect(options.find(option => option.kind === "new-step")!.target).toEqual({ field: "steps", ref: null });
-    expect(options.find(option => option.kind === "note")!.target).toEqual({ field: "notes", ref: null });
+    expect(options.find(option => option.kind === "new-note")!.target).toEqual({ field: "notes", ref: null });
     expect(rereadTargetValue(options, "steps", "s2")).toBe("steps:s2");
     expect(rereadTargetValue(options, "prep_time", null)).toBe("prepTime");
     expect(rereadTargetValue(options, "ingredients", "gone")).toBe("ingredients:i1");
     // an empty section's flag has no line: its re-read adds one
     expect(rereadTargetValue(options, "steps", null)).toBe("steps:new");
     expect(rereadTargetValue(rereadTargets(normalizeDraft({ name: "Banana Mug Cake" })), "ingredients", "gone")).toBe("ingredients:new");
+  });
+
+  test("each note is a re-read target by its id, named by its title or its first words", () => {
+    const options = rereadTargets(normalizeDraft(bananaDraft({
+      notes: [{ id: "n1", title: "From", text: "Grandma Jo" }, { id: "n2", title: "", text: "Doubles well in a 9x13 pan, baked a little longer" }],
+    })));
+    expect(options.filter(option => option.kind === "note").map(option => [option.value, option.target, option.text])).toEqual([
+      ["notes:n1", { field: "notes", ref: "n1" }, "From"],
+      ["notes:n2", { field: "notes", ref: "n2" }, "Doubles well in a 9x13 pan, baked a…"],
+    ]);
+    // a note flag's Re-read is aimed at its note, not at a new one
+    expect(rereadTargetValue(options, "notes", "n2")).toBe("notes:n2");
+    expect(rereadTargetValue(options, "notes", null)).toBe("notes:new");
+  });
+
+  test("a card can become the back of the previous card only while both can be read again together", () => {
+    const card = { pageCount: 1 };
+    const previous = (overrides: Partial<RecipeIngestionJobOut> = {}) => ({ ...job({ id: "j0", pageCount: 1, permissions: { canMerge: true } }), ...overrides });
+
+    expect(mergeBlockOf(card, previous(), 4)).toBeNull();
+    // still finding out which card is before it
+    expect(mergeBlockOf(card, undefined, 4)).toBe("checking");
+    expect(mergeBlockOf(card, null, 4)).toBe("no-previous");
+    expect(mergeBlockOf(card, previous({ status: "committed" }), 4)).toBe("previous-added");
+    expect(mergeBlockOf(card, previous({ status: "committing" }), 4)).toBe("previous-added");
+    expect(mergeBlockOf(card, previous({ status: "processing" }), 4)).toBe("previous-busy");
+    expect(mergeBlockOf(card, previous({ task: { kind: "reread", state: "running" } }), 4)).toBe("previous-busy");
+    expect(mergeBlockOf({ pageCount: 2 }, previous({ pageCount: 3 }), 4)).toBe("too-many-pages");
+    expect(mergeBlockOf({ pageCount: 2 }, previous({ pageCount: 2 }), 4)).toBeNull();
+    // a failed card can take a back too, but only one the user may change
+    expect(mergeBlockOf(card, previous({ status: "failed" }), 4)).toBeNull();
+    expect(mergeBlockOf(card, previous({ permissions: { canMerge: false } }), 4)).toBe("previous-not-allowed");
   });
 
   test("eval case names are made from the recipe's name", () => {
@@ -1052,7 +1119,8 @@ describe("useRecipeIngestReview", () => {
     // the next card's page says it in its review bar: upstream's toast would cover that page's header on phones
     expect(toast.success).not.toHaveBeenCalled();
     expect(takeRecipeIngestCommitNotice()).toBeNull();
-    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null });
+    // with Undo for the card just added
+    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null, undoJobId: "j1" });
     expect(takeCarriedReviewNotice("j2")).toBeNull();
   });
 
@@ -1073,7 +1141,8 @@ describe("useRecipeIngestReview", () => {
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
     // left for the queue, which says it beside its summary line: a toast would cover the page's title
     expect(toast.success).not.toHaveBeenCalled();
-    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake", warning: null });
+    // with the card just added, for the queue's Undo
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake", warning: null, undoJobId: "j1" });
   });
 
   test("after the last ready card, while cards of the batch are still being read, the queue opens on the batch", async () => {
@@ -1092,7 +1161,7 @@ describe("useRecipeIngestReview", () => {
 
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
     expect(api.getJobs).not.toHaveBeenCalled();
-    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake · 2 cards are still being read", warning: null });
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake · 2 cards are still being read", warning: null, undoJobId: "j1" });
   });
 
   test("after a batch's last card, Commit & next goes on to another batch's ready card", async () => {
@@ -1115,6 +1184,7 @@ describe("useRecipeIngestReview", () => {
       kind: "warning",
       text: "Added Banana Mug Cake · Next batch",
       detail: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+      undoJobId: "j1",
     });
   });
 
@@ -1377,22 +1447,32 @@ describe("useRecipeIngestReview", () => {
     expect(review.proposals.value.map(item => item.id)).toEqual(["p1"]);
   });
 
+  test("Save as eval case sends the name, the tick, the tags and the notes", async () => {
+    const { review } = await loaded();
+    api.saveEvalCase.mockResolvedValueOnce(ok({ slug: "banana-mug-cake", files: [] }));
+
+    const request = { slug: "banana-mug-cake", verified: true, tags: ["handwritten" as const, "faded" as const], notes: "Pencil" };
+    expect(await review.saveEvalCase(request)).toBe("saved");
+    expect(api.saveEvalCase).toHaveBeenCalledExactlyOnceWith("j1", request);
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "Saved as banana-mug-cake" });
+  });
+
   test("Save as eval case says a name is taken only when it is; other refusals say why", async () => {
     const { review } = await loaded();
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "eval_case_exists" }));
-    expect(await review.saveEvalCase("banana-mug-cake", true)).toBe("exists");
+    expect(await review.saveEvalCase({ slug: "banana-mug-cake", verified: true })).toBe("exists");
     expect(review.notice.value).toBeNull();
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "not_exportable" }));
-    expect(await review.saveEvalCase("banana-mug-cake-2", true)).toBe("failed");
+    expect(await review.saveEvalCase({ slug: "banana-mug-cake-2", verified: true })).toBe("failed");
     expect(review.notice.value).toMatchObject({
       kind: "error",
       text: "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
     });
 
     api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "files_missing" }));
-    expect(await review.saveEvalCase("banana-mug-cake-3", true)).toBe("failed");
+    expect(await review.saveEvalCase({ slug: "banana-mug-cake-3", verified: true })).toBe("failed");
     expect(review.notice.value).toMatchObject({ kind: "error", text: "The card's photos are missing. Scan it again." });
     expect(toast.error).not.toHaveBeenCalled();
   });
@@ -1412,6 +1492,7 @@ describe("useRecipeIngestReview", () => {
       kind: "warning",
       text: "Added Banana Mug Cake",
       detail: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+      undoJobId: "j1",
     });
     expect(toast.success).not.toHaveBeenCalled();
     expect(toast.warning).not.toHaveBeenCalled();
@@ -1430,6 +1511,7 @@ describe("useRecipeIngestReview", () => {
     expect(takeRecipeIngestCommitNotice()).toEqual({
       text: "Added Banana Mug Cake",
       warning: "The tag \"Desserts\" no longer exists, so it wasn't added.",
+      undoJobId: "j1",
     });
   });
 
@@ -1612,6 +1694,205 @@ describe("useRecipeIngestReview", () => {
     await review.runNoticeAction();
     expect(api.retry).toHaveBeenCalledExactlyOnceWith("j1");
     expect(api.reextract).not.toHaveBeenCalled();
+  });
+
+  test("a failed card kept on this server can be read with the group's cloud providers: it's no longer kept local", async () => {
+    const localOnlyFailed = { code: "local_only_unavailable" as const, params: {} };
+    api.getJob.mockResolvedValueOnce(ok(job({
+      status: "failed",
+      draft: null,
+      flags: [],
+      localOnly: true,
+      error: localOnlyFailed,
+      permissions: { canDiscard: true, canReadWithCloud: true },
+    })));
+    api.readWithCloud.mockResolvedValueOnce(ok(state({ status: "processing", task: { kind: "extract", state: "queued" } })));
+    const { review } = await loaded();
+
+    expect(await review.readWithCloud()).toBe(true);
+    expect(api.readWithCloud).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(review.job.value).toMatchObject({ status: "processing", localOnly: false, error: null, task: { kind: "extract", state: "queued" } });
+    expect(review.job.value!.permissions).toEqual({ canDiscard: true, canReadWithCloud: false });
+    expect(review.notice.value).toBeNull();
+  });
+
+  test("reading with the cloud refused (the group now keeps every card local) says why and shows the card as it is", async () => {
+    const failed = job({
+      status: "failed",
+      draft: null,
+      flags: [],
+      localOnly: true,
+      error: { code: "local_only_unavailable", params: {} },
+      permissions: { canReadWithCloud: true },
+    });
+    api.getJob.mockResolvedValueOnce(ok(failed));
+    const { review } = await loaded();
+    api.readWithCloud.mockResolvedValueOnce(apiError(409, { code: "group_local_only" }));
+    api.getJob.mockResolvedValueOnce(ok({ ...failed, permissions: { canReadWithCloud: false } }));
+
+    expect(await review.readWithCloud()).toBe(false);
+    expect(review.notice.value).toMatchObject({
+      kind: "error",
+      text: "This group keeps every card on this server, so cards can't be read with a cloud provider.",
+    });
+    expect(api.getJob).toHaveBeenCalledTimes(2);
+    expect(review.job.value).toMatchObject({ status: "failed", localOnly: true, permissions: { canReadWithCloud: false } });
+  });
+
+  test("Back to review deletes the recipe and brings the card back for review with its draft", async () => {
+    const committed = job({ status: "committed", flags: [], recipe: { id: "r1", slug: "banana-mug-cake", name: "Banana Mug Cake" }, permissions: { canUncommit: true } });
+    api.getJob.mockResolvedValueOnce(ok(committed));
+    const { review } = await loaded();
+    expect(review.readOnly.value).toBe(true);
+
+    api.uncommit.mockResolvedValueOnce(ok(state({ status: "ready", draftVersion: 4 })));
+    api.getJob.mockResolvedValueOnce(ok(job({ draftVersion: 4, flags: [], recipe: null, permissions: { canUncommit: false } })));
+    expect(await review.uncommit()).toBe("done");
+
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("j1", {});
+    expect(review.job.value).toMatchObject({ status: "ready", draftVersion: 4, recipe: null });
+    expect(review.draft.value.name).toBe("Banana Mug Cake");
+    expect(review.readOnly.value).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "The card is back for review." });
+    expect(api.getCounts).toHaveBeenCalled();
+  });
+
+  test("Back to review asks again when the recipe was edited since; with force it goes back anyway", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ status: "committed", flags: [], permissions: { canUncommit: true } })));
+    const { review } = await loaded();
+
+    api.uncommit.mockResolvedValueOnce(apiError(409, { code: "recipe_edited" }));
+    expect(await review.uncommit()).toBe("edited");
+    // the page asks; nothing to say yet
+    expect(review.notice.value).toBeNull();
+    expect(review.job.value!.status).toBe("committed");
+
+    api.uncommit.mockResolvedValueOnce(ok(state({ status: "ready", draftVersion: 4 })));
+    api.getJob.mockResolvedValueOnce(ok(job({ draftVersion: 4, flags: [] })));
+    expect(await review.uncommit(true)).toBe("done");
+    expect(api.uncommit).toHaveBeenLastCalledWith("j1", { force: true });
+    expect(review.job.value!.status).toBe("ready");
+  });
+
+  test("Back to review refused (the card's photos were removed) says why and shows the card as it is", async () => {
+    const committed = job({ status: "committed", flags: [], permissions: { canUncommit: true } });
+    api.getJob.mockResolvedValueOnce(ok(committed));
+    const { review } = await loaded();
+
+    api.uncommit.mockResolvedValueOnce(apiError(409, { code: "purged" }));
+    api.getJob.mockResolvedValueOnce(ok({ ...committed, permissions: { canUncommit: false } }));
+    expect(await review.uncommit()).toBe("failed");
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "This card's photos and draft were removed after a while, so it can't go back to review." });
+    expect(review.job.value!.permissions!.canUncommit).toBe(false);
+  });
+
+  test("the next card's Added notice has Undo, which takes the card just added back to review", async () => {
+    carryReviewNotice("j1", { kind: "success", text: "Added Lemon Bars", detail: null, undoJobId: "j0" });
+    api.uncommit.mockResolvedValueOnce(ok(state({ status: "ready", draftVersion: 2 })));
+    const { review, navigate } = await loaded();
+
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "Added Lemon Bars", action: { label: "Undo" } });
+    // with its action it stays until it's used or dismissed
+    await vi.advanceTimersByTimeAsync(NOTICE_MS * 2);
+    expect(review.notice.value).not.toBeNull();
+
+    await review.runNoticeAction();
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("j0", {});
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j0");
+    expect(takeCarriedReviewNotice("j0")).toEqual({ kind: "success", text: "The card is back for review.", detail: null });
+    expect(api.getCounts).toHaveBeenCalled();
+  });
+
+  test("Undo on a recipe edited since doesn't delete it: the notice says so and opens the card to decide there", async () => {
+    carryReviewNotice("j1", { kind: "success", text: "Added Lemon Bars", detail: null, undoJobId: "j0" });
+    api.uncommit.mockResolvedValueOnce(apiError(409, { code: "recipe_edited" }));
+    const { review, navigate } = await loaded();
+
+    await review.runNoticeAction();
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("j0", {});
+    expect(navigate).not.toHaveBeenCalled();
+    expect(review.notice.value).toMatchObject({
+      kind: "warning",
+      text: "The recipe was changed after this card was added. Going back to review would delete those changes.",
+      action: { label: "Open card" },
+    });
+    await review.runNoticeAction();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j0");
+  });
+
+  test("Add as back of previous card: the card before it in the batch gets its photos and is opened, being read", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j0", 0, "ready"), batchJob("j1", 1, "ready", 1, 1)] }));
+    const previous = job({ id: "j0", position: 0, pageCount: 1, permissions: { canMerge: true } });
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0" ? previous : job({ position: 1, permissions: { canMerge: true } }))));
+    api.merge.mockResolvedValueOnce(ok(state({ status: "ready", draftVersion: 3, task: { kind: "extract", state: "queued" } })));
+    const { review, navigate } = await loaded();
+
+    expect(review.mergeBlock.value).toBe("checking");
+    await review.checkPreviousCard();
+    expect(api.getJob).toHaveBeenLastCalledWith("j0");
+    expect(review.mergeBlock.value).toBeNull();
+    // an edit waiting to be saved goes with the card
+    review.draft.value.name = "Banana Mug Cake, back";
+    await nextTick();
+
+    expect(await review.mergeIntoPrevious()).toBe(true);
+    expect(api.merge).toHaveBeenCalledExactlyOnceWith("j1", { intoJobId: "j0" });
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j0");
+    expect(takeCarriedReviewNotice("j0")).toEqual({ kind: "info", text: "Photos added. The card is being read again.", detail: null });
+    expect(await review.saveBeforeLeaving()).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(api.updateJob).not.toHaveBeenCalled();
+    expect(api.getCounts).toHaveBeenCalled();
+  });
+
+  test("Add as back of previous card says why it can't: the first card, an added one, or too many photos", async () => {
+    const { review } = await loaded();
+    // without the permission there's nothing to offer
+    expect(review.mergeBlock.value).toBeNull();
+    expect(review.canMerge.value).toBe(false);
+    wrappers.forEach(wrapper => wrapper.unmount());
+    wrappers.length = 0;
+
+    api.getJob.mockResolvedValue(ok(job({ permissions: { canMerge: true } })));
+    const first = await loaded();
+    await first.review.checkPreviousCard();
+    expect(first.review.canMerge.value).toBe(true);
+    expect(first.review.mergeBlock.value).toBe("no-previous");
+    expect(await first.review.mergeIntoPrevious()).toBe(false);
+    expect(api.merge).not.toHaveBeenCalled();
+
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j0", 0, "committed"), batchJob("j1", 1, "ready")] }));
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0"
+      ? job({ id: "j0", status: "committed", pageCount: 1, permissions: { canMerge: false } })
+      : job({ position: 1, pageCount: 2, permissions: { canMerge: true } }))));
+    const second = await loaded();
+    await second.review.checkPreviousCard();
+    expect(second.review.mergeBlock.value).toBe("previous-added");
+
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0"
+      ? job({ id: "j0", pageCount: 3, permissions: { canMerge: true } })
+      : job({ position: 1, pageCount: 2, permissions: { canMerge: true } }))));
+    await second.review.checkPreviousCard();
+    expect(second.review.mergeBlock.value).toBe("too-many-pages");
+
+    // a card being read can't move until that's done
+    second.review.job.value!.task = { kind: "reread", state: "running" };
+    expect(second.review.mergeBlock.value).toBe("busy");
+  });
+
+  test("a merge the server refuses says why with its numbers, and checks the previous card again", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [batchJob("j0", 0, "ready"), batchJob("j1", 1, "ready")] }));
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0"
+      ? job({ id: "j0", pageCount: 1, permissions: { canMerge: true } })
+      : job({ position: 1, permissions: { canMerge: true } }))));
+    const { review, navigate } = await loaded();
+    await review.checkPreviousCard();
+
+    api.merge.mockResolvedValueOnce(apiError(409, { code: "too_many_pages", max: 4 }));
+    expect(await review.mergeIntoPrevious()).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "A card can have at most 4 photos." });
+    expect(navigate).not.toHaveBeenCalled();
+    expect(api.getJob.mock.calls.filter(([id]) => id === "j0")).toHaveLength(2);
   });
 
   test("Discard goes on to the next card, which says the card was discarded", async () => {

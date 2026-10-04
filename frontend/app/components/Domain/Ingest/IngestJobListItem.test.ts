@@ -1,5 +1,5 @@
 import { mount, type VueWrapper } from "@vue/test-utils";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import IngestJobListItem from "./IngestJobListItem.vue";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
@@ -154,6 +154,51 @@ describe("IngestJobListItem", () => {
   });
 });
 
+describe("IngestJobListItem: when a failed card is read again or removed", () => {
+  const withTime = (iso: string) =>
+    new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("over the monthly limit: it tries again by itself when the limit resets", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T15:00:00Z"));
+    const wrapper = mountItem(job({
+      status: "failed",
+      error: { code: "limit_reached", params: {} },
+      autoRetryAt: "2026-11-01T00:00:00+00:00",
+      expiresAt: "2026-11-15T00:00:00+00:00",
+    }));
+    expect(wrapper.get(".job-when").text()).toBe(`Tries again on ${withTime("2026-11-01T00:00:00Z")}`);
+    // still Retry now, by hand
+    expect(wrapper.find(".job-retry").exists()).toBe(true);
+  });
+
+  test("a retry that's due says it comes shortly", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-01T00:00:30Z"));
+    const wrapper = mountItem(job({ status: "failed", error: { code: "limit_reached", params: {} }, autoRetryAt: "2026-11-01T00:00:00" }));
+    expect(wrapper.get(".job-when").text()).toBe("Tries again shortly");
+  });
+
+  test("any other failure: the day it's removed with its photos", () => {
+    const wrapper = mountItem(job({
+      status: "failed",
+      error: { code: "timeout", params: {} },
+      autoRetryAt: null,
+      expiresAt: "2026-10-18T12:00:00+00:00",
+    }));
+    expect(wrapper.get(".job-when").text()).toBe("Removed on Oct 18, 2026");
+  });
+
+  test("nothing when the server sends neither, or the card hasn't failed", () => {
+    expect(mountItem(job({ status: "failed", error: { code: "timeout", params: {} } })).find(".job-when").exists()).toBe(false);
+    expect(mountItem(job({ status: "ready", expiresAt: "2026-10-18T12:00:00+00:00" })).find(".job-when").exists()).toBe(false);
+  });
+});
+
 describe("IngestJobListItem on a phone", () => {
   test("the name and the reason are laid out to wrap, and the actions can go under them", () => {
     const wrapper = mountItem(job({
@@ -165,7 +210,7 @@ describe("IngestJobListItem on a phone", () => {
     expect(wrapper.get(".job-text .job-title").text()).toContain("Brown Butter");
     expect(wrapper.get(".job-status").text()).toBe("Failed");
     expect(wrapper.get(".job-text .job-caption").text())
-      .toBe("Every AI provider for this task has reached its monthly token limit.");
+      .toBe("Every AI provider for this task has used its monthly token limit. The limit resets at the start of next month, or a group manager can raise it.");
     // actions follow the text in one wrapping row, not in the list item's append slot
     const body = wrapper.get(".job-body");
     expect(body.element.children[0]!.classList).toContain("job-text");

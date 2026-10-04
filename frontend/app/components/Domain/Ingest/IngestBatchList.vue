@@ -315,13 +315,13 @@ const batchSummary = computed(() => {
   const added = recent.value.filter(job => job.batchId === props.batchId).length + count("committing");
   const reading = count("processing");
   const parts = [
-    { key: "summary-added", count: added },
-    { key: "summary-left", count: count("ready") },
-    { key: "summary-reading", count: reading },
-    { key: "summary-failed", count: count("failed") },
+    { key: "recipe-ingest.queue.summary-added", count: added },
+    { key: "recipe-ingest.queue.summary-left", count: count("ready") },
+    { key: "recipe-ingest.queue.summary-reading", count: reading },
+    { key: "recipe-ingest.queue.summary-failed", count: count("failed") },
   ]
     .filter(part => part.count > 0)
-    .map(part => i18n.t(`recipe-ingest.queue.${part.key}`, { count: part.count }));
+    .map(part => i18n.t(part.key, { count: part.count }));
   if (!parts.length) {
     return null;
   }
@@ -627,7 +627,14 @@ function notifyRefusal(error: unknown) {
     return;
   }
   const code = errorCodeOf(error);
-  alert.error(code ? ingestErrorText(code) : i18n.t("recipe-ingest.error.unknown", { code: errorStatusOf(error) ?? "network" }));
+  const status = errorStatusOf(error);
+  if (code) {
+    alert.error(ingestErrorText(code));
+  }
+  else {
+    // no answer at all: the server couldn't be reached
+    alert.error(status === null ? i18n.t("recipe-ingest.error.network") : i18n.t("recipe-ingest.error.unknown", { code: status }));
+  }
 }
 
 /** Shows the card's state as the server answered it */

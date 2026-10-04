@@ -16,6 +16,8 @@ vi.mock("~/composables/use-logged-in-state", () => ({
 }));
 
 const wrappers: VueWrapper[] = [];
+/** A JPEG's first bytes: chosen files are told apart by them */
+const JPEG_HEAD = new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]);
 
 function mountHeader() {
   const wrapper = mount(AppHeader, {
@@ -81,7 +83,7 @@ describe("logging out from the header", () => {
     api.upload.mockImplementation(() => new Promise(() => {})); // still uploading
     const queue = useRecipeIngestUploads();
     queue.takePhoto(new File(["a"], "IMG_1.jpg", { type: "image/jpeg" }));
-    queue.addPhotos([new File(["b"], "IMG_2.jpg", { type: "image/jpeg" })]);
+    await queue.addPhotos([new File([JPEG_HEAD, "b"], "IMG_2.jpg", { type: "image/jpeg" })]);
     await flushPromises();
     const wrapper = mountHeader();
 
@@ -97,7 +99,7 @@ describe("logging out from the header", () => {
   });
 
   test("closing the question keeps the user signed in", async () => {
-    useRecipeIngestUploads().addPhotos([new File(["b"], "IMG_2.jpg", { type: "image/jpeg" })]);
+    await useRecipeIngestUploads().addPhotos([new File([JPEG_HEAD, "b"], "IMG_2.jpg", { type: "image/jpeg" })]);
     const wrapper = mountHeader();
     await logoutButton(wrapper).trigger("click");
     expect(wrapper.get(".confirm-dialog").text()).toBe("1 photo hasn't been uploaded. Log out anyway?");

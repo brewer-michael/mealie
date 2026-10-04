@@ -64,6 +64,33 @@
     <p v-if="openBatchCardCount" class="cards-queued text-caption mt-2 mb-0">
       {{ $t("recipe-ingest.capture.cards-queued", openBatchCardCount) }}
     </p>
+    <!-- chosen or dropped files the server can't use; under the buttons, so they don't move -->
+    <v-alert
+      v-if="skipped"
+      class="skipped-files mt-3"
+      type="warning"
+      variant="tonal"
+      density="compact"
+      closable
+      @click:close="skipped = null"
+    >
+      <div v-if="skipped.unsupported.length" class="skipped-unsupported">
+        {{ $t("recipe-ingest.capture.skipped-unsupported", { count: skipped.unsupported.length }, skipped.unsupported.length) }}
+        <div class="skipped-names text-caption">
+          {{ fileList(skipped.unsupported) }}
+        </div>
+      </div>
+      <div
+        v-if="skipped.tooManyPages.length"
+        class="skipped-too-many-pages"
+        :class="{ 'mt-2': skipped.unsupported.length }"
+      >
+        {{ $t("recipe-ingest.capture.skipped-too-many-pages", { count: skipped.tooManyPages.length, max: maxPagesPerCard }, skipped.tooManyPages.length) }}
+        <div class="skipped-names text-caption">
+          {{ fileList(skipped.tooManyPages) }}
+        </div>
+      </div>
+    </v-alert>
 
     <!-- One shot per tap: iOS ignores `multiple` with `capture` -->
     <input
@@ -78,7 +105,7 @@
       ref="chooseInput"
       class="choose-input d-none"
       type="file"
-      accept="image/*"
+      :accept="SCANNABLE_ACCEPT"
       multiple
       @change="onChoose"
     >
@@ -95,6 +122,8 @@
           <v-card class="draft-card" variant="outlined">
             <v-card-title class="text-subtitle-2">
               {{ $t("recipe-ingest.capture.card-number", { number: index + 1 }) }}
+              <!-- a PDF or a multi-page TIFF: how many pages the card gets from it -->
+              <span v-if="documentPages(card.photos)" class="draft-pages text-caption text-medium-emphasis">· {{ $t("recipe-ingest.capture.pages", documentPages(card.photos) ?? 0) }}</span>
             </v-card-title>
             <div class="d-flex ga-2 px-4">
               <figure
@@ -128,7 +157,7 @@
                 {{ $t("recipe-ingest.capture.split") }}
               </v-btn>
               <v-btn
-                v-if="canJoin(drafts, index, maxPagesPerCard)"
+                v-if="canJoinDraft(index, maxPagesPerCard)"
                 class="draft-join"
                 size="small"
                 :prepend-icon="mdiCallMerge"
@@ -206,14 +235,17 @@
 import { mdiCallMerge, mdiCallSplit, mdiCamera, mdiCheck, mdiImageMultiple, mdiImagePlus, mdiSwapHorizontal } from "@mdi/js";
 import { useDropZone } from "@vueuse/core";
 import IngestCapturePhoto from "./IngestCapturePhoto.vue";
-import { canJoin, DEFAULT_MAX_PAGES_PER_CARD, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
+import { SCANNABLE_ACCEPT } from "~/composables/use-recipe-ingest-files";
+import { DEFAULT_MAX_PAGES_PER_CARD, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
+import type { AddPhotosResult } from "~/composables/use-recipe-ingest-uploads";
 
 /**
  * Taking and choosing card photos (docs/ai/PHASE2.md §1.1). A card taken with the camera uploads as soon as it's
- * complete; chosen or dropped photos are paired into cards first, with Swap and Split/Join. The tray shows small
- * thumbnails (a placeholder where the browser can't show a photo), and Data saver sends smaller photos. Fork-owned.
+ * complete; chosen or dropped photos and PDFs are paired into cards first, with Swap and Split/Join (a PDF is a card
+ * of its own). Files the server can't read are left out, and the panel says which. The tray shows small thumbnails (a
+ * placeholder where the browser can't show a photo), and Data saver sends smaller photos. Fork-owned.
  */
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   /** The server's limit, from the card settings */
   maxPagesPerCard?: number;
 }>(), {
@@ -233,6 +265,8 @@ const {
   retake,
   noBack,
   addPhotos,
+  pagesOf,
+  canJoinDraft,
   swapDraft,
   splitDraft,
   joinDraft,
@@ -254,6 +288,10 @@ const chooseInput = ref<HTMLInputElement | null>(null);
 const dropZone = ref<HTMLElement | null>(null);
 /** What the next camera photo is for */
 const cameraPurpose = ref<"shot" | "retake">("shot");
+/** What the last chosen or dropped files left out; until closed or the next files */
+const skipped = ref<AddPhotosResult | null>(null);
+/** Names listed under the skipped notice */
+const LISTED_NAMES = 5;
 
 const cameraLabel = computed(() => {
   if (pendingFront.value) {
@@ -284,9 +322,39 @@ function readFiles(event: Event): File[] {
   return files;
 }
 
+/** Chosen or dropped files go to the tray, once the server's formats and page limit have been checked */
+async function addFiles(files: File[]) {
+  if (!files.length) {
+    return;
+  }
+  const result = await addPhotos(files, props.maxPagesPerCard);
+  skipped.value = result.unsupported.length || result.tooManyPages.length ? result : null;
+}
+
+function fileList(names: string[]): string {
+  const listed = names.filter(Boolean).slice(0, LISTED_NAMES).join(", ");
+  const more = names.length - Math.min(names.length, LISTED_NAMES);
+  return more ? `${listed} ${i18n.t("recipe-ingest.capture.skipped-more", { count: more })}` : listed;
+}
+
+/** The pages a draft card gets, when one of its files is a document of several pages */
+function documentPages(photos: Blob[]): number | null {
+  const counts = photos.map(photo => pagesOf(photo));
+  if (!counts.some(count => count !== null && count > 1) || counts.includes(null)) {
+    return null;
+  }
+  return counts.reduce<number>((total, count) => total + (count ?? 0), 0);
+}
+
 function onCamera(event: Event) {
   const [photo] = readFiles(event);
   if (!photo) {
+    return;
+  }
+  if (!photo.type.startsWith("image/") || photo.type === "image/tiff") {
+    // a computer's file picker can give anything: a PDF (a card of its own), or a file to leave out
+    cameraPurpose.value = "shot";
+    void addFiles([photo]);
     return;
   }
   if (cameraPurpose.value === "retake") {
@@ -299,13 +367,17 @@ function onCamera(event: Event) {
 }
 
 function onChoose(event: Event) {
-  addPhotos(readFiles(event));
+  void addFiles(readFiles(event));
 }
 
-const { isOverDropZone } = useDropZone(dropZone, (files) => {
-  if (files?.length) {
-    addPhotos(files);
-  }
+// No `dataTypes`: vueuse refuses a whole drop when one file doesn't match (ten photos and a Thumbs.db), can't tell a
+// .txt file from dragged text, and says nothing. Every dropped file goes to `addFiles`, which reads what each is and
+// says what it left out; the browser never opens a dropped file itself.
+const { isOverDropZone } = useDropZone(dropZone, {
+  onDrop: (files) => {
+    void addFiles(files ?? []);
+  },
+  preventDefaultForUnhandled: true,
 });
 </script>
 

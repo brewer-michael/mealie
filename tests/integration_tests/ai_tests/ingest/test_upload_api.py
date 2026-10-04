@@ -27,7 +27,7 @@ from PIL import Image
 from mealie.core.exceptions import NoEntryFound
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import IngestRepos
+from mealie.repos.repository_recipe_ingest import IngestJobsRepo, IngestRepos
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate
 from mealie.schema.recipe_ingest import (
     IngestSource,
@@ -295,6 +295,77 @@ def test_429_at_the_groups_processing_quota(api_client: TestClient, reader: Test
     assert response.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
     assert response.json()["detail"]["code"] == "too_many_jobs"
     assert response.json()["detail"]["message"]
+
+
+def _per_user_cap(monkeypatch: pytest.MonkeyPatch, cap: int) -> None:
+    monkeypatch.setattr(
+        upload_service, "get_ingest_settings", lambda: IngestSettings(MAX_PROCESSING_PER_USER=cap, WORKER=False)
+    )
+
+
+def _set_status(job_id: str, status: IngestStatus) -> None:
+    with session_context() as session:
+        session.execute(
+            sa.update(RecipeIngestionJob)
+            .where(RecipeIngestionJob.id == UUID(job_id))
+            .values(status=status.value, task_state=None, task_kind=None)
+        )
+        session.commit()
+
+
+def test_429_at_the_per_user_cap_on_cards_being_read(
+    api_client: TestClient, user_tuple: list[TestUser], monkeypatch: pytest.MonkeyPatch
+):
+    uploader, housemate = user_tuple  # one group, one household
+    configure_card_reading(uploader)
+    _per_user_cap(monkeypatch, 2)
+    first = post_card(api_client, uploader, jpeg())
+    assert first.status_code == 202
+    assert post_card(api_client, uploader, jpeg()).status_code == 202
+    stored = job_count(uploader)
+
+    response = post_card(api_client, uploader, jpeg())
+    detail = assert_summary(response, 429)
+    assert detail["code"] == "user_quota"
+    assert detail["message"] == "You can have at most 2 recipe cards being read at once. Try again when some are done."
+    assert response.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
+    assert job_count(uploader) == stored  # refused before the body
+
+    # another member of the household has cards of their own to send
+    assert post_card(api_client, housemate, jpeg()).status_code == 202
+
+    # a card read (ready for review) no longer counts
+    _set_status(first.json()["jobs"][0]["id"], IngestStatus.ready)
+    assert post_card(api_client, uploader, jpeg()).status_code == 202
+    assert post_card(api_client, uploader, jpeg()).status_code == 429
+
+    # one at most: the message says so in the singular
+    _per_user_cap(monkeypatch, 1)
+    message = post_card(api_client, housemate, jpeg()).json()["detail"]["message"]
+    assert message == "You can have at most 1 recipe card being read at once. Try again when it's done."
+
+    # 0 is off
+    _per_user_cap(monkeypatch, 0)
+    assert post_card(api_client, uploader, jpeg()).status_code == 202
+
+
+def test_the_per_user_cap_is_counted_only_when_its_on(
+    api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    counted: list[UUID] = []
+    real = IngestJobsRepo.count_processing_by_user
+
+    def counting(self: IngestJobsRepo, user_id: UUID) -> int:
+        counted.append(user_id)
+        return real(self, user_id)
+
+    monkeypatch.setattr(IngestJobsRepo, "count_processing_by_user", counting)
+    _per_user_cap(monkeypatch, 0)
+    assert post_card(api_client, reader, jpeg()).status_code == 202
+    assert counted == []
+    _per_user_cap(monkeypatch, 50)
+    assert post_card(api_client, reader, jpeg()).status_code == 202
+    assert counted == [reader.user_id]
 
 
 def test_the_checks_before_the_body_run_in_one_worker_thread_call(

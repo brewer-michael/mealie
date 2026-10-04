@@ -467,6 +467,11 @@ class ReadingReadiness:
     any to suggest) and the `cross_read` (the image slot, when the group reads every card twice and OCR does the main
     read). Empty whenever `limit_reached`, which stops the whole read.
     """
+    user_processing: int | None = None
+    """
+    The uploader's `processing` cards, every household's of the group, for the optional per-user cap
+    (`AI_INGEST_MAX_PROCESSING_PER_USER`); None unless asked for (`user_id`)
+    """
 
 
 def _slot_usable(service: OpenAIService, slot: AIProviderSlot, over_limit: set[AIProviderSlot] | None = None) -> bool:
@@ -529,18 +534,22 @@ def _limited_features(
     return tuple(limited)
 
 
-def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> ReadingReadiness:
+def reading_readiness(
+    session: Session, group_id: UUID, household_id: UUID, user_id: UUID | None = None
+) -> ReadingReadiness:
     """
     Whether the group can read cards at all and with local providers only, its local-only setting and its processing
-    jobs. Blocking (provider settings, address lookups for "local", a count): call it from a worker thread. A monthly
-    token limit doesn't count as "can't read": the card fails `limit_reached` when it's read, if it still applies, and
-    `limit_reached` says so beforehand; `limited_features` names the optional parts it skips.
+    jobs (and `user_id`'s, when given). Blocking (provider settings, address lookups for "local", counts): call it from
+    a worker thread. A monthly token limit doesn't count as "can't read": the card fails `limit_reached` when it's
+    read, if it still applies, and `limit_reached` says so beforehand; `limited_features` names the optional parts it
+    skips.
     """
     from mealie.services.openai import OpenAIService
 
     ingest_repos = IngestRepos(session, group_id, household_id)
     group_local_only = ingest_repos.settings.get().local_only
     processing = ingest_repos.processing_jobs_in_group()
+    user_processing = ingest_repos.jobs.count_processing_by_user(user_id) if user_id is not None else None
 
     service = OpenAIService(get_repositories(session, group_id=group_id, household_id=household_id))
     # the limits are tallied under the group's own policy, from the same lookups
@@ -564,4 +573,5 @@ def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> R
         processing=processing,
         limit_reached=limit_reached,
         limited_features=limited,
+        user_processing=user_processing,
     )

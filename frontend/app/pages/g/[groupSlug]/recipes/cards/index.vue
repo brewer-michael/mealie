@@ -79,7 +79,7 @@
       >
         {{ $t("recipe-ingest.capture.local-only-blocked") }}
       </v-alert>
-      <!-- uploads are still taken (the limit may reset first); a card read while it applies fails and can be retried -->
+      <!-- uploads are still taken: a card read while the limit applies is read again by itself once it resets -->
       <v-alert
         v-else-if="settings?.limitReached"
         class="limit-reached mb-4"
@@ -87,7 +87,7 @@
         variant="tonal"
         density="compact"
       >
-        {{ $t("recipe-ingest.capture.limit-reached") }}
+        {{ $t("recipe-ingest.capture.limit-reached", { date: dateText(nextLimitReset(), true) }) }}
       </v-alert>
       <IngestPrivacyChip
         v-model:local-only="localOnly"
@@ -115,7 +115,7 @@ import IngestBatchList from "~/components/Domain/Ingest/IngestBatchList.vue";
 import IngestCapture from "~/components/Domain/Ingest/IngestCapture.vue";
 import IngestPrivacyChip from "~/components/Domain/Ingest/IngestPrivacyChip.vue";
 import IngestUploadQueue from "~/components/Domain/Ingest/IngestUploadQueue.vue";
-import { useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
+import { nextLimitReset, useRecipeIngestSettings, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 
 /**
@@ -147,6 +147,7 @@ const {
   load: loadSettings,
 } = useRecipeIngestSettings();
 const { localOnly, sentBeforeLocalOnlyChange, localOnlyFinishedBatch, openCardsPage } = useRecipeIngestUploads();
+const { dateText } = useRecipeIngestText();
 
 const canReadCards = computed(() => !!settings.value?.canReadCards);
 /** The group keeps cards on this server, and no AI provider on the network can read them */

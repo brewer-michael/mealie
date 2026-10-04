@@ -28,6 +28,7 @@ import {
   useRecipeIngestUploads,
 } from "../use-recipe-ingest-uploads";
 import type { DraftCard, UploadQueueAction, UploadQueueState } from "../use-recipe-ingest-uploads";
+import { classicPdf, file, objectStreamPdf, tiff } from "./use-recipe-ingest-files.fixtures";
 import { resetRecipeIngestCounts, useRecipeIngestCounts } from "../use-recipe-ingest";
 import { clearComposableCaches } from "../use-clear-composable-caches";
 import { carryReviewNotice, takeCarriedReviewNotice } from "../use-recipe-ingest-review";
@@ -54,10 +55,15 @@ vi.mock("~/composables/use-toast", () => ({
 // ==========================================
 // Helpers
 
+/** The first bytes the server (and `addPhotos`) tells a format by */
+const JPEG_HEAD = new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]);
+const HEIC_HEAD = new Uint8Array([0, 0, 0, 24, ...new TextEncoder().encode("ftypheic")]);
+
 let photoCount = 0;
 function photo(name?: string, type = "image/jpeg"): File {
   photoCount += 1;
-  return new File([`photo ${photoCount}`], name ?? `IMG_${photoCount}.jpg`, { type });
+  const head = type === "image/heic" ? HEIC_HEAD : JPEG_HEAD;
+  return new File([head, `photo ${photoCount}`], name ?? `IMG_${photoCount}.jpg`, { type });
 }
 
 function ok<T>(data: T) {
@@ -187,6 +193,28 @@ describe("grouping photos into cards", () => {
     expect(canJoin(list, 1, 4)).toBe(false);
     expect(photosOf(joinCards(list, 0, "front-and-back", keys(), 4))).toEqual(photosOf(list));
   });
+
+  /** A PDF of 3 pages, one of 1 page, and one whose pages aren't known; the rest are photos */
+  const documents: Record<string, number | null> = { doc3: 3, doc1: 1, unknown: null };
+  const pages = (photo: string) => (photo in documents ? documents[photo] ?? null : 1);
+
+  test("front & back: a document of several pages is a card of its own; a one-page one pairs like a photo", () => {
+    expect(groupPhotosIntoCards(["a1", "doc3", "b1", "b2", "doc1", "c1", "unknown", "d1"], "front-and-back", pages))
+      .toEqual([["a1"], ["doc3"], ["b1", "b2"], ["doc1", "c1"], ["unknown"], ["d1"]]);
+    expect(groupPhotosIntoCards(["doc3", "a1"], "one-side", pages)).toEqual([["doc3"], ["a1"]]);
+  });
+
+  test("Join counts a document's pages, and never joins one whose pages aren't known", () => {
+    const list = cards(["doc3"], ["a1"], ["b1"], ["unknown"]);
+    expect(canJoin(list, 0, 4, pages)).toBe(true);
+    expect(canJoin(list, 0, 3, pages)).toBe(false);
+    expect(canJoin(cards(["a1"], ["doc3"]), 0, 4, pages)).toBe(true);
+    expect(canJoin(cards(["a1", "a2"], ["doc3"]), 0, 4, pages)).toBe(false);
+    expect(canJoin(list, 2, 4, pages)).toBe(false);
+    expect(canJoin(cards(["unknown"], ["a1"]), 0, 4, pages)).toBe(false);
+    expect(photosOf(joinCards(list, 0, "one-side", keys(), 4, pages))).toEqual([["doc3", "a1"], ["b1"], ["unknown"]]);
+    expect(photosOf(joinCards(list, 0, "one-side", keys(), 3, pages))).toEqual(photosOf(list));
+  });
 });
 
 describe("the queue reducer", () => {
@@ -311,7 +339,7 @@ describe("the upload queue", () => {
     api.upload.mockImplementation(() => pending[n++]!.promise);
     const queue = useRecipeIngestUploads();
 
-    queue.addPhotos([photo(), photo(), photo()]);
+    await queue.addPhotos([photo(), photo(), photo()]);
     queue.uploadDrafts();
     await flushPromises();
     expect(api.upload).toHaveBeenCalledTimes(2);
@@ -625,7 +653,7 @@ describe("the upload queue", () => {
     queue.mode.value = "front-and-back";
     const [front, a, b] = [photo(), photo(), photo()];
     queue.takePhoto(front);
-    queue.addPhotos([a, b]);
+    await queue.addPhotos([a, b]);
     expect(queue.drafts.value.map(card => card.photos)).toEqual([[a, b]]);
 
     queue.done();
@@ -638,7 +666,7 @@ describe("the upload queue", () => {
     const queue = useRecipeIngestUploads();
     queue.mode.value = "front-and-back";
     const [a1, a2, b1, c1, c2] = [photo(), photo(), photo(), photo(), photo()];
-    queue.addPhotos([a1, a2, b1, c1, c2]);
+    await queue.addPhotos([a1, a2, b1, c1, c2]);
     expect(queue.drafts.value.map(card => card.photos)).toEqual([[a1, a2], [b1, c1], [c2]]);
 
     queue.splitDraft(1);
@@ -661,7 +689,7 @@ describe("the upload queue", () => {
     queue.mode.value = "front-and-back";
     const [front, a, b] = [photo(), photo(), photo()];
     queue.takePhoto(front);
-    queue.addPhotos([a, b]);
+    await queue.addPhotos([a, b]);
 
     queue.mode.value = "one-side";
     await flushPromises();
@@ -768,7 +796,7 @@ describe("the upload queue", () => {
       const release = holdFirstTwo();
       const queue = useRecipeIngestUploads();
       queue.localOnly.value = true;
-      queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
+      await queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
       queue.uploadDrafts();
       await flushPromises();
       expect(queue.cards.value.map(card => card.status))
@@ -790,7 +818,7 @@ describe("the upload queue", () => {
     test("switched on after Done: the cards still waiting stay on this server", async () => {
       const release = holdFirstTwo();
       const queue = useRecipeIngestUploads();
-      queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
+      await queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
       queue.uploadDrafts();
       queue.done();
       await flushPromises();
@@ -898,7 +926,7 @@ describe("the upload queue", () => {
     counts.set({ processing: 2, ready: 3, needsAttention: 0, failed: 0 });
     queue.takePhoto(photo());
     queue.takePhoto(photo());
-    queue.addPhotos([photo()]);
+    await queue.addPhotos([photo()]);
     await flushPromises();
     expect(queue.cards.value.map(card => card.status)).toEqual(["uploading", "retrying"]);
 
@@ -1001,7 +1029,7 @@ describe("thumbnails", () => {
     const { urls, revoked } = stubObjectUrls();
     const queue = useRecipeIngestUploads();
     const photos = [photo(), photo(), photo()];
-    queue.addPhotos(photos);
+    await queue.addPhotos(photos);
 
     // asking starts it; the template shows a placeholder meanwhile
     expect(photos.map(p => queue.previewState(p))).toEqual(["pending", "pending", "pending"]);
@@ -1033,7 +1061,7 @@ describe("thumbnails", () => {
     const { urls } = stubObjectUrls();
     const queue = useRecipeIngestUploads();
     const chosen = photo();
-    queue.addPhotos([chosen]);
+    await queue.addPhotos([chosen]);
     queue.previewUrl(chosen);
     await flushPromises();
 
@@ -1045,7 +1073,7 @@ describe("thumbnails", () => {
     stubObjectUrls();
     const queue = useRecipeIngestUploads();
     const [heic, jpeg] = [photo("IMG_0001.HEIC", "image/heic"), photo()];
-    queue.addPhotos([heic, jpeg]);
+    await queue.addPhotos([heic, jpeg]);
     queue.previewState(heic);
     queue.previewState(jpeg);
     await flushPromises();
@@ -1129,6 +1157,151 @@ describe("a photo too large for the server", () => {
   });
 });
 
+// ==========================================
+// Chosen and dropped files: what the server reads, and PDFs
+
+const names = (list: readonly DraftCard[]) => list.map(card => card.photos.map(photoName));
+
+/** A PDF whose full read waits for `release` (its first bytes come at once) */
+function slowPdf(name = "slow.pdf") {
+  const pdf = classicPdf(1, name);
+  const gate = deferred<null>();
+  const read = pdf.arrayBuffer.bind(pdf);
+  Object.defineProperty(pdf, "arrayBuffer", { value: () => gate.promise.then(read) });
+  return { pdf, release: () => gate.resolve(null) };
+}
+
+describe("chosen and dropped files", () => {
+  test("files the server doesn't read are left out, and named", async () => {
+    const queue = useRecipeIngestUploads();
+    const result = await queue.addPhotos([
+      photo("a.jpg"),
+      file(["2 cups flour"], "notes.txt", "text/plain"),
+      file(["GIF89a"], "card.gif", "image/gif"),
+      photo("b.jpg"),
+    ]);
+
+    expect(result).toEqual({ unsupported: ["notes.txt", "card.gif"], tooManyPages: [] });
+    expect(names(queue.drafts.value)).toEqual([["a.jpg"], ["b.jpg"]]);
+    expect(await queue.addPhotos([file(["x"], "notes.txt", "text/plain")])).toEqual({
+      unsupported: ["notes.txt"],
+      tooManyPages: [],
+    });
+    expect(queue.drafts.value).toHaveLength(2);
+  });
+
+  test("a PDF is a card of its own, with its pages; one with more pages than a card can have is left out", async () => {
+    const queue = useRecipeIngestUploads();
+    queue.mode.value = "front-and-back";
+    const [a, b, c] = [photo("a.jpg"), photo("b.jpg"), photo("c.jpg")];
+    const scan = classicPdf(2, "scan.pdf");
+    const result = await queue.addPhotos([a, scan, objectStreamPdf(5, { name: "long.pdf" }), b, c], 4);
+
+    expect(result).toEqual({ unsupported: [], tooManyPages: ["long.pdf"] });
+    expect(names(queue.drafts.value)).toEqual([["a.jpg"], ["scan.pdf"], ["b.jpg", "c.jpg"]]);
+    expect(queue.pagesOf(scan)).toBe(2);
+    expect(queue.canJoinDraft(0, 4)).toBe(true);
+    expect(queue.canJoinDraft(0, 2)).toBe(false);
+    expect(queue.canJoinDraft(1, 3)).toBe(true);
+    expect(queue.canJoinDraft(1, 2)).toBe(false);
+
+    queue.uploadDrafts();
+    await flushPromises();
+    expect(uploadedPhotos()).toEqual([[a], [scan], [b, c]]);
+  });
+
+  test("files added one after another keep their order, even when a PDF before them takes longer to read", async () => {
+    const queue = useRecipeIngestUploads();
+    const { pdf, release } = slowPdf();
+    const first = queue.addPhotos([pdf]);
+    const second = queue.addPhotos([photo("b.jpg")]);
+    await flushPromises();
+    expect(queue.drafts.value).toEqual([]);
+
+    release();
+    await Promise.all([first, second]);
+    expect(names(queue.drafts.value)).toEqual([["slow.pdf"], ["b.jpg"]]);
+  });
+
+  test("a logout while files are read adds nothing", async () => {
+    const queue = useRecipeIngestUploads();
+    const { pdf, release } = slowPdf();
+    const adding = queue.addPhotos([pdf, photo()]);
+    resetRecipeIngestUploads();
+    release();
+    await adding;
+
+    expect(useRecipeIngestUploads().drafts.value).toEqual([]);
+  });
+
+  test("a PDF goes as it is: no thumbnail decode, no data saver, no re-encode when it's refused as too large", async () => {
+    const { decode } = stubImageDecoding();
+    stubObjectUrls();
+    api.upload.mockImplementation(() => failed(400, {
+      batchId: "b1",
+      jobs: [],
+      rejected: [{ index: 0, filename: "scan.pdf", reason: "too_large" }],
+      summary: "",
+    }));
+    const queue = useRecipeIngestUploads();
+    queue.dataSaver.value = true;
+    const scan = classicPdf(2);
+    await queue.addPhotos([scan]);
+    expect(queue.previewState(scan)).toBe("unavailable");
+    expect(queue.isPdf(scan)).toBe(true);
+
+    queue.uploadDrafts();
+    await flushPromises();
+    expect(decode).not.toHaveBeenCalled();
+    expect(uploadedPhotos()).toEqual([[scan]]);
+    expect(queue.cards.value[0]).toMatchObject({ status: "failed", error: "too_large", retryable: false });
+  });
+
+  test("a card of a photo and a PDF refused for the photo's size: only the photo is made smaller", async () => {
+    stubImageDecoding({ width: 16000, height: 12000 });
+    api.upload
+      .mockImplementationOnce(() => failed(400, {
+        batchId: "b1",
+        jobs: [],
+        rejected: [{ index: 0, filename: "big.jpg", reason: "too_many_pixels" }],
+        summary: "",
+      }))
+      .mockImplementation(() => ok(accepted()));
+    const queue = useRecipeIngestUploads();
+    const [big, scan] = [photo("big.jpg"), classicPdf(1)];
+    await queue.addPhotos([big, scan]);
+    queue.joinDraft(0);
+    queue.uploadDrafts();
+    await flushPromises();
+
+    const [resent, document] = uploadedPhotos()[1]!;
+    expect(await blobText(resent!)).toBe(`${REENCODE_MAX_SIDE}x2304 q0.9`);
+    expect(document).toBe(scan);
+  });
+
+  test("with data saver, a multi-page TIFF goes as it is: a smaller copy would keep one page", async () => {
+    const { decode } = stubImageDecoding();
+    const queue = useRecipeIngestUploads();
+    queue.dataSaver.value = true;
+    const scan = tiff([{}, {}]);
+    await queue.addPhotos([scan]);
+    queue.uploadDrafts();
+    await flushPromises();
+
+    expect(decode).not.toHaveBeenCalled();
+    expect(uploadedPhotos()).toEqual([[scan]]);
+  });
+
+  test("a PDF read back from this device's storage is counted again before it can be joined", async () => {
+    const queue = useRecipeIngestUploads();
+    const restored = new File([classicPdf(3)], "scan.pdf", { type: "application/pdf" });
+    expect(queue.pagesOf(restored)).toBeNull();
+    await flushPromises();
+    expect(queue.pagesOf(restored)).toBe(3);
+    expect(queue.pagesOf(photo())).toBe(1);
+  });
+});
+
 describe("data saver", () => {
   test("off (the default): the photos go as they are", async () => {
     const { decode } = stubImageDecoding();
@@ -1195,7 +1368,7 @@ describe("the queue kept on this device", () => {
     const [front, back, trayA, trayB, waiting] = [photo("a.jpg"), photo("b.jpg"), photo("c.jpg"), photo("d.jpg"), photo("e.jpg")];
     queue.takePhoto(front);
     queue.takePhoto(back);
-    queue.addPhotos([trayA, trayB]);
+    await queue.addPhotos([trayA, trayB]);
     queue.takePhoto(waiting);
     await flushPromises();
 
@@ -1248,7 +1421,7 @@ describe("the queue kept on this device", () => {
     api.upload.mockImplementation(() => new Promise(() => {}));
     const queue = useRecipeIngestUploads();
     await queue.connect("u1", id => storages.get(id)!);
-    queue.addPhotos([photo()]);
+    await queue.addPhotos([photo()]);
     queue.localOnly.value = true;
     await flushPromises();
     expect(storages.get("u1")!.photos.size).toBe(1);
@@ -1351,7 +1524,7 @@ describe("logging out", () => {
     expect(recipeIngestPhotosNotUploaded.value).toBe(0);
 
     queue.takePhoto(photo());
-    queue.addPhotos([photo(), photo()]);
+    await queue.addPhotos([photo(), photo()]);
     await flushPromises();
     expect(recipeIngestPhotosNotUploaded.value).toBe(3);
 

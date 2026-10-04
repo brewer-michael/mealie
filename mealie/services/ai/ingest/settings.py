@@ -21,6 +21,8 @@ APP_DIR = Path("/app")
 """The container's code directory, which the inbox must stay out of"""
 MOUNTED_INBOX = Path("/inbox")
 """Where the compose file and the Unraid template mount the inbox: used when it's a mount and nothing else is set"""
+DEFAULT_INBOX_DIR_MODE = "2775"
+"""The inbox folders' mode when `AI_INGEST_INBOX_DIR_MODE` is unset, or isn't a mode"""
 
 
 def _worker_default() -> bool:
@@ -47,9 +49,9 @@ class IngestSettings(BaseSettings):
     """Move ingested files to `processed/` rather than deleting them"""
     INBOX_PROCESSED_DAYS: int | None = Field(None, ge=1)
     """Files in `processed/` older than this many days are deleted (once a day); unset keeps them all"""
-    INBOX_DIR_MODE: str = "2775"
+    INBOX_DIR_MODE: str = DEFAULT_INBOX_DIR_MODE
     """The octal mode of the inbox folders Mealie creates (setgid and group-writable, so writers in its group can add
-    photos); existing folders are never changed"""
+    photos); existing folders are never changed. A value that isn't a mode is logged, and 2775 is used."""
     ORIENT: bool = True
     """Turn sideways cards upright with Tesseract when it's installed, whatever `OCR_ENABLED` says"""
     LOCK_DIR: Path | None = None
@@ -81,9 +83,17 @@ class IngestSettings(BaseSettings):
     @field_validator("INBOX_DIR_MODE", mode="before")
     @classmethod
     def _octal_mode(cls, value: object) -> str:
+        # a mistyped mode never stops Mealie from starting (these settings are read at startup): it's logged, and the
+        # inbox's new folders get the default
         text = str(value).strip().lower().removeprefix("0o")
-        if not text or any(digit not in "01234567" for digit in text) or int(text, 8) > 0o7777:
-            raise ValueError("must be an octal file mode from 0 to 7777, such as 2775")
+        if not text:
+            return DEFAULT_INBOX_DIR_MODE
+        if any(digit not in "01234567" for digit in text) or int(text, 8) > 0o7777:
+            logger.error(
+                f"AI_INGEST_INBOX_DIR_MODE is {str(value)!r}, which isn't an octal file mode from 0 to 7777 (such as "
+                f"2775): the recipe card inbox's new folders get {DEFAULT_INBOX_DIR_MODE}"
+            )
+            return DEFAULT_INBOX_DIR_MODE
         return format(int(text, 8), "o")
 
     @property

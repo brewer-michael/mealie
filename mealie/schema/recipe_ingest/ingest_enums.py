@@ -84,6 +84,11 @@ class IngestRejectReason(StrEnum):
     """An image URL while URL fetching is off, or one pointing somewhere it may not go"""
     url_fetch_failed = "url_fetch_failed"
     """An image URL that couldn't be fetched (network error, timeout, HTTP error)"""
+    no_permission = "no_permission"
+    """
+    An inbox photo or card folder Mealie may not move out of the household folder (its group needs write access there,
+    and to a card folder itself: umask 002); it stays where it is, and the inbox status lists it
+    """
 
 
 class IngestReadPath(StrEnum):

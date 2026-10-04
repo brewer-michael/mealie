@@ -67,11 +67,16 @@ class CardDraftSaved(MealieModel):
     error_count: int = 0
     warning_count: int = 0
     ingredients: list[CardDraftIngredient] | None = None
-    """The lines this save parsed (a filled blank, an edited or new line), as stored; None when it parsed none"""
+    """
+    The lines this save parsed, as stored: a filled blank, an edited or new line, or a line kept as written with a
+    marker (parsed around it); None when it parsed none
+    """
     duplicate_of: RecipeIngestionRecipeRef | None = None
     """As on the job, for the saved name"""
     duplicate_job: RecipeIngestionJobRef | None = None
+    """As on the job, for the saved name"""
     duplicate_name: str | None = None
+    """As on the job, for the saved name"""
 
 
 class RereadRequest(MealieModel):
@@ -128,6 +133,12 @@ class RebuildRequest(MealieModel):
     """The card's text as the reviewer corrected it"""
 
     model_config = _STRICT
+
+    @model_validator(mode="after")
+    def _some_text(self) -> Self:
+        if not self.transcription.strip():
+            raise ValueError("The card's text is empty")
+        return self
 
 
 class ParseLinesRequest(MealieModel):

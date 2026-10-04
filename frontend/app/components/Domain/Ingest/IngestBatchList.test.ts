@@ -515,6 +515,20 @@ describe("IngestBatchList", () => {
     expect(wrapper.get(".job-status").text()).toBe("Waiting to be read");
   });
 
+  test("a Retry the server never answered says the server couldn't be reached; an answer without a code names its status", async () => {
+    serverJobs = [job({ status: "failed", error: { code: "timeout" } })];
+    api.retry.mockResolvedValue({ data: null, error: { message: "Network Error" } });
+    const wrapper = await mountList();
+    await wrapper.get(".job-retry").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("The server couldn't be reached. Check your connection and try again.");
+
+    api.retry.mockResolvedValue({ data: null, error: { response: { status: 500, data: {} } } });
+    await wrapper.get(".job-retry").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenLastCalledWith("Something went wrong (500).");
+  });
+
   test("a refusal the API client already showed isn't shown twice", async () => {
     serverJobs = [job({ status: "failed", error: { code: "timeout" } })];
     api.retry.mockResolvedValue({ data: null, error: { response: { status: 503, data: { detail: { code: "paused_for_restore", message: "Paused" } } } } });

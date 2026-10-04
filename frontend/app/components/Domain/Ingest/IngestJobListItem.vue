@@ -60,6 +60,10 @@
         <div v-if="chip.caption" class="job-caption text-caption mt-1" :class="chip.color === 'error' ? 'text-error' : 'text-medium-emphasis'">
           {{ chip.caption }}
         </div>
+        <!-- a failed card: when it's read again by itself (over the monthly limit), else when it's removed -->
+        <div v-if="failedWhen" class="job-when text-caption text-medium-emphasis">
+          {{ failedWhen }}
+        </div>
       </div>
       <div class="job-actions d-flex align-center ga-1">
         <v-btn
@@ -120,12 +124,13 @@
 
 <script setup lang="ts">
 import { mdiCardTextOutline } from "@mdi/js";
-import { sourceFileName, useRecipeIngestText } from "~/composables/use-recipe-ingest";
+import { serverDate, sourceFileName, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
 /**
  * One card in the queue (docs/ai/PHASE2.md §6.7): thumbnail, name (two lines at most), a short status chip with the
- * reason or progress under it, and Review, Retry, Cancel or Discard. Fork-owned.
+ * reason or progress under it, and Review, Retry, Cancel or Discard. A failed card says when it's read again by
+ * itself (it failed over the monthly token limit, §3.6) or else when it's removed with its photos (§16). Fork-owned.
  */
 const props = defineProps<{
   job: RecipeIngestionJobSummary;
@@ -139,7 +144,7 @@ const emit = defineEmits<{
 }>();
 
 const i18n = useI18n();
-const { cardTitle, ingestErrorText, progressText } = useRecipeIngestText();
+const { cardTitle, ingestErrorText, progressText, dateText } = useRecipeIngestText();
 
 /** The file a card came from: shown for inbox and API cards, whose capture order means nothing to the user */
 const fileName = computed(() => sourceFileName(props.job.sourceName));
@@ -164,6 +169,22 @@ const link = computed(() => (props.job.status === "committed" ? recipeLink.value
 const canDiscard = computed(() =>
   props.job.canDiscard !== false && props.job.status !== "committing" && props.job.status !== "committed",
 );
+
+/** "Tries again on Nov 1, 2026, 1:00 AM" (`autoRetryAt`), else "Removed on Nov 15, 2026" (`expiresAt`) */
+const failedWhen = computed(() => {
+  if (props.job.status !== "failed") {
+    return null;
+  }
+  const retryAt = serverDate(props.job.autoRetryAt);
+  if (retryAt) {
+    // the dispatcher reads a card that's due within a minute
+    return retryAt.getTime() > Date.now()
+      ? i18n.t("recipe-ingest.queue.retries-on", { date: dateText(retryAt, true) })
+      : i18n.t("recipe-ingest.queue.retries-soon");
+  }
+  const expiresAt = serverDate(props.job.expiresAt);
+  return expiresAt ? i18n.t("recipe-ingest.queue.removed-on", { date: dateText(expiresAt) }) : null;
+});
 
 interface Chip {
   text: string;

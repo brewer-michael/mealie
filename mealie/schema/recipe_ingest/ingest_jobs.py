@@ -129,11 +129,17 @@ class RecipeIngestionJobOut(RecipeIngestionJobSummary):
     proposals: list[CardProposal] = Field(default_factory=list)
     permissions: RecipeIngestionJobPermissions = Field(default_factory=RecipeIngestionJobPermissions)
     duplicate_of: RecipeIngestionRecipeRef | None = None
-    """A group recipe whose slug matches the draft's name: committing would make "Name (1)\""""
+    """
+    A group recipe with the draft's name (its slug is taken, so committing names the recipe `duplicate_name`), else
+    the household's recipe whose name is most like it ("Bananna Bread" for "Banana Bread")
+    """
     duplicate_job: RecipeIngestionJobRef | None = None
     """Another card of the household, waiting or being read, with the same name"""
     duplicate_name: str | None = None
-    """The name the recipe would get when `duplicate_of` is set, e.g. "Banana Bread (2)\""""
+    """
+    The name committing gives the recipe while `duplicate_of` has the draft's name: the first free "Name (n)", e.g.
+    "Banana Bread (2)"; None when the name is only similar, or no free one is left
+    """
     household_recipes_public: bool = False
     """New recipes in the household are public, so the card photo would be too"""
     card_photo_default: bool = True

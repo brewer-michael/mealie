@@ -1,6 +1,7 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import ReviewPage from "./[jobId].vue";
+import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vue";
 import {
   resetRecipeIngestCounts,
@@ -19,7 +20,10 @@ const api = vi.hoisted(() => ({
   reextract: vi.fn(),
   rotatePage: vi.fn(),
   retry: vi.fn(),
+  readWithCloud: vi.fn(),
   commit: vi.fn(),
+  uncommit: vi.fn(),
+  merge: vi.fn(),
   discard: vi.fn(),
   saveEvalCase: vi.fn(),
   getCounts: vi.fn(),
@@ -151,11 +155,16 @@ const stubs = {
   VDivider: { template: "<hr>" },
   VSpacer: { template: "<span />" },
   VList: slot(),
-  VMenu: { template: "<div class=\"menu\"><slot name=\"activator\" :props=\"{}\" /><slot /></div>" },
+  VMenu: {
+    emits: ["update:modelValue"],
+    template: "<div class=\"menu\"><slot name=\"activator\" :props=\"{ onClick: () => $emit('update:modelValue', true) }\" /><slot /></div>",
+  },
   VListItem: {
-    props: ["title", "disabled"],
+    props: ["title", "subtitle", "disabled"],
     emits: ["click"],
-    template: "<button type=\"button\" class=\"menu-item\" :disabled=\"disabled\" @click=\"$emit('click')\">{{ title }}</button>",
+    template: `
+      <button type="button" class="menu-item" :class="$attrs.class" :disabled="disabled" @click="$emit('click')">{{ title }}<small v-if="subtitle" class="menu-item-reason">{{ subtitle }}</small></button>
+    `,
   },
   VueDraggable: { props: ["modelValue", "disabled", "handle"], template: "<div class=\"draggable\" :data-disabled=\"disabled\"><slot /></div>" },
   VExpansionPanels: slot(),
@@ -403,7 +412,7 @@ describe("the recipe card review page", () => {
     // said by the next card's page in its review bar, not by a toast over its header
     expect(toast.success).not.toHaveBeenCalled();
     expect(takeRecipeIngestCommitNotice()).toBeNull();
-    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null });
+    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null, undoJobId: "j1" });
   });
 
   test("the card opened by Commit & next says what was added inside its review bar, not over the page", async () => {
@@ -525,6 +534,65 @@ describe("the recipe card review page", () => {
     expect(wrapper.getComponent(IngestRegionDialog).props("initialTarget")).toBe("steps:s1");
   });
 
+  test("a flagged note is marked like a step, and its flag finds the note by id wherever it is", async () => {
+    const notes = [{ id: "n1", title: "From", text: "Grandma Jo" }, { id: "n2", title: "", text: "Doubles [illegible] in a 9x13 pan" }];
+    const illegible: CardFlag = { id: "illegible:notes:n2", kind: "illegible", severity: "error", source: "marker", field: "notes", ref: "n2", params: {}, alternatives: ["well"] };
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...job().draft!, notes }, flags: [illegible] })));
+    const wrapper = await mountPage();
+
+    // upstream's RecipeNotes knows nothing of flags: the fork's note list marks the note the flag names
+    expect(wrapper.find(".notes").exists()).toBe(false);
+    expect(wrapper.get("#ingest-field-notes-n2").classes()).toContain("ingest-note--error");
+    expect(wrapper.get("#ingest-field-notes-n1").classes()).not.toContain("ingest-note--error");
+    const item = wrapper.get("[data-flag=\"illegible:notes:n2\"]");
+    expect(item.text()).toContain("Doubles [illegible] in a 9x13 pan");
+    // named as the note list numbers it
+    expect(item.text()).toContain("· Note 2");
+
+    // the first note goes: the flag still finds its note, and Edit scrolls to that note
+    await wrapper.findAll(".ingest-note__delete")[0]!.trigger("click");
+    expect(wrapper.get("#ingest-field-notes-n2").classes()).toContain("ingest-note--error");
+    expect(item.text()).toContain("· Note 1");
+    await item.findAll("button").find(b => b.text() === "Edit")!.trigger("click");
+    await flushPromises();
+    expect(scrolled.at(-1)).toBe("ingest-field-notes-n2");
+
+    // what's typed over the unreadable spot goes into that note, which keeps its id
+    await item.get("input").setValue("well");
+    await item.findAll("button").find(b => b.text() === "Fill in")!.trigger("click");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls.at(-1)![1].draft.notes).toEqual([{ id: "n2", title: "", text: "Doubles well in a 9x13 pan" }]);
+    expect(wrapper.get("#ingest-field-notes-n2").classes()).not.toContain("ingest-note--error");
+  });
+
+  test("a note added in review gets an id that its saves keep, and a note's Re-read aims at that note", async () => {
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...job().draft!, notes: [{ id: "n1", title: "Tip", text: "Use a big mug" }] } })));
+    const wrapper = await mountPage();
+
+    await button(wrapper, "Add note").trigger("click");
+    const added = wrapper.findAll(".ingest-note")[1]!;
+    await added.findAll("textarea, input").at(-1)!.setValue("Freezes well");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    const sent = api.updateJob.mock.calls.at(-1)![1].draft.notes as { id: string; text: string }[];
+    expect(sent.map(note => note.text)).toEqual(["Use a big mug", "Freezes well"]);
+    expect(sent[0]!.id).toBe("n1");
+    expect(sent[1]!.id).toMatch(/^[0-9a-f-]{36}$/);
+
+    // an edit keeps it
+    await added.findAll("textarea, input").at(-1)!.setValue("Freezes well for a month");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls.at(-1)![1].draft.notes[1]).toEqual({ id: sent[1]!.id, title: "", text: "Freezes well for a month" });
+
+    await wrapper.findAll(".ingest-note__reread")[0]!.trigger("click");
+    const dialog = wrapper.getComponent(IngestRegionDialog);
+    expect(dialog.props("initialTarget")).toBe("notes:n1");
+    expect(dialog.props("targets")!.map((option: { value: string }) => option.value))
+      .toEqual(expect.arrayContaining(["notes:n1", `notes:${sent[1]!.id}`, "notes:new"]));
+  });
+
   test("on a failed card nothing offers a re-read that couldn't happen", async () => {
     api.getJob.mockResolvedValue(ok(job({ status: "failed", draft: null, flags: [], error: { code: "no_recipe_found", params: {} } })));
     const desktop = await mountPage(true);
@@ -588,6 +656,21 @@ describe("the recipe card review page", () => {
     expect(wrapper.get(".dialog[data-title=\"What the card says\"]").text()).toContain("Microwave on high for [blank] minutes.");
   });
 
+  test("Save as eval case sends what the dialog says about the card: its tags and notes", async () => {
+    api.saveEvalCase.mockResolvedValueOnce(ok({ slug: "banana-mug-cake", files: [] }));
+    const wrapper = await mountPage();
+
+    await wrapper.findAll(".menu-item").find(item => item.text() === "Save as eval case")!.trigger("click");
+    const dialog = wrapper.getComponent(IngestEvalCaseDialog);
+    expect(dialog.props("modelValue")).toBe(true);
+    dialog.vm.$emit("save", { slug: "banana-mug-cake", verified: true, tags: ["handwritten", "faded"], notes: "Pencil" });
+    await flushPromises();
+
+    expect(api.saveEvalCase).toHaveBeenCalledExactlyOnceWith("j1", { slug: "banana-mug-cake", verified: true, tags: ["handwritten", "faded"], notes: "Pencil" });
+    expect(dialog.props("modelValue")).toBe(false);
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Saved as banana-mug-cake");
+  });
+
   test("Ctrl+Enter commits from the keyboard, even while typing", async () => {
     api.getJob.mockResolvedValue(ok(job({ flags: [unsure] })));
     api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: "j2" }));
@@ -634,6 +717,198 @@ describe("the recipe card review page", () => {
     await flushPromises();
     expect(api.retry).toHaveBeenCalledExactlyOnceWith("j1");
     expect(wrapper.get(".ingest-review__status").text()).toBe("Waiting to be read Cancel");
+  });
+
+  test("a failed card kept on this server can be read with cloud providers, once the reviewer agrees its photos leave", async () => {
+    api.getJob.mockResolvedValue(ok(job({
+      status: "failed",
+      draft: null,
+      flags: [],
+      localOnly: true,
+      error: { code: "local_only_unavailable", params: {} },
+      permissions: { canDiscard: true, canReadWithCloud: true },
+    })));
+    api.readWithCloud.mockResolvedValueOnce(ok({ draftVersion: 0, status: "processing", task: { kind: "extract", state: "queued" }, proposalIds: [] }));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__status").text()).toMatch(/^Failed: This card must stay on this server/);
+    await button(wrapper, "Read with cloud providers").trigger("click");
+    const dialog = wrapper.get(".dialog[data-title=\"Read with cloud providers\"]");
+    expect(dialog.text()).toContain("This card was set to stay on this server. Reading it with a cloud provider sends its photos to that provider, outside your network.");
+    expect(api.readWithCloud).not.toHaveBeenCalled();
+
+    // Cancel changes nothing
+    await dialog.get(".ingest-review__cloud-cancel").trigger("click");
+    expect(wrapper.find(".dialog[data-title=\"Read with cloud providers\"]").exists()).toBe(false);
+    expect(api.readWithCloud).not.toHaveBeenCalled();
+
+    await button(wrapper, "Read with cloud providers").trigger("click");
+    await wrapper.get(".ingest-review__cloud-confirm").trigger("click");
+    await flushPromises();
+    expect(api.readWithCloud).toHaveBeenCalledExactlyOnceWith("j1");
+    expect(wrapper.find(".dialog[data-title=\"Read with cloud providers\"]").exists()).toBe(false);
+    // being read now, and no longer kept on this server
+    expect(wrapper.get(".ingest-review__status").text()).toBe("Waiting to be read Cancel");
+    expect(wrapper.get(".ingest-review__position").text()).not.toContain("Local only");
+  });
+
+  test("reading with cloud providers isn't offered without the permission", async () => {
+    api.getJob.mockResolvedValue(ok(job({
+      status: "failed",
+      draft: null,
+      flags: [],
+      localOnly: true,
+      error: { code: "local_only_unavailable", params: {} },
+      permissions: { canDiscard: true, canReadWithCloud: false },
+    })));
+    const wrapper = await mountPage();
+
+    expect(wrapper.findAll("button").filter(b => b.text() === "Read with cloud providers")).toHaveLength(0);
+    expect(button(wrapper, "Retry").exists()).toBe(true);
+  });
+
+  test("an added card can go back to review: the recipe is deleted once the reviewer agrees", async () => {
+    const committed = job({
+      status: "committed",
+      flags: [],
+      recipe: { id: "r1", slug: "banana-mug-cake", name: "Banana Mug Cake" },
+      permissions: { canDiscard: false, canUncommit: true },
+    });
+    api.getJob.mockResolvedValue(ok(committed));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__status").text()).toBe("Added");
+    await button(wrapper, "Back to review").trigger("click");
+    const dialog = () => wrapper.find(".dialog[data-title=\"Back to review\"]");
+    expect(dialog().text()).toContain("This deletes the recipe \"Banana Mug Cake\" and brings the card back for review.");
+    expect(api.uncommit).not.toHaveBeenCalled();
+
+    api.uncommit.mockResolvedValueOnce(ok({ draftVersion: 4, status: "ready", task: null, proposalIds: [] }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4, recipe: null })));
+    await dialog().get(".ingest-review__uncommit-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("j1", {});
+    expect(dialog().exists()).toBe(false);
+    // the card is back, ready to review
+    expect(wrapper.find(".ingest-review__status").exists()).toBe(false);
+    expect(primary(wrapper).text()).toBe("1 to fix");
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("The card is back for review.");
+  });
+
+  test("going back to review asks again when the recipe was edited since, and only then deletes it anyway", async () => {
+    api.getJob.mockResolvedValue(ok(job({ status: "committed", flags: [], recipe: { id: "r1", slug: "banana-mug-cake", name: "Banana Mug Cake" }, permissions: { canUncommit: true } })));
+    const wrapper = await mountPage();
+
+    api.uncommit.mockResolvedValueOnce({ data: null, response: null, error: { response: { status: 409, data: { detail: { code: "recipe_edited" } } } } });
+    await button(wrapper, "Back to review").trigger("click");
+    await wrapper.get(".ingest-review__uncommit-confirm").trigger("click");
+    await flushPromises();
+
+    const edited = () => wrapper.find(".dialog[data-title=\"The recipe was changed\"]");
+    expect(edited().text()).toContain("The recipe was changed after this card was added. Going back to review would delete those changes.");
+    // keeping the recipe changes nothing
+    await edited().get(".ingest-review__uncommit-keep").trigger("click");
+    expect(edited().exists()).toBe(false);
+    expect(api.uncommit).toHaveBeenCalledOnce();
+
+    await button(wrapper, "Back to review").trigger("click");
+    api.uncommit.mockResolvedValueOnce({ data: null, response: null, error: { response: { status: 409, data: { detail: { code: "recipe_edited" } } } } });
+    await wrapper.get(".ingest-review__uncommit-confirm").trigger("click");
+    await flushPromises();
+    api.uncommit.mockResolvedValueOnce(ok({ draftVersion: 4, status: "ready", task: null, proposalIds: [] }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4, recipe: null })));
+    await edited().get(".ingest-review__uncommit-force").trigger("click");
+    await flushPromises();
+    expect(api.uncommit).toHaveBeenLastCalledWith("j1", { force: true });
+    expect(primary(wrapper).text()).toBe("1 to fix");
+  });
+
+  test("an added card isn't offered back to review without the permission", async () => {
+    api.getJob.mockResolvedValue(ok(job({ status: "committed", flags: [], recipe: { id: "r1", slug: "banana-mug-cake" }, permissions: { canUncommit: false } })));
+    const wrapper = await mountPage();
+
+    expect(wrapper.findAll("button").filter(b => b.text() === "Back to review")).toHaveLength(0);
+    expect(button(wrapper, "View recipe").attributes("data-to")).toBe("/g/home/r/banana-mug-cake");
+  });
+
+  test("the next card's review bar offers Undo for the card just added", async () => {
+    carryReviewNotice("j1", { kind: "success", text: "Added Lemon Bars", undoJobId: "j0" });
+    api.uncommit.mockResolvedValueOnce(ok({ draftVersion: 2, status: "ready", task: null, proposalIds: [] }));
+    const wrapper = await mountPage();
+
+    const notice = wrapper.get(".ingest-review-bar__notice");
+    expect(notice.text()).toContain("Added Lemon Bars");
+    await notice.findAll("button").find(b => b.text() === "Undo")!.trigger("click");
+    await flushPromises();
+
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("j0", {});
+    expect(router.replace).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j0");
+  });
+
+  test("a back sent as its own card can be added to the card before it, which opens being read", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [{ id: "j0", position: 0, status: "ready" }, { id: "j1", position: 1, status: "ready" }] }));
+    const previous = job({ id: "j0", position: 0, pageCount: 1, permissions: { canMerge: true } });
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0" ? previous : job({ position: 1, permissions: { canDiscard: true, canMerge: true } }))));
+    api.merge.mockResolvedValueOnce(ok({ draftVersion: 3, status: "ready", task: { kind: "extract", state: "queued" }, proposalIds: [] }));
+    const wrapper = await mountPage();
+    const item = () => wrapper.get(".ingest-review__merge");
+
+    // opening the ⋯ menu checks the card before this one
+    await button(wrapper, "More").trigger("click");
+    await flushPromises();
+    expect(api.getJob).toHaveBeenLastCalledWith("j0");
+    expect(item().text()).toBe("Add as back of previous card");
+    expect(item().attributes("disabled")).toBeUndefined();
+
+    await item().trigger("click");
+    const dialog = () => wrapper.find(".dialog[data-title=\"Add as back of previous card\"]");
+    expect(dialog().text()).toContain("This card's photos are added to card 1 as its back, and that card is read again. This card is then removed.");
+    expect(api.merge).not.toHaveBeenCalled();
+    await dialog().get(".ingest-review__merge-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.merge).toHaveBeenCalledExactlyOnceWith("j1", { intoJobId: "j0" });
+    expect(router.replace).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j0");
+    expect(takeCarriedReviewNotice("j0")).toEqual({ kind: "info", text: "Photos added. The card is being read again.", detail: null });
+  });
+
+  test("Add as back of previous card is off, with the reason, when it can't be done", async () => {
+    api.getBatch.mockResolvedValue(ok({ id: "b1", source: "app", jobs: [{ id: "j0", position: 0, status: "committed" }, { id: "j1", position: 1, status: "ready" }] }));
+    let previous = job({ id: "j0", position: 0, status: "committed", pageCount: 1, permissions: { canMerge: false } });
+    api.getJob.mockImplementation((id: string) => Promise.resolve(ok(id === "j0" ? previous : job({ position: 1, pageCount: 2, permissions: { canMerge: true } }))));
+    const wrapper = await mountPage();
+    const item = () => wrapper.get(".ingest-review__merge");
+
+    // until the menu opens, the card before it isn't known
+    expect(item().attributes("disabled")).toBeDefined();
+    expect(item().get(".menu-item-reason").text()).toBe("Checking the previous card…");
+
+    await button(wrapper, "More").trigger("click");
+    await flushPromises();
+    expect(item().attributes("disabled")).toBeDefined();
+    expect(item().get(".menu-item-reason").text()).toBe("The previous card was already added as a recipe.");
+
+    previous = job({ id: "j0", position: 0, pageCount: 3, permissions: { canMerge: true } });
+    await button(wrapper, "More").trigger("click");
+    await flushPromises();
+    expect(item().get(".menu-item-reason").text()).toBe("Together they would have more than 4 photos.");
+    expect(api.merge).not.toHaveBeenCalled();
+  });
+
+  test("the batch's first card, or a card the member can't change, isn't offered as a back", async () => {
+    api.getJob.mockResolvedValue(ok(job({ permissions: { canDiscard: true, canMerge: true } })));
+    const first = await mountPage();
+    await button(first, "More").trigger("click");
+    await flushPromises();
+    expect(first.get(".ingest-review__merge").get(".menu-item-reason").text()).toBe("This is the first card in its batch.");
+    expect(first.get(".ingest-review__merge").attributes("disabled")).toBeDefined();
+    first.unmount();
+    wrappers.length = 0;
+
+    api.getJob.mockResolvedValue(ok(job({ permissions: { canDiscard: true, canMerge: false } })));
+    const other = await mountPage();
+    expect(other.find(".ingest-review__merge").exists()).toBe(false);
   });
 
   test("a card that's gone says so, with the way back", async () => {

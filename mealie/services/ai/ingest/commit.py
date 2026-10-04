@@ -14,7 +14,8 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is attached (`attaches_card_photo`: the
    draft's switch, else not in a household whose recipes are public), and the front's `view.jpg` as the cover when the
    draft asks for it, a portrait card letterboxed to 4:3 (`cover_image`).
-5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): ingredients re-linked through a fresh
+5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): a line kept as written with a marker
+   that no save parsed parsed around it (`review.parse_kept_lines`), ingredients re-linked through a fresh
    `IngestMatcher` (§5), organizers looked up in the group by id (or created by name, for a committer who can
    organize), the kept markers converted, the attribution as a
    note titled "From", the card assets when attached, and settings from the household with `show_assets` on when
@@ -125,11 +126,13 @@ from mealie.services.ai.ingest.review import (
     VERSION_CONFLICT,
     JobActionError,
     ReviewService,
+    amount_marker_note,
     attaches_card_photo,
     invalid_status,
     is_slimmed,
     not_found,
     parse_flags,
+    parse_kept_lines,
     parse_pages,
     settle_turns,
     version_conflict,
@@ -293,6 +296,17 @@ class IngredientLinker:
                 self._new_foods[key] = food
         return self._new_foods[key], None
 
+    def unit_text(self, ref: CardDraftRef) -> str:
+        """
+        How the recipe page names a unit in a line without an amount (`review.amount_marker_note`), by upstream's rule
+        (`RecipeIngredientBase._format_unit_for_display`, singular): the group's unit's abbreviation when it uses one,
+        else its name; a unit the group hasn't, by the draft's name. Nothing is linked or created.
+        """
+        unit = self.matcher.unit_by_id(ref.id) or self.matcher.exact_unit(ref.name)
+        if unit is None:
+            return ref.name.strip()
+        return ((unit.abbreviation if unit.use_abbreviation else "") or unit.name).strip()
+
     def _reloaded(self) -> IngestMatcher:
         self.matcher = IngestMatcher(self.repos)
         return self.matcher
@@ -311,10 +325,17 @@ def _ingredient(
 
     # A unit or food name holding a marker the reviewer kept is never linked or created (it would become one of the
     # group's units or foods): the names stay as text at the head of the note, the unit's first, as the line reads.
+    # A unit whose amount is a kept marker ("[blank] C. sugar") is named in the note after it, where the recipe page
+    # shows it ("sugar ___ cup"): it shows a unit only with an amount.
     as_text: list[str] = []
     unit: IngredientUnit | None = None
     food: IngredientFood | None = None
-    if line.unit is not None and _has_marker(line.unit):
+    marker_note = None
+    if line.unit is not None and not line.quantity:
+        marker_note = amount_marker_note(line, linker.unit_text(line.unit) if linker else line.unit.name)
+    if marker_note is not None:
+        note = convert(marker_note).strip()
+    elif line.unit is not None and _has_marker(line.unit):
         as_text.append(line.unit.name.strip())
     elif linker:
         unit = linker.unit(line.unit)
@@ -994,6 +1015,9 @@ def _run(
         try:
             if draft is None or household is None:
                 raise DraftInvalid(["draft"])
+            # a line kept as written with a marker that no save parsed (a draft kept before saves did) is parsed
+            # around its markers now, as a save would have; the stored draft keeps it as it is
+            draft = parse_kept_lines(repos, job, draft)
             attach = attaches_card_photo(draft, household)
             settings = recipe_settings(household, show_assets=attach)
             build = partial(

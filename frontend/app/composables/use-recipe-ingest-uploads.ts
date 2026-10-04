@@ -22,6 +22,8 @@ import {
   resetRecipeIngestSettings,
   useRecipeIngestCounts,
 } from "~/composables/use-recipe-ingest";
+import { inspectScanFile, mayBeDocument } from "~/composables/use-recipe-ingest-files";
+import type { ScanFile } from "~/composables/use-recipe-ingest-files";
 import { resetCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
 import { openUploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
 import type { UploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
@@ -78,21 +80,69 @@ function newKey(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${keyCounter}`;
 }
 
-/** Photos into cards, in selection order: one each, or pairs (front, back) with a lone last front */
-export function groupPhotosIntoCards<T>(photos: readonly T[], mode: CaptureMode): T[][] {
+/** The card pages a file holds: 1 for a photo, a PDF's or a multi-page TIFF's pages; null when they aren't known */
+export type PagesOf<T> = (photo: T) => number | null;
+
+const onePageEach = () => 1;
+
+/** The pages of a card's files; null when one of them isn't known */
+export function cardPages<T>(photos: readonly T[], pages: PagesOf<T> = onePageEach): number | null {
+  let total = 0;
+  for (const photo of photos) {
+    const count = pages(photo);
+    if (count === null) {
+      return null;
+    }
+    total += count;
+  }
+  return total;
+}
+
+/**
+ * Photos into cards, in selection order: one each, or pairs (front, back) with a lone last front. A document of
+ * several pages (a PDF, a multi-page TIFF), or one whose pages aren't known, is a card of its own: its pages are the
+ * card's sides, as the server and the inbox take it. A one-page document pairs like a photo.
+ */
+export function groupPhotosIntoCards<T>(
+  photos: readonly T[],
+  mode: CaptureMode,
+  pages: PagesOf<T> = onePageEach,
+): T[][] {
   if (mode === "one-side") {
     return photos.map(photo => [photo]);
   }
   const cards: T[][] = [];
-  for (let i = 0; i < photos.length; i += 2) {
-    cards.push(photos.slice(i, i + 2));
+  let front: T[] | null = null;
+  for (const photo of photos) {
+    if (pages(photo) !== 1) {
+      if (front) {
+        cards.push(front);
+        front = null;
+      }
+      cards.push([photo]);
+    }
+    else if (front) {
+      cards.push([...front, photo]);
+      front = null;
+    }
+    else {
+      front = [photo];
+    }
+  }
+  if (front) {
+    cards.push(front);
   }
   return cards;
 }
 
 /** Draft cards for chosen photos */
-export function draftCards<T>(photos: readonly T[], mode: CaptureMode, makeKey = () => newKey("draft")): DraftCard<T>[] {
-  return groupPhotosIntoCards(photos, mode).map(group => ({ key: makeKey(), photos: group }));
+export function draftCards<T>(
+  photos: readonly T[],
+  mode: CaptureMode,
+  makeKey = () => newKey("draft"),
+  pages: PagesOf<T> = onePageEach,
+): DraftCard<T>[] {
+  return groupPhotosIntoCards(photos, mode, pages).map(group => ({ key: makeKey(), photos: group }));
 }
 
 /**
@@ -105,13 +155,14 @@ function repairAfter<T>(
   extra: readonly T[],
   mode: CaptureMode,
   makeKey: () => string,
+  pages: PagesOf<T>,
 ): DraftCard<T>[] {
   let end = index + 1;
   while (end < cards.length && !cards[end]?.locked) {
     end += 1;
   }
   const photos = [...extra, ...cards.slice(index + 1, end).flatMap(card => card.photos)];
-  return [...cards.slice(0, index + 1), ...draftCards(photos, mode, makeKey), ...cards.slice(end)];
+  return [...cards.slice(0, index + 1), ...draftCards(photos, mode, makeKey, pages), ...cards.slice(end)];
 }
 
 /** Swaps a card's front and back */
@@ -130,19 +181,34 @@ export function splitCard<T>(
   index: number,
   mode: CaptureMode,
   makeKey = () => newKey("draft"),
+  pages: PagesOf<T> = onePageEach,
 ): DraftCard<T>[] {
   const card = cards[index];
   if (!card || card.photos.length < 2) {
     return [...cards];
   }
   const kept = cards.map((c, i) => (i === index ? { ...c, photos: card.photos.slice(0, 1), locked: true } : c));
-  return repairAfter(kept, index, card.photos.slice(1), mode, makeKey);
+  return repairAfter(kept, index, card.photos.slice(1), mode, makeKey, pages);
 }
 
-/** Whether `joinCards` can add the next card's first photo to this card */
-export function canJoin<T>(cards: readonly DraftCard<T>[], index: number, maxPages = DEFAULT_MAX_PAGES_PER_CARD) {
+/**
+ * Whether `joinCards` can add the next card's first photo to this card: the pages of both must be known and fit the
+ * server's limit
+ */
+export function canJoin<T>(
+  cards: readonly DraftCard<T>[],
+  index: number,
+  maxPages = DEFAULT_MAX_PAGES_PER_CARD,
+  pages: PagesOf<T> = onePageEach,
+) {
   const card = cards[index];
-  return !!card && index + 1 < cards.length && card.photos.length < maxPages;
+  const next = cards[index + 1]?.photos[0];
+  if (!card || next === undefined) {
+    return false;
+  }
+  const have = cardPages(card.photos, pages);
+  const adding = pages(next);
+  return have !== null && adding !== null && have + adding <= maxPages;
 }
 
 /** Adds the next card's first photo to this card (its back, or another page); the rest pair up again */
@@ -152,9 +218,10 @@ export function joinCards<T>(
   mode: CaptureMode,
   makeKey = () => newKey("draft"),
   maxPages = DEFAULT_MAX_PAGES_PER_CARD,
+  pages: PagesOf<T> = onePageEach,
 ): DraftCard<T>[] {
   const next = cards[index + 1];
-  if (!next || !canJoin(cards, index, maxPages)) {
+  if (!next || !canJoin(cards, index, maxPages, pages)) {
     return [...cards];
   }
   const taken = next.photos.slice(0, 1);
@@ -166,7 +233,7 @@ export function joinCards<T>(
       ? joined.map((c, i) => (i === index + 1 ? { ...c, photos: left } : c))
       : joined.filter((_, i) => i !== index + 1);
   }
-  return repairAfter(joined.filter((_, i) => i !== index + 1), index, left, mode, makeKey);
+  return repairAfter(joined.filter((_, i) => i !== index + 1), index, left, mode, makeKey, pages);
 }
 
 /** Drops a draft card and its photos */
@@ -810,7 +877,11 @@ function requestPreview(photo: Blob): Preview {
     return known;
   }
   let preview: Preview;
-  if (typeof createImageBitmap !== "function") {
+  if (isPdf(photo)) {
+    // no browser decodes a PDF as an image: the placeholder with its name, without reading it
+    preview = { state: "unavailable", url: null };
+  }
+  else if (typeof createImageBitmap !== "function") {
     // no way to make a small one: the photo itself, which the browser shows if it can (`markPreviewBroken` if not)
     const url = objectUrl(photo);
     preview = url ? { state: "ready", url } : { state: "unavailable", url: null };
@@ -867,6 +938,69 @@ function releaseUnusedPreviews() {
     const waiting = previewQueue.filter(photo => previews.has(photo));
     previewQueue.splice(0, previewQueue.length, ...waiting);
   }
+}
+
+// ---- what a file holds (`use-recipe-ingest-files.ts`)
+
+const inspections = new WeakMap<Blob, Promise<ScanFile | null>>();
+const inspected = new WeakMap<Blob, ScanFile | null>();
+/** Bumped when a file has been read, so what depends on its pages (Join) renders again */
+const inspectedVersion = ref(0);
+
+/** Reads the file once: its format and the card pages it holds; null for a file the server doesn't read */
+function inspect(photo: Blob): Promise<ScanFile | null> {
+  let pending = inspections.get(photo);
+  if (!pending) {
+    pending = inspectScanFile(photo)
+      .catch(() => null)
+      .then((found) => {
+        inspected.set(photo, found);
+        inspectedVersion.value += 1;
+        return found;
+      });
+    inspections.set(photo, pending);
+  }
+  return pending;
+}
+
+/**
+ * The card pages a file holds: 1 for a photo; a document's (a PDF, a multi-page TIFF) once it has been read, null
+ * until then or when its pages can't be counted. Photos from the camera aren't read: a page each.
+ */
+function pagesOf(photo: Blob): number | null {
+  void inspectedVersion.value;
+  if (inspected.has(photo)) {
+    const found = inspected.get(photo);
+    return found ? found.pages : 1;
+  }
+  if (!mayBeDocument(photo)) {
+    return 1;
+  }
+  void inspect(photo); // one read back from this device's storage
+  return null;
+}
+
+/** A PDF, by what it was read as, else by its type and name */
+function isPdf(photo: Blob): boolean {
+  const found = inspected.get(photo);
+  if (found) {
+    return found.kind === "pdf";
+  }
+  return photo.type === "application/pdf" || (photo.type === "" && /\.pdf$/i.test(photoName(photo)));
+}
+
+/** A JPEG, by what it was read as, else by its type and name: its pixel limit is higher (`images.py`) */
+function isJpeg(photo: Blob): boolean {
+  const found = inspected.get(photo);
+  if (found) {
+    return found.kind === "jpeg";
+  }
+  return photo.type === "image/jpeg" || (photo.type === "" && /\.jpe?g$/i.test(photoName(photo)));
+}
+
+/** A photo the browser may make smaller: one page, not a PDF (a multi-page TIFF would lose its other pages) */
+function canReencode(photo: Blob): boolean {
+  return !isPdf(photo) && pagesOf(photo) === 1;
 }
 
 // ---- keeping the queue between visits (per user)
@@ -1282,11 +1416,18 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
   const body = status === 400 ? rejectedBody(error) : null;
 
   // Too large for the server: a proxy's body limit (413), or a photo over its size or pixel limit (400 with nothing
-  // accepted). The card's photos go again, smaller, once.
-  const tooLarge = status === 413
-    || (!!body && !body.jobs?.length && (body.rejected ?? []).some(rejected => SHRINKABLE_REASONS.has(rejected.reason)));
+  // accepted). The card's photos go again, smaller, once. A PDF or a multi-page TIFF can't be made smaller here: when
+  // it's the file refused, the server's reason is the card's.
+  const tooLargeIndexes = new Set(
+    (body?.jobs?.length ? [] : body?.rejected ?? [])
+      .filter(rejected => SHRINKABLE_REASONS.has(rejected.reason))
+      .map(rejected => rejected.index),
+  );
+  const tooLarge = status === 413 || tooLargeIndexes.size > 0;
+  const shrinkable = card.photos.some((photo, index) =>
+    canReencode(photo) && (status === 413 || tooLargeIndexes.has(index)));
   if (tooLarge) {
-    if (card.reencoded) {
+    if (card.reencoded || !shrinkable) {
       if (body) {
         dispatch({ type: "uploaded", key, response: body });
       }
@@ -1296,9 +1437,9 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
       return;
     }
     dispatch({ type: "re-encoding", key });
-    let photos: File[];
+    let photos: Blob[];
     try {
-      photos = await Promise.all(card.photos.map(photo => reencodePhoto(photo)));
+      photos = await Promise.all(card.photos.map(photo => (canReencode(photo) ? reencodePhoto(photo) : photo)));
     }
     catch {
       // this browser can't decode the photo (HEIC outside Safari), so it can't make it smaller
@@ -1369,7 +1510,8 @@ async function runCard(key: string) {
     }
     if (currentDataSaver() && !card.downscaled && !card.reencoded) {
       // data saver: the photos go at most the size the server keeps
-      const smaller = await Promise.all(card.photos.map(photo => shrinkForUpload(photo)));
+      // a PDF or a multi-page TIFF goes as it is: re-encoding would keep one page
+      const smaller = await Promise.all(card.photos.map(photo => (canReencode(photo) ? shrinkForUpload(photo) : photo)));
       if (gen !== generation) {
         return;
       }
@@ -1658,7 +1800,7 @@ function setMode(mode: CaptureMode) {
   catch {
     // private browsing: the choice lasts for this visit
   }
-  drafts.value = draftCards(drafts.value.flatMap(card => card.photos), mode);
+  drafts.value = draftCards(drafts.value.flatMap(card => card.photos), mode, undefined, pagesOf);
 }
 
 /** A photo from the camera: a card of its own, the front of a card, or that front's back */
@@ -1698,8 +1840,19 @@ function noBack() {
   }
 }
 
-/** Chosen or dropped photos become draft cards, paired in selection order */
-function addPhotos(photos: readonly Blob[]) {
+/** What `addPhotos` left out, by file name */
+export interface AddPhotosResult {
+  /** Files the server doesn't read: not a JPEG, PNG, WebP, HEIC, AVIF or TIFF photo, nor a PDF */
+  unsupported: string[];
+  /** Documents with more pages than a card can have */
+  tooManyPages: string[];
+}
+
+/** Chosen or dropped files wait for the ones before them, so the tray keeps the order they came in */
+let addChain: Promise<unknown> = Promise.resolve();
+
+/** Photos that can go on cards become draft cards, paired in selection order */
+function addDrafts(photos: readonly Blob[]) {
   if (!photos.length) {
     return;
   }
@@ -1712,11 +1865,43 @@ function addPhotos(photos: readonly Blob[]) {
   }
   const kept = drafts.value.slice(0, keptCount);
   const loose = all.slice(kept.flatMap(card => card.photos).length);
-  drafts.value = [...kept, ...draftCards(loose, currentMode())];
+  drafts.value = [...kept, ...draftCards(loose, currentMode(), undefined, pagesOf)];
 }
 
-function editDrafts(edit: (cards: DraftCard[], mode: CaptureMode) => DraftCard[]) {
-  drafts.value = edit(drafts.value, currentMode());
+/**
+ * Chosen or dropped files become draft cards, paired in selection order. Each file is read first, as the server will
+ * (`use-recipe-ingest-files.ts`): a file it doesn't read is left out, and so is a document with more pages than
+ * `maxPages`; the result names them. A PDF or a multi-page TIFF is a card of its own.
+ */
+function addPhotos(photos: readonly Blob[], maxPages = DEFAULT_MAX_PAGES_PER_CARD): Promise<AddPhotosResult> {
+  const gen = generation;
+  const added = addChain.then(async (): Promise<AddPhotosResult> => {
+    const found = await Promise.all(photos.map(photo => inspect(photo)));
+    const result: AddPhotosResult = { unsupported: [], tooManyPages: [] };
+    if (gen !== generation) {
+      return result; // signed out meanwhile
+    }
+    const usable = photos.filter((photo, index) => {
+      const file = found[index];
+      if (!file) {
+        result.unsupported.push(photoName(photo));
+        return false;
+      }
+      if (file.pages !== null && file.pages > maxPages) {
+        result.tooManyPages.push(photoName(photo));
+        return false;
+      }
+      return true;
+    });
+    addDrafts(usable);
+    return result;
+  });
+  addChain = added.catch(() => undefined);
+  return added;
+}
+
+function editDrafts(edit: (cards: DraftCard[], mode: CaptureMode, pages: PagesOf<Blob>) => DraftCard[]) {
+  drafts.value = edit(drafts.value, currentMode(), pagesOf);
   releaseUnusedPreviews();
 }
 
@@ -1893,10 +2078,17 @@ export function useRecipeIngestUploads() {
     retake,
     noBack,
     addPhotos,
+    /** The card pages a file holds (a PDF's or a multi-page TIFF's); null while unknown */
+    pagesOf,
+    isPdf,
+    isJpeg,
     swapDraft: (index: number) => editDrafts(cards => swapSides(cards, index)),
-    splitDraft: (index: number) => editDrafts((cards, mode) => splitCard(cards, index, mode)),
+    splitDraft: (index: number) => editDrafts((cards, mode, pages) => splitCard(cards, index, mode, undefined, pages)),
+    /** Whether Join can add the next draft card's first photo to this one, within `maxPages` */
+    canJoinDraft: (index: number, maxPages = DEFAULT_MAX_PAGES_PER_CARD) =>
+      canJoin(drafts.value, index, maxPages, pagesOf),
     joinDraft: (index: number, maxPages = DEFAULT_MAX_PAGES_PER_CARD) =>
-      editDrafts((cards, mode) => joinCards(cards, index, mode, undefined, maxPages)),
+      editDrafts((cards, mode, pages) => joinCards(cards, index, mode, undefined, maxPages, pages)),
     removeDraft: (index: number) => editDrafts(cards => removeCard(cards, index)),
     uploadDrafts,
     done,
@@ -2025,6 +2217,7 @@ export function resetRecipeIngestUploads() {
   sealFailures.clear();
   releaseUnusedPreviews();
   previewQueue.length = 0;
+  addChain = Promise.resolve();
   api = null;
   refreshCounts = null;
 }

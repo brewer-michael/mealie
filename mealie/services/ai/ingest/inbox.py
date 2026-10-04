@@ -6,6 +6,9 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
 - **Off** unless `AI_INGEST_INBOX_DIR` is set and outside `DATA_DIR` and `/app` (`settings.inbox_root`), and on
   Windows (no directory-descriptor calls). Each scan creates every household's folder; unknown folders are logged once
   and ignored. Inbox jobs have no uploader.
+- **In the household's language** (`household_locale`): an inbox card, its batch's "ready" notification, the "not
+  added" notification and the notes in `failed/` take the language of the household's latest app or API batch (the
+  `Accept-Language` its people capture and upload with), else en-US; a text that language lacks is in English.
 - **A file is one card; a first-level subfolder is one multi-page card** (pages in name order); a multi-page TIFF or a
   PDF gives the card all its pages (`images.expand_document`, through intake). Skipped: anything that isn't a regular
   file or directory by `lstat` (symlinks included: each is logged once, since it stays for good), names starting with
@@ -26,9 +29,14 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   are skipped); one with more than `MAX_PAGES_PER_CARD` is refused before any is opened.
 - **Then** a rename to a unique name in `processed/YYYY-MM/` (or an unlink with `AI_INGEST_INBOX_KEEP_PROCESSED=false`);
   a rejected card goes to `failed/` with `<name>.error.txt`, created with `O_EXCL | O_NOFOLLOW` under a name nothing
-  in `failed/` has yet.
+  in `failed/` has yet. The note is `recipe-ingest.inbox-rejected.*` (`rejection_note`): `Not added (<code>): …` in
+  the household's language, its numbers from `limits`.
 - **One bad entry or folder stops nothing else:** a file that can't be claimed and a folder that can't be scanned are
   logged once and skipped; names that aren't UTF-8 are taken like any other (shown with U+FFFD).
+- **No write access** (`EACCES`/`EPERM` on the claim): moving a card folder needs write access to the folder itself,
+  so one another user made under umask 022 (mode 2755) stays where it is. The log names the fix (Mealie's group needs
+  write access: umask 002), and the app's inbox status lists it as `no_permission` until it's taken or gone
+  (`household_status`; remembered by each process that scans).
 - **Crash safety:** a claim older than `INBOX_CLAIM_RETRY` (by the time in its name) is claimed again by a second
   rename to a fresh claim time, so only one process retries it. A card already inserted is then found by its content
   hash, and the file is just moved to `processed/`.
@@ -46,8 +54,9 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   and a burst of them sends the household one "Recipe cards not added" notification
   (`events.notify_inbox_rejections`): once a scan of the folder took everything it found, or two minutes after the
   burst's first refusal, whichever comes first (a long burst spans scans: `INBOX_FILES_PER_TICK`).
-- **The app sees the folder** through `household_status`: how many photos wait and why (the scan's own gate), and the
-  newest refusals in `failed/`, read through the same descriptors without following a link and without writing.
+- **The app sees the folder** through `household_status`: how many photos wait and why (the scan's own gate), the
+  photos the scan may not move, and the newest refusals in `failed/`, read through the same descriptors without
+  following a link and without writing.
 """
 
 import calendar
@@ -58,7 +67,7 @@ import shutil
 import stat
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -73,6 +82,8 @@ from mealie.core.root_logger import get_logger
 from mealie.db.db_setup import session_context
 from mealie.db.models.group import Group
 from mealie.db.models.household import Household
+from mealie.lang.providers import Translator
+from mealie.repos.repository_recipe_ingest import IngestRepos
 from mealie.schema.recipe_ingest import (
     InboxWaitingReason,
     IngestInboxRejection,
@@ -81,7 +92,8 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services.ai.errors import IngestPaused
 
-from . import events, limits, storage
+from . import events, images, limits, storage
+from .i18n import DEFAULT_LOCALE, translator_for
 from .intake import (
     ClaimLost,
     IntakeAccepted,
@@ -107,8 +119,12 @@ IGNORED_NAMES = frozenset({"thumbs.db", "desktop.ini"})
 ERROR_SUFFIX = ".error.txt"
 OTHER_CODE = events.OTHER_REASON
 """How the log names a refusal without a reason code (a link, a device, an empty folder)"""
-INBOX_LOCALE = "en-US"
-"""Inbox cards have no uploader whose language they could take"""
+LOCALE_SOURCES = (IngestSource.app, IngestSource.api)
+"""The batches whose language the household's inbox cards take: the ones people capture and upload with"""
+
+NO_PERMISSION_HINT = "Mealie's group needs write access to the household folder, and to a card folder itself: umask 002"
+"""What the log adds when a claim is refused for permissions (`IngestRejectReason.no_permission`)"""
+_PERMISSION_ERRNOS = (errno.EACCES, errno.EPERM)
 
 NAME_MAX_BYTES = 255
 _CLAIM_NAME = re.compile(r"^(?P<ms>\d+)__(?P<token>[0-9a-f]{32})__(?P<name>.+)$", re.DOTALL)
@@ -135,28 +151,25 @@ _SUPPORTED = (
 )
 """Whether every inbox operation can be made relative to a directory descriptor (Linux and macOS; not Windows)"""
 
-REJECTION_TEXT = {
-    IngestRejectReason.too_large: "The file is larger than 30 MB.",
-    IngestRejectReason.unsupported_format: (
-        "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF."
-    ),
-    IngestRejectReason.pdf_not_supported: "This PDF can't be opened. It may need a password or be damaged.",
-    IngestRejectReason.too_many_pixels: "The photo has too many pixels (260 megapixels for a JPEG, else 100).",
-    IngestRejectReason.unreadable_image: "The image couldn't be read. It may be damaged or incomplete.",
-    IngestRejectReason.too_many_pages: "A card can have at most 4 pages.",
-    IngestRejectReason.duplicate: "This card was already scanned.",
-    IngestRejectReason.url_not_allowed: "Mealie may not download images from that address.",
-    IngestRejectReason.url_fetch_failed: "The image couldn't be downloaded.",
-}
-"""What a refused file's note says after `Not added (<code>):`; every reason has one"""
+NOTE_TEXTS = "recipe-ingest.inbox-rejected"
+"""
+The notes' texts: `.prefix` (`Not added ({code}):`) then `.<code>` (every reason has one; `.duplicate-of` names the
+earlier card), or `.prefix-other` then `.other.<detail>` for a refusal without a code (`_Refused.detail`)
+"""
 
 
 class _Refused(Exception):
-    """A claimed entry that can't be read safely (a symlink, a device, a path outside the inbox), or too many pages"""
+    """
+    A claimed entry that can't be read safely (a symlink, a device, a path outside the inbox), or too many pages:
+    `detail` names its note's text (`recipe-ingest.inbox-rejected.other.<detail>`, filled with `params`) when there's
+    no reason code
+    """
 
-    def __init__(self, message: str, reason: IngestRejectReason | None = None) -> None:
-        super().__init__(message)
+    def __init__(self, detail: str, reason: IngestRejectReason | None = None, **params: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
         self.reason = reason
+        self.params = params
 
 
 class _UnsafeFolder(OSError):
@@ -201,6 +214,11 @@ class _ScanState:
     """When `processed/` is purged next (`time.monotonic()`); None until the first scan"""
     refusals: dict[str, _Refusals] = field(default_factory=dict)
     """Each folder's refusals not yet told (`notify_refusals`)"""
+    blocked: dict[str, dict[str, float]] = field(default_factory=dict)
+    """
+    Each folder's entries its claim was refused for permissions (`no_permission`), with when that first happened
+    (`time.time()`): listed by `household_status` until they're taken or gone
+    """
 
     def first(self, key: str) -> bool:
         """Whether `key` is new since it was last forgotten (and marks it seen)"""
@@ -224,6 +242,7 @@ class _ScanState:
             self.logged.clear()
             self.next_purge = None
             self.refusals.clear()
+            self.blocked.clear()
 
 
 _state = _ScanState()
@@ -515,6 +534,9 @@ def _settled_entries(dirs: _FolderDirs, now: float) -> list[str]:
     with _state.lock:
         previous = _state.seen.get(folder.key, {})
         _state.seen[folder.key] = current
+        blocked = _state.blocked.get(folder.key, {})
+        for name in blocked.keys() - current.keys():
+            del blocked[name]  # gone, or no longer a card: no longer listed
 
     settle_ns = limits.INBOX_SETTLE * 1_000_000_000
     now_ns = int(now * 1_000_000_000)
@@ -624,16 +646,16 @@ def open_page(path: str | Path, root: Path, *, dir_fd: int | None = None) -> Bin
         raise
     except OSError as e:
         if e.errno == errno.ELOOP:
-            raise _Refused("a symbolic link, which is never followed") from e
-        raise _Refused(f"unreadable ({e.strerror})") from e
+            raise _Refused("symbolic-link") from e
+        raise _Refused("unreadable", error=e.strerror or str(e)) from e
 
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise _Refused("not a regular file")
+            raise _Refused("not-a-file")
         # without /proc, a page opened through the descriptors is inside the root by how they were opened
         real = _fd_path(fd) or (os.path.realpath(path) if dir_fd is None else None)
         if real is not None and not _within(real, os.path.realpath(root)):
-            raise _Refused("outside the inbox folder")
+            raise _Refused("outside-inbox")
         os.set_blocking(fd, True)
         return os.fdopen(fd, "rb")
     except BaseException:
@@ -651,20 +673,20 @@ def _open_card(dirs: _FolderDirs, claimed: str, root: Path) -> list[tuple[Binary
     if stat.S_ISREG(st.st_mode):
         return [(open_page(claimed, root, dir_fd=claim_dir), "")]
     if not stat.S_ISDIR(st.st_mode):
-        raise _Refused("not a regular file or folder")
+        raise _Refused("not-a-file-or-folder")
 
     try:
         card_fd = _open_dir(claimed, claim_dir, claimed)
     except _UnsafeFolder as e:
-        raise _Refused("not a regular file or folder") from e  # swapped for a link since
+        raise _Refused("not-a-file-or-folder") from e  # swapped for a link since
 
     opened: list[tuple[BinaryIO, str]] = []
     try:
         pages = _page_entries(card_fd)
         if not pages:
-            raise _Refused("the folder is empty")
+            raise _Refused("empty-folder")
         if len(pages) > limits.MAX_PAGES_PER_CARD:
-            raise _Refused("too many pages", IngestRejectReason.too_many_pages)
+            raise _Refused("too-many-pages", IngestRejectReason.too_many_pages)
         for name, _ in pages:
             opened.append((open_page(name, root, dir_fd=card_fd), name))
     except BaseException:
@@ -749,8 +771,35 @@ def fail(dirs: _FolderDirs, claimed: str, name: str, reason: str, code: IngestRe
         os.close(failed)
 
 
-def _rejection(reason: IngestRejectReason) -> str:
-    return f"Not added ({reason.value}): {REJECTION_TEXT[reason]}"
+def _limit_params() -> dict[str, int]:
+    """The numbers the notes name, from the limits as they are now"""
+    return {
+        "mib": limits.MAX_FILE_BYTES // limits.MIB,
+        "megapixels": limits.MAX_PIXELS // 1_000_000,
+        "jpeg_megapixels": images.MAX_JPEG_SOURCE_PIXELS // 1_000_000,
+        "pages": limits.MAX_PAGES_PER_CARD,
+    }
+
+
+def rejection_note(translator: Translator, reason: IngestRejectReason, duplicate_of: UUID | None = None) -> str:
+    """
+    A refused file's note: `Not added (<code>): <why>`, in the translator's language. The code stays in it whatever
+    the language: the status reads it back (`_note_reason`). A duplicate names the card it duplicates.
+    """
+    prefix = translator.t(f"{NOTE_TEXTS}.prefix", code=reason.value)
+    if reason == IngestRejectReason.duplicate and duplicate_of is not None:
+        text = translator.t(f"{NOTE_TEXTS}.duplicate-of", job=str(duplicate_of))
+    else:
+        text = translator.t(f"{NOTE_TEXTS}.{reason.value}", **_limit_params())
+    return f"{prefix} {text}"
+
+
+def _refusal_note(translator: Translator, refused: _Refused) -> str:
+    """The note of a refusal `_open_card` raised: with its code when it has one, else `Not added: <what it is>`"""
+    if refused.reason is not None:
+        return rejection_note(translator, refused.reason)
+    prefix = translator.t(f"{NOTE_TEXTS}.prefix-other")
+    return f"{prefix} {translator.t(f'{NOTE_TEXTS}.other.{refused.detail}', **refused.params)}"
 
 
 # ==================================================================================================================
@@ -896,7 +945,11 @@ STATUS_MAX_ENTRIES = 5000
 STATUS_REJECTIONS = 10
 """The newest refusals listed"""
 _NOTE_READ_BYTES = 512
-_NOTE_CODE = re.compile(r"^Not added \((?P<code>[a-z_]+)\)")
+_NOTE_CODE = re.compile(r"[(\uff08](?P<code>[a-z_]+)[)\uff09]")
+"""
+A reason code in a note's first line, however its language words the rest (`Not added (too_large): …`), in ASCII or
+full-width parentheses
+"""
 
 
 @dataclass(frozen=True)
@@ -908,17 +961,22 @@ class InboxStatus:
     waiting_reason: InboxWaitingReason | None = None
     """Why they can't be taken now (`waiting_reason`); None when they can, or nothing waits"""
     rejections: list[IngestInboxRejection] = field(default_factory=list)
-    """The newest files in `failed/` refused in the last `AI_INGEST_RETENTION_DAYS`, newest first"""
+    """
+    The entries the scan may not move (`no_permission`, still in the folder), then the newest files and card folders
+    in `failed/` refused in the last `AI_INGEST_RETENTION_DAYS`, newest first: `STATUS_REJECTIONS` in all, unless more
+    are stuck
+    """
 
 
 def household_status(
     group_slug: str | None, household_slug: str | None, readiness: ReadingReadiness | None = None
 ) -> InboxStatus:
     """
-    What waits in a household's inbox folder and what it refused lately, read without writing anything or following a
-    link (through the scan's descriptors, from the root down); an empty status when the inbox is off or the folder
-    doesn't exist (yet). `readiness` is the group's (`intake.reading_readiness`), which says why photos wait; without
-    it no reason is given. Blocking (file system): call it from a worker thread.
+    What waits in a household's inbox folder, what the scan may not move (`no_permission`: what this process's scans
+    found) and what it refused lately, read without writing anything or following a link (through the scan's
+    descriptors, from the root down); an empty status when the inbox is off or the folder doesn't exist (yet).
+    `readiness` is the group's (`intake.reading_readiness`), which says why photos wait; without it no reason is given.
+    Blocking (file system): call it from a worker thread.
     """
     root = inbox_root()
     if root is None or not get_ingest_settings().ENABLED or not _SUPPORTED:
@@ -935,15 +993,38 @@ def household_status(
         if fd is None:
             return InboxStatus()
         try:
-            waiting = _count_waiting(fd, time.time())
+            blocked = _still_there(fd, _blocked(f"{group_slug}/{household_slug}"))
+            waiting = _count_waiting(fd, time.time(), skip=blocked.keys())
             rejections = _recent_rejections(fd, time.time())
         finally:
             os.close(fd)
     finally:
         os.close(root_fd)
 
+    # what the scan may not move comes first: it stays in the folder until someone gives Mealie's group write access
+    stuck = [
+        IngestInboxRejection(
+            name=_display_name(name), reason=IngestRejectReason.no_permission, at=datetime.fromtimestamp(at, UTC)
+        )
+        for name, at in sorted(blocked.items(), key=lambda item: (-item[1], item[0]))
+    ]
     reason = waiting_reason(readiness) if waiting and readiness is not None else None
-    return InboxStatus(waiting=waiting, waiting_reason=reason, rejections=rejections)
+    return InboxStatus(
+        waiting=waiting, waiting_reason=reason, rejections=(stuck + rejections)[: max(STATUS_REJECTIONS, len(stuck))]
+    )
+
+
+def _still_there(fd: int, blocked: dict[str, float]) -> dict[str, float]:
+    """The entries of `blocked` the folder still has, as a file or a folder (never a link)"""
+    there = {}
+    for name, at in blocked.items():
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+            there[name] = at
+    return there
 
 
 def _open_household(root_fd: int, group_slug: str, household_slug: str) -> int | None:
@@ -960,8 +1041,11 @@ def _open_household(root_fd: int, group_slug: str, household_slug: str) -> int |
         os.close(group_fd)
 
 
-def _count_waiting(fd: int, now: float) -> int:
-    """The folder's settled cards, as the scan would take them: regular files, and folders holding pages"""
+def _count_waiting(fd: int, now: float, skip: Collection[str] = ()) -> int:
+    """
+    The folder's settled cards, as the scan would take them: regular files, and folders holding pages; not those in
+    `skip` (the ones the scan may not move, listed instead)
+    """
     settle = limits.INBOX_SETTLE
     waiting = 0
     looked = 0
@@ -971,7 +1055,7 @@ def _count_waiting(fd: int, now: float) -> int:
                 looked += 1
                 if waiting >= STATUS_MAX_WAITING or looked > STATUS_MAX_ENTRIES:
                     break
-                if _ignored_name(entry.name):
+                if _ignored_name(entry.name) or entry.name in skip:
                     continue
                 try:
                     st = entry.stat(follow_symlinks=False)
@@ -999,8 +1083,9 @@ def _count_waiting(fd: int, now: float) -> int:
 
 def _recent_rejections(fd: int, now: float) -> list[IngestInboxRejection]:
     """
-    The newest files in `failed/` (not their notes) refused within `AI_INGEST_RETENTION_DAYS`, newest first. A refusal's
-    time is its note's (a move keeps the photo's own mtime), else the file's ctime; its reason is the note's code.
+    The newest files and card folders in `failed/` (not their notes) refused within `AI_INGEST_RETENTION_DAYS`, newest
+    first. A refusal's time is its note's (a move keeps the photo's own mtime), else the entry's ctime; its reason is
+    the note's code.
     """
     try:
         failed = _open_dir(FAILED_DIR, fd, FAILED_DIR)
@@ -1020,7 +1105,8 @@ def _recent_rejections(fd: int, now: float) -> list[IngestInboxRejection]:
         cutoff = now - get_ingest_settings().RETENTION_DAYS * 86400
         refused: list[tuple[float, str]] = []
         for name, st in found.items():
-            if name.endswith(ERROR_SUFFIX) or not stat.S_ISREG(st.st_mode):
+            # a refused file, or a refused card folder (never a link)
+            if name.endswith(ERROR_SUFFIX) or not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
                 continue
             note = found.get(name + ERROR_SUFFIX)
             if note is not None and stat.S_ISREG(note.st_mode):
@@ -1046,7 +1132,10 @@ def _recent_rejections(fd: int, now: float) -> list[IngestInboxRejection]:
 
 
 def _note_reason(failed: int, note: str) -> IngestRejectReason | None:
-    """The reason code a refusal's note starts with (`Not added (<code>): …`); None without a readable one"""
+    """
+    The reason code a refusal's note gives in its first line (`Not added (<code>): …`, the first code in parentheses
+    in whatever language it's written); None without a readable one
+    """
     try:
         fd = os.open(note, _OPEN_FLAGS, dir_fd=failed)
     except OSError:
@@ -1059,17 +1148,35 @@ def _note_reason(failed: int, note: str) -> IngestRejectReason | None:
         return None
     finally:
         os.close(fd)
-    match = _NOTE_CODE.match(head)
-    if match is None:
-        return None
-    try:
-        return IngestRejectReason(match.group("code"))
-    except ValueError:
-        return None
+    first_line = head.split("\n", 1)[0]
+    for match in _NOTE_CODE.finditer(first_line):
+        try:
+            return IngestRejectReason(match.group("code"))
+        except ValueError:
+            continue
+    return None
 
 
 # ==================================================================================================================
 # The scan
+
+
+def household_locale(session: Session, group_id: UUID, household_id: UUID) -> str:
+    """
+    The language a household's inbox cards take (they have no uploader): that of its latest app or API batch (the
+    `Accept-Language` its people capture and upload with, `LOCALE_SOURCES`), else en-US. Ends the session's
+    transaction. Never raises: a failed lookup is logged and gives en-US (the cards and notes are then in English).
+    """
+    try:
+        locale = IngestRepos(session, group_id, household_id).batches.latest_locale(LOCALE_SOURCES)
+    except Exception:
+        logger.exception(f"Couldn't look up the language of household {household_id} for its recipe card inbox")
+        if session.in_transaction():
+            session.rollback()
+        return DEFAULT_LOCALE
+    if session.in_transaction():
+        session.commit()
+    return locale or DEFAULT_LOCALE
 
 
 def waiting_reason(readiness: ReadingReadiness, taken: int = 0) -> InboxWaitingReason | None:
@@ -1129,9 +1236,16 @@ class _Taken:
 
 
 def _ingest_claimed(
-    session: Session, root: Path, dirs: _FolderDirs, claimed: str, *, local_only: bool, recovered: bool
+    session: Session,
+    root: Path,
+    dirs: _FolderDirs,
+    claimed: str,
+    *,
+    local_only: bool,
+    recovered: bool,
+    locale: str,
 ) -> _Taken:
-    """Intake for one claimed entry, then where it goes"""
+    """Intake for one claimed entry, then where it goes; `locale` is the household's (`household_locale`)"""
     folder = dirs.folder
     parsed = _parse_claim(claimed)
     name = parsed[1] if parsed else claimed
@@ -1141,7 +1255,7 @@ def _ingest_claimed(
     except FileNotFoundError:
         return _Taken()  # another scanner retried it
     except _Refused as e:
-        fail(dirs, claimed, name, _rejection(e.reason) if e.reason else f"Not added: {e}.", e.reason)
+        fail(dirs, claimed, name, _refusal_note(translator_for(locale), e), e.reason)
         return _Taken(refused=True, reason=e.reason)
 
     try:
@@ -1156,7 +1270,7 @@ def _ingest_claimed(
             source=IngestSource.inbox,
             source_key=folder.key,
             local_only=local_only,
-            locale=INBOX_LOCALE,
+            locale=locale,
         )
 
         def still_claimed() -> bool:
@@ -1187,10 +1301,8 @@ def _ingest_claimed(
         finish(dirs, claimed, name)
         return _Taken()
 
-    reason = _rejection(outcome.reason)
-    if outcome.duplicate_of:
-        reason += f" Recipe card job {outcome.duplicate_of}."
-    fail(dirs, claimed, name, reason, outcome.reason)
+    note = rejection_note(translator_for(locale), outcome.reason, outcome.duplicate_of)
+    fail(dirs, claimed, name, note, outcome.reason)
     return _Taken(refused=True, reason=outcome.reason)
 
 
@@ -1217,6 +1329,7 @@ def _scan_folder(
     """
     folder = dirs.folder
     result = _FolderScan()
+    locale: str | None = None  # looked up once a card is taken
     work: list[tuple[str, str]] = [("stale", claimed_name) for claimed_name in stale_claims(dirs, _now_ms())]
     work += [("new", name) for name in _settled_entries(dirs, time.time())]
 
@@ -1236,15 +1349,25 @@ def _scan_folder(
             raise
         except OSError as e:
             # permissions, a name too long for a claim: the next entry is still taken
+            hint = ""
+            if kind == "new" and e.errno in _PERMISSION_ERRNOS:
+                # moving a card folder needs write access to the folder itself: one another user made under umask
+                # 022 stays where it is, so the app lists it until it's taken (`household_status`)
+                _block(folder, name)
+                hint = f" ({NO_PERMISSION_HINT})"
             _state.log_once(
                 f"claim:{folder.key}/{name}",
-                f"Couldn't take {_display_name(name)} from the recipe card inbox of {folder.key}: {e}",
+                f"Couldn't take {_display_name(name)} from the recipe card inbox of {folder.key}: {e}{hint}",
             )
             continue
+        if kind == "new":
+            _unblock(folder, name)
         if claimed is None:
             continue
         result.claims += 1
         try:
+            if locale is None:
+                locale = household_locale(session, folder.group_id, folder.household_id)
             taken = _ingest_claimed(
                 session,
                 root,
@@ -1252,6 +1375,7 @@ def _scan_folder(
                 claimed,
                 local_only=gate.readiness.group_local_only,
                 recovered=kind == "stale",
+                locale=locale,
             )
         except IngestPaused:
             result.paused = True  # the claim stays; it's retried after INBOX_CLAIM_RETRY
@@ -1270,6 +1394,22 @@ def _scan_folder(
             _record_refusals(folder, [taken.reason])  # at once: a later error in this scan doesn't lose it
     result.complete = True
     return result
+
+
+def _block(folder: HouseholdFolder, name: str) -> None:
+    with _state.lock:
+        _state.blocked.setdefault(folder.key, {}).setdefault(name, time.time())
+
+
+def _unblock(folder: HouseholdFolder, name: str) -> None:
+    with _state.lock:
+        _state.blocked.get(folder.key, {}).pop(name, None)
+
+
+def _blocked(key: str) -> dict[str, float]:
+    """The folder's entries the scan may not move (`no_permission`), with when it first found each"""
+    with _state.lock:
+        return dict(_state.blocked.get(key, {}))
 
 
 REFUSALS_BURST = limits.AUTO_BATCH_IDLE
@@ -1310,8 +1450,9 @@ def notify_refusals(session: Session, folder: HouseholdFolder) -> bool:
         pending = _state.refusals.pop(folder.key, None)
     if pending is None:
         return False
+    locale = household_locale(session, folder.group_id, folder.household_id)
     return events.notify_inbox_rejections(
-        folder.group_id, folder.household_id, pending.reasons, locale=INBOX_LOCALE, session=session
+        folder.group_id, folder.household_id, pending.reasons, locale=locale, session=session
     )
 
 

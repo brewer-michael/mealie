@@ -115,10 +115,39 @@ def test_the_folder_mode_is_octal(given: str, mode: int):
     assert settings.INBOX_DIR_MODE == format(mode, "o")
 
 
-@pytest.mark.parametrize("given", ["", "8", "778", "17777", "rwxrwxr-x", "-1", "0x1ff", "2775.0"])
-def test_a_folder_mode_that_isnt_octal_is_refused(given: str):
-    with pytest.raises(ValidationError):
-        IngestSettings(INBOX_DIR_MODE=given)
+@pytest.fixture()
+def errors(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    logged: list[str] = []
+    monkeypatch.setattr(ingest_settings.logger, "error", logged.append)
+    return logged
+
+
+@pytest.mark.parametrize("given", ["8", "778", "17777", "rwxrwxr-x", "-1", "0x1ff", "2775.0", "8888"])
+def test_a_folder_mode_that_isnt_octal_is_logged_and_the_default_used(given: str, errors: list[str]):
+    # a mistyped mode never stops Mealie from starting
+    settings = IngestSettings(INBOX_DIR_MODE=given)
+    assert settings.inbox_dir_mode == 0o2775
+    assert len(errors) == 1
+    assert f"AI_INGEST_INBOX_DIR_MODE is {given!r}" in errors[0]
+    assert "2775" in errors[0]
+
+
+def test_a_folder_mode_from_the_environment_that_isnt_octal_still_starts(
+    monkeypatch: pytest.MonkeyPatch, errors: list[str]
+):
+    monkeypatch.setenv("AI_INGEST_INBOX_DIR_MODE", "8888")
+    ingest_settings.get_ingest_settings.cache_clear()
+    try:
+        assert ingest_settings.get_ingest_settings().inbox_dir_mode == 0o2775
+    finally:
+        ingest_settings.get_ingest_settings.cache_clear()
+    assert len(errors) == 1 and "'8888'" in errors[0]
+
+
+@pytest.mark.parametrize("given", ["", "  ", "0o"])
+def test_a_blank_folder_mode_is_the_default(given: str, errors: list[str]):
+    assert IngestSettings(INBOX_DIR_MODE=given).inbox_dir_mode == 0o2775
+    assert errors == []
 
 
 # ==========================================

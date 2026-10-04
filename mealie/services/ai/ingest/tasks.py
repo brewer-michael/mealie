@@ -23,9 +23,9 @@ on the card got (one a backup restore cut off) for a request with the same input
 """
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -44,6 +44,7 @@ from mealie.repos.repository_recipe_ingest import IngestQueue, IngestRepos
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.recipe_ingest import (
     CardDraft,
+    CardDraftIngredient,
     CardProposalOrigin,
     ExtractionMeta,
     ExtractionUsage,
@@ -79,6 +80,9 @@ from .pipeline.reread import field_name
 from .pipeline.service import JobAIRuntime, JobOpenAIService, end_transaction
 from .runner.answers import KeptAnswers
 from .runner.types import ExtractResult, ParseLinesResult, RereadResult, TaskContext, TaskFailed
+
+if TYPE_CHECKING:
+    from .review import KeptLine  # review imports this module
 
 logger = get_logger(__name__)
 
@@ -475,18 +479,30 @@ def rebuild_payload(transcription: str) -> dict[str, Any]:
     return {"mode": IngestTaskMode.rebuild.value, "transcription": transcription}
 
 
-def parse_lines_payload(draft: CardDraft, refs: Sequence[UUID]) -> dict[str, Any]:
+def parse_lines_payload(
+    draft: CardDraft, refs: Sequence[UUID], kept: Mapping[UUID, KeptLine] | None = None
+) -> dict[str, Any]:
     """
     The `task_payload` of an extract task that parses the draft's lines `refs` with the AI ingredient parser, each
-    with its text as it reads now (`ingredient_line`): a line the reviewer changes meanwhile keeps their change.
+    with its text as it reads now (`ingredient_line`): a line the reviewer changes meanwhile keeps their change. A line
+    kept as written with a marker (`kept`, by `reference_id`: `review.kept_line`) also carries its `KeptLine`: the
+    parser reads it around its markers, and they go back into the parsed line's note (`_parse_chosen_lines`).
     Raises `KeyError` for a ref the draft hasn't.
     """
     lines = {str(ingredient.reference_id): ingredient for ingredient in draft.ingredients}
     chosen = [lines[str(ref)] for ref in dict.fromkeys(refs)]
-    return {
-        "mode": IngestTaskMode.parse_lines.value,
-        "lines": [{"ref": str(line.reference_id), "text": ingredient_line(line)} for line in chosen],
-    }
+    entries: list[dict[str, Any]] = []
+    for line in chosen:
+        entry: dict[str, Any] = {"ref": str(line.reference_id), "text": ingredient_line(line)}
+        if kept and (marked := kept.get(line.reference_id)) is not None:
+            entry["kept"] = {
+                "text": marked.text,
+                "parse_text": marked.parse_text,
+                "markers": list(marked.markers),
+                "amount_marker": marked.amount_marker,
+            }
+        entries.append(entry)
+    return {"mode": IngestTaskMode.parse_lines.value, "lines": entries}
 
 
 def _transcription(payload: dict[str, Any] | None) -> str:
@@ -548,13 +564,40 @@ def _lines_to_parse(payload: dict[str, Any] | None) -> dict[str, str]:
     return sent
 
 
+def _kept_to_parse(payload: dict[str, Any] | None) -> dict[str, KeptLine]:
+    """A `parse_lines` payload's lines kept as written with a marker, by ref (`parse_lines_payload`)"""
+    from .review import KeptLine  # review imports this module
+
+    kept: dict[str, KeptLine] = {}
+    lines = payload.get("lines") if isinstance(payload, dict) else None
+    for line in lines if isinstance(lines, list) else []:
+        marked = line.get("kept") if isinstance(line, dict) else None
+        if marked is None:
+            continue
+        try:
+            kept[str(UUID(str(line["ref"])))] = KeptLine(
+                text=str(marked["text"]),
+                parse_text=str(marked["parse_text"]),
+                markers=tuple(str(marker) for marker in marked["markers"]),
+                amount_marker=bool(marked["amount_marker"]),
+            )
+        except KeyError, TypeError, ValueError:
+            raise TaskFailed(IngestErrorCode.internal_error) from None
+    return kept
+
+
 async def _parse_chosen_lines(ctx: TaskContext) -> ParseLinesResult:
     """
     Chosen ingredient lines parsed by the AI ingredient parser in any language (`pipeline.parse_lines`, the review
     page's "Parse with AI"), through the job's own service under its policy. The runner writes the parsed fields into
     the lines still as they were sent (`finalize.finalize_parse_lines`). The provider's error fails the task (a banner).
+
+    A line kept as written with a marker ("1 C. [illegible]") is parsed around its markers, as a save parses it
+    (`review.KeptLine`): its markers go back into the parsed line's note, kept, and a line the parser reads nothing
+    else on is left as it is.
     """
     sent = _lines_to_parse(ctx.payload)
+    kept = _kept_to_parse(ctx.payload)
     with session_context() as session:
         job = _load_job(session, ctx)
         draft = CardDraft.model_validate(job.draft) if job.draft else None
@@ -563,12 +606,16 @@ async def _parse_chosen_lines(ctx: TaskContext) -> ParseLinesResult:
 
         current = {str(line.reference_id): line for line in draft.ingredients} if draft else {}
         lines = [
-            IngredientLine(text=text, title=current[ref].title if ref in current else None, reference_id=UUID(ref))
+            IngredientLine(
+                text=kept[ref].parse_text if ref in kept else text,
+                title=current[ref].title if ref in current else None,
+                reference_id=UUID(ref),
+            )
             for ref, text in sent.items()
         ]
         repos = get_repositories(session, group_id=ctx.group_id, household_id=ctx.household_id)
         matcher = IngestMatcher(repos)
-        ingredients = await parse_lines(
+        parsed = await parse_lines(
             lines,
             ai=_ai_service(repos, ctx),
             repos=repos,
@@ -576,6 +623,13 @@ async def _parse_chosen_lines(ctx: TaskContext) -> ParseLinesResult:
             matcher=matcher,
             language=extraction.language if extraction else None,
         )
+        ingredients: list[CardDraftIngredient] = []
+        for line in parsed:
+            marked = kept.get(str(line.reference_id))
+            if marked is None:
+                ingredients.append(line)
+            elif (around := marked.ingredient(line)) is not None:
+                ingredients.append(around)
         # what the parsed lines' parse flags are judged with, as extraction's are (`finalize_parse_lines`)
         units = matcher.unit_names()
         linked = matcher.linked_names([*(draft.ingredients if draft else []), *ingredients])

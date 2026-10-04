@@ -5,13 +5,14 @@ and the pause. Runs on SQLite and PostgreSQL.
 """
 
 import calendar
+import errno
 import io
 import os
 import stat
 import threading
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -26,17 +27,19 @@ from mealie.db.db_setup import session_context
 from mealie.db.models.group import Group
 from mealie.db.models.household import Household
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import IngestRepos
+from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate
 from mealie.schema.recipe_ingest import (
     InboxWaitingReason,
     IngestRejectReason,
+    IngestSource,
     PageMeta,
     RecipeIngestionSettingsUpdate,
 )
 from mealie.services import ocr
-from mealie.services.ai.ingest import inbox, limits, storage
+from mealie.services.ai.ingest import images, inbox, limits, storage
 from mealie.services.ai.ingest import settings as ingest_settings
+from mealie.services.ai.ingest.i18n import translator_for
 from mealie.services.ai.ingest.settings import IngestSettings
 from tests.integration_tests.ai_tests.ingest.card_flow_testing import (
     Notified,
@@ -402,6 +405,17 @@ def test_a_group_at_its_quota_keeps_its_files(root: Path, reader: TestUser, monk
     _drop(folder, "later.jpg")
     assert _scan_twice() == 0
     assert (folder / "later.jpg").exists()
+
+
+def test_the_per_user_cap_leaves_inbox_cards_alone(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    # inbox cards have no uploader: only the group's quota holds them back
+    monkeypatch.setattr(inbox, "get_ingest_settings", lambda: IngestSettings(MAX_PROCESSING_PER_USER=1, WORKER=False))
+    folder = _folder(root, reader)
+    before = len(_jobs(reader))
+    _drop(folder, "a.jpg")
+    _drop(folder, "b.jpg")
+    assert _scan_twice() == 2
+    assert len(_jobs(reader)) == before + 2
 
 
 def test_at_most_twenty_files_a_scan(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
@@ -1282,6 +1296,65 @@ def test_the_status_is_empty_when_the_inbox_is_off_or_the_folder_missing(
     assert inbox.household_status(group_slug, household_slug) == inbox.InboxStatus()
 
 
+def test_a_card_folder_mealie_may_not_move_is_listed_until_it_can(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    # another user's card folder made under umask 022 (2755): moving a folder needs write access to the folder itself
+    folder = _folder(root, reader)
+    card = folder / "card"
+    card.mkdir()
+    _drop(card, "front.jpg")
+    _drop(card, "back.jpg")
+    _drop(folder, "single.jpg")
+    real_rename = os.rename
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if src == "card":
+            raise PermissionError(errno.EACCES, "Permission denied", "card")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert _scan_twice() == 1  # the photo is taken; the folder stays where it is
+    assert inbox.scan_once() == 0
+    assert sorted(path.name for path in card.iterdir()) == ["back.jpg", "front.jpg"]
+    [logged] = [message for message in warnings if message.startswith("Couldn't take card ")]
+    assert "write access" in logged and "umask 002" in logged
+
+    status = _status(reader, _readiness(reader))
+    assert [(item.name, item.reason) for item in status.rejections] == [("card", IngestRejectReason.no_permission)]
+    assert status.rejections[0].at is not None and status.rejections[0].at.tzinfo is not None
+    assert (status.waiting, status.waiting_reason) == (0, None)  # listed as stuck, not as waiting
+
+    # once Mealie may move it, the next scan takes it and it's no longer listed
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert inbox.scan_once() == 1
+    assert not card.exists()
+    assert _status(reader).rejections == []
+
+
+def test_a_stuck_entry_that_is_gone_is_no_longer_listed(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    folder = _folder(root, reader)
+    photo = _drop(folder, "locked.jpg")
+    real_rename = os.rename
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if src == "locked.jpg":
+            raise PermissionError(errno.EPERM, "Operation not permitted", "locked.jpg")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert _scan_twice() == 0
+    assert [item.reason for item in _status(reader).rejections] == [IngestRejectReason.no_permission]
+
+    photo.unlink()  # whoever wrote it took it back
+    assert _status(reader).rejections == []  # the status checks it's still there
+    assert inbox.scan_once() == 0
+    _drop(folder, "locked.jpg")  # a new one by the same name is tried afresh
+    assert _status(reader).rejections == []
+
+
 def test_a_burst_of_refusals_reaches_the_households_notifier_once(
     root: Path,
     api_client: TestClient,
@@ -1302,3 +1375,174 @@ def test_a_burst_of_refusals_reaches_the_households_notifier_once(
     assert sent.received_document()["count"] == 2
     assert sent.received_document()["reasons"] == {"unsupported_format": 1, "pdf_not_supported": 1}
     assert "notes" not in sent.body and "menu" not in sent.body  # no file names
+
+
+# ==========================================
+# The household's language, and what the notes say
+
+
+def _batch(user: TestUser, source: IngestSource, locale: str | None, *, minutes_ago: float = 0) -> UUID:
+    with session_context() as session:
+        return IngestRepos(session, UUID(user.group_id), UUID(user.household_id)).batches.create(
+            source=source,
+            created_by=None if source == IngestSource.inbox else user.user_id,
+            source_key="somewhere/else" if source == IngestSource.inbox else None,
+            locale=locale,
+            now=utcnow() - timedelta(minutes=minutes_ago),
+        )
+
+
+def test_inbox_cards_take_the_language_of_the_households_latest_app_or_api_batch(
+    root: Path, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    _configure(user)
+    _batch(user, IngestSource.app, "fr-FR", minutes_ago=30)
+    _batch(user, IngestSource.app, "de-DE", minutes_ago=20)
+    _batch(user, IngestSource.inbox, "nl-NL", minutes_ago=10)  # an inbox batch never says what the household speaks
+    told: list[str | None] = []
+    monkeypatch.setattr(
+        inbox.events, "notify_inbox_rejections", lambda *args, locale=None, **kwargs: told.append(locale) or True
+    )
+    folder = _folder(root, user)
+    _drop(folder, "card.jpg")
+    _drop(folder, "notes.txt", b"not an image")
+
+    assert _scan_twice() == 1
+    [job] = _jobs(user)
+    assert job.locale == "de-DE"
+    with session_context() as session:
+        batch = session.get(RecipeIngestionBatch, job.batch_id)
+        assert batch is not None
+        assert (batch.source, batch.locale) == ("inbox", "de-DE")  # its "ready" notification is in German
+    assert told == ["de-DE"]
+    # German has no text for the note yet: it falls back to English, never to the key
+    assert (folder / "failed" / "notes.txt.error.txt").read_text().startswith("Not added (unsupported_format): ")
+
+    _batch(user, IngestSource.api, "pt-BR")  # e.g. a Shortcut on a phone set to Portuguese
+    _drop(folder, "next.jpg")
+    assert _scan_twice() == 1
+    assert _jobs(user)[-1].locale == "pt-BR"
+
+
+def test_inbox_cards_are_en_us_when_the_household_never_said(root: Path, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    _configure(user)
+    _batch(user, IngestSource.app, None)
+    _drop(_folder(root, user), "card.jpg")
+    assert _scan_twice() == 1
+    assert [job.locale for job in _jobs(user)] == ["en-US"]
+
+
+def test_the_note_is_in_the_households_language(
+    root: Path, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    _configure(user)
+    _batch(user, IngestSource.app, "de-DE")
+    asked: list[str | None] = []
+    real = inbox.translator_for
+
+    def translator_for(locale: str | None) -> Any:
+        asked.append(locale)
+        return real(locale)
+
+    monkeypatch.setattr(inbox, "translator_for", translator_for)
+    _drop(_folder(root, user), "notes.txt", b"not an image")
+    _scan_twice()
+    assert asked and set(asked) == {"de-DE"}
+
+
+def test_every_refusal_reason_has_a_note(root: Path):
+    translator = translator_for("en-US")
+    notes = {reason: inbox.rejection_note(translator, reason) for reason in IngestRejectReason}
+    for reason, note in notes.items():
+        assert note.startswith(f"Not added ({reason.value}): ")
+        assert "recipe-ingest" not in note and "{" not in note
+    assert len(set(notes.values())) == len(notes)
+
+
+def test_the_notes_take_their_numbers_from_the_limits(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, told: list
+):
+    monkeypatch.setattr(limits, "MAX_FILE_BYTES", 10 * limits.MIB)
+    monkeypatch.setattr(limits, "MAX_PAGES_PER_CARD", 3)
+    folder = _folder(root, reader)
+    _drop(folder, "huge.jpg", b"\xff\xd8\xff" + b"\0" * (10 * limits.MIB))
+    stack = folder / "stack"
+    stack.mkdir()
+    for n in range(4):
+        _drop(stack, f"{n}.jpg", _jpeg((8, 8)))
+
+    assert _scan_twice() == 0
+    assert (folder / "failed" / "huge.jpg.error.txt").read_text() == (
+        "Not added (too_large): The file is larger than 10 MB.\n"
+    )
+    assert "at most 3 pages" in (folder / "failed" / "stack.error.txt").read_text()
+    # a refused card folder is listed like a refused file
+    assert {item.name: item.reason for item in _status(reader).rejections} == {
+        "huge.jpg": IngestRejectReason.too_large,
+        "stack": IngestRejectReason.too_many_pages,
+    }
+
+    translator = translator_for("en-US")
+    monkeypatch.setattr(limits, "MAX_PIXELS", 50_000_000)
+    pixels = inbox.rejection_note(translator, IngestRejectReason.too_many_pixels)
+    assert "50 megapixels" in pixels
+    assert f"{images.MAX_JPEG_SOURCE_PIXELS // 1_000_000} megapixels" in pixels
+
+
+def test_a_duplicate_note_names_the_earlier_card(root: Path, reader: TestUser, told: list):
+    folder = _folder(root, reader)
+    photo = _jpeg()
+    _drop(folder, "card.jpg", photo)
+    assert _scan_twice() == 1
+    earlier = _jobs(reader)[-1].id
+    _drop(folder, "card again.jpg", photo)
+    assert _scan_twice() == 0
+
+    note = (folder / "failed" / "card again.jpg.error.txt").read_text()
+    assert note.startswith("Not added (duplicate): ")
+    assert str(earlier) in note
+    assert _status(reader).rejections[0].reason == IngestRejectReason.duplicate
+
+
+def test_a_refusal_without_a_code_has_a_note_from_the_texts(
+    root: Path, reader: TestUser, told: list, monkeypatch: pytest.MonkeyPatch
+):
+    folder = _folder(root, reader)
+    card = folder / "emptied"
+    card.mkdir()
+    _drop(card, "front.jpg")
+    real = inbox._page_entries
+
+    def emptied_once_claimed(dir_fd: int, label: str | None = None) -> list[tuple[str, os.stat_result]]:
+        # the scan saw the folder's page (with a label); it's gone when the claimed folder is opened (none)
+        return real(dir_fd, label) if label is not None else []
+
+    monkeypatch.setattr(inbox, "_page_entries", emptied_once_claimed)
+    assert _scan_twice() == 0
+    assert (folder / "failed" / "emptied.error.txt").read_text() == "Not added: The folder has no pages.\n"
+    assert _status(reader).rejections[0].reason is None
+
+
+@pytest.mark.parametrize(
+    "note, reason",
+    [
+        ("Not added (too_large): The file is larger than 30 MB.\n", IngestRejectReason.too_large),
+        ("Nicht hinzugefügt (too_large): Die Datei ist zu groß.\n", IngestRejectReason.too_large),
+        ("(duplicate) 追加されませんでした: (page 2)\n", IngestRejectReason.duplicate),
+        ("追加されませんでした（too_many_pages）：\n", IngestRejectReason.too_many_pages),
+        ("Pas ajouté : (page 2) (unsupported_format).\n", IngestRejectReason.unsupported_format),
+        ("Not added: It isn't a regular file.\n", None),
+        ("Not added (no_such_reason): who knows.\n", None),
+        ("Not added\n(too_large): on the second line\n", None),
+    ],
+)
+def test_a_notes_reason_is_read_in_any_language(root: Path, reader: TestUser, note: str, reason: Any):
+    failed = _folder(root, reader) / "failed"
+    failed.mkdir()
+    (failed / "card.jpg").write_bytes(b"x")
+    (failed / "card.jpg.error.txt").write_text(note)
+    [rejection] = _status(reader).rejections
+    assert rejection.reason == reason

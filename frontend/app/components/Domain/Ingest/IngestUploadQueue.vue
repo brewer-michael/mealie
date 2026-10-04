@@ -60,7 +60,7 @@
         </div>
         <ul v-if="rejections(card).length" class="upload-rejected text-caption pl-4 mb-0">
           <li v-for="rejected in rejections(card)" :key="rejected.index">
-            {{ $t("recipe-ingest.capture.rejected", { reason: rejectReasonText(rejected.reason) }) }}
+            {{ $t("recipe-ingest.capture.rejected", { reason: rejectionText(card, rejected) }) }}
           </li>
         </ul>
         <v-progress-linear
@@ -102,7 +102,12 @@
 
 <script setup lang="ts">
 import IngestCapturePhoto from "./IngestCapturePhoto.vue";
-import { INGEST_API_ERROR_CODES, INGEST_ERROR_CODES, useRecipeIngestText } from "~/composables/use-recipe-ingest";
+import {
+  INGEST_API_ERROR_CODES,
+  INGEST_ERROR_CODES,
+  useRecipeIngestSettings,
+  useRecipeIngestText,
+} from "~/composables/use-recipe-ingest";
 import {
   CANNOT_SHRINK,
   hasNote,
@@ -124,13 +129,16 @@ const props = defineProps<{
 
 const i18n = useI18n();
 const { ingestErrorText, rejectReasonText } = useRecipeIngestText();
-const { cards, batches, previewState, retry, scanAgain, remove } = useRecipeIngestUploads();
+const { cards, batches, previewState, isJpeg, retry, scanAgain, remove } = useRecipeIngestUploads();
+/** The server's limits, which the rejections name; the page loads them */
+const { settings } = useRecipeIngestSettings();
 
 const KNOWN_CODES = new Set<string>([...INGEST_ERROR_CODES, ...INGEST_API_ERROR_CODES]);
 /** Why a card waits to go again, where the error's own text asks the user to try again */
 const RETRYING_TEXT: Record<string, string> = {
   paused_for_restore: "recipe-ingest.capture.retrying-paused",
   too_many_jobs: "recipe-ingest.capture.retrying-busy",
+  user_quota: "recipe-ingest.capture.retrying-user-quota",
 };
 
 /** Everything but cards uploaded with nothing more to say */
@@ -184,6 +192,12 @@ function detailText(card: UploadCard): string | null {
 function unshownName(card: UploadCard): string | null {
   const front = card.photos[0];
   return front && previewState(front) === "unavailable" ? photoName(front) || null : null;
+}
+
+/** Why the server didn't use a photo, with the limit it went over (a JPEG may have more pixels) */
+function rejectionText(card: UploadCard, rejected: IngestRejected): string {
+  const photo = card.photos[rejected.index];
+  return rejectReasonText(rejected.reason, { limits: settings.value?.limits, jpeg: !!photo && isJpeg(photo) });
 }
 
 /** Photos the server didn't use, except the duplicate the chip already shows */

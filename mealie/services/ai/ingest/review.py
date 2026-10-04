@@ -26,12 +26,13 @@ import errno
 import fcntl
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -41,21 +42,27 @@ import sqlalchemy as sa
 from fastapi import status
 from pydantic import ValidationError
 from pydantic_core import to_jsonable_python
+from rapidfuzz import fuzz
 from sqlalchemy.engine import RowMapping
 
+from mealie.core.exceptions import SlugError
 from mealie.core.root_logger import get_logger
 from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
+from mealie.db.models.users.users import User
 from mealie.repos.all_repositories import get_repositories
-from mealie.repos.repository_recipe_ingest import IngestRepos, JobConflict, enqueue_task
+from mealie.repos.repository_factory import AllRepositories
+from mealie.repos.repository_recipe_ingest import IngestRepos, JobConflict, JobOrder, enqueue_task, title_key
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.recipe.recipe import create_recipe_slug
+from mealie.schema.recipe.recipe_ingredient import CreateIngredientFood, CreateIngredientUnit, RecipeIngredient
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardDraftIngredient,
     CardDraftSaved,
     CardDraftUpdate,
     CardFlag,
+    CardFlagKind,
     CardFlagSeverity,
     CardProposal,
     CardProposalKind,
@@ -69,28 +76,34 @@ from mealie.schema.recipe_ingest import (
     PageMeta,
     PageOut,
     PageRotationSource,
+    ProposalTarget,
     RecipeIngestionJobCounts,
     RecipeIngestionJobError,
     RecipeIngestionJobOut,
     RecipeIngestionJobPagination,
     RecipeIngestionJobPermissions,
+    RecipeIngestionJobRef,
     RecipeIngestionJobState,
     RecipeIngestionJobSummary,
     RecipeIngestionJobTask,
     RecipeIngestionRecipeRef,
+    RegionHintOut,
     RereadRequest,
 )
 from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.errors import IngestPaused
-from mealie.services.ai.ingest import flag_rules, images, limits, retention, storage
+from mealie.services.ai.ingest import flag_rules, images, limits, retention, storage, tasks
 from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
 from mealie.services.ai.ingest.i18n import translator_for
 from mealie.services.ai.ingest.intake import source_sha256
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline import flags as card_flags
-from mealie.services.ai.ingest.pipeline.cardtext import markers_in
+from mealie.services.ai.ingest.pipeline.cardtext import MARKER_RE, canonical_markers, markers_in
 from mealie.services.ai.ingest.pipeline.ingredients import IngredientLine, normalize_lines
+from mealie.services.ai.ingest.pipeline.regions import region_hint
+from mealie.services.ai.ingest.pipeline.reread import field_name
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
+from mealie.services.ai.ingest.shorthand import QTY
 
 logger = get_logger(__name__)
 
@@ -137,6 +150,14 @@ PAUSED_FOR_RESTORE = "paused_for_restore"
 
 UNCOMMIT_GRACE = timedelta(seconds=5)
 """A recipe updated later than this after its commit was edited (the commit's own cover update is within it)"""
+
+NEAR_NAME_RATIO = 90
+"""
+A household recipe whose name is at least this like the draft's (rapidfuzz `ratio` of the two as `title_key` compares
+names) is a possible duplicate: "Bananna Bread" for "Banana Bread", not "Banana Bread Muffins"
+"""
+NAME_SUFFIXES = 10
+"""Upstream's recipe create tries "Name (1)" to "Name (10)" in turn while the name's slug is taken"""
 
 
 class JobActionError(Exception):
@@ -343,6 +364,220 @@ def _text_to_parse(ingredient: CardDraftIngredient, stored: Mapping[UUID, CardDr
     return text
 
 
+# ==========================================
+# Lines kept as written with a marker (§4.6)
+
+
+AMOUNT_STAND_IN = "1"
+"""
+Stands for an amount the card leaves blank or unreadable while the line is parsed: card shorthand is read after an
+amount only ("[blank] C. sugar" is parsed as "1 C. sugar"), and the amount is dropped again
+"""
+
+_LEADING_AMOUNT = re.compile(rf"^{QTY}")
+
+
+def kept_flag_ids(flags: Iterable[CardFlag], changes: Mapping[str, FlagResolution | None] | None = None) -> set[str]:
+    """The ids of the flags resolved `kept`, as stored, with a save's resolution `changes` applied"""
+    kept = {flag.id for flag in flags if flag.resolution == FlagResolution.kept}
+    for flag_id, resolution in (changes or {}).items():
+        if resolution == FlagResolution.kept:
+            kept.add(flag_id)
+        else:
+            kept.discard(flag_id)
+    return kept
+
+
+@dataclass(frozen=True)
+class KeptLine:
+    """
+    A text-only ingredient line whose every marker the reviewer kept as written ("1 C. [illegible]"), ready for the
+    parser: it reads the line without its markers, and they go back into the parsed line's note, which commit
+    writes out ("(unreadable)", "___"). The line keeps its flags and their resolutions, so keeping can be taken back.
+    """
+
+    text: str
+    """The line as written, its markers in their canonical form"""
+    parse_text: str
+    """What the parser reads: the line without its markers (`AMOUNT_STAND_IN` for one standing for the amount)"""
+    markers: tuple[str, ...]
+    amount_marker: bool
+    """A marker led the line, where its amount goes: the parsed amount is the stand-in's"""
+
+    def ingredient(self, parsed: CardDraftIngredient) -> CardDraftIngredient | None:
+        """The parsed line with its markers back in its note; None when the parser read no amount, unit or food"""
+        quantity = None if self.amount_marker else parsed.quantity
+        unit = parsed.unit if parsed.unit and parsed.unit.name.strip() else None
+        food = parsed.food if parsed.food and parsed.food.name.strip() else None
+        if quantity is None and unit is None and food is None:
+            return None
+
+        note = ", ".join(part for part in (" ".join(self.markers), parsed.note.strip()) if part)
+        ingredient = parsed.model_copy(update={"original_text": self.text, "quantity": quantity, "note": note})
+        # as the recipe will read: a unit whose amount is the marker is named after it (`amount_marker_note`)
+        marker_note = amount_marker_note(ingredient, unit.name.strip()) if unit else None
+        display = RecipeIngredient(
+            quantity=quantity,
+            unit=CreateIngredientUnit(name=unit.name) if unit and marker_note is None else None,
+            food=CreateIngredientFood(name=food.name) if food else None,
+            note=marker_note or note,
+        ).display
+        ingredient.display = display or self.text
+        # as read: its flags are a parsed line's, against the line as written (`flags.ingredient_line`)
+        ingredient.extracted_hash = card_flags.ingredient_hash(ingredient)
+        return ingredient
+
+
+def amount_marker_note(line: CardDraftIngredient, unit: str) -> str | None:
+    """
+    For a line whose amount is a marker ("[blank] C. sugar", as `KeptLine` parses it: the marker leads the line as read
+    and its note, and the line has a unit but no amount), its note with `unit` (the unit as the recipe names it) right
+    after that marker: "[blank] cup". Upstream's recipe page shows a unit only with an amount
+    (`RecipeIngredientBase._format_display`, the frontend's `useParsedIngredientText`), so commit puts it there and
+    links no unit: the recipe reads "sugar ___ cup". None for any other line.
+    """
+    note = line.note.strip()
+    marker = MARKER_RE.match(note)
+    if (
+        marker is None
+        or line.quantity
+        or not unit.strip()
+        or line.unit is None
+        or not line.unit.name.strip()
+        or MARKER_RE.search(line.unit.name)
+        or not MARKER_RE.match(line.original_text.strip())
+    ):
+        return None
+    return f"{note[: marker.end()]} {unit.strip()}{note[marker.end() :]}"
+
+
+def kept_line(ingredient: CardDraftIngredient, kept: Collection[str]) -> KeptLine | None:
+    """
+    The line as a `KeptLine` when it has no amount, unit or food, holds a marker, and every marker on it is resolved
+    kept (the flag ids in `kept`); None otherwise, or when nothing but markers is written on it
+    """
+    if _has_parts(ingredient):
+        return None
+    text = canonical_markers(ingredient.note.strip())
+    markers = tuple(match.group(0) for match in MARKER_RE.finditer(text))
+    if not markers:
+        return None
+    ref = str(ingredient.reference_id)
+    kinds = {*markers_in(text), *markers_in(ingredient.title)}
+    if any(card_flags.flag_id(CardFlagKind(kind), card_flags.FIELD_INGREDIENTS, ref) not in kept for kind in kinds):
+        return None
+
+    rest = " ".join(MARKER_RE.sub(" ", text).split())
+    if not any(character.isalnum() for character in rest):
+        return None
+    amount_marker = MARKER_RE.match(text) is not None and not _LEADING_AMOUNT.match(rest)
+    parse_text = f"{AMOUNT_STAND_IN} {rest}" if amount_marker else rest
+    return KeptLine(text=text, parse_text=parse_text, markers=markers, amount_marker=amount_marker)
+
+
+def parse_written_lines(
+    draft: CardDraft,
+    chosen: Mapping[UUID, str | KeptLine],
+    *,
+    repos: AllRepositories,
+    locale: str | None,
+    language: str | None,
+    job_id: UUID,
+) -> tuple[CardDraft, list[CardDraftIngredient]]:
+    """
+    `draft` with the `chosen` lines (by `reference_id`: a line's text, or a `KeptLine`) parsed and linked as extraction
+    does (§5): the shorthand written out, then the parser with the group's foods and units (`normalize_lines`; only the
+    NLP parser runs, for a card in English or of unknown language). A line the parser can't split stays as it is. Also
+    the lines that changed, as they stand in the new draft.
+
+    The parse is a help, never a reason to lose an edit or stop a commit: when it fails, a warning naming the job and
+    the error's type is logged, and nothing changes. Blocking: call it from a worker thread.
+    """
+    lines = [
+        IngredientLine(
+            text=choice.parse_text if isinstance(choice, KeptLine) else choice,
+            title=ingredient.title,
+            reference_id=ingredient.reference_id,
+        )
+        for ingredient in draft.ingredients
+        if (choice := chosen.get(ingredient.reference_id)) is not None
+    ]
+    if not lines:
+        return draft, []
+
+    try:
+        parsed = asyncio.run(
+            normalize_lines(
+                lines,
+                repos=repos,
+                translator=translator_for(locale),
+                matcher=IngestMatcher(repos),
+                language=language,
+            )
+        )
+    except Exception as e:
+        # no traceback or message: a database error's text holds its parameters, here food names from the card (§10)
+        logger.warning(
+            f"Couldn't parse the ingredient lines written on recipe card job {job_id} ({type(e).__qualname__})"
+        )
+        if repos.session.in_transaction():
+            repos.session.rollback()
+        return draft, []
+
+    by_ref: dict[UUID, CardDraftIngredient] = {}
+    for line in parsed:
+        choice = chosen.get(line.reference_id)
+        result = choice.ingredient(line) if isinstance(choice, KeptLine) else line if _has_parts(line) else None
+        if result is not None:
+            by_ref[line.reference_id] = result
+    if not by_ref:
+        return draft, []
+    ingredients = [by_ref.get(ingredient.reference_id, ingredient) for ingredient in draft.ingredients]
+    changed = [line for line in ingredients if line.reference_id in by_ref]
+    return draft.model_copy(update={"ingredients": ingredients}), changed
+
+
+def parse_kept_lines(repos: AllRepositories, job: RecipeIngestionJob, draft: CardDraft) -> CardDraft:
+    """
+    At commit (§7): the draft's text-only lines whose every marker was kept as written (by the job's stored flags),
+    parsed around their markers as the save that keeps them parses them (`KeptLine`), for a draft whose markers were
+    kept before saves did that, and for lines a save couldn't split. A card in another language keeps them as text, as
+    its other text lines. Blocking.
+    """
+    extraction = _parse_extraction(job.extraction)
+    language = extraction.language if extraction else None
+    if not card_flags.is_english(language):
+        return draft
+    kept = kept_flag_ids(parse_flags(job.flags))
+    chosen: dict[UUID, str | KeptLine] = {
+        ingredient.reference_id: line for ingredient in draft.ingredients if (line := kept_line(ingredient, kept))
+    }
+    return parse_written_lines(draft, chosen, repos=repos, locale=job.locale, language=language, job_id=job.id)[0]
+
+
+def _target_text(draft: CardDraft, target: ProposalTarget) -> str | None:
+    """
+    What the card says for a re-read's target: an ingredient's line as read (`original_text`; as it reads now for a
+    line the reviewer added), a step's or note's text (a note by its id, or by its place for a client from before note
+    ids), or a single field's; None for a line the draft hasn't, or an empty field
+    """
+    field = field_name(target.field.strip())
+    text: str | None = None
+    if field in card_flags.DRAFT_TEXT_FIELDS:
+        text = getattr(draft, card_flags.DRAFT_TEXT_FIELDS[field])
+    elif field == card_flags.FIELD_INGREDIENTS:
+        line = next((line for line in draft.ingredients if str(line.reference_id) == target.ref), None)
+        text = (line.original_text.strip() or card_flags.ingredient_line(line)) if line else None
+    elif field == card_flags.FIELD_STEPS:
+        text = next((step.text for step in draft.steps if str(step.id) == target.ref), None)
+    elif field == card_flags.FIELD_NOTES and target.ref:
+        note = next((note for note in draft.notes if str(note.id) == target.ref), None)
+        if note is None and target.ref.isdigit() and int(target.ref) < len(draft.notes):
+            note = draft.notes[int(target.ref)]
+        text = note.text if note else None
+    return text.strip() if text and text.strip() else None
+
+
 def _stored_form(draft: CardDraft) -> Any:
     """The draft as the `draft` column stores it (and reads it back)"""
     return to_jsonable_python(draft, by_alias=False, inf_nan_mode="null")
@@ -401,6 +636,53 @@ def recipes_public(household: HouseholdInDB | None) -> bool:
     """
     preferences = household.preferences if household else None
     return bool(preferences and not preferences.private_household and preferences.recipe_public)
+
+
+def _slug(name: str) -> str | None:
+    """The slug a recipe named `name` gets (`create_recipe_slug`); None for a name without one ("!!!")"""
+    try:
+        return create_recipe_slug(name)
+    except SlugError:
+        return None
+
+
+def _recipe_name(name: str, locale: str | None) -> str:
+    """The name commit gives the recipe: the draft's, its kept markers written out in the job's language"""
+    name = name.strip()
+    if not markers_in(name):
+        return name
+    from .commit import convert_markers  # imported here: commit builds on this module
+
+    return convert_markers(name, translator_for(locale).t("recipe-ingest.unreadable")).strip()
+
+
+def suffixed_names(name: str) -> list[str]:
+    """The names upstream's create tries, in turn, while the slug of `name` is taken: "Name (1)" to "Name (10)" """
+    return [f"{name} ({number})" for number in range(1, NAME_SUFFIXES + 1)]
+
+
+def _near_name_lengths(key: str) -> tuple[int, int]:
+    """
+    The name lengths that can reach `NEAR_NAME_RATIO` against `key`, widened for spacing and case folding that
+    `title_key` changes: a filter for the database, which the ratio then decides
+    """
+    share = NEAR_NAME_RATIO / (200 - NEAR_NAME_RATIO)  # the shorter name's least share of the longer one's length
+    return max(math.floor(len(key) * share) - 2, 1), math.ceil(len(key) / share) + 8
+
+
+@dataclass(frozen=True)
+class PossibleDuplicates:
+    """What the review page's possible-duplicate banner shows for a card being reviewed (§6.4)"""
+
+    recipe: RecipeIngestionRecipeRef | None = None
+    """
+    A group recipe whose slug the draft's name would get (commit names the recipe `name` then), else the household's
+    recipe with the most similar name
+    """
+    job: RecipeIngestionJobRef | None = None
+    """Another card of the household, waiting or being read, with the same name"""
+    name: str | None = None
+    """The name commit would give the recipe while `recipe` holds the slug: the first free "Name (n)" """
 
 
 def attaches_card_photo(draft: CardDraft, household: HouseholdInDB | None) -> bool:
@@ -664,12 +946,25 @@ class ReviewService:
         *,
         statuses: Sequence[IngestStatus] | None = None,
         batch_id: UUID | None = None,
+        committed_since: datetime | None = None,
+        order: JobOrder = "created",
         page: int = 1,
         per_page: int = 50,
     ) -> RecipeIngestionJobPagination:
-        """A page of the household's jobs, newest first; `per_page=-1` gives them all"""
+        """
+        A page of the household's jobs, newest first, or by commit time (`order="committed"`: the latest added first,
+        then the cards not added newest first); `committed_since` keeps the cards added since then (a naive time is
+        UTC); `per_page=-1` gives them all
+        """
         page = max(page, 1)
-        jobs, total = self.repos.jobs.page(statuses=statuses or None, batch_id=batch_id, page=page, per_page=per_page)
+        jobs, total = self.repos.jobs.page(
+            statuses=statuses or None,
+            batch_id=batch_id,
+            committed_since=committed_since,
+            order=order,
+            page=page,
+            per_page=per_page,
+        )
         recipes = self._recipe_refs(job.recipe_id for job in jobs if job.recipe_id)
         items = [RecipeIngestionJobSummary(**self._summary_fields(job, recipes)) for job in jobs]
 
@@ -762,19 +1057,82 @@ class ReviewService:
             return True
         return bool(self.user.can_manage_household)
 
-    def _duplicate_of(self, job: RecipeIngestionJob, draft: CardDraft | None) -> RecipeIngestionRecipeRef | None:
-        """A group recipe whose slug matches the draft's name: committing would make "Name (1)" (§6.4)"""
-        if draft is None or job.status != IngestStatus.ready.value or not draft.name.strip():
-            return None
-        slug = create_recipe_slug(draft.name)
-        if not slug:
-            return None
+    def possible_duplicates(self, job: RecipeIngestionJob, draft: CardDraft | None) -> PossibleDuplicates:
+        """
+        A card being reviewed (§6.4): the group recipe whose slug its name would get, and then the name commit would
+        give the recipe, as upstream's create picks it (`duplicate_name`); else the household's recipe whose name is
+        most like it (`NEAR_NAME_RATIO`); and the household's oldest other card waiting or being read with the same
+        name (`IngestJobsRepo.same_title`). Nothing for a card in any other state, or a blank name.
+        """
+        if draft is None or job.status != IngestStatus.ready.value:
+            return PossibleDuplicates()
+        return self._duplicates(job.id, draft, recipe_id=job.recipe_id, locale=job.locale)
+
+    def _duplicates(
+        self, job_id: UUID, draft: CardDraft, *, recipe_id: UUID | None, locale: str | None
+    ) -> PossibleDuplicates:
+        """`possible_duplicates` of a card being reviewed, by its id, its recipe (if any) and its language"""
+        if not draft.name.strip():
+            return PossibleDuplicates()
+        name = _recipe_name(draft.name, locale)
+        recipe, suffixed = self._same_name(name, recipe_id)
+        return PossibleDuplicates(
+            recipe=recipe or self._near_name(name, recipe_id),
+            job=self.repos.jobs.same_title(draft.name, exclude_id=job_id),
+            name=suffixed,
+        )
+
+    def _same_name(self, name: str, own_recipe: UUID | None) -> tuple[RecipeIngestionRecipeRef | None, str | None]:
+        """
+        The group recipe holding the slug `name` gets (slugs are unique in a group), and the first of
+        `suffixed_names` whose slug is free, which commit names the recipe; (None, None) when the slug is free or held
+        by the card's own recipe
+        """
+        slug = _slug(name)
+        if slug is None:
+            return None, None
         stmt = sa.select(RecipeModel.id, RecipeModel.slug, RecipeModel.name).where(
             RecipeModel.group_id == self.group_id, RecipeModel.slug == slug
         )
         row = self.session.execute(stmt.limit(1)).one_or_none()
-        if row is None or row.id == job.recipe_id:
+        if row is None or row.id == own_recipe:
+            return None, None
+
+        candidates = {candidate: _slug(candidate) for candidate in suffixed_names(name)}
+        taken_stmt = sa.select(RecipeModel.slug).where(
+            RecipeModel.group_id == self.group_id,
+            RecipeModel.slug.in_({slug for slug in candidates.values() if slug}),
+        )
+        taken = set(self.session.execute(taken_stmt).scalars())
+        free = next((candidate for candidate, slug in candidates.items() if slug and slug not in taken), None)
+        return RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name), free
+
+    def _near_name(self, name: str, own_recipe: UUID | None) -> RecipeIngestionRecipeRef | None:
+        """The household's recipe whose name is most like `name`, at least `NEAR_NAME_RATIO`; the oldest of a tie"""
+        key = title_key(name)
+        if not key:
             return None
+        shortest, longest = _near_name_lengths(key)
+        stmt = (
+            sa.select(RecipeModel.id, RecipeModel.slug, RecipeModel.name)
+            .join(User, User.id == RecipeModel.user_id)
+            .where(
+                RecipeModel.group_id == self.group_id,
+                User.household_id == self.household_id,
+                sa.func.length(RecipeModel.name).between(shortest, longest),
+            )
+            .order_by(RecipeModel.created_at, RecipeModel.id)
+        )
+        best: tuple[float, Any] | None = None
+        for row in self.session.execute(stmt):
+            if row.id == own_recipe or not row.name:
+                continue
+            score = fuzz.ratio(key, title_key(row.name), score_cutoff=NEAR_NAME_RATIO)
+            if score and (best is None or score > best[0]):
+                best = (score, row)
+        if best is None:
+            return None
+        row = best[1]
         return RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name)
 
     @cached_property
@@ -788,6 +1146,7 @@ class ReviewService:
         draft = _parse_draft(job.draft)
         extraction = _parse_extraction(job.extraction)
         recipes = self._recipe_refs([job.recipe_id] if job.recipe_id else [])
+        duplicates = self.possible_duplicates(job, draft)
         out = RecipeIngestionJobOut(
             **self._summary_fields(job, recipes),
             pages=[] if is_slimmed(job) else [PageOut.from_meta(job.id, page) for page in parse_pages(job.pages)],
@@ -797,7 +1156,9 @@ class ReviewService:
             flags=parse_flags(job.flags),
             proposals=_parse_proposals(job.proposals),
             permissions=self._permissions(job),
-            duplicate_of=self._duplicate_of(job, draft),
+            duplicate_of=duplicates.recipe,
+            duplicate_job=duplicates.job,
+            duplicate_name=duplicates.name,
             household_recipes_public=self._household_recipes_public,
             card_photo_default=not self._household_recipes_public,
         )
@@ -845,8 +1206,12 @@ class ReviewService:
         changed (§3.3): a save that only resolves flags or proposals, or dismisses the banner, keeps it, so the draft
         still counts as unedited for a re-extract and another device's next save doesn't conflict. A save that changes
         the draft and uses a proposal that is no longer there (another device settled it) is a 409 too.
+
+        The answer carries the lines this save parsed (`_parse_text_lines`), as stored, so the page shows their amount,
+        unit and food at once, and the possible duplicates for the saved name (`possible_duplicates`), so the banner
+        follows a rename.
         """
-        draft = self._parse_text_lines(job_id, _with_unique_ids(update.draft), update.draft_version)
+        draft, parsed = self._parse_text_lines(job_id, _with_unique_ids(update.draft), update)
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
         units = self._unit_names() if resolved_proposals else []
         linked = self._linked_names(draft)
@@ -909,11 +1274,17 @@ class ReviewService:
                 raise invalid_status(job.status)
             raise version_conflict(job.draft_version)
 
+        before = written.before
+        duplicates = self._duplicates(job_id, draft, recipe_id=before["recipe_id"], locale=before["locale"])
         return CardDraftSaved(
             draft_version=written.values["draft_version"],
             flags=written.values["flags"],
             error_count=written.values["error_count"],
             warning_count=written.values["warning_count"],
+            ingredients=parsed or None,
+            duplicate_of=duplicates.recipe,
+            duplicate_job=duplicates.job,
+            duplicate_name=duplicates.name,
         )
 
     def _unit_names(self) -> list[str]:
@@ -935,61 +1306,53 @@ class ReviewService:
             self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
         return linked
 
-    def _parse_text_lines(self, job_id: UUID, draft: CardDraft, draft_version: int) -> CardDraft:
+    def _parse_text_lines(
+        self, job_id: UUID, draft: CardDraft, update: CardDraftUpdate
+    ) -> tuple[CardDraft, list[CardDraftIngredient]]:
         """
-        `draft` with each line the reviewer wrote as text (`_text_to_parse`) parsed and linked as extraction does (§5):
-        the shorthand written out, then the NLP parser with the group's foods and units. A line the parser can't split
-        stays as sent, and nothing is parsed on a card that isn't in English, or for a save that will be refused.
+        `draft` with each line the reviewer wrote as text (`_text_to_parse`) parsed and linked as extraction does (§5),
+        and each text-only line whose every marker this save keeps as written (`kept_line`, with the save's
+        resolutions) parsed around its markers (`parse_written_lines`); and the lines parsed, as the draft now holds
+        them. A line the parser can't split stays as sent, and nothing is parsed on a card that isn't in English, or
+        for a save that will be refused. A kept line is parsed when it's kept, written again or added, not on every
+        save; commit parses one that never was (`parse_kept_lines`).
 
-        The page keeps the line as it typed it until it reloads, and sends that with its next saves: it differs from
+        A page that didn't take the answer's lines sends the line as it typed it with its next saves: it differs from
         the stored (parsed) line's note, so it's parsed again into the same line, and the draft doesn't change.
         Blocking: the parse runs here, before the draft's write.
         """
         job = self.repos.jobs.get(job_id)
         if self.session.in_transaction():
             self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
-        if job is None or job.status != IngestStatus.ready.value or job.draft_version != draft_version:
-            return draft
+        if job is None or job.status != IngestStatus.ready.value or job.draft_version != update.draft_version:
+            return draft, []
         extraction = _parse_extraction(job.extraction)
         language = extraction.language if extraction else None
         if not card_flags.is_english(language):
-            return draft
+            return draft, []
 
         stored_draft = _parse_draft(job.draft)
         stored = {line.reference_id: line for line in stored_draft.ingredients} if stored_draft else {}
-        lines = [
-            IngredientLine(text=text, title=ingredient.title, reference_id=ingredient.reference_id)
-            for ingredient in draft.ingredients
-            if (text := _text_to_parse(ingredient, stored)) is not None
-        ]
-        if not lines:
-            return draft
+        stored_flags = parse_flags(job.flags)
+        kept_before = kept_flag_ids(stored_flags)
+        kept_now = kept_flag_ids(stored_flags, update.flag_resolutions)
+        chosen: dict[UUID, str | KeptLine] = {}
+        for ingredient in draft.ingredients:
+            if (text := _text_to_parse(ingredient, stored)) is not None:
+                chosen[ingredient.reference_id] = text
+            elif (line := kept_line(ingredient, kept_now)) is not None:
+                before = stored.get(ingredient.reference_id)
+                if (
+                    before is None
+                    or before.note.strip() != ingredient.note.strip()
+                    or not kept_line(ingredient, kept_before)
+                ):
+                    chosen[ingredient.reference_id] = line
+        if not chosen:
+            return draft, []
 
         repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
-        try:
-            parsed = asyncio.run(
-                normalize_lines(
-                    lines,
-                    repos=repos,
-                    translator=translator_for(job.locale),
-                    matcher=IngestMatcher(repos),
-                    language=language,
-                )
-            )
-        except Exception as e:
-            # the lines are saved as they were written; the parse is a help, never a reason to lose an edit. No
-            # traceback or message: a database error's text holds its parameters, here food names from the card (§10)
-            logger.warning(
-                f"Couldn't parse the ingredient lines edited on recipe card job {job_id} ({type(e).__qualname__})"
-            )
-            if self.session.in_transaction():
-                self.session.rollback()
-            return draft
-        by_ref = {line.reference_id: line for line in parsed if _has_parts(line)}
-        if not by_ref:
-            return draft
-        ingredients = [by_ref.get(ingredient.reference_id, ingredient) for ingredient in draft.ingredients]
-        return draft.model_copy(update={"ingredients": ingredients})
+        return parse_written_lines(draft, chosen, repos=repos, locale=job.locale, language=language, job_id=job_id)
 
     # ==========================================
     # Tasks
@@ -1059,6 +1422,51 @@ class ReviewService:
             raise self._refuse_enqueue(job_id, IngestStatus.ready)
         return self._queued(job_id)
 
+    def rebuild(self, job_id: UUID, transcription: str) -> RecipeIngestionJobState:
+        """
+        Builds the recipe again from the card's text as the reviewer corrected it (no photo is read): like a
+        re-extract, it replaces a draft nobody edited, else becomes a whole-card proposal marked as a rebuild (§3.1).
+        A card being reviewed with no task; it runs under the card's policy, as every task does.
+        """
+        self._check_idle(self.job(job_id))
+        return self._enqueue(job_id, tasks.rebuild_payload(transcription), limits.PRIORITY_EXTRACT)
+
+    def parse_lines(self, job_id: UUID, refs: Sequence[UUID]) -> RecipeIngestionJobState:
+        """
+        Parses the draft's ingredient lines `refs` with the AI ingredient parser, in any language ("Parse with AI"),
+        each with its text as it reads now; the result is written into the lines still as they were (§5). A line kept
+        as written with a marker is parsed around its markers (`KeptLine`). A card being reviewed with no task, in the
+        re-read slot (a reviewer waits for it); 422 `unknown_target` for a line the draft hasn't.
+        """
+        job = self.job(job_id)
+        self._check_idle(job)
+        draft = _parse_draft(job.draft)
+        if draft is None:
+            raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNKNOWN_TARGET)
+        # a line kept as written with a marker is parsed around its markers, as a save parses it (`KeptLine`)
+        kept = kept_flag_ids(parse_flags(job.flags))
+        marked = {line.reference_id: m for line in draft.ingredients if (m := kept_line(line, kept)) is not None}
+        try:
+            payload = tasks.parse_lines_payload(draft, refs, marked)
+        except KeyError:
+            raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNKNOWN_TARGET) from None
+        return self._enqueue(job_id, payload, limits.PRIORITY_REREAD)
+
+    @staticmethod
+    def _check_idle(job: RecipeIngestionJob) -> None:
+        """A task for a card being reviewed: 409 `invalid_status` in any other state, 409 `busy` while it has one"""
+        if job.status != IngestStatus.ready.value:
+            raise invalid_status(job.status)
+        if job.task_state is not None:
+            raise busy()
+
+    def _enqueue(self, job_id: UUID, payload: dict[str, Any], priority: int) -> RecipeIngestionJobState:
+        """An extract task in the mode `payload` names, for a card still being reviewed with no task"""
+        where = [Job.status == IngestStatus.ready.value]
+        if not self.repos.jobs.enqueue_task(job_id, IngestTaskKind.extract, payload, priority, where=where):
+            raise self._refuse_enqueue(job_id, IngestStatus.ready)
+        return self._queued(job_id)
+
     def retry(self, job_id: UUID) -> RecipeIngestionJobState:
         """A failed first extraction goes back to `processing` with a fresh extract task"""
         job = self.job(job_id)
@@ -1120,6 +1528,29 @@ class ReviewService:
         self.job(job_id)
         self.repos.jobs.cancel_task(job_id)
         return self.get_state(job_id)
+
+    # ==========================================
+    # Where on the card a field's text is
+
+    def region_hint(self, job_id: UUID, target: ProposalTarget) -> RegionHintOut:
+        """
+        Where on an upright page the target field's text probably is, for the re-read selection to start there
+        (§6.5, `pipeline.region_hint`): by the lines Tesseract found when it oriented the page, else by the text's line
+        in the transcription. The text is what the card says for the field: an ingredient's line as read
+        (`original_text`; a line added on the page, as it reads now), a step's or note's text, or a single field's.
+        404 `not_found` when the draft has no such text or neither finds it (the reviewer typed it, or there's no
+        reading to go by), as for a card that isn't there: the page starts the selection as it would without a hint.
+        """
+        job = self.job(job_id)
+        draft = _parse_draft(job.draft)
+        pages = [] if is_slimmed(job) else parse_pages(job.pages)
+        text = _target_text(draft, target) if draft is not None and pages else None
+        hint = region_hint(pages, job.transcription, text) if text else None
+        if hint is None:
+            raise not_found()
+        return RegionHintOut(
+            page=hint.page, x=hint.x, y=hint.y, width=hint.width, height=hint.height, source=hint.source
+        )
 
     # ==========================================
     # Files (the caller holds the ingest write lock)

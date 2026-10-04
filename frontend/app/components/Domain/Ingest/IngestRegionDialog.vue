@@ -177,6 +177,8 @@ function targetTitle(option: RereadTargetOption): string {
     case "new-step":
       return i18n.t("recipe-ingest.review.add-step");
     case "note":
+      return option.text || i18n.t("recipe-ingest.review.notes");
+    case "new-note":
       return i18n.t("recipe-ingest.review.add-note");
     default:
       return option.value;

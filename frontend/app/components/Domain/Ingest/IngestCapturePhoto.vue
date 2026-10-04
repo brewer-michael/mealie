@@ -19,19 +19,20 @@
       :aria-label="altText"
       :title="name || undefined"
     >
-      <v-icon :icon="state === 'pending' ? mdiImageOutline : mdiCardTextOutline" :size="size >= 64 ? 28 : 22" />
+      <v-icon :icon="icon" :size="size >= 64 ? 28 : 22" />
       <span v-if="showName && state === 'unavailable' && name" class="photo-name">{{ name }}</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { mdiCardTextOutline, mdiImageOutline } from "@mdi/js";
+import { mdiCardTextOutline, mdiFilePdfBox, mdiImageOutline } from "@mdi/js";
 import { photoName, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 
 /**
  * A photo in the capture tray or the upload queue (docs/ai/PHASE2.md §1.1): its small thumbnail, made once, or a card
- * placeholder with the file name where the browser can't show the photo (HEIC outside Safari, a PDF). Fork-owned.
+ * placeholder with the file name where the browser can't show the photo (HEIC outside Safari; a PDF, with a PDF
+ * icon). Fork-owned.
  */
 const props = withDefaults(defineProps<{
   photo: Blob;
@@ -47,12 +48,18 @@ const props = withDefaults(defineProps<{
   showName: true,
 });
 
-const { previewUrl, previewState, markPreviewBroken } = useRecipeIngestUploads();
+const { previewUrl, previewState, markPreviewBroken, isPdf } = useRecipeIngestUploads();
 
 const url = computed(() => previewUrl(props.photo));
 const state = computed(() => previewState(props.photo));
 const name = computed(() => photoName(props.photo));
 const altText = computed(() => [props.label, name.value].filter(Boolean).join(": "));
+const icon = computed(() => {
+  if (state.value === "pending") {
+    return mdiImageOutline;
+  }
+  return isPdf(props.photo) ? mdiFilePdfBox : mdiCardTextOutline;
+});
 </script>
 
 <style scoped>

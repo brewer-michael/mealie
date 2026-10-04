@@ -1,7 +1,8 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import IngestUploadQueue from "./IngestUploadQueue.vue";
-import { resetRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import { resetRecipeIngestCounts, resetRecipeIngestSettings, useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
+import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 import { resetRecipeIngestUploads, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 
 const api = vi.hoisted(() => ({
@@ -80,6 +81,7 @@ afterEach(() => {
   wrappers.forEach(wrapper => wrapper.unmount());
   wrappers.length = 0;
   resetRecipeIngestUploads();
+  resetRecipeIngestSettings();
   vi.useRealTimers();
 });
 
@@ -155,6 +157,43 @@ describe("IngestUploadQueue", () => {
     expect(wrapper.find(".upload-retry").exists()).toBe(false);
   });
 
+  test("a refusal names the server's limit; a JPEG has its own pixel limit", async () => {
+    const MIB = 1024 * 1024;
+    useRecipeIngestSettings().settings.value = {
+      limits: {
+        maxUploadBytes: 100 * MIB,
+        maxFileBytes: 20 * MIB,
+        maxImagesPerRequest: 20,
+        maxPagesPerCard: 4,
+        maxPixels: 100_000_000,
+        maxJpegPixels: 260_000_000,
+      },
+    } as RecipeIngestionSettingsOut;
+    api.upload.mockResolvedValue({
+      data: {
+        batchId: "b1",
+        jobs: [],
+        rejected: [
+          { index: 0, filename: "IMG_1.jpg", reason: "too_many_pixels" },
+          { index: 1, filename: "scan.png", reason: "too_large" },
+        ],
+        summary: "",
+      },
+      error: null,
+    });
+    const queue = useRecipeIngestUploads();
+    queue.mode.value = "front-and-back";
+    const wrapper = mountQueue();
+    queue.takePhoto(photo());
+    queue.takePhoto(new File(["png"], "scan.png", { type: "image/png" }));
+    await flushPromises();
+
+    expect(wrapper.findAll(".upload-rejected li").map(item => item.text())).toEqual([
+      "Not used: This photo has more than 260 megapixels.",
+      "Not used: This file is larger than 20 MB.",
+    ]);
+  });
+
   test("retrying, then failed with Retry, and the server's reason when it gave one", async () => {
     vi.useFakeTimers();
     api.upload.mockResolvedValue({
@@ -182,6 +221,23 @@ describe("IngestUploadQueue", () => {
     await flushPromises();
     expect(rows(wrapper)).toHaveLength(0);
     expect(api.upload).toHaveBeenCalledTimes(5);
+  });
+
+  test("over the uploader's own limit of cards being read: it waits and goes again, then says why", async () => {
+    vi.useFakeTimers();
+    const quota = { code: "user_quota", message: "You can have at most 5 recipe cards being read at once." };
+    api.upload.mockResolvedValue({ data: null, error: { response: { status: 429, headers: { "retry-after": "60" }, data: { detail: quota } } } });
+    const queue = useRecipeIngestUploads();
+    const wrapper = mountQueue();
+    queue.takePhoto(photo());
+    await flushPromises();
+
+    expect(wrapper.get(".upload-status").text()).toBe("Retrying");
+    expect(wrapper.get(".upload-detail").text()).toBe("You have as many cards being read as you're allowed. Trying again shortly.");
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(wrapper.get(".upload-status").text()).toBe("Upload failed");
+    expect(wrapper.get(".upload-detail").text())
+      .toBe("You have as many recipe cards being read as you're allowed. Try again when some are done.");
   });
 
   test("a network failure just says Upload failed", async () => {

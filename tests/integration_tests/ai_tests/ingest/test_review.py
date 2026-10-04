@@ -22,6 +22,7 @@ from mealie.schema.recipe_ingest import (
     IngestStatus,
     ProposalTarget,
 )
+from tests.utils import api_routes
 from tests.utils.fixture_schemas import TestUser
 
 
@@ -231,6 +232,31 @@ def test_clear_error_dismisses_the_banner(api_client: TestClient, unique_user_fn
     row = job_row(job_id)
     assert (row["error_code"], row["error_params"]) == (None, None)
     assert row["draft_version"] == 1
+
+
+def test_a_save_answers_the_possible_duplicates_of_the_saved_name(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """The banner follows a rename: the save's answer says whether the saved name is a recipe's or a waiting card's"""
+    user = unique_user_fn_scoped
+    response = api_client.post(api_routes.recipes, json={"name": "Zucchini Bread"}, headers=user.token)
+    assert response.status_code == 201, response.text
+    recipe = api_client.get(api_routes.recipes_slug(response.json()), headers=user.token).json()
+    waiting = seed_job(user, draft=banana_draft(name="Apple Crisp"))
+    job_id = seed_job(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+
+    renamed = _put(api_client, user, job_id, 1, draft={**draft, "name": "Zucchini Bread"}).json()
+    assert renamed["duplicateOf"] == {"id": recipe["id"], "slug": "zucchini-bread", "name": "Zucchini Bread"}
+    assert (renamed["duplicateJob"], renamed["duplicateName"]) == (None, "Zucchini Bread (1)")
+
+    again = _put(api_client, user, job_id, 2, draft={**draft, "name": "apple  crisp"}).json()
+    assert (again["duplicateOf"], again["duplicateName"]) == (None, None)
+    assert again["duplicateJob"] == {"id": str(waiting), "title": "Apple Crisp"}
+
+    away = _put(api_client, user, job_id, 3, draft={**draft, "name": "Grandma's Banana Mug Cake"}).json()
+    assert (away["duplicateOf"], away["duplicateJob"], away["duplicateName"]) == (None, None, None)
+    assert away["ingredients"] is None  # nothing was parsed
 
 
 def test_a_tasks_proposal_never_conflicts_with_a_save(api_client: TestClient, unique_user_fn_scoped: TestUser):

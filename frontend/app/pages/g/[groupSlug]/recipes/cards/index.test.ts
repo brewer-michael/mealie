@@ -95,6 +95,7 @@ describe("the recipe cards page", () => {
     wrappers.forEach(wrapper => wrapper.unmount());
     wrappers.length = 0;
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   test("a group that can read cards gets the capture buttons", async () => {
@@ -112,6 +113,20 @@ describe("the recipe cards page", () => {
     expect(wrapper.get(".limit-reached").attributes("data-type")).toBe("warning");
     expect(wrapper.get(".limit-reached").text()).toContain("monthly token limit");
     expect(wrapper.find(".capture-buttons").exists()).toBe(true); // uploads are still taken
+  });
+
+  test("the limit warning says the cards are read again by themselves, and when", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T15:00:00Z"));
+    api.getSettings.mockResolvedValue({ data: settings({ limitReached: true }), error: null });
+    const wrapper = await mountPage();
+
+    const reset = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date("2026-11-01T00:00:00Z"));
+    expect(wrapper.get(".limit-reached").text()).toBe(
+      "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. "
+      + `They're read again automatically when the limit resets on ${reset}, or sooner if a manager raises it.`,
+    );
   });
 
   test("with scanning turned off on the server, says so rather than asking for a provider", async () => {

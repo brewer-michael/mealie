@@ -277,8 +277,10 @@ def test_keep_as_written_conversions(api_client: TestClient, unique_user_fn_scop
 
     assert recipe["name"] == "Grandma's (unreadable) Cake"
     assert recipe["prepTime"] == "___ minutes"
-    assert recipe["recipeIngredient"][0]["note"] == "1 (unreadable) flour"
-    assert recipe["recipeIngredient"][0]["food"] is None
+    # a line kept as written is parsed around its marker (the unit is the unreadable word here)
+    ingredient = recipe["recipeIngredient"][0]
+    assert (ingredient["quantity"], ingredient["unit"], ingredient["food"]["name"]) == (1, None, "flour")
+    assert (ingredient["note"], ingredient["originalText"]) == ("(unreadable)", "1 (unreadable) flour")
     assert recipe["recipeInstructions"][1]["text"] == "Microwave for ___ minutes."
     assert recipe["notes"][1] == {**recipe["notes"][1], "title": "Tip", "text": "Use (unreadable) bananas"}
 
@@ -441,6 +443,56 @@ def test_markers_kept_in_unit_and_food_names_stay_text(api_client: TestClient, u
         units = [unit.name for unit in repos.ingredient_units.page_all(_all()).items]
     assert foods == []
     assert units == ["cup"]
+
+
+def test_a_unit_whose_amount_is_a_kept_marker_is_named_in_the_note(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    Upstream's recipe page shows a unit only with an amount: "[blank] C. sugar" kept as written would read "sugar ___"
+    and lose its cup. The unit is named after the marker instead, as the page names the group's unit (its abbreviation
+    when it uses one), and isn't linked; a unit the group hasn't is named as written and not created.
+    """
+    user = unique_user_fn_scoped
+    with session_context() as session:
+        repos = get_repositories(session, group_id=UUID(user.group_id), household_id=None)
+        cup = repos.ingredient_units.create(
+            SaveIngredientUnit(name="cup", abbreviation="c", use_abbreviation=True, group_id=user.group_id)
+        )
+    draft = banana_draft(
+        ingredients=[
+            CardDraftIngredient(
+                original_text="[blank] C. sugar",
+                unit=CardDraftRef(id=cup.id, name="cup"),
+                food=CardDraftRef(name="sugar"),
+                note="[blank], packed",
+            ),
+            CardDraftIngredient(
+                original_text="[illegible] scoops flour",
+                unit=CardDraftRef(name="scoop"),
+                food=CardDraftRef(name="flour"),
+                note="[illegible]",
+            ),
+            CardDraftIngredient(
+                original_text="2 C. [blank]",
+                quantity=2,
+                unit=CardDraftRef(id=cup.id, name="cup"),
+                note="[blank]",
+            ),
+        ]
+    )
+    response = commit(api_client, user, ready_to_commit(user, draft=draft))
+    assert response.status_code == 201, response.text
+
+    sugar, flour, other = recipe_of(api_client, user, response.json()["slug"])["recipeIngredient"]
+    assert (sugar["quantity"] or None, sugar["unit"], sugar["food"]["name"]) == (None, None, "sugar")
+    assert sugar["note"] == "___ c, packed"
+    assert sugar["display"] == "sugar ___ c, packed"  # the recipe page's text: food, then note
+    assert (flour["unit"], flour["food"]["name"], flour["note"]) == (None, "flour", "(unreadable) scoop")
+    assert flour["display"] == "flour (unreadable) scoop"
+    assert units_named(user, "scoop") == []
+    # a line with an amount keeps its unit, linked
+    assert (other["quantity"], other["unit"]["id"], other["note"]) == (2, str(cup.id), "___")
 
 
 @pytest.mark.parametrize("kind", ["food", "unit"])
