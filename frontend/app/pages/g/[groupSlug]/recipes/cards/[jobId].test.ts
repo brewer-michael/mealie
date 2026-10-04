@@ -4,6 +4,7 @@ import ReviewPage from "./[jobId].vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vue";
 import {
+  formatIngestDate,
   resetRecipeIngestCounts,
   resetRecipeIngestReviewState,
   takeRecipeIngestCommitNotice,
@@ -29,6 +30,9 @@ const api = vi.hoisted(() => ({
   getCounts: vi.fn(),
   getJobs: vi.fn(),
   cancel: vi.fn(),
+  regionHint: vi.fn(),
+  rebuild: vi.fn(),
+  parseLines: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }));
 const router = vi.hoisted(() => ({ replace: vi.fn(), push: vi.fn() }));
@@ -278,6 +282,8 @@ describe("the recipe card review page", () => {
       Promise.resolve(ok({ draftVersion: payload.draftVersion + 1, flags: [unsure], errorCount: 0, warningCount: 1 })),
     );
     api.getCounts.mockResolvedValue(ok({ ready: 1 }));
+    // no hint: the selection starts as a band
+    api.regionHint.mockResolvedValue({ data: null, response: null, error: { response: { status: 404, data: { detail: { code: "not_found" } } } } });
   });
 
   afterEach(() => {
@@ -511,6 +517,46 @@ describe("the recipe card review page", () => {
     expect(dialog.props("targets")!.map((option: { value: string }) => option.value)).toContain("ingredients:i1");
   });
 
+  test("Re-read on a flagged ingredient starts the selection on that line, where the server says it is", async () => {
+    const hint = { page: 0, x: 0.05, y: 0.31, width: 0.9, height: 0.06, source: "ocr" };
+    let answer: (value: unknown) => void = () => {};
+    api.regionHint.mockImplementationOnce(() => new Promise((resolve) => {
+      answer = resolve;
+    }));
+    const wrapper = await mountPage();
+
+    await wrapper.get("[data-flag=\"unsure:ingredients:i1\"]").findAll("button").find(b => b.text() === "Re-read")!.trigger("click");
+    const dialog = wrapper.getComponent(IngestRegionDialog);
+    expect(api.regionHint).toHaveBeenCalledExactlyOnceWith("j1", { field: "ingredients", ref: "i1" });
+    expect(dialog.props("modelValue")).toBe(true);
+    expect(dialog.props("locating")).toBe(true);
+
+    answer(ok(hint));
+    await flushPromises();
+    expect(dialog.props("locating")).toBe(false);
+    expect(dialog.props("initialRegion")).toEqual(hint);
+    expect(dialog.props("initialTarget")).toBe("ingredients:i1");
+  });
+
+  test("with no hint, or one too slow to wait for, the selection starts without it", async () => {
+    const wrapper = await mountPage();
+    await wrapper.get("[data-flag=\"blank:steps:s2\"]").findAll("button").find(b => b.text() === "Re-read")!.trigger("click");
+    await flushPromises();
+    const dialog = wrapper.getComponent(IngestRegionDialog);
+    expect(dialog.props("locating")).toBe(false);
+    expect(dialog.props("initialRegion")).toBeNull();
+
+    // a server that doesn't answer: the dialog waits a moment, then starts without it
+    api.regionHint.mockImplementationOnce(() => new Promise(() => {}));
+    await wrapper.get(".ingest-ingredient__line").trigger("click");
+    await wrapper.get(".ingest-ingredient__reread").trigger("click");
+    expect(dialog.props("locating")).toBe(true);
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(dialog.props("locating")).toBe(false);
+    expect(dialog.props("initialRegion")).toBeNull();
+  });
+
   test("on a phone the ⋯ menu re-reads an area: nothing is preselected, a new ingredient or step can be chosen", async () => {
     const wrapper = await mountPage();
 
@@ -521,6 +567,9 @@ describe("the recipe card review page", () => {
     expect(dialog.props("initialTarget")).toBeNull();
     expect(dialog.props("targets")!.map((option: { value: string }) => option.value))
       .toEqual(expect.arrayContaining(["name", "ingredients:new", "steps:new"]));
+    // no line to look for: the selection starts at once
+    expect(dialog.props("locating")).toBe(false);
+    expect(api.regionHint).not.toHaveBeenCalled();
   });
 
   test("a line or step re-reads its own area of the card", async () => {
@@ -979,5 +1028,191 @@ describe("the recipe card review page", () => {
     await flushPromises();
     expect(router.replace).toHaveBeenLastCalledWith("/g/home/recipes/cards/j2");
     expect(router.push).not.toHaveBeenCalled();
+  });
+
+  // ==========================================
+  // Wave 3: rebuild, Parse with AI, the duplicate banner, failed dates, link checks
+
+  const extracting = { kind: "extract", state: "queued" };
+  const idle = (overrides = {}) => ok({ draftVersion: 3, status: "ready", task: null, proposalIds: [], ...overrides });
+
+  test("What the card says can be corrected, and the recipe rebuilt from it; the page waits, saying so", async () => {
+    api.rebuild.mockResolvedValueOnce(idle({ task: extracting }));
+    const wrapper = await mountPage();
+
+    await button(wrapper, "What the card says").trigger("click");
+    const dialog = () => wrapper.find(".dialog[data-title=\"What the card says\"]");
+    await dialog().get(".ingest-transcription__edit").trigger("click");
+    // (the stub box is one line; the component's own test keeps the lines)
+    await dialog().get(".ingest-transcription .textarea input").setValue("Banana Mug Cake. 1/4 t. salt. Microwave on high for 2 minutes.");
+    await dialog().get(".ingest-transcription__rebuild").trigger("click");
+    await flushPromises();
+
+    expect(api.rebuild).toHaveBeenCalledExactlyOnceWith("j1", { transcription: "Banana Mug Cake. 1/4 t. salt. Microwave on high for 2 minutes." });
+    expect(dialog().exists()).toBe(false);
+    expect(wrapper.get(".ingest-review__reading").text()).toContain("Rebuilding the recipe from your text. You can edit it when that's done.");
+
+    // done: the draft nobody had edited is replaced, and the review bar says where it came from
+    api.getJobState.mockResolvedValueOnce(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValueOnce(ok(job({ draftVersion: 4, transcription: "Banana Mug Cake\n1/4 t. salt\nMicrowave on high for 2 minutes.", flags: [unsure] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.find(".ingest-review__reading").exists()).toBe(false);
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Rebuilt from your text");
+  });
+
+  test("on desktop the card panel's text is corrected in place", async () => {
+    api.rebuild.mockResolvedValueOnce(idle({ task: extracting }));
+    const wrapper = await mountPage(true);
+
+    await wrapper.findAll("button").find(b => b.text() === "What the card says" && !b.classes("menu-item"))!.trigger("click");
+    const panel = wrapper.get(".ingest-card-panel");
+    await panel.get(".ingest-transcription__edit").trigger("click");
+    await panel.get(".ingest-transcription .textarea input").setValue("Banana Mug Cake");
+    await panel.get(".ingest-transcription__rebuild").trigger("click");
+    await flushPromises();
+
+    expect(api.rebuild).toHaveBeenCalledOnce();
+    expect(panel.find(".ingest-transcription .textarea").exists()).toBe(false);
+    // nothing more can be rebuilt while it runs
+    expect(panel.find(".ingest-transcription__edit").exists()).toBe(false);
+  });
+
+  test("Parse with AI on Check this ingredient parses that line; the line shows it, and takes the parse when done", async () => {
+    const check: CardFlag = { id: "check_parse:ingredients:i1", kind: "check_parse", severity: "warning", source: "parser", field: "ingredients", ref: "i1", params: { confidence: 55 }, alternatives: [] };
+    api.getJob.mockResolvedValue(ok(job({ flags: [check] })));
+    api.parseLines.mockResolvedValueOnce(idle({ task: extracting }));
+    const wrapper = await mountPage();
+
+    await wrapper.get("[data-flag=\"check_parse:ingredients:i1\"]").get(".ingest-flag-item__parse").trigger("click");
+    await flushPromises();
+    expect(api.parseLines).toHaveBeenCalledExactlyOnceWith("j1", { refs: ["i1"] });
+    expect(wrapper.get(".ingest-review__reading").text()).toContain("Parsing with AI. You can edit the card when that's done.");
+    expect(wrapper.get(".ingest-ingredient__parsing").text()).toBe("Parsing with AI…");
+
+    const parsed = { ...job().draft!.ingredients![0]!, quantity: 0.25, unit: { id: "u-tsp", name: "teaspoon" }, food: { id: "f-salt", name: "salt" }, display: "1/4 teaspoon salt", parseConfidence: 0.95 };
+    api.getJobState.mockResolvedValueOnce(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4, draft: { ...job().draft!, ingredients: [parsed] }, flags: [] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.find(".ingest-ingredient__parsing").exists()).toBe(false);
+    expect(wrapper.find(".ingest-review__reading").exists()).toBe(false);
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Parsed with AI");
+  });
+
+  test("the open line parses itself with AI; a card in another language parses its lines kept as text at once", async () => {
+    const lines = [
+      { referenceId: "i1", originalText: "2 tazas de harina", quantity: null, unit: null, food: null, note: "2 tazas de harina", display: "2 tazas de harina" },
+      { referenceId: "i2", originalText: "1 [illegible] de sal", quantity: null, unit: null, food: null, note: "1 [illegible] de sal", display: "1 [illegible] de sal" },
+      { referenceId: "i3", originalText: "3 huevos", quantity: null, unit: null, food: null, note: "3 huevos", display: "3 huevos" },
+    ];
+    const notParsed: CardFlag = { id: "not_parsed:card", kind: "not_parsed", severity: "info", source: "parser", field: "card", ref: null, params: {}, alternatives: [] };
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...job().draft!, ingredients: lines }, flags: [notParsed] })));
+    api.parseLines.mockResolvedValue(idle({ task: extracting }));
+    const wrapper = await mountPage();
+
+    const info = wrapper.get(".ingest-review__info");
+    expect(info.text()).toContain("Ingredients kept as text");
+    await info.get(".ingest-review__parse-all").trigger("click");
+    await flushPromises();
+    // the line with a marker has a flag of its own
+    expect(api.parseLines).toHaveBeenCalledExactlyOnceWith("j1", { refs: ["i1", "i3"] });
+    expect(wrapper.findAll(".ingest-ingredient__parsing")).toHaveLength(2);
+
+    api.getJobState.mockResolvedValueOnce(idle());
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    await wrapper.findAll(".ingest-ingredient__line")[2]!.trigger("click");
+    await wrapper.get(".ingest-ingredient__parse").trigger("click");
+    await flushPromises();
+    expect(api.parseLines).toHaveBeenLastCalledWith("j1", { refs: ["i3"] });
+  });
+
+  test("the possible-duplicate banner names what commit would call the recipe, a near name, or a card waiting", async () => {
+    api.getJob.mockResolvedValue(ok(job({
+      duplicateOf: { id: "r0", slug: "banana-mug-cake", name: "Banana Mug Cake" },
+      duplicateName: "Banana Mug Cake (2)",
+      duplicateJob: { id: "j7", title: "Banana Mug Cake" },
+    })));
+    const wrapper = await mountPage();
+    const banner = () => wrapper.find(".ingest-review__duplicate");
+
+    expect(banner().get(".ingest-review__duplicate-recipe").text())
+      .toContain("A recipe called \"Banana Mug Cake\" already exists. Adding this card makes \"Banana Mug Cake (2)\".");
+    expect(banner().get(".ingest-review__duplicate-card").text()).toContain("Another card waiting has the same name.");
+    await banner().get(".ingest-review__duplicate-card button").trigger("click");
+    expect(router.replace).toHaveBeenLastCalledWith("/g/home/recipes/cards/j7");
+
+    // renamed: the save's answer says the name is like another recipe's, and no card waits with it
+    api.updateJob.mockResolvedValueOnce(ok({
+      draftVersion: 4,
+      flags: [unsure],
+      duplicateOf: { id: "r5", slug: "banana-mug-cakes", name: "Banana Mug Cakes" },
+      duplicateJob: null,
+      duplicateName: null,
+    }));
+    await wrapper.get("#ingest-field-name input").setValue("Banana Mug-Cake");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(banner().text()).toContain("A recipe with a similar name already exists: \"Banana Mug Cakes\".");
+    expect(banner().find(".ingest-review__duplicate-card").exists()).toBe(false);
+
+    // and away from both: the banner goes
+    api.updateJob.mockResolvedValueOnce(ok({ draftVersion: 5, flags: [unsure], duplicateOf: null, duplicateJob: null, duplicateName: null }));
+    await wrapper.get("#ingest-field-name input").setValue("Banana Bread");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(banner().exists()).toBe(false);
+  });
+
+  test("a failed card says when it's read again by itself and when it's removed", async () => {
+    // dates the server sends without an offset are UTC; they show in the reader's time zone
+    const date = (iso: string, withTime = false) => formatIngestDate(new Date(`${iso}Z`), "en-US", withTime);
+    api.getJob.mockResolvedValue(ok(job({
+      status: "failed",
+      draft: null,
+      flags: [],
+      error: { code: "limit_reached", params: {} },
+      autoRetryAt: "2099-11-01T00:00:00",
+      expiresAt: "2099-11-15T00:00:00",
+    })));
+    const wrapper = await mountPage();
+
+    expect(wrapper.findAll(".ingest-review__failed-when").map(line => line.text())).toEqual([
+      `Tries again on ${date("2099-11-01T00:00:00", true)}`,
+      `Removed on ${date("2099-11-15T00:00:00")} unless it's read again before then.`,
+    ]);
+
+    // a card that isn't waiting for the limits: only when it's removed; one due now is read shortly
+    api.getJob.mockResolvedValue(ok(job({ status: "failed", draft: null, flags: [], error: { code: "no_recipe_found", params: {} }, expiresAt: "2099-10-18T09:00:00" })));
+    const other = await mountPage();
+    expect(other.findAll(".ingest-review__failed-when").map(line => line.text()))
+      .toEqual([`Removed on ${date("2099-10-18T09:00:00")} unless it's read again before then.`]);
+
+    api.getJob.mockResolvedValue(ok(job({ status: "failed", draft: null, flags: [], error: { code: "limit_reached", params: {} }, autoRetryAt: "2000-01-01T00:00:00" })));
+    const due = await mountPage();
+    expect(due.findAll(".ingest-review__failed-when").map(line => line.text())).toEqual(["Tries again shortly"]);
+  });
+
+  test("a near-miss link can be kept as a new food; skipped tag suggestions say why", async () => {
+    const draft = job().draft!;
+    const onion = { referenceId: "i2", originalText: "2 rd onions, diced", quantity: 2, unit: null, food: { id: "f-red", name: "red onion" }, note: "diced", display: "2 red onion diced" };
+    const fuzzy: CardFlag = { id: "linked_fuzzy:ingredients:i2", kind: "linked_fuzzy", severity: "warning", source: "parser", field: "ingredients", ref: "i2", params: { name: "red onion", kind: "food", start: 2, end: 11 }, alternatives: [] };
+    const skipped: CardFlag = { id: "organizers_skipped:card", kind: "organizers_skipped", severity: "info", source: "model", field: "card", ref: null, params: { reason: "local_only" }, alternatives: [] };
+    api.getJob.mockResolvedValue(ok(job({
+      draft: { ...draft, ingredients: [...draft.ingredients!, onion] },
+      flags: [fuzzy, skipped],
+      permissions: { canCreateFoods: true, canDiscard: true },
+    })));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__info").text())
+      .toBe("No tags suggested: Tags, categories and tools weren't suggested: this card stays on this server, and no AI provider on your network can suggest them.");
+    const item = wrapper.get("[data-flag=\"linked_fuzzy:ingredients:i2\"]");
+    expect(item.text()).toContain("Linked to \"red onion\": check it's the same thing.");
+    await item.get(".ingest-flag-item__keep-new").trigger("click");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft.ingredients[1].food).toEqual({ id: null, name: "rd onions" });
   });
 });

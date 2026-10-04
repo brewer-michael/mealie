@@ -28,6 +28,9 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
     crossRead: false,
     canReadCards: true,
     limitReached: false,
+    limitedFeatures: [],
+    baseUrlSet: true,
+    readerRunning: true,
     ocrAvailable: false,
     reader: { name: "Claude", local: false, viaOcr: false },
     localOnlyAvailable: false,
@@ -73,6 +76,11 @@ async function mountPage() {
   wrappers.push(wrapper);
   await flushPromises();
   return wrapper;
+}
+
+function setVisibility(state: "visible" | "hidden") {
+  Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  document.dispatchEvent(new Event("visibilitychange"));
 }
 
 const route = { params: { groupSlug: "home" }, query: {} as Record<string, string> };
@@ -200,6 +208,98 @@ describe("the recipe cards page", () => {
     wrapper.unmount();
     wrappers.length = 0;
     expect(uploads.closeCardsPage).toHaveBeenCalledOnce();
+  });
+
+  test("warns when nothing on the server reads cards; uploads are still taken", async () => {
+    api.getSettings.mockResolvedValue({ data: settings({ readerRunning: false }), error: null });
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".reader-not-running").attributes("data-type")).toBe("warning");
+    expect(wrapper.get(".reader-not-running").text()).toBe(
+      "Cards are accepted, but nothing on the server is reading them, so they wait. "
+      + "A server administrator can check that AI_INGEST_WORKER is on and look at the server's log.",
+    );
+    expect(wrapper.find(".capture-buttons").exists()).toBe(true);
+  });
+
+  test("notes, softly, which optional parts of the read a monthly limit skips, and until when", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T15:00:00Z"));
+    api.getSettings.mockResolvedValue({ data: settings({ limitedFeatures: ["suggestions", "cross_read"] }), error: null });
+    const wrapper = await mountPage();
+
+    const reset = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(new Date("2026-11-01T00:00:00Z"));
+    const note = wrapper.get(".limited-features");
+    expect(note.findAll(".limited-feature").map(line => line.text())).toEqual([
+      `Tag, category and tool suggestions are off until the monthly token limit resets on ${reset}.`,
+      `The second reading is off until the monthly token limit resets on ${reset}.`,
+    ]);
+    // a note, not a warning
+    expect(wrapper.find(".alert").exists()).toBe(false);
+  });
+
+  test("shows the household's inbox: photos waiting there and why, and the ones it refused", async () => {
+    api.getSettings.mockResolvedValue({
+      data: settings({
+        inbox: {
+          enabled: true,
+          folder: "home/family",
+          waiting: 4,
+          waitingReason: "quota",
+          rejections: [{ name: "IMG_0001.jpg", reason: "duplicate", at: "2026-10-04T13:00:00Z" }],
+        },
+      }),
+      error: null,
+    });
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".inbox-hint").text()).toBe("Put photos in the home/family folder of the inbox share to scan them.");
+    expect(wrapper.get(".inbox-waiting").text())
+      .toBe("4 photos are waiting in the inbox: too many of your group's cards are being read. They're added as those finish.");
+    expect(wrapper.get(".inbox-rejection").text()).toContain("IMG_0001.jpg: Already scanned");
+  });
+
+  test("inbox photos that wait because the group can't read cards show too", async () => {
+    api.getSettings.mockResolvedValue({
+      data: settings({ canReadCards: false, inbox: { enabled: true, folder: "home/family", waiting: 2, waitingReason: "cannot_read", rejections: [] } }),
+      error: null,
+    });
+    const wrapper = await mountPage();
+    expect(wrapper.find(".cannot-read").exists()).toBe(true);
+    expect(wrapper.get(".inbox-waiting").text()).toBe("2 photos are waiting in the inbox: AI isn't set up to read recipe cards.");
+  });
+
+  test("while it's visible, the page asks for the settings again every minute and when it's back, so its warnings follow", async () => {
+    vi.useFakeTimers();
+    setVisibility("visible");
+    api.getSettings.mockResolvedValue({ data: settings({ readerRunning: false }), error: null });
+    const wrapper = await mountPage();
+    expect(wrapper.find(".reader-not-running").exists()).toBe(true);
+    expect(api.getSettings).toHaveBeenCalledOnce();
+
+    // the reader started
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(api.getSettings).toHaveBeenCalledTimes(2);
+    expect(wrapper.find(".reader-not-running").exists()).toBe(false);
+
+    // hidden: nothing is asked
+    setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(api.getSettings).toHaveBeenCalledTimes(2);
+
+    // back: asked at once, then every minute again
+    setVisibility("visible");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.getSettings).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(api.getSettings).toHaveBeenCalledTimes(4);
+
+    // gone from the page: nothing more
+    wrapper.unmount();
+    wrappers.length = 0;
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(api.getSettings).toHaveBeenCalledTimes(4);
   });
 
   test("a group without AI is told to set it up", async () => {

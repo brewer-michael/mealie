@@ -39,6 +39,9 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
     crossRead: false,
     canReadCards: true,
     limitReached: false,
+    limitedFeatures: [],
+    baseUrlSet: true,
+    readerRunning: true,
     ocrAvailable: false,
     reader: { name: "Qwen VL", local: true, viaOcr: false },
     localOnlyAvailable: true,
@@ -336,6 +339,81 @@ describe("GroupRecipeCardSettings", () => {
     const notAdvanced = await mountSettings();
     expect(notAdvanced.find(".notifications a").exists()).toBe(false);
     expect(notAdvanced.get(".notifications").text()).not.toBe("");
+  });
+
+  test("warns when nothing on the server reads cards", async () => {
+    const running = await mountSettings();
+    expect(running.find(".reader-not-running").exists()).toBe(false);
+
+    api.getSettings.mockResolvedValue({ data: settings({ readerRunning: false }), error: null });
+    const stopped = await mountSettings();
+    expect(stopped.get(".reader-not-running").attributes("data-type")).toBe("warning");
+    expect(stopped.get(".reader-not-running").text()).toContain("nothing on the server is reading them");
+
+    // with scanning off on the server, that's what it says
+    api.getSettings.mockResolvedValue({ data: settings({ enabled: false, readerRunning: false }), error: null });
+    const disabled = await mountSettings();
+    expect(disabled.find(".reader-not-running").exists()).toBe(false);
+  });
+
+  test("notes the optional parts of the read a monthly limit skips, and until when", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T15:00:00Z"));
+    try {
+      api.getSettings.mockResolvedValue({ data: settings({ limitedFeatures: ["suggestions"] }), error: null });
+      const wrapper = await mountSettings();
+
+      const reset = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(new Date("2026-11-01T00:00:00Z"));
+      expect(wrapper.get(".limited-features").attributes("data-type")).toBe("info");
+      expect(wrapper.findAll(".limited-feature").map(line => line.text()))
+        .toEqual([`Tag, category and tool suggestions are off until the monthly token limit resets on ${reset}.`]);
+    }
+    finally {
+      vi.useRealTimers();
+    }
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    const none = await mountSettings();
+    expect(none.find(".limited-features").exists()).toBe(false);
+  });
+
+  test("shows the photos waiting in the household's inbox folder and the ones it refused", async () => {
+    api.getSettings.mockResolvedValue({
+      data: settings({
+        inbox: {
+          enabled: true,
+          folder: "home/family",
+          waiting: 2,
+          waitingReason: "local_only_unavailable",
+          rejections: [{ name: "Grandma's card", reason: "no_permission", at: null }],
+        },
+      }),
+      error: null,
+    });
+    const wrapper = await mountSettings();
+
+    expect(wrapper.get(".inbox").text()).toBe("Put photos in the home/family folder of the inbox share to scan them.");
+    expect(wrapper.get(".inbox-waiting").text()).toBe(
+      "2 photos are waiting in the inbox: your group keeps cards on this server, and no AI provider on your network can read them.",
+    );
+    expect(wrapper.get(".inbox-rejection-name").text()).toBe("Grandma's card");
+    expect(wrapper.get(".inbox-rejection-reason").text()).toContain("Mealie may not move this out of the inbox folder.");
+  });
+
+  test("warns that notification links won't open on a phone while BASE_URL points to localhost", async () => {
+    const set = await mountSettings();
+    expect(set.find(".base-url-unset").exists()).toBe(false);
+
+    api.getSettings.mockResolvedValue({ data: settings({ baseUrlSet: false }), error: null });
+    const unset = await mountSettings();
+    expect(unset.get(".base-url-unset").attributes("data-type")).toBe("warning");
+    expect(unset.get(".base-url-unset").text()).toBe(
+      "Links in notifications point to localhost, so they won't open on a phone. Set BASE_URL on the server to the address your phone uses.",
+    );
+
+    // with scanning off nothing is sent
+    api.getSettings.mockResolvedValue({ data: settings({ enabled: false, baseUrlSet: false }), error: null });
+    const disabled = await mountSettings();
+    expect(disabled.find(".base-url-unset").exists()).toBe(false);
   });
 
   test("lists the group's eval cases with their tags, notes and whether they're verified", async () => {

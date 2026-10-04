@@ -70,6 +70,16 @@
     </v-alert>
 
     <section v-else-if="canReadCards" class="capture mb-6">
+      <!-- no card reader has run lately (AI_INGEST_WORKER off, or it stopped): uploads are taken, but nothing reads them -->
+      <v-alert
+        v-if="readerStopped"
+        class="reader-not-running mb-4"
+        type="warning"
+        variant="tonal"
+        density="compact"
+      >
+        {{ $t("recipe-ingest.settings.reader-not-running") }}
+      </v-alert>
       <!-- the group keeps cards on this server, and nothing on the network can read them: every card would fail -->
       <v-alert
         v-if="localOnlyBlocked"
@@ -89,6 +99,12 @@
       >
         {{ $t("recipe-ingest.capture.limit-reached", { date: dateText(nextLimitReset(), true) }) }}
       </v-alert>
+      <!-- cards are read, but an optional part of the read is skipped this month: a soft note, not a warning -->
+      <p v-if="limitedFeatures.length" class="limited-features text-caption text-medium-emphasis mb-3">
+        <span v-for="feature in limitedFeatures" :key="feature" class="limited-feature d-block">
+          {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
+        </span>
+      </p>
       <IngestPrivacyChip
         v-model:local-only="localOnly"
         class="mb-3 mb-sm-4"
@@ -103,6 +119,8 @@
     <p v-if="inboxFolder" class="inbox-hint text-body-2 text-medium-emphasis mb-6">
       {{ $t("recipe-ingest.settings.inbox-hint", { folder: inboxFolder }) }}
     </p>
+    <!-- photos waiting in the household's inbox folder and why, and the ones it refused lately -->
+    <IngestInboxStatus class="mb-6" :settings="settings" />
 
     <!-- with scanning turned off on the server every list request is refused: no list at all -->
     <IngestBatchList v-if="showList" :group-slug="groupSlug" :batch-id="batchId" />
@@ -111,8 +129,10 @@
 
 <script setup lang="ts">
 import { mdiCardTextOutline } from "@mdi/js";
+import { useDocumentVisibility, useIntervalFn } from "@vueuse/core";
 import IngestBatchList from "~/components/Domain/Ingest/IngestBatchList.vue";
 import IngestCapture from "~/components/Domain/Ingest/IngestCapture.vue";
+import IngestInboxStatus from "~/components/Domain/Ingest/IngestInboxStatus.vue";
 import IngestPrivacyChip from "~/components/Domain/Ingest/IngestPrivacyChip.vue";
 import IngestUploadQueue from "~/components/Domain/Ingest/IngestUploadQueue.vue";
 import { nextLimitReset, useRecipeIngestSettings, useRecipeIngestText } from "~/composables/use-recipe-ingest";
@@ -121,7 +141,10 @@ import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads"
 /**
  * Recipe cards (docs/ai/PHASE2.md §1.1, §6.7): take or choose card photos, watch them upload and get read, and open
  * them for review. `?batch=<id>` shows one batch with its summary; `?unavailable=1` says the batch a notification
- * named can't be opened. Fork-owned.
+ * named can't be opened. It warns when nothing on the server reads cards, notes optional parts of the read a monthly
+ * limit skips, and shows the household's inbox: photos waiting there and why, and the ones it refused. Those change
+ * by themselves, so while the page is visible the settings are asked again every minute, and on coming back to it.
+ * Fork-owned.
  */
 definePageMeta({
   middleware: ["group-only"],
@@ -149,7 +172,14 @@ const {
 const { localOnly, sentBeforeLocalOnlyChange, localOnlyFinishedBatch, openCardsPage } = useRecipeIngestUploads();
 const { dateText } = useRecipeIngestText();
 
+/** While the page is visible, the settings (the reader, the inbox) are asked again this often */
+const SETTINGS_REFRESH_MS = 60_000;
+
 const canReadCards = computed(() => !!settings.value?.canReadCards);
+/** No card reader (the ingest worker) has run in the last 3 minutes */
+const readerStopped = computed(() => settings.value?.enabled !== false && settings.value?.readerRunning === false);
+/** Optional parts of the read a monthly limit skips (tag suggestions, the second reading) */
+const limitedFeatures = computed(() => settings.value?.limitedFeatures ?? []);
 /** The group keeps cards on this server, and no AI provider on the network can read them */
 const localOnlyBlocked = computed(() => !!settings.value?.localOnly && !settings.value.localOnlyAvailable);
 const inboxFolder = computed(() => (settings.value?.inbox?.enabled && settings.value.inbox.folder) || null);
@@ -162,13 +192,33 @@ function dismissBatchUnavailable() {
   void router.replace({ query });
 }
 
+// what the page warns about changes by itself (a reader starts or stops, the inbox takes or refuses photos): asked
+// again every minute while the page is visible, and at once when it's back
+const visibility = useDocumentVisibility();
+const settingsRefresh = useIntervalFn(() => void loadSettings(), SETTINGS_REFRESH_MS, { immediate: false });
+watch(visibility, (state) => {
+  if (state === "visible") {
+    void loadSettings();
+    settingsRefresh.resume();
+  }
+  else {
+    settingsRefresh.pause();
+  }
+});
+
 // cards that fail to upload while this page is open show here, not as a toast and a sidebar badge
 let closeCardsPage: (() => void) | null = null;
 onMounted(() => {
   closeCardsPage = openCardsPage();
   void loadSettings();
+  if (visibility.value === "visible") {
+    settingsRefresh.resume();
+  }
 });
-onBeforeUnmount(() => closeCardsPage?.());
+onBeforeUnmount(() => {
+  settingsRefresh.pause();
+  closeCardsPage?.();
+});
 </script>
 
 <style scoped>

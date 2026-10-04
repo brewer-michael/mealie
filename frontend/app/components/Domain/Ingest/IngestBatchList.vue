@@ -23,7 +23,14 @@
       what the review said about the batch's last card, or what "Add N clean cards" did when its batch has gone: here,
       by the summary, where a toast would cover the page title
     -->
-    <IngestBatchListNotice v-if="notice && !noticeInBatch" class="mb-3" :notice="notice" @dismiss="notice = null" />
+    <IngestBatchListNotice
+      v-if="notice && !noticeInBatch"
+      class="mb-3"
+      :notice="notice"
+      :busy="undoing"
+      @dismiss="notice = null"
+      @undo="undoCommit"
+    />
 
     <v-alert
       v-if="loadFailed"
@@ -99,7 +106,9 @@
         v-if="notice && notice.batchId === batch.id"
         class="my-2"
         :notice="notice"
+        :busy="undoing"
         @dismiss="notice = null"
+        @undo="undoCommit"
       />
       <v-list class="py-0" density="comfortable">
         <IngestJobListItem
@@ -115,6 +124,23 @@
       </v-list>
     </section>
 
+    <!-- more open cards than one load fetches: the oldest wait for this, rather than being left out unsaid -->
+    <div v-if="openMore" class="load-older-open d-flex align-center flex-wrap ga-2 mb-4">
+      <span class="text-body-2 text-medium-emphasis">
+        {{ $t("recipe-ingest.queue.newest-shown", jobs.length) }}
+      </span>
+      <v-btn
+        class="load-older"
+        size="small"
+        variant="tonal"
+        :loading="loadingOlder === 'open'"
+        :disabled="loadingOlder !== null"
+        @click="loadOlder('open')"
+      >
+        {{ $t("recipe-ingest.queue.load-older") }}
+      </v-btn>
+    </div>
+
     <section v-if="recent.length" class="recently-added mt-6">
       <h4 class="text-subtitle-1 mb-1">
         {{ $t("recipe-ingest.queue.recently-added") }}
@@ -127,6 +153,17 @@
           :group-slug="groupSlug"
         />
       </v-list>
+      <v-btn
+        v-if="recentMore"
+        class="load-older-recent mt-2"
+        size="small"
+        variant="tonal"
+        :loading="loadingOlder === 'recent'"
+        :disabled="loadingOlder !== null"
+        @click="loadOlder('recent')"
+      >
+        {{ $t("recipe-ingest.queue.load-older") }}
+      </v-btn>
     </section>
 
     <BaseDialog
@@ -174,11 +211,13 @@ import {
   errorCodeOf,
   errorMessageOf,
   errorStatusOf,
+  serverDate,
   takeRecipeIngestCommitNotice,
   useRecipeIngestCounts,
   useRecipeIngestText,
 } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
+import { carryReviewNotice } from "~/composables/use-recipe-ingest-review";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import { alert } from "~/composables/use-toast";
 import type {
@@ -190,11 +229,13 @@ import type {
 import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
 
 /**
- * The household's cards by batch, newest first (docs/ai/PHASE2.md §6.7), and the ones added in the last 7 days. It
- * polls the batches that are being read or uploaded every 3 s while the page is visible, and at once after an upload.
- * Cards that arrive or change elsewhere (the inbox, a Shortcut, another device) show too: while the page is visible
- * the shared counts are checked every 20 s and a change reloads the list, as does coming back to the page. With one
- * batch it sums the batch up, and shows what the review said about the batch's last card. Fork-owned.
+ * The household's cards by batch, newest first (docs/ai/PHASE2.md §6.7), and the ones added as recipes in the last 7
+ * days, latest added first. A load fetches the newest 1000 open cards and 50 added ones; "Load older cards" fetches
+ * more of either. It polls the batches that are being read or uploaded every 3 s while the page is visible, and at
+ * once after an upload. Cards that arrive or change elsewhere (the inbox, a Shortcut, another device) show too: while
+ * the page is visible the shared counts are checked every 20 s and a change reloads the list, as does coming back to
+ * the page. With one batch it sums the batch up, and shows what the review said about the batch's last card, whose
+ * Undo takes that card back to review. Fork-owned.
  */
 const props = defineProps<{
   groupSlug: string;
@@ -221,16 +262,22 @@ const POLL_INTERVAL_MS = 3000;
 /** How often, while the page is visible, the counts are checked for changes made elsewhere */
 const COUNTS_INTERVAL_MS = 20_000;
 const PER_PAGE = 100;
-/** At most this many pages of a list (a household has at most 200 cards being read) */
-const MAX_PAGES = 10;
+/**
+ * The open cards' pages a load fetches at first, and how many more each "Load older cards" adds: ready and failed
+ * cards stay until they're reviewed or removed, so a household can have more open cards than one load should fetch
+ */
+const OPEN_PAGES = 10;
 const RECENT_DAYS = 7;
-const RECENT_LIMIT = 50;
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Added cards per page; a load fetches one page at first, and each "Load older cards" one more */
+const RECENT_PER_PAGE = 50;
 const OPEN_STATUSES: IngestStatus[] = ["processing", "ready", "failed", "committing"];
 /** At least this many clean cards make "Add N clean cards" worth offering */
 const MIN_CLEAN_CARDS = 2;
 
 const i18n = useI18n();
 const api = useUserApi();
+const router = useRouter();
 const { cardTitle, ingestErrorText } = useRecipeIngestText();
 const counts = useRecipeIngestCounts();
 const uploads = useRecipeIngestUploads();
@@ -238,8 +285,16 @@ const visibility = useDocumentVisibility();
 
 /** Cards not added yet (all of the batch's when filtered) */
 const jobs = ref<Job[]>([]);
-/** Cards added in the last 7 days, newest first */
+/** Cards added in the last 7 days (all of the batch's when filtered), latest added first */
 const recent = ref<Job[]>([]);
+/** How many pages of open and of added cards a load fetches ("Load older cards" raises them) */
+const openPages = ref(OPEN_PAGES);
+const recentPages = ref(1);
+/** The server has more open, or more added, cards than the list fetched */
+const openMore = ref(false);
+const recentMore = ref(false);
+/** The list whose older cards are being loaded */
+const loadingOlder = ref<"open" | "recent" | null>(null);
 const loading = ref(false);
 const loaded = ref(false);
 const loadFailed = ref(false);
@@ -249,10 +304,19 @@ const retryingBatch = ref<string | null>(null);
 const discardDialog = ref(false);
 const discardTarget = ref<Job | null>(null);
 
-/** "Added Banana Mug Cake · 2 cards are still being read", left by the review page after the batch's last card */
+/**
+ * "Added Banana Mug Cake · 2 cards are still being read", left by the review page after the batch's last card, with
+ * Undo for the card just added
+ */
 const left = takeRecipeIngestCommitNotice();
 const notice = ref<RecipeIngestQueueNotice | null>(left
-  ? { kind: left.warning ? "warning" : "success", text: left.text, detail: left.warning, items: [] }
+  ? {
+      kind: left.warning ? "warning" : "success",
+      text: left.text,
+      detail: left.warning,
+      items: [],
+      undoJobId: left.undoJobId ?? null,
+    }
   : null);
 
 function isActive(job: Job): boolean {
@@ -264,14 +328,15 @@ function isClean(job: Job): boolean {
   return job.status === "ready" && !job.task && !job.errorCount && !job.warningCount;
 }
 
-function isRecent(job: Job, now = Date.now()): boolean {
-  const created = job.createdAt ? new Date(job.createdAt).getTime() : Number.NaN;
-  return Number.isFinite(created) && now - created <= RECENT_DAYS * 24 * 60 * 60 * 1000;
+/** The time a card was added as a recipe, or uploaded; 0 for none (a server time without an offset is UTC) */
+function time(value: string | null | undefined): number {
+  return serverDate(value)?.getTime() ?? 0;
 }
 
-function time(value: string | null | undefined): number {
-  const parsed = value ? new Date(value).getTime() : Number.NaN;
-  return Number.isFinite(parsed) ? parsed : 0;
+/** Added as a recipe in the last 7 days (by when it was added, not when it was uploaded) */
+function isRecent(job: Job, now = Date.now()): boolean {
+  const committed = time(job.committedAt);
+  return committed > 0 && now - committed <= RECENT_DAYS * DAY_MS;
 }
 
 const batches = computed<BatchView[]>(() => {
@@ -344,24 +409,38 @@ function sourceText(source: IngestSource): string {
 // ==========================================
 // Loading and polling
 
-/** Every page of a job list; null when a request failed */
-async function fetchAll(query: RecipeIngestJobsQuery): Promise<Job[] | null> {
-  const items: Job[] = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const { data: result } = await api.recipeIngest.getJobs({ ...query, page, perPage: PER_PAGE });
+interface FetchedPages {
+  items: Job[];
+  /** The server has more pages than were fetched */
+  more: boolean;
+}
+
+/** The first `pages` pages of a job list (fewer when it ends sooner); null when a request failed */
+async function fetchPages(query: RecipeIngestJobsQuery, pages: number, perPage: number): Promise<FetchedPages | null> {
+  const items = new Map<string, Job>();
+  for (let page = 1; page <= pages; page++) {
+    const { data: result } = await api.recipeIngest.getJobs({ ...query, page, perPage });
     if (!result) {
       return null;
     }
-    items.push(...result.items);
+    // a card that moved to the next page while the pages were read shows once
+    result.items.forEach(job => items.set(job.id, job));
     if (page >= (result.total_pages ?? 1)) {
-      break;
+      return { items: [...items.values()], more: false };
     }
   }
-  return items;
+  return { items: [...items.values()], more: true };
 }
 
+/** All of one batch's cards, in one request (a batch shows whole: its counts, Retry failed, Add clean cards) */
+async function fetchBatch(batchId: string): Promise<Job[] | null> {
+  const { data: result } = await api.recipeIngest.getJobs({ batchId, perPage: -1 });
+  return result?.items ?? null;
+}
+
+/** Latest added first */
 function sortRecent(list: Job[]): Job[] {
-  return [...list].sort((a, b) => time(b.createdAt) - time(a.createdAt));
+  return [...list].sort((a, b) => time(b.committedAt) - time(a.committedAt) || time(b.createdAt) - time(a.createdAt));
 }
 
 /** Replaces one batch's cards with what the server says now; whether a card arrived, changed status or left */
@@ -468,7 +547,7 @@ async function poll() {
   if (!ids.length) {
     return;
   }
-  const results = await Promise.all(ids.map(batchId => fetchAll({ batchId })));
+  const results = await Promise.all(ids.map(batchId => fetchBatch(batchId)));
   if (disposed) {
     return;
   }
@@ -515,7 +594,7 @@ async function load() {
   loading.value = true;
   try {
     if (props.batchId) {
-      const all = await fetchAll({ batchId: props.batchId });
+      const all = await fetchBatch(props.batchId);
       if (!current()) {
         return;
       }
@@ -527,19 +606,22 @@ async function load() {
       loaded.value ||= !!all;
     }
     else {
+      // added in the last 7 days by when they were added: a card uploaded earlier and added today is among them
+      const since = new Date(Date.now() - RECENT_DAYS * DAY_MS);
       const [open, committed] = await Promise.all([
-        fetchAll({ status: OPEN_STATUSES }),
-        api.recipeIngest.getJobs({ status: "committed", perPage: RECENT_LIMIT }),
+        fetchPages({ status: OPEN_STATUSES }, openPages.value, PER_PAGE),
+        fetchPages({ status: "committed", committedSince: since, orderBy: "committedAt" }, recentPages.value, RECENT_PER_PAGE),
       ]);
       if (!current()) {
         return;
       }
       if (open) {
-        jobs.value = open;
+        jobs.value = open.items;
+        openMore.value = open.more;
       }
-      const added = committed.data?.items;
-      if (added) {
-        recent.value = sortRecent(added.filter(job => isRecent(job)));
+      if (committed) {
+        recent.value = sortRecent(committed.items);
+        recentMore.value = committed.more;
       }
       loadFailed.value = !open;
       loaded.value ||= !!open;
@@ -587,10 +669,34 @@ watch(uploads.uploadedCount, () => {
   void pollNow();
 });
 
+/** "Load older cards": the next open cards, or the next added ones; the list keeps them through its reloads */
+async function loadOlder(list: "open" | "recent") {
+  if (loadingOlder.value) {
+    return;
+  }
+  loadingOlder.value = list;
+  if (list === "open") {
+    openPages.value += OPEN_PAGES;
+  }
+  else {
+    recentPages.value += 1;
+  }
+  try {
+    await load();
+  }
+  finally {
+    loadingOlder.value = null;
+  }
+}
+
 watch(() => props.batchId, () => {
   loaded.value = false;
   jobs.value = [];
   recent.value = [];
+  openPages.value = OPEN_PAGES;
+  recentPages.value = 1;
+  openMore.value = false;
+  recentMore.value = false;
   notice.value = null;
   void load();
 });
@@ -735,7 +841,7 @@ function showNotice(
 async function askAddClean(batch: BatchView) {
   cleanBusy.value = batch.id;
   try {
-    const items = await fetchAll({ batchId: batch.id });
+    const items = await fetchBatch(batch.id);
     if (disposed) {
       return;
     }
@@ -818,11 +924,66 @@ async function addClean() {
     cleanBatchId.value = null;
   }
   // the list shows what happened: added cards move to Recently added, the others stay
-  const items = await fetchAll({ batchId });
+  const items = await fetchBatch(batchId);
   if (items && !disposed) {
     mergeBatch(batchId, items);
   }
   void refreshCounts();
+}
+
+// ==========================================
+// Undo on "Added …"
+
+/** Undo is being sent */
+const undoing = ref(false);
+
+function cardPath(jobId: string): string {
+  return `/g/${props.groupSlug}/recipes/cards/${jobId}`;
+}
+
+/**
+ * Undo on the review's "Added …": takes the card just added back to review (its recipe is deleted) and opens it. A
+ * recipe edited since isn't deleted from here: the line says so and links to the card, whose Back to review asks
+ * first. Other refusals say why.
+ */
+async function undoCommit(jobId: string) {
+  if (undoing.value) {
+    return;
+  }
+  undoing.value = true;
+  try {
+    const { data, error } = await api.recipeIngest.uncommit(jobId, {});
+    if (disposed) {
+      return;
+    }
+    if (data) {
+      void refreshCounts();
+      carryReviewNotice(jobId, { kind: "success", text: i18n.t("recipe-ingest.review.back-to-review-done"), detail: null });
+      await router.push(cardPath(jobId));
+      return;
+    }
+    if (errorCodeOf(error) === "recipe_edited") {
+      notice.value = {
+        kind: "warning",
+        text: ingestErrorText("recipe_edited"),
+        detail: null,
+        items: [],
+        batchId: notice.value?.batchId ?? null,
+        cardPath: cardPath(jobId),
+      };
+    }
+    else {
+      notifyRefusal(error);
+      // gone, or not added any more (taken back elsewhere): Undo can't do anything now
+      const status = errorStatusOf(error);
+      if ((status === 404 || status === 409) && notice.value?.undoJobId === jobId) {
+        notice.value = { ...notice.value, undoJobId: null };
+      }
+    }
+  }
+  finally {
+    undoing.value = false;
+  }
 }
 
 function askDiscard(job: Job) {

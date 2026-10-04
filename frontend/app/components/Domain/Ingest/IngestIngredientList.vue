@@ -22,12 +22,15 @@
         :can-move-down="index < model.ingredients.length - 1"
         :draggable="draggable"
         :can-reread="canReread"
+        :can-parse="canParse"
+        :parsing="parsingRefs.includes(ingredient.referenceId ?? '')"
         @update:model-value="value => (model.ingredients[index] = value)"
         @toggle="toggle(ingredient.referenceId)"
         @remove="remove(index)"
         @move-up="move(index, -1)"
         @move-down="move(index, 1)"
         @reread="emit('reread', ingredient.referenceId ?? null)"
+        @parse="ingredient.referenceId && emit('parse', ingredient.referenceId)"
       />
     </VueDraggable>
     <v-btn
@@ -69,6 +72,10 @@ withDefaults(defineProps<{
   draggable?: boolean;
   /** Offers Re-read on the open line (a ready card) */
   canReread?: boolean;
+  /** Offers "Parse with AI" on the open line */
+  canParse?: boolean;
+  /** The lines (`referenceId`s) "Parse with AI" is reading now */
+  parsingRefs?: string[];
 }>(), {
   flags: () => [],
   infoFlags: () => [],
@@ -76,11 +83,15 @@ withDefaults(defineProps<{
   canCreateFoods: false,
   draggable: false,
   canReread: false,
+  canParse: false,
+  parsingRefs: () => [],
 });
 
 const emit = defineEmits<{
   /** re-read the area of the card this line (its `referenceId`) is on */
   (e: "reread", referenceId: string | null): void;
+  /** parse this line (its `referenceId`) with the AI ingredient parser */
+  (e: "parse", referenceId: string): void;
 }>();
 
 const model = defineModel<ReviewDraft>({ required: true });

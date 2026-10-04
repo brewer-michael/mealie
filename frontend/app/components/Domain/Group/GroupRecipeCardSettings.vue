@@ -53,6 +53,28 @@
           >
             {{ $t("recipe-ingest.settings.limit-reached") }}
           </v-alert>
+          <!-- no card reader has run lately (AI_INGEST_WORKER off, or it stopped): cards and inbox photos wait -->
+          <v-alert
+            v-if="!disabled && settings.readerRunning === false"
+            type="warning"
+            density="compact"
+            variant="tonal"
+            class="mb-4 reader-not-running"
+          >
+            {{ $t("recipe-ingest.settings.reader-not-running") }}
+          </v-alert>
+          <!-- cards are read, but an optional part of the read is skipped until the monthly limit resets -->
+          <v-alert
+            v-if="!disabled && settings.limitedFeatures?.length"
+            type="info"
+            density="compact"
+            variant="tonal"
+            class="mb-4 limited-features"
+          >
+            <div v-for="feature in settings.limitedFeatures" :key="feature" class="limited-feature">
+              {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
+            </div>
+          </v-alert>
           <p v-if="settings.ocrAvailable" class="text-caption text-medium-emphasis mb-2 ocr-available">
             {{ $t("recipe-ingest.settings.ocr-available") }}
           </p>
@@ -118,6 +140,8 @@
               {{ $t("recipe-ingest.settings.inbox-off") }}
             </template>
           </p>
+          <!-- photos waiting in the household's folder and why, and the ones it refused lately -->
+          <IngestInboxStatus class="mb-4" :settings="settings" />
 
           <!-- The notifiers page is behind the profile's "Show advanced features" -->
           <p class="text-body-2 mb-4 notifications">
@@ -128,6 +152,16 @@
               {{ $t("recipe-ingest.settings.notifications-advanced") }}
             </template>
           </p>
+          <!-- notification links are built from BASE_URL: at its default (or another local address) a phone can't open them -->
+          <v-alert
+            v-if="!disabled && settings.baseUrlSet === false"
+            type="warning"
+            density="compact"
+            variant="tonal"
+            class="mb-4 base-url-unset"
+          >
+            {{ $t("recipe-ingest.settings.base-url-unset") }}
+          </v-alert>
         </template>
 
         <template v-if="canManage">
@@ -248,12 +282,14 @@
 </template>
 
 <script setup lang="ts">
+import IngestInboxStatus from "~/components/Domain/Ingest/IngestInboxStatus.vue";
 import { useUserApi } from "~/composables/api";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useMealieAuth } from "~/composables/use-mealie-auth";
 import {
   errorMessageOf,
   errorStatusOf,
+  nextLimitReset,
   useRecipeIngestSettings,
   useRecipeIngestText,
 } from "~/composables/use-recipe-ingest";
@@ -267,13 +303,15 @@ import type {
 
 /**
  * Group Settings → Recipe cards (docs/ai/PHASE2.md §10, §11.6): keep cards on this server (with which local providers
- * would read them), the second reading, the household's inbox folder, a way to the notifiers page, and the group's
- * eval cases, whose tags and "verified" save at once and which download as a zip. The switches save at once; only
- * group managers change them. Fork-owned.
+ * would read them), the second reading, the household's inbox folder with the photos waiting there and the ones it
+ * refused, a way to the notifiers page, and the group's eval cases, whose tags and "verified" save at once and which
+ * download as a zip. It warns when nothing on the server reads cards, when notification links can't open on a phone
+ * (BASE_URL), and notes optional parts of the read a monthly limit skips. The switches save at once; only group
+ * managers change them. Fork-owned.
  */
 const api = useUserApi();
 const i18n = useI18n();
-const { ingestErrorText } = useRecipeIngestText();
+const { ingestErrorText, dateText } = useRecipeIngestText();
 const auth = useMealieAuth();
 const { group } = useGroupSelf();
 const { settings, loading, loadFailed, saving, load, save: saveSettings } = useRecipeIngestSettings();

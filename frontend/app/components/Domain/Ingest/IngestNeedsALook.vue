@@ -22,11 +22,15 @@
           :item="item"
           :readonly="readonly"
           :can-reread="canReread"
+          :can-parse="canParse"
+          :can-create-foods="canCreateFoods"
           @alternative="(flag, alternative) => emit('alternative', flag, alternative)"
           @fill="(flag, value) => emit('fill', flag, value)"
           @reread="flag => emit('reread', flag)"
           @edit="flag => emit('edit', flag)"
           @keep-as-text="flag => emit('keep-as-text', flag)"
+          @parse="flag => emit('parse', flag)"
+          @keep-as-new="flag => emit('keep-as-new', flag)"
           @resolve="(flag, resolution) => emit('resolve', flag, resolution)"
           @use-proposal="(proposal, mode) => emit('use-proposal', proposal, mode)"
           @dismiss-proposal="proposal => emit('dismiss-proposal', proposal)"
@@ -50,15 +54,21 @@ const props = withDefaults(defineProps<{
   readonly?: boolean;
   /** Whether Re-read works now */
   canReread?: boolean;
+  /** Whether "Parse with AI" works now */
+  canParse?: boolean;
+  /** Whether the reviewer may add foods and units (Keep as new food) */
+  canCreateFoods?: boolean;
 }>(), {
   readonly: false,
   canReread: true,
+  canParse: false,
+  canCreateFoods: false,
 });
 
 const emit = defineEmits<{
   /** an alternative reading to apply, or the value typed over a blank */
   (e: "alternative" | "fill", flag: CardFlag, text: string): void;
-  (e: "reread" | "edit" | "keep-as-text", flag: CardFlag): void;
+  (e: "reread" | "edit" | "keep-as-text" | "parse" | "keep-as-new", flag: CardFlag): void;
   (e: "resolve", flag: CardFlag, resolution: FlagResolution | null): void;
   (e: "use-proposal", proposal: CardProposal, mode: "replace" | "append"): void;
   (e: "dismiss-proposal", proposal: CardProposal): void;

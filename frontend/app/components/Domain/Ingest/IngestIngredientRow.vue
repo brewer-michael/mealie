@@ -64,6 +64,13 @@
       </div>
       <v-icon size="small" :icon="expanded ? $globals.icons.chevronDown : $globals.icons.chevronRight" />
     </div>
+    <!-- "Parse with AI" is reading this line -->
+    <div v-if="parsing" class="ingest-ingredient__parsing pb-1" role="status">
+      <div class="text-caption text-medium-emphasis">
+        {{ $t("recipe-ingest.review.parsing") }}
+      </div>
+      <v-progress-linear indeterminate color="primary" height="2" />
+    </div>
 
     <div v-if="expanded" class="ingest-ingredient__editor">
       <div class="d-flex flex-wrap ga-2">
@@ -174,6 +181,16 @@
         >
           {{ $t("recipe-ingest.review.re-read") }}
         </v-btn>
+        <v-btn
+          v-if="canParse && hasText"
+          class="ingest-ingredient__parse"
+          size="small"
+          variant="text"
+          :prepend-icon="mdiCreation"
+          @click="emit('parse')"
+        >
+          {{ $t("recipe-ingest.review.parse-with-ai") }}
+        </v-btn>
         <v-spacer />
         <v-btn
           size="small"
@@ -190,13 +207,14 @@
 </template>
 
 <script setup lang="ts">
-import { mdiArrowDown, mdiArrowUp, mdiCropFree } from "@mdi/js";
+import { mdiArrowDown, mdiArrowUp, mdiCreation, mdiCropFree } from "@mdi/js";
 import { useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,
   fieldSeverity,
   formatQuantity,
   ingredientDisplay,
+  ingredientLineText,
   parseQuantity,
   type IngestNamedOption,
 } from "~/composables/use-recipe-ingest-review";
@@ -206,7 +224,8 @@ import type { CardDraftIngredient, CardDraftRef, CardFlag } from "~/lib/api/type
  * One ingredient line (docs/ai/PHASE2.md §6.2): it reads like the card ("1 tbsp coconut oil (melted)") with its link
  * status; tapped, it opens amount, unit and food autocompletes from the group's stores (with no "create": a name
  * that isn't linked becomes a New food, or Kept as text for members who can't add foods) and the card's line. The
- * open line can be moved up or down (or dragged by its handle on desktop) and re-read from the card.
+ * open line can be moved up or down (or dragged by its handle on desktop), re-read from the card, and parsed by the
+ * AI ingredient parser ("Parse with AI"), which shows on the line while it runs.
  */
 const props = withDefaults(defineProps<{
   /** This line's unresolved errors and warnings */
@@ -225,6 +244,10 @@ const props = withDefaults(defineProps<{
   draggable?: boolean;
   /** Offers Re-read for this line (a ready card) */
   canReread?: boolean;
+  /** Offers "Parse with AI" for this line (a ready card nothing is reading) */
+  canParse?: boolean;
+  /** "Parse with AI" is reading this line now */
+  parsing?: boolean;
 }>(), {
   flags: () => [],
   infos: () => [],
@@ -237,10 +260,12 @@ const props = withDefaults(defineProps<{
   canMoveDown: false,
   draggable: false,
   canReread: false,
+  canParse: false,
+  parsing: false,
 });
 
 const emit = defineEmits<{
-  (e: "toggle" | "remove" | "move-up" | "move-down" | "reread"): void;
+  (e: "toggle" | "remove" | "move-up" | "move-down" | "reread" | "parse"): void;
 }>();
 
 const model = defineModel<CardDraftIngredient>({ required: true });
@@ -254,6 +279,8 @@ const infoTexts = computed(() =>
 );
 const lineText = computed(() => model.value.display || ingredientDisplay(model.value) || model.value.originalText || "");
 const foodLinked = computed(() => !!model.value.food?.id);
+/** A line with something written on it, which "Parse with AI" can read */
+const hasText = computed(() => !!ingredientLineText(model.value));
 const newFood = computed(() => !!model.value.food?.name && !model.value.food.id);
 const newUnit = computed(() => !!model.value.unit?.name && !model.value.unit.id);
 

@@ -1496,7 +1496,9 @@
       "retries-soon": "Tries again shortly",
       "removed-on": "Removed on {date}",
       "cancel": "Cancel",
-      "batch-unavailable": "That batch isn't available any more."
+      "batch-unavailable": "That batch isn't available any more.",
+      "newest-shown": "Showing the newest {count} card. | Showing the newest {count} cards.",
+      "load-older": "Load older cards"
     },
     "review": {
       "card-of": "Card {number} of {total}",
@@ -1578,7 +1580,7 @@
       "busy": "This card is being read. Your re-read starts when it's done.",
       "reading-again": "Reading the card again",
       "read-only-while-reading": "The card is being read again; you can edit it when that's done.",
-      "possible-duplicate": "A recipe called \"{name}\" already exists. Adding this card makes \"{name} (1)\".",
+      "possible-duplicate": "A recipe called \"{name}\" already exists. Adding this card makes \"{newName}\".",
       "view-duplicate": "View it",
       "public-photo": "Recipes in this household are public: the card photo will be visible to anyone.",
       "local-only": "Local only",
@@ -1635,7 +1637,23 @@
       "merge-previous-busy": "The previous card is being read.",
       "merge-previous-not-allowed": "You can't change the previous card.",
       "merge-too-many-pages": "Together they would have more than {max} photos.",
-      "merge-busy": "This card is being read."
+      "merge-busy": "This card is being read.",
+      "rebuild": "Rebuild from this text",
+      "rebuild-hint": "Correct the text, then rebuild the recipe from it. The photos aren't read again.",
+      "rebuilding": "Rebuilding the recipe from your text. You can edit it when that's done.",
+      "rebuilt": "Rebuilt from your text",
+      "proposal-rebuild": "Rebuilt from your text, and you've edited the card since.",
+      "text-too-long": "At most {max} characters",
+      "action-unsaved": "Your last changes aren't saved yet. Try again when they are.",
+      "parse-with-ai": "Parse with AI",
+      "parsing": "Parsing with AI…",
+      "parsing-wait": "Parsing with AI. You can edit the card when that's done.",
+      "parsed": "Parsed with AI",
+      "parse-unchanged": "Parse with AI didn't change the line. | Parse with AI didn't change the lines.",
+      "duplicate-exists": "A recipe called \"{name}\" already exists.",
+      "similar-recipe": "A recipe with a similar name already exists: \"{name}\".",
+      "duplicate-card": "Another card waiting has the same name.",
+      "failed-removed-on": "Removed on {date} unless it's read again before then."
     },
     "flag": {
       "actions": {
@@ -1742,7 +1760,9 @@
       "linked_fuzzy": {
         "title": "Check the link",
         "explanation": "Linked to \"{name}\": check it's the same thing.",
-        "action": "Looks right"
+        "action": "Looks right",
+        "keep-new-food": "Keep as new food",
+        "keep-new-unit": "Keep as new unit"
       },
       "organizers_skipped": {
         "title": "No tags suggested",
@@ -1793,7 +1813,7 @@
       "purged": "This card's photos and draft were removed after a while, so it can't go back to review.",
       "recipe_edited": "The recipe was changed after this card was added. Going back to review would delete those changes.",
       "not_clean": "This card has a highlighted problem to check, so it wasn't added.",
-      "notification_failed": "The test notification wasn't delivered.",
+      "notification_failed": "The notifier didn't get it. Check its URL, and that the service it sends to is running.",
       "unknown": "Something went wrong ({code}).",
       "network": "The server couldn't be reached. Check your connection and try again."
     },
@@ -1847,9 +1867,11 @@
       "recipe-cards-ready-hint": "One notification when a batch of cards has been read, with a link to review them, and one when photos put in the inbox couldn't be added.",
       "send-test": "Send test notification",
       "test-sent": "Test notification sent",
-      "test-failed": "Couldn't send the test notification",
+      "test-failed": "Test failed: {reason}",
       "load-failed": "Couldn't load this notifier's recipe card setting",
-      "save-failed": "Couldn't save the notifier's recipe card setting"
+      "save-failed": "Couldn't save the notifier's recipe card setting",
+      "saved-at-once": "Saved right away. The options above wait for Save.",
+      "gone": "This notifier no longer exists."
     },
     "settings": {
       "title": "Recipe cards",
@@ -1876,7 +1898,26 @@
       "notifications-advanced": "To get notified when cards are ready, turn on \"Show advanced features\" in your profile settings, then add a notifier.",
       "saved": "Recipe card settings saved",
       "save-failed": "Couldn't save the recipe card settings",
-      "load-failed": "Couldn't load the recipe card settings"
+      "load-failed": "Couldn't load the recipe card settings",
+      "base-url-unset": "Links in notifications point to localhost, so they won't open on a phone. Set BASE_URL on the server to the address your phone uses.",
+      "reader-not-running": "Cards are accepted, but nothing on the server is reading them, so they wait. A server administrator can check that AI_INGEST_WORKER is on and look at the server's log.",
+      "limited": {
+        "suggestions": "Tag, category and tool suggestions are off until the monthly token limit resets on {date}.",
+        "cross_read": "The second reading is off until the monthly token limit resets on {date}."
+      }
+    },
+    "inbox": {
+      "waiting": "{count} photo is waiting in the inbox: {reason} | {count} photos are waiting in the inbox: {reason}",
+      "adding": "{count} photo in the inbox is being added. | {count} photos in the inbox are being added.",
+      "waiting-reason": {
+        "cannot_read": "AI isn't set up to read recipe cards.",
+        "local_only_unavailable": "your group keeps cards on this server, and no AI provider on your network can read them.",
+        "quota": "too many of your group's cards are being read. They're added as those finish.",
+        "no-reader": "nothing on the server is reading cards."
+      },
+      "rejections-title": "Not added from the inbox",
+      "unknown-reason": "Its note in the failed folder says why.",
+      "failed-folder": "Refused photos are in the failed folder of {folder}, each with a note saying why."
     },
     "provider": {
       "runs-locally": "Runs on my network (local model)",

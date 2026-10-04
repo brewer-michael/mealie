@@ -132,11 +132,12 @@
         </v-btn>
       </div>
       <div class="ingest-card-panel__content">
-        <IngestTranscription
-          v-if="showTranscription"
-          class="pa-3"
-          :text="transcription"
-        />
+        <!-- the page's own "What the card says" (correctable there), else the text as read -->
+        <div v-if="showTranscription" class="pa-3">
+          <slot name="transcription">
+            <IngestTranscription :text="transcription" />
+          </slot>
+        </div>
         <button
           v-else-if="current"
           type="button"
@@ -174,6 +175,7 @@ import type { PageOut } from "~/lib/api/types/recipe-ingest";
  * with Front/Back, Rotate, Re-read an area and the transcription toggle. Images load through the authenticated page
  * routes (`<img>` sends the session cookie); their URLs change when a page is rotated. Rotate follows `readonly`
  * (a failed card can be turned before it's read again); Re-read an area follows `canReread` (only a ready card).
+ * The `transcription` slot replaces the panel's text (the review page's, with Rebuild from this text).
  */
 const props = withDefaults(defineProps<{
   pages?: PageOut[];

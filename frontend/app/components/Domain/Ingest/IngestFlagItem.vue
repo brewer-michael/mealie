@@ -121,6 +121,29 @@
             >
               {{ $t("recipe-ingest.flag.check_parse.keep-as-text") }}
             </v-btn>
+            <!-- "Check this ingredient": the AI ingredient parser reads the line again -->
+            <v-btn
+              v-if="parsable"
+              class="ingest-flag-item__parse"
+              size="small"
+              variant="tonal"
+              :prepend-icon="mdiCreation"
+              :disabled="readonly || !canParse"
+              @click="emit('parse', item.flag)"
+            >
+              {{ $t("recipe-ingest.review.parse-with-ai") }}
+            </v-btn>
+            <!-- "Check the link": not the group's food (or unit) after all, but a new one named as on the card -->
+            <v-btn
+              v-if="newName"
+              class="ingest-flag-item__keep-new"
+              size="small"
+              variant="tonal"
+              :disabled="readonly"
+              @click="emit('keep-as-new', item.flag)"
+            >
+              {{ linkKind(item.flag) === "unit" ? $t("recipe-ingest.flag.linked_fuzzy.keep-new-unit") : $t("recipe-ingest.flag.linked_fuzzy.keep-new-food") }}
+            </v-btn>
             <v-btn
               v-if="onField"
               size="small"
@@ -138,7 +161,7 @@
 </template>
 
 <script setup lang="ts">
-import { mdiCropFree } from "@mdi/js";
+import { mdiCreation, mdiCropFree } from "@mdi/js";
 import IngestProposalBanner from "./IngestProposalBanner.vue";
 import { useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import {
@@ -148,8 +171,10 @@ import {
   flagAlternatives,
   highlightSegments,
   isParsedIngredient,
+  linkKind,
   parsedReading,
   parseLoss,
+  unlinkedName,
   type NeedsALookItem,
 } from "~/composables/use-recipe-ingest-review";
 import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/recipe-ingest";
@@ -158,23 +183,33 @@ import type { CardFlag, CardProposal, FlagResolution } from "~/lib/api/types/rec
  * One "Needs a look" item (docs/ai/PHASE2.md §6.2): the line as read with the problem highlighted, then its one-tap
  * fixes: alternative readings, a fill-in box for a blank, Re-read, Keep as written (errors) or Looks right
  * (warnings), and Edit. "Check this ingredient" also shows what the parser read ("Read as: 2 cup flour, to 3"), what
- * it lost, and Keep as text. A resolved item collapses with a check mark and can be undone; a fixed one just collapses.
+ * it lost, Keep as text and Parse with AI; "Check the link" offers Keep as new food (or unit), named as on the card.
+ * A resolved item collapses with a check mark and can be undone; a fixed one just collapses.
  */
 const props = withDefaults(defineProps<{
   item: NeedsALookItem;
   readonly?: boolean;
   /** Whether Re-read works now (the page is busy turning a page, say) */
   canReread?: boolean;
+  /** Whether "Parse with AI" works now: a ready card nothing is reading */
+  canParse?: boolean;
+  /** Commit adds foods and units that don't exist yet; otherwise Keep as new isn't offered */
+  canCreateFoods?: boolean;
 }>(), {
   readonly: false,
   canReread: true,
+  canParse: false,
+  canCreateFoods: false,
 });
 
 const emit = defineEmits<{
   /** an alternative reading to apply, or the value typed over a blank */
   (e: "alternative" | "fill", flag: CardFlag, text: string): void;
-  /** "Keep as text": the flagged ingredient line kept as written, with no amount, unit or food */
-  (e: "reread" | "edit" | "keep-as-text", flag: CardFlag): void;
+  /**
+   * "Keep as text": the flagged ingredient line kept as written, with no amount, unit or food; "Parse with AI": the
+   * line parsed again by the AI parser; "Keep as new food": the line's near-miss link replaced by a new food
+   */
+  (e: "reread" | "edit" | "keep-as-text" | "parse" | "keep-as-new", flag: CardFlag): void;
   (e: "resolve", flag: CardFlag, resolution: FlagResolution | null): void;
   (e: "use-proposal", proposal: CardProposal, mode: "replace" | "append"): void;
   (e: "dismiss-proposal", proposal: CardProposal): void;
@@ -203,6 +238,10 @@ const explanation = computed(() => {
   return i18n.t(`recipe-ingest.flag.check_parse.${key}`, { ...loss });
 });
 const alternatives = computed(() => flagAlternatives(props.item.flag));
+/** "Check this ingredient" on a line still in the draft: Parse with AI is offered */
+const parsable = computed(() => props.item.flag.kind === "check_parse" && !!props.item.ingredient);
+/** "Check the link": the name a new food (or unit) would take, when the reviewer may add one */
+const newName = computed(() => (props.canCreateFoods ? unlinkedName(props.item.flag, props.item.ingredient) : null));
 const fillable = computed(() => canFillFlag(props.item.flag));
 /** Edit and Re-read need a place in the editor; a re-read for an ingredient or step flag without a line adds one */
 const onField = computed(() => props.item.field !== "card");

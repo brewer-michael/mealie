@@ -4,7 +4,7 @@ import { defineComponent } from "vue";
 import IngestRegionDialog from "./IngestRegionDialog.vue";
 import IngestRegionStencil from "./IngestRegionStencil.vue";
 import { normalizeDraft, rereadTargets, rereadTargetValue } from "~/composables/use-recipe-ingest-review";
-import type { PageOut } from "~/lib/api/types/recipe-ingest";
+import type { PageOut, RegionHintOut } from "~/lib/api/types/recipe-ingest";
 
 type Coordinates = { left: number; top: number; width: number; height: number };
 type Transform = (params: { coordinates: Coordinates; imageSize: { width: number; height: number } }) => Coordinates;
@@ -20,7 +20,7 @@ const cropper = vi.hoisted(() => ({
 vi.mock("vue-advanced-cropper", async () => ({
   Cropper: (await import("vue")).defineComponent({
     name: "Cropper",
-    props: ["src", "canvas", "checkOrientation", "defaultSize", "stencilComponent", "stencilProps"],
+    props: ["src", "canvas", "checkOrientation", "defaultSize", "defaultPosition", "stencilComponent", "stencilProps"],
     emits: ["change", "ready"],
     created() {
       cropper.props.push({ ...this.$props });
@@ -114,7 +114,15 @@ const stubs = {
 
 const wrappers: VueWrapper[] = [];
 
-function mountDialog(props: { initialTarget?: string | null; initialPage?: number; pages?: PageOut[] } = {}) {
+type DialogProps = {
+  initialTarget?: string | null;
+  initialPage?: number;
+  pages?: PageOut[];
+  initialRegion?: RegionHintOut | null;
+  locating?: boolean;
+};
+
+function mountDialog(props: DialogProps = {}) {
   const wrapper = mount(IngestRegionDialog, {
     props: { modelValue: true, pages: [page(0), page(1)], targets, ...props },
     global: { stubs },
@@ -267,5 +275,99 @@ describe("IngestRegionDialog", () => {
     cropper.instance!.$emit("change", cropper.result);
     await flushPromises();
     expect(live.text()).toBe("10% from the left, 52% from the top, 80% wide, 10% high");
+  });
+
+  // ==========================================
+  // Where the selection starts (FR-03)
+
+  const image = { width: 1536, height: 2048 };
+  /** Where the cropper last mounted starts its selection, in the image's pixels, given a selection of `size` */
+  function startOf(size?: { width: number; height: number }) {
+    const props = cropper.props.at(-1)!;
+    const defaultSize = props.defaultSize as (params: { imageSize: typeof image }) => { width: number; height: number };
+    const defaultPosition = props.defaultPosition as (params: { coordinates: { left: number; top: number; width: number; height: number }; imageSize: typeof image }) => { left: number; top: number };
+    const sized = size ?? defaultSize({ imageSize: image });
+    const position = defaultPosition({ coordinates: { left: 0, top: 0, ...sized }, imageSize: image });
+    const round = (value: number) => Math.round(value * 100) / 100;
+    return { left: round(position.left), top: round(position.top), width: round(sized.width), height: round(sized.height) };
+  }
+
+  // the server's band across the card at the line's height; the selection reaches 5% further either side, as the
+  // card's writing often starts nearer its edge
+  const ingredientHint: RegionHintOut = { page: 1, x: 0.05, y: 0.3, width: 0.9, height: 0.06, source: "ocr" };
+
+  test("opened from a flagged line, the selection starts on that line, on the page it's written on", async () => {
+    const wrapper = mountDialog({ initialTarget: "ingredients:i1", initialRegion: ingredientHint });
+    await flushPromises();
+
+    expect(wrapper.get(".cropper").attributes("data-src")).toBe("/api/ai/ingest/jobs/j1/pages/1/view?v=abc");
+    expect(startOf()).toEqual({ left: 0, top: 614.4, width: 1536, height: 122.88 });
+
+    // the other page has no hint: it starts with the band across the middle
+    await wrapper.findAll(".pages button")[0]!.trigger("click");
+    expect(wrapper.get(".cropper").attributes("data-src")).toBe("/api/ai/ingest/jobs/j1/pages/0/view?v=abc");
+    expect(startOf()).toEqual({ left: 76.8, top: 819.2, width: 1382.4, height: 409.6 });
+  });
+
+  test("while the server says where the line is, the selection waits, then starts there", async () => {
+    const wrapper = mountDialog({ initialTarget: "ingredients:i1", locating: true });
+    await flushPromises();
+    expect(wrapper.find(".cropper").exists()).toBe(false);
+    expect(wrapper.find(".ingest-region-dialog__locating").exists()).toBe(true);
+    expect(wrapper.get(".submit").attributes("disabled")).toBeDefined();
+
+    await wrapper.setProps({ locating: false, initialRegion: { ...ingredientHint, page: 0 } });
+    await flushPromises();
+    expect(wrapper.find(".ingest-region-dialog__locating").exists()).toBe(false);
+    expect(wrapper.get(".cropper").attributes("data-src")).toBe("/api/ai/ingest/jobs/j1/pages/0/view?v=abc");
+    expect(startOf()).toEqual({ left: 0, top: 614.4, width: 1536, height: 122.88 });
+  });
+
+  test("a page picked while the server says where the line is stays picked", async () => {
+    const wrapper = mountDialog({ initialTarget: "ingredients:i1", locating: true });
+    await flushPromises();
+    await wrapper.findAll(".pages button")[1]!.trigger("click");
+
+    await wrapper.setProps({ locating: false, initialRegion: { ...ingredientHint, page: 0 } });
+    await flushPromises();
+    expect(wrapper.get(".cropper").attributes("data-src")).toBe("/api/ai/ingest/jobs/j1/pages/1/view?v=abc");
+    // the hint is for the front: the back starts as a band
+    expect(startOf()).toEqual({ left: 76.8, top: 819.2, width: 1382.4, height: 409.6 });
+  });
+
+  test("without a hint, the selection starts where the last one read on that page was, else as a band", async () => {
+    const wrapper = mountDialog({ initialTarget: "name" });
+    await flushPromises();
+    expect(startOf()).toEqual({ left: 76.8, top: 819.2, width: 1382.4, height: 409.6 });
+
+    // a re-read of the top of the front
+    cropper.result = { coordinates: { left: 153.6, top: 204.8, width: 1228.8, height: 409.6 }, image };
+    await wrapper.get(".submit").trigger("click");
+
+    await wrapper.setProps({ modelValue: false });
+    await wrapper.setProps({ modelValue: true, initialTarget: "description" });
+    await flushPromises();
+    expect(startOf()).toEqual({ left: 153.6, top: 204.8, width: 1228.8, height: 409.6 });
+
+    // the back hasn't been read from yet
+    await wrapper.findAll(".pages button")[1]!.trigger("click");
+    expect(startOf()).toEqual({ left: 76.8, top: 819.2, width: 1382.4, height: 409.6 });
+
+    // a hint for the line opened from still comes first
+    await wrapper.setProps({ modelValue: false });
+    await wrapper.setProps({ modelValue: true, initialPage: 0, initialRegion: { ...ingredientHint, page: 0 } });
+    await flushPromises();
+    expect(startOf()).toEqual({ left: 0, top: 614.4, width: 1536, height: 122.88 });
+  });
+
+  test("each opening starts the selection afresh", async () => {
+    const wrapper = mountDialog({ initialTarget: "name" });
+    await flushPromises();
+    const mounted = cropper.props.length;
+
+    await wrapper.setProps({ modelValue: false });
+    await wrapper.setProps({ modelValue: true });
+    await flushPromises();
+    expect(cropper.props.length).toBe(mounted + 1);
   });
 });

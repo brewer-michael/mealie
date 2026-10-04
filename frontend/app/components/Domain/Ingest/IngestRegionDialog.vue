@@ -5,7 +5,7 @@
     :icon="mdiCropFree"
     :submit-text="$t('recipe-ingest.review.reread-send')"
     :submit-icon="mdiTextRecognition"
-    :submit-disabled="!current || !targetValue"
+    :submit-disabled="!current || !targetValue || locating"
     can-submit
     keep-open
     max-width="900"
@@ -23,6 +23,7 @@
           density="compact"
           variant="outlined"
           divided
+          @update:model-value="pickPage"
         >
           <v-btn
             v-for="(page, index) in pages"
@@ -47,15 +48,20 @@
       </div>
       <!-- arrow keys on the focused selection move it, Shift and arrow keys resize it -->
       <div ref="frame" class="ingest-region-dialog__frame" @keydown="onKeydown">
+        <!-- the server is saying where the line is on the card: the selection starts there once it has -->
+        <div v-if="locating" class="ingest-region-dialog__locating d-flex align-center justify-center">
+          <v-progress-circular indeterminate color="primary" />
+        </div>
         <Cropper
-          v-if="current"
-          :key="current.viewUrl"
+          v-else-if="current"
+          :key="`${current.viewUrl}#${opening}`"
           ref="cropper"
           class="ingest-region-dialog__cropper"
           :src="current.viewUrl"
           :canvas="false"
           :check-orientation="false"
           :default-size="defaultSize"
+          :default-position="defaultPosition"
           :stencil-component="IngestRegionStencil"
           :stencil-props="stencilProps"
           @ready="tooSmall = false"
@@ -89,11 +95,13 @@ import IngestRegionStencil from "./IngestRegionStencil.vue";
 import {
   nudgeRegion,
   regionFromCropResult,
+  regionFromHint,
   type CropResultLike,
+  type PageRegion,
   type RegionCoordinates,
   type RereadTargetOption,
 } from "~/composables/use-recipe-ingest-review";
-import type { PageOut, RereadRequest } from "~/lib/api/types/recipe-ingest";
+import type { PageOut, RegionHintOut, RereadRequest } from "~/lib/api/types/recipe-ingest";
 
 /**
  * "Re-read an area" (docs/ai/PHASE2.md §4.7, §6.5): the reviewer drags over part of an upright page and picks what
@@ -101,6 +109,10 @@ import type { PageOut, RereadRequest } from "~/lib/api/types/recipe-ingest";
  * EXIF-free, so the cropper neither reads orientation nor draws a canvas. Full screen on phones (BaseDialog).
  * The selection (`IngestRegionStencil`) follows a finger from the first pixel, and takes the keyboard focus: arrow
  * keys move it, Shift and arrow keys resize it, and a screen reader hears where it is.
+ *
+ * Each opening starts the selection where the text probably is: `initialRegion` (the server's region hint for the
+ * line it was opened from, on that line's page, with a margin either side: `regionFromHint`; `locating` while it's on
+ * its way), else where the last area read on that page was while this card is open, else a band across the middle.
  */
 const props = withDefaults(defineProps<{
   pages?: PageOut[];
@@ -110,11 +122,17 @@ const props = withDefaults(defineProps<{
   initialPage?: number;
   /** The target chosen first: the flag's or field's line the dialog was opened from */
   initialTarget?: string | null;
+  /** Where that line probably is on the card (`GET …/region-hint`): its page and the selection to start with */
+  initialRegion?: RegionHintOut | null;
+  /** The region hint is still on its way: the selection waits for it */
+  locating?: boolean;
 }>(), {
   pages: () => [],
   targets: () => [],
   initialPage: 0,
   initialTarget: null,
+  initialRegion: null,
+  locating: false,
 });
 
 const emit = defineEmits<{
@@ -187,9 +205,51 @@ function targetTitle(option: RereadTargetOption): string {
 
 const targetItems = computed(() => props.targets.map(option => ({ value: option.value, title: targetTitle(option) })));
 
-/** A wide band across the middle: most fields are one line of writing */
-function defaultSize({ imageSize }: { imageSize: { width: number; height: number } }) {
+type ImageSize = { width: number; height: number };
+
+/** The last area read on each page while this card is open, by the page's image (a turned page has a new one) */
+const lastRegions = new Map<string, PageRegion>();
+/** Counts the openings: each one mounts the cropper afresh, so its selection starts where `startRegion` says */
+const opening = ref(0);
+
+/**
+ * Where the selection starts on the shown page, as fractions of it: the hint for its line, else the last area read
+ * there. Read as the cropper mounts.
+ */
+function startRegion(): PageRegion | null {
+  const page = current.value;
+  if (!page) {
+    return null;
+  }
+  const hint = props.initialRegion;
+  if (hint && hint.page === page.index) {
+    return regionFromHint(hint);
+  }
+  return lastRegions.get(page.viewUrl) ?? null;
+}
+
+/** The start region's size; else a wide band across the middle: most fields are one line of writing */
+function defaultSize({ imageSize }: { imageSize: ImageSize }) {
+  const start = startRegion();
+  if (start) {
+    return { width: start.width * imageSize.width, height: start.height * imageSize.height };
+  }
   return { width: imageSize.width * 0.9, height: imageSize.height * 0.2 };
+}
+
+/** The start region's place; else the band is centred */
+function defaultPosition({ coordinates, imageSize }: { coordinates: RegionCoordinates; imageSize: ImageSize }) {
+  const start = startRegion();
+  if (start) {
+    return { left: start.x * imageSize.width, top: start.y * imageSize.height };
+  }
+  return { left: (imageSize.width - coordinates.width) / 2, top: (imageSize.height - coordinates.height) / 2 };
+}
+
+/** The position in `pages` of the page with this `PageOut.index`, if the card has it */
+function pagePosition(index: number | null | undefined): number | null {
+  const position = props.pages.findIndex(page => page.index === index);
+  return position < 0 ? null : position;
 }
 
 // The cropper measures its box when it mounts, which is mid-transition inside a dialog: measure again once the
@@ -201,9 +261,27 @@ function refreshCropper() {
   cropper.value?.refresh();
 }
 
+/** Whether the reviewer picked a page since the dialog opened: a hint arriving later doesn't turn it */
+let pagePicked = false;
+
+function pickPage() {
+  pagePicked = true;
+}
+
+// the hint names the page its line is on, which the dialog shows (unless the reviewer already picked one)
+watch(() => [props.initialRegion, props.locating] as const, ([hint, locating]) => {
+  const position = pagePosition(hint?.page);
+  if (dialog.value && !locating && !pagePicked && position !== null) {
+    selected.value = position;
+  }
+});
+
 watch(dialog, async (open) => {
   if (open) {
-    selected.value = Math.min(props.initialPage, Math.max(0, props.pages.length - 1));
+    opening.value += 1;
+    pagePicked = false;
+    selected.value = pagePosition(props.locating ? null : props.initialRegion?.page)
+      ?? Math.min(props.initialPage, Math.max(0, props.pages.length - 1));
     // opened from a flag or a line, it's for that line; otherwise the reviewer picks what it's for
     targetValue.value = props.initialTarget ?? null;
     tooSmall.value = false;
@@ -275,6 +353,7 @@ function submit() {
     tooSmall.value = true;
     return;
   }
+  lastRegions.set(page.viewUrl, region);
   emit("submit", { page: page.index, ...region, target: { ...option.target } });
   dialog.value = false;
 }
@@ -293,5 +372,10 @@ function submit() {
 .ingest-region-dialog__cropper {
   max-height: 65dvh;
   background: #ddd;
+}
+
+.ingest-region-dialog__locating {
+  height: 40dvh;
+  min-height: 160px;
 }
 </style>

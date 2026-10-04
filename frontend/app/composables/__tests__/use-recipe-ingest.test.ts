@@ -155,11 +155,13 @@ describe("the recipe card API client", () => {
 
     const quiet = await client.upload([new Blob(["x"])], {}, { suppressAlert: true });
     const quietBatch = await client.createBatch({ suppressAlert: true });
+    const quietTest = await client.testNotifierEvents("n1", { suppressAlert: true });
     expect(toasted).toEqual([]);
     // the caller still reads the code
     expect(errorCodeOf(quiet.error)).toBe("paused_for_restore");
     expect(errorStatusOf(quiet.error)).toBe(503);
     expect(errorCodeOf(quietBatch.error)).toBe("paused_for_restore");
+    expect(errorCodeOf(quietTest.error)).toBe("paused_for_restore");
 
     await client.upload([new Blob(["x"])]);
     expect(toasted).toEqual(["Recipe cards are paused"]);

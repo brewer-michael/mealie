@@ -31,6 +31,7 @@ const stubs = {
   },
   VTextField: field,
   VCombobox: field,
+  VProgressLinear: { template: "<div class=\"progress\" />" },
   VueDraggable: {
     name: "VueDraggable",
     props: ["modelValue", "disabled", "handle"],
@@ -111,5 +112,13 @@ describe("IngestIngredientList", () => {
     const wrapper = mountList(draft(), { expanded: "i3", canReread: true });
     await wrapper.get(".ingest-ingredient__reread").trigger("click");
     expect(wrapper.emitted("reread")).toEqual([["i3"]]);
+  });
+
+  test("the open line's Parse with AI asks for that line; the lines being parsed show it", async () => {
+    const wrapper = mountList(draft(), { expanded: "i2", canParse: true, parsingRefs: ["i3"] });
+    await wrapper.get(".ingest-ingredient__parse").trigger("click");
+    expect(wrapper.emitted("parse")).toEqual([["i2"]]);
+    const parsing = wrapper.findAll(".ingest-ingredient").map(row => row.find(".ingest-ingredient__parsing").exists());
+    expect(parsing).toEqual([false, false, true]);
   });
 });

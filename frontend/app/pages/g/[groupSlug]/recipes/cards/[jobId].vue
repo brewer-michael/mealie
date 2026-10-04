@@ -142,7 +142,17 @@
             :rotating="review.pendingAction.value === 'rotate'"
             @rotate="pageNumber => review.rotate(pageNumber)"
             @reread="openReread()"
-          />
+          >
+            <template #transcription>
+              <IngestTranscription
+                v-model:editing="panelTranscriptionEditing"
+                :text="job.transcription"
+                :can-rebuild="canRebuild"
+                :rebuilding="review.pendingAction.value === 'rebuild'"
+                @rebuild="rebuild"
+              />
+            </template>
+          </IngestCardViewer>
         </v-col>
 
         <v-col cols="12" md="7" class="ingest-review__editor">
@@ -168,6 +178,14 @@
             <template v-else-if="job.status === 'failed'">
               <v-alert type="error" variant="tonal" class="ingest-review__status">
                 {{ $t("recipe-ingest.queue.failed", { reason: job.error ? ingestErrorText(job.error.code, job.error.params) : "" }) }}
+                <!-- when it's read again by itself (the monthly limits reset), and when it goes if it isn't -->
+                <div
+                  v-for="line in failedWhen"
+                  :key="line"
+                  class="text-body-2 mt-1 ingest-review__failed-when"
+                >
+                  {{ line }}
+                </div>
               </v-alert>
               <div class="d-flex flex-wrap ga-2 mt-3">
                 <v-btn
@@ -250,6 +268,18 @@
               >
                 <v-icon size="x-small" :icon="$globals.icons.informationOutline" />
                 {{ info.title }}: {{ info.explanation }}
+                <!-- lines of a card in another language kept as written: the AI parser can read them -->
+                <v-btn
+                  v-if="info.kind === 'not_parsed' && textLines.length"
+                  class="ingest-review__parse-all ml-1"
+                  size="x-small"
+                  variant="tonal"
+                  :prepend-icon="mdiCreation"
+                  :disabled="!canParse"
+                  @click="review.parseWithAi(textLines)"
+                >
+                  {{ $t("recipe-ingest.review.parse-with-ai") }}
+                </v-btn>
               </p>
 
               <v-alert
@@ -281,9 +311,9 @@
                 variant="tonal"
                 class="mb-3 ingest-review__reading"
               >
-                {{ $t("recipe-ingest.review.read-only-while-reading") }}
-                <div class="text-caption">
-                  {{ progressLabel }}
+                {{ readingText }}
+                <div v-if="readingCaption" class="text-caption">
+                  {{ readingCaption }}
                 </div>
                 <v-progress-linear indeterminate class="mt-2" />
                 <template v-if="canCancel" #append>
@@ -318,23 +348,31 @@
                   </v-btn>
                 </template>
               </v-alert>
+              <!-- a recipe with this name (or one like it), or another card waiting with it: it follows the saved name -->
               <v-alert
-                v-if="job.duplicateOf"
+                v-if="job.duplicateOf || job.duplicateJob"
                 type="warning"
                 variant="tonal"
                 density="compact"
                 class="mb-3 ingest-review__duplicate"
               >
-                {{ $t("recipe-ingest.review.possible-duplicate", { name: job.duplicateOf.name || review.draft.value.name }) }}
-                <template v-if="job.duplicateOf.slug" #append>
+                <div v-if="job.duplicateOf" class="d-flex flex-wrap align-center ga-1 ingest-review__duplicate-recipe">
+                  <span class="flex-grow-1">{{ duplicateText }}</span>
                   <v-btn
+                    v-if="job.duplicateOf.slug"
                     size="small"
                     variant="text"
                     :to="`/g/${groupSlug}/r/${job.duplicateOf.slug}`"
                   >
                     {{ $t("recipe-ingest.review.view-duplicate") }}
                   </v-btn>
-                </template>
+                </div>
+                <div v-if="job.duplicateJob" class="d-flex flex-wrap align-center ga-1 ingest-review__duplicate-card">
+                  <span class="flex-grow-1">{{ $t("recipe-ingest.review.duplicate-card") }}</span>
+                  <v-btn size="small" variant="text" @click="review.goTo(job.duplicateJob.id)">
+                    {{ $t("recipe-ingest.review.open-card") }}
+                  </v-btn>
+                </div>
               </v-alert>
 
               <IngestNeedsALook
@@ -342,11 +380,15 @@
                 :items="review.needsALook.value"
                 :readonly="review.readOnly.value"
                 :can-reread="canReread"
+                :can-parse="canParse"
+                :can-create-foods="!!job.permissions?.canCreateFoods"
                 @alternative="(flag, text) => review.applyFlagAlternative(flag, text)"
                 @fill="(flag, value) => review.fillFlagBlank(flag, value)"
                 @reread="flag => openReread(flag.field, flag.ref)"
                 @edit="flag => revealField(flag.field, flag.ref, true)"
                 @keep-as-text="flag => review.keepIngredientAsText(flag)"
+                @parse="flag => flag.ref && review.parseWithAi([flag.ref])"
+                @keep-as-new="flag => review.keepAsNew(flag)"
                 @resolve="(flag, resolution) => review.resolveFlag(flag, resolution)"
                 @use-proposal="(proposal, mode) => review.useProposal(proposal, mode)"
                 @dismiss-proposal="proposal => review.dismissProposal(proposal)"
@@ -391,8 +433,11 @@
                       :readonly="review.readOnly.value"
                       :can-create-foods="!!job.permissions?.canCreateFoods"
                       :can-reread="canReread"
+                      :can-parse="canParse"
+                      :parsing-refs="review.parsingRefs.value"
                       :draggable="$vuetify.display.mdAndUp"
                       @reread="ref => openReread('ingredients', ref)"
+                      @parse="ref => review.parseWithAi([ref])"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -500,6 +545,8 @@
         :targets="regionTargets"
         :initial-page="pageIndex"
         :initial-target="regionTarget"
+        :initial-region="regionHint"
+        :locating="regionLocating"
         @submit="request => review.requestReread(request)"
       />
       <IngestEvalCaseDialog
@@ -516,7 +563,13 @@
         max-width="700"
       >
         <v-card-text>
-          <IngestTranscription :text="job.transcription" />
+          <IngestTranscription
+            v-model:editing="dialogTranscriptionEditing"
+            :text="job.transcription"
+            :can-rebuild="canRebuild"
+            :rebuilding="review.pendingAction.value === 'rebuild'"
+            @rebuild="rebuild"
+          />
         </v-card-text>
       </BaseDialog>
       <BaseDialog
@@ -662,7 +715,7 @@
 </template>
 
 <script setup lang="ts">
-import { mdiCardMultipleOutline, mdiCloudUploadOutline, mdiCropFree, mdiTextRecognition } from "@mdi/js";
+import { mdiCardMultipleOutline, mdiCloudUploadOutline, mdiCreation, mdiCropFree, mdiTextRecognition } from "@mdi/js";
 import { useActiveElement, useElementSize, useMagicKeys, whenever } from "@vueuse/core";
 import IngestCardViewer from "~/components/Domain/Ingest/IngestCardViewer.vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
@@ -676,17 +729,19 @@ import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vu
 import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
-import { useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
+import { serverDate, useRecipeIngestSettings, useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
 import {
+  canLocateTarget,
   fieldAnchorId,
   fieldLabel,
+  isTextLine,
   normalizeField,
   rereadTargets,
   rereadTargetValue,
   type RereadTargetOption,
 } from "~/composables/use-recipe-ingest-review";
 import { useRecipeIngestReview } from "~/composables/use-recipe-ingest-review";
-import type { EvalCaseRequest } from "~/lib/api/types/recipe-ingest";
+import type { EvalCaseRequest, RegionHintOut } from "~/lib/api/types/recipe-ingest";
 
 /**
  * Reviewing one recipe card (docs/ai/PHASE2.md §6): the card beside (desktop) or above (phone) its draft, what needs a
@@ -700,7 +755,8 @@ definePageMeta({
 const i18n = useI18n();
 const route = useRoute();
 const router = useRouter();
-const { flagText, ingestErrorText, progressText } = useRecipeIngestText();
+const { dateText, flagText, ingestErrorText, progressText } = useRecipeIngestText();
+const ingestSettings = useRecipeIngestSettings();
 const i18nT: TranslateFn = (key, named) => i18n.t(key, named ?? {});
 
 const groupSlug = computed(() => String(route.params.groupSlug ?? ""));
@@ -802,7 +858,71 @@ const checksLine = computed(() => {
 const cardInfos = computed(() =>
   review.infoFlags.value
     .filter(flag => normalizeField(flag.field) === "card" && flag.kind !== "cross_read_failed")
-    .map(flag => ({ id: flag.id, ...flagText(flag) })),
+    .map(flag => ({ id: flag.id, kind: flag.kind, ...flagText(flag) })),
+);
+
+/** The lines kept as written with nothing parsed, which "Parse with AI" on "Ingredients kept as text" reads */
+const textLines = computed(() =>
+  review.draft.value.ingredients.filter(isTextLine).map(line => line.referenceId).filter((ref): ref is string => !!ref),
+);
+
+/**
+ * The possible-duplicate banner: the recipe this name is taken by, and what commit would name this one ("Name (2)");
+ * the same name with no free one left; or a recipe with a similar name
+ */
+const duplicateText = computed(() => {
+  const recipe = job.value?.duplicateOf;
+  if (!recipe) {
+    return "";
+  }
+  const name = recipe.name || review.draft.value.name;
+  if (job.value?.duplicateName) {
+    return i18n.t("recipe-ingest.review.possible-duplicate", { name, newName: job.value.duplicateName });
+  }
+  const same = name.trim().toLowerCase() === review.draft.value.name.trim().toLowerCase();
+  return i18n.t(same ? "recipe-ingest.review.duplicate-exists" : "recipe-ingest.review.similar-recipe", { name });
+});
+
+/**
+ * A failed card's dates: when it's read again by itself (`autoRetryAt`: the monthly limits reset), and when it's
+ * removed unless it's read before then (`expiresAt`)
+ */
+const failedWhen = computed(() => {
+  if (job.value?.status !== "failed") {
+    return [];
+  }
+  const lines: string[] = [];
+  const retryAt = serverDate(job.value.autoRetryAt);
+  if (retryAt) {
+    // the dispatcher reads a card that's due within a minute
+    lines.push(retryAt.getTime() > Date.now()
+      ? i18n.t("recipe-ingest.queue.retries-on", { date: dateText(retryAt, true) })
+      : i18n.t("recipe-ingest.queue.retries-soon"));
+  }
+  const expiresAt = serverDate(job.value.expiresAt);
+  if (expiresAt) {
+    lines.push(i18n.t("recipe-ingest.review.failed-removed-on", { date: dateText(expiresAt) }));
+  }
+  return lines;
+});
+
+/** What the card is doing while the editor waits: read again, rebuilt from the reviewer's text, or lines parsed */
+const readingText = computed(() => {
+  switch (review.taskMode.value) {
+    case "rebuild":
+      return i18n.t("recipe-ingest.review.rebuilding");
+    case "parse_lines":
+      return i18n.t("recipe-ingest.review.parsing-wait");
+    default:
+      return i18n.t("recipe-ingest.review.read-only-while-reading");
+  }
+});
+
+/** The step it's on; a parse has none to tell but its place in the queue */
+const readingCaption = computed(() =>
+  review.taskMode.value === "parse_lines" && review.task.value?.state !== "queued" && !review.task.value?.cancelRequested
+    ? null
+    : progressLabel.value,
 );
 
 const progressLabel = computed(() => {
@@ -826,6 +946,9 @@ const progressLabel = computed(() => {
 const pageIndex = ref(0);
 const transcriptionPanel = ref(false);
 const transcriptionDialog = ref(false);
+/** Whether the panel's or the dialog's "What the card says" is being corrected */
+const panelTranscriptionEditing = ref(false);
+const dialogTranscriptionEditing = ref(false);
 const discardDialog = ref(false);
 const evalDialog = ref(false);
 const evalExists = ref(false);
@@ -855,6 +978,10 @@ const canRotate = computed(() =>
   && !review.pendingAction.value,
 );
 const canReextract = computed(() => job.value?.status === "ready" && !review.task.value && !review.pendingAction.value);
+/** The card's text can be corrected and the recipe rebuilt from it: as for a re-extract, with the editor free */
+const canRebuild = computed(() => canReextract.value && !review.readOnly.value);
+/** "Parse with AI" works now: as for a rebuild, while the group can read cards with AI */
+const canParse = computed(() => canRebuild.value && ingestSettings.settings.value?.canReadCards !== false);
 /** An area can be re-read on a ready card the editor isn't locked on; while a re-read runs, more wait their turn */
 const canReread = computed(() =>
   job.value?.status === "ready"
@@ -876,6 +1003,21 @@ function rotateCurrent() {
     void review.rotate(page.index);
   }
 }
+
+/** "Rebuild from this text": once it's on its way, the text shows as it was sent and the dialog closes */
+async function rebuild(text: string) {
+  if (await review.rebuild(text)) {
+    panelTranscriptionEditing.value = false;
+    dialogTranscriptionEditing.value = false;
+    transcriptionDialog.value = false;
+  }
+}
+
+watch(transcriptionDialog, (open) => {
+  if (!open) {
+    dialogTranscriptionEditing.value = false;
+  }
+});
 
 async function readWithCloud() {
   cloudDialog.value = false;
@@ -920,15 +1062,33 @@ async function reload() {
 const regionDialog = ref(false);
 const regionTargets = ref<RereadTargetOption[]>([]);
 const regionTarget = ref<string | null>(null);
+/** Where the line the dialog was opened for is on the card, and whether the server is still saying */
+const regionHint = ref<RegionHintOut | null>(null);
+const regionLocating = ref(false);
+let regionOpening = 0;
 
-/** Opens the region dialog, aimed at a field (and line) when opened from a flag or a line; else for the reviewer to say */
-function openReread(field?: string, ref?: string | null) {
+/**
+ * Opens the region dialog, aimed at a field (and line) when opened from a flag or a line, with its selection on that
+ * line once the server says where it is; else for the reviewer to say
+ */
+async function openReread(field?: string, ref?: string | null) {
   if (!canReread.value) {
     return;
   }
   regionTargets.value = rereadTargets(review.draft.value);
   regionTarget.value = field ? rereadTargetValue(regionTargets.value, field, ref ?? null) : null;
+  const option = regionTargets.value.find(item => item.value === regionTarget.value);
+  const opening = ++regionOpening;
+  regionHint.value = null;
+  regionLocating.value = canLocateTarget(option);
   regionDialog.value = true;
+  if (option && regionLocating.value) {
+    const hint = await review.regionHint(option.target);
+    if (opening === regionOpening) {
+      regionHint.value = hint;
+      regionLocating.value = false;
+    }
+  }
 }
 
 // ==========================================

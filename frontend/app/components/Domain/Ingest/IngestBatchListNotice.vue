@@ -1,6 +1,6 @@
 <template>
   <div
-    class="commit-notice d-flex align-center ga-2"
+    class="commit-notice d-flex align-center flex-wrap ga-2"
     :class="`commit-notice--${notice.kind}`"
     :data-type="notice.kind"
     role="status"
@@ -20,16 +20,38 @@
         </li>
       </ul>
     </div>
-    <v-btn
-      class="commit-notice-close"
-      icon
-      size="x-small"
-      variant="text"
-      :aria-label="$t('general.close')"
-      @click="emit('dismiss')"
-    >
-      <v-icon :icon="$globals.icons.close" />
-    </v-btn>
+    <!-- on a phone, Undo or Open card go under the text rather than squeezing it -->
+    <div class="commit-notice-actions d-flex align-center ga-1 ms-auto">
+      <v-btn
+        v-if="notice.undoJobId"
+        class="commit-notice-undo"
+        size="small"
+        variant="text"
+        :loading="busy"
+        @click="emit('undo', notice.undoJobId)"
+      >
+        {{ $t("recipe-ingest.review.undo") }}
+      </v-btn>
+      <v-btn
+        v-if="notice.cardPath"
+        class="commit-notice-open"
+        size="small"
+        variant="text"
+        :to="notice.cardPath"
+      >
+        {{ $t("recipe-ingest.review.open-card") }}
+      </v-btn>
+      <v-btn
+        class="commit-notice-close"
+        icon
+        size="x-small"
+        variant="text"
+        :aria-label="$t('general.close')"
+        @click="emit('dismiss')"
+      >
+        <v-icon :icon="$globals.icons.close" />
+      </v-btn>
+    </div>
   </div>
 </template>
 
@@ -38,14 +60,18 @@ import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
 
 /**
  * A dismissible line in the cards list (what the review said about a batch's last card, what "Add N clean cards"
- * did): it takes its own place in the page, so it never covers the page title the way a toast does. Fork-owned.
+ * did): it takes its own place in the page, so it never covers the page title the way a toast does. "Added …" offers
+ * Undo; a line about one card can link to it. Fork-owned.
  */
 const props = defineProps<{
   notice: RecipeIngestQueueNotice;
+  /** Its Undo is being sent */
+  busy?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "dismiss"): void;
+  (e: "undo", jobId: string): void;
 }>();
 
 /** The icon, by its name in `$globals.icons` */
@@ -84,6 +110,7 @@ const icon = computed(() => {
 }
 
 .commit-notice-body {
+  flex: 1 1 14rem;
   min-width: 0;
   overflow-wrap: anywhere;
 }

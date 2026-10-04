@@ -7,6 +7,7 @@ import {
   resetRecipeIngestReviewState,
   takeRecipeIngestCommitNotice,
 } from "~/composables/use-recipe-ingest";
+import { takeCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
 import { resetRecipeIngestUploads, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
@@ -19,11 +20,13 @@ const api = vi.hoisted(() => ({
   retry: vi.fn(),
   cancel: vi.fn(),
   discard: vi.fn(),
+  uncommit: vi.fn(),
   upload: vi.fn(),
   createBatch: vi.fn(),
   sealBatch: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
+const router = vi.hoisted(() => ({ push: vi.fn() }));
 
 vi.mock("~/composables/api", () => ({
   useUserApi: () => ({ recipeIngest: api }),
@@ -71,6 +74,7 @@ const stubs = {
 };
 
 const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 
 function ago(ms: number) {
   return new Date(Date.now() - ms).toISOString();
@@ -94,15 +98,40 @@ function job(overrides: Partial<RecipeIngestionJobSummary> = {}): RecipeIngestio
     recipe: null,
     localOnly: false,
     createdAt: ago(HOUR),
+    // an added card was added half an hour ago, unless it says otherwise
+    committedAt: overrides.status === "committed" ? ago(HOUR / 2) : null,
     ...overrides,
   };
 }
 
-/** The server's jobs; GET /jobs filters them like the real route */
+/** The server's jobs; GET /jobs filters, orders and pages them like the real route */
 let serverJobs: RecipeIngestionJobSummary[] = [];
 
-function page(items: RecipeIngestionJobSummary[]) {
-  return { data: { page: 1, per_page: 100, total: items.length, total_pages: 1, items }, error: null };
+/** One page of a list, as GET /jobs answers it; `perPage` -1 is all of it */
+function page(items: RecipeIngestionJobSummary[], number = 1, perPage = -1) {
+  if (perPage < 0) {
+    return { data: { page: 1, per_page: -1, total: items.length, total_pages: 1, items }, error: null };
+  }
+  const totalPages = Math.max(1, Math.ceil(items.length / perPage));
+  const pageItems = items.slice((number - 1) * perPage, number * perPage);
+  return { data: { page: number, per_page: perPage, total: items.length, total_pages: totalPages, items: pageItems }, error: null };
+}
+
+function msOf(value: string | null | undefined) {
+  return value ? new Date(value).getTime() : 0;
+}
+
+/** GET /jobs over `jobs`: status, batch and `committedSince` filters; newest card first, or latest added first */
+function listJobs(jobs: RecipeIngestionJobSummary[], query: RecipeIngestJobsQuery) {
+  const statuses = query.status ? [query.status].flat() : null;
+  const since = query.committedSince ? new Date(query.committedSince).getTime() : null;
+  const items = jobs.filter(j => (!statuses || statuses.includes(j.status))
+    && (!query.batchId || j.batchId === query.batchId)
+    && (since === null || (!!j.committedAt && msOf(j.committedAt) >= since)));
+  if (query.orderBy === "committedAt") {
+    items.sort((a, b) => msOf(b.committedAt) - msOf(a.committedAt));
+  }
+  return page(items, query.page ?? 1, query.perPage ?? 50);
 }
 
 function deferred() {
@@ -151,11 +180,9 @@ beforeEach(() => {
   resetRecipeIngestCounts();
   resetRecipeIngestReviewState();
   setVisibility("visible");
+  vi.stubGlobal("useRouter", () => router);
   serverJobs = [];
-  api.getJobs.mockImplementation(async (query: RecipeIngestJobsQuery) => {
-    const statuses = query.status ? [query.status].flat() : null;
-    return page(serverJobs.filter(j => (!statuses || statuses.includes(j.status)) && (!query.batchId || j.batchId === query.batchId)));
-  });
+  api.getJobs.mockImplementation(async (query: RecipeIngestJobsQuery) => listJobs(serverJobs, query));
   api.getCounts.mockResolvedValue({ data: { processing: 0, ready: 1, needsAttention: 0, failed: 0 }, error: null });
   api.getJobState.mockImplementation(async (id: string) => {
     const found = serverJobs.find(j => j.id === id);
@@ -171,6 +198,7 @@ afterEach(() => {
   wrappers.length = 0;
   resetRecipeIngestUploads();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("IngestBatchList", () => {
@@ -203,7 +231,7 @@ describe("IngestBatchList", () => {
   test("cards added in the last 7 days link to their recipes", async () => {
     serverJobs = [
       job({ id: "c1", status: "committed", title: "Banana Mug Cake", recipe: { id: "r1", slug: "banana-mug-cake" } }),
-      job({ id: "c0", status: "committed", title: "Old Cake", createdAt: ago(8 * 24 * HOUR), recipe: { id: "r0", slug: "old" } }),
+      job({ id: "c0", status: "committed", title: "Old Cake", createdAt: ago(9 * DAY), committedAt: ago(8 * DAY), recipe: { id: "r0", slug: "old" } }),
     ];
     const wrapper = await mountList();
 
@@ -211,6 +239,108 @@ describe("IngestBatchList", () => {
     expect(rowTitles(wrapper, ".recently-added")).toEqual(["Banana Mug Cake"]);
     expect(wrapper.get(".recently-added .job-view-recipe").attributes("href")).toBe("/g/home/r/banana-mug-cake");
     expect(wrapper.find(".no-cards").exists()).toBe(false);
+  });
+
+  test("the last 7 days go by when a card was added, latest first: one uploaded earlier and added today is there", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T12:00:00Z"));
+    serverJobs = [
+      // uploaded 8 days ago, added an hour ago
+      job({ id: "late", status: "committed", title: "Scones", createdAt: ago(8 * DAY), committedAt: ago(HOUR), recipe: { id: "r1", slug: "scones" } }),
+      // uploaded today, added before it
+      job({ id: "early", status: "committed", title: "Fudge", createdAt: ago(3 * HOUR), committedAt: ago(2 * HOUR), recipe: { id: "r2", slug: "fudge" } }),
+      // uploaded and added 10 days ago
+      job({ id: "old", status: "committed", title: "Old Cake", createdAt: ago(10 * DAY), committedAt: ago(10 * DAY), recipe: { id: "r3", slug: "old" } }),
+    ];
+    const wrapper = await mountList();
+
+    expect(rowTitles(wrapper, ".recently-added")).toEqual(["Scones", "Fudge"]);
+    const query = jobsCalls().find(call => call.status === "committed")!;
+    expect(query.orderBy).toBe("committedAt");
+    expect((query.committedSince as Date).toISOString()).toBe("2026-09-27T12:00:00.000Z");
+  });
+
+  test("a card of the list that's added while it's open moves to the added cards by when it was added", async () => {
+    vi.useFakeTimers();
+    serverJobs = [
+      job({ id: "p1", status: "processing", createdAt: ago(8 * DAY), title: null, task: { kind: "extract", state: "running" } }),
+      job({ id: "c1", position: 1, status: "committed", title: "Fudge", committedAt: ago(2 * HOUR), recipe: { id: "r1", slug: "fudge" } }),
+    ];
+    const wrapper = await mountList();
+    expect(rowTitles(wrapper, ".recently-added")).toEqual(["Fudge"]);
+
+    // read and added since (an older upload): it's polled with its batch, and leads the added cards
+    serverJobs = serverJobs.map(j => (j.id === "p1"
+      ? { ...j, status: "committed", task: null, title: "Scones", committedAt: ago(1000), recipe: { id: "r2", slug: "scones" } }
+      : j));
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(rowTitles(wrapper, ".recently-added")).toEqual(["Scones", "Fudge"]);
+  });
+
+  test("more open cards than a load fetches: says so, and Load older cards fetches the next ones and keeps them", async () => {
+    // 12 pages of open cards (one card a page here); a load fetches the first 10
+    const open = Array.from({ length: 12 }, (_, i) => job({
+      id: `o${i}`,
+      batchId: `b${i}`,
+      title: `Card ${i}`,
+      createdAt: ago((i + 1) * HOUR),
+    }));
+    api.getJobs.mockImplementation(async (query: RecipeIngestJobsQuery) => {
+      if (query.status !== "committed" && !query.batchId) {
+        const number = query.page ?? 1;
+        return { data: { page: number, per_page: 100, total: 1200, total_pages: 12, items: open.slice(number - 1, number) }, error: null };
+      }
+      return listJobs([], query);
+    });
+    const wrapper = await mountList();
+
+    expect(batchSections(wrapper)).toHaveLength(10);
+    expect(jobsCalls().filter(call => call.status !== "committed").map(call => call.page)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(wrapper.get(".load-older-open").text()).toContain("Showing the newest 10 cards.");
+
+    api.getJobs.mockClear();
+    await wrapper.get(".load-older-open .load-older").trigger("click");
+    await flushPromises();
+    expect(batchSections(wrapper)).toHaveLength(12);
+    expect(rowTitles(wrapper).at(-1)).toBe("Card 11");
+    expect(wrapper.find(".load-older-open").exists()).toBe(false);
+    // the whole list again, now 20 pages at most: it stops at the last one
+    expect(jobsCalls().filter(call => call.status !== "committed").map(call => call.page)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+    // a reload (coming back to the page) keeps the older cards
+    setVisibility("hidden");
+    setVisibility("visible");
+    await flushPromises();
+    expect(batchSections(wrapper)).toHaveLength(12);
+  });
+
+  test("more cards added this week than a load fetches: Load older cards fetches the next ones", async () => {
+    serverJobs = Array.from({ length: 60 }, (_, i) => job({
+      id: `c${i}`,
+      batchId: `b${i}`,
+      status: "committed",
+      title: `Recipe ${i}`,
+      committedAt: ago((i + 1) * 60_000),
+      recipe: { id: `r${i}`, slug: `recipe-${i}` },
+    }));
+    const wrapper = await mountList();
+
+    expect(rowTitles(wrapper, ".recently-added")).toHaveLength(50);
+    expect(rowTitles(wrapper, ".recently-added")[0]).toBe("Recipe 0");
+    await wrapper.get(".load-older-recent").trigger("click");
+    await flushPromises();
+    expect(rowTitles(wrapper, ".recently-added")).toHaveLength(60);
+    expect(rowTitles(wrapper, ".recently-added").at(-1)).toBe("Recipe 59");
+    expect(wrapper.find(".load-older-recent").exists()).toBe(false);
+  });
+
+  test("a batch shows whole: all of its cards in one request", async () => {
+    serverJobs = Array.from({ length: 150 }, (_, i) => job({ id: `j${i}`, position: i, title: `Card ${i}` }));
+    const wrapper = await mountList({ batchId: "b1" });
+
+    expect(jobsCalls()).toEqual([{ batchId: "b1", perPage: -1 }]);
+    expect(rowTitles(wrapper)).toHaveLength(150);
+    expect(wrapper.find(".load-older-open").exists()).toBe(false);
   });
 
   test("says when there are no cards", async () => {
@@ -250,7 +380,7 @@ describe("IngestBatchList", () => {
     await vi.advanceTimersByTimeAsync(2999);
     expect(api.getJobs).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(jobsCalls()).toEqual([{ batchId: "b1", page: 1, perPage: 100 }]);
+    expect(jobsCalls()).toEqual([{ batchId: "b1", perPage: -1 }]);
     expect(api.getCounts).not.toHaveBeenCalled();
 
     serverJobs = [job({ status: "ready", warningCount: 2 }), added];
@@ -288,11 +418,11 @@ describe("IngestBatchList", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(jobsCalls()).toEqual([
       { status: ["processing", "ready", "failed", "committing"], page: 1, perPage: 100 },
-      { status: "committed", perPage: 50 },
+      { status: "committed", committedSince: expect.any(Date), orderBy: "committedAt", page: 1, perPage: 50 },
     ]);
     api.getJobs.mockClear();
     await vi.advanceTimersByTimeAsync(3000);
-    expect(jobsCalls()).toEqual([{ batchId: "b1", page: 1, perPage: 100 }]);
+    expect(jobsCalls()).toEqual([{ batchId: "b1", perPage: -1 }]);
   });
 
   test("an upload shows up at once", async () => {
@@ -308,7 +438,7 @@ describe("IngestBatchList", () => {
     useRecipeIngestUploads().takePhoto(new File(["x"], "IMG_9.jpg", { type: "image/jpeg" }));
     await flushPromises();
 
-    expect(jobsCalls()).toContainEqual({ batchId: "b3", page: 1, perPage: 100 });
+    expect(jobsCalls()).toContainEqual({ batchId: "b3", perPage: -1 });
     expect(wrapper.get(".ingest-batch").attributes("data-batch")).toBe("b3");
     expect(wrapper.get(".job-status").text()).toBe("Waiting to be read");
   });
@@ -335,7 +465,7 @@ describe("IngestBatchList", () => {
     expect(wrapper.get(".job-status").text()).toBe("Waiting to be read");
     expect(wrapper.findComponent({ name: "IngestJobListItem" }).props("busy")).toBe(false);
     // ...and it's watched until it's read
-    expect(jobsCalls()).toContainEqual({ batchId: "b1", page: 1, perPage: 100 });
+    expect(jobsCalls()).toContainEqual({ batchId: "b1", perPage: -1 });
   });
 
   test("Retry failed retries every failed card of the batch", async () => {
@@ -388,7 +518,7 @@ describe("IngestBatchList", () => {
     ];
     const wrapper = await mountList({ batchId: "b1" });
 
-    expect(jobsCalls()).toEqual([{ batchId: "b1", page: 1, perPage: 100 }]);
+    expect(jobsCalls()).toEqual([{ batchId: "b1", perPage: -1 }]);
     expect(wrapper.get(".batch-summary").text()).toBe("Batch done: 1 added, 1 left to review");
     expect(rowTitles(wrapper)).toEqual(["Pancakes"]);
     expect(rowTitles(wrapper, ".recently-added")).toEqual(["Banana Mug Cake"]);
@@ -458,6 +588,76 @@ describe("IngestBatchList", () => {
     expect(notice.get(".commit-notice-detail").text()).toBe("The tag \"Dessert\" was left out: it was deleted.");
   });
 
+  test("Undo on the review's \"Added …\" takes the card just added back to review, and opens it", async () => {
+    serverJobs = [
+      job({ id: "c1", status: "committed", title: "Banana Mug Cake", recipe: { id: "r1", slug: "banana-mug-cake" } }),
+      job({ id: "p1", position: 1, status: "processing", title: null, task: { kind: "extract", state: "running" } }),
+    ];
+    leaveRecipeIngestCommitNotice({ text: "Added Banana Mug Cake · 1 card is still being read", warning: null, undoJobId: "c1" });
+    api.uncommit.mockResolvedValue({ data: { status: "ready", draftVersion: 3, task: null, error: null }, error: null });
+    const wrapper = await mountList({ batchId: "b1" });
+    api.getCounts.mockClear();
+
+    const undo = wrapper.get(".commit-notice .commit-notice-undo");
+    expect(undo.text()).toBe("Undo");
+    await undo.trigger("click");
+    await flushPromises();
+
+    expect(api.uncommit).toHaveBeenCalledExactlyOnceWith("c1", {});
+    expect(router.push).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/c1");
+    // the card's page says it's back
+    expect(takeCarriedReviewNotice("c1")).toEqual({ kind: "success", text: "The card is back for review.", detail: null });
+    expect(api.getCounts).toHaveBeenCalled();
+  });
+
+  test("Undo on a card whose recipe was edited since deletes nothing: it says so and links to the card", async () => {
+    serverJobs = [job({ id: "c1", status: "committed", recipe: { id: "r1", slug: "banana-mug-cake" } })];
+    leaveRecipeIngestCommitNotice({ text: "Added Banana Mug Cake", warning: null, undoJobId: "c1" });
+    api.uncommit.mockResolvedValue({ data: null, error: { response: { status: 409, data: { detail: { code: "recipe_edited" } } } } });
+    const wrapper = await mountList({ batchId: "b1" });
+
+    await wrapper.get(".commit-notice-undo").trigger("click");
+    await flushPromises();
+
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.attributes("data-type")).toBe("warning");
+    expect(notice.get(".commit-notice-text").text())
+      .toBe("The recipe was changed after this card was added. Going back to review would delete those changes.");
+    expect(notice.get(".commit-notice-open").attributes("href")).toBe("/g/home/recipes/cards/c1");
+    expect(notice.find(".commit-notice-undo").exists()).toBe(false);
+    expect(router.push).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("an Undo refused otherwise says why; once the card isn't added any more, Undo goes", async () => {
+    serverJobs = [job({ id: "c1", status: "committed", recipe: { id: "r1", slug: "banana-mug-cake" } })];
+    leaveRecipeIngestCommitNotice({ text: "Added Banana Mug Cake", warning: null, undoJobId: "c1" });
+    const wrapper = await mountList({ batchId: "b1" });
+
+    // the server couldn't be reached: Undo stays, to try again
+    api.uncommit.mockResolvedValueOnce({ data: null, error: { message: "Network Error" } });
+    await wrapper.get(".commit-notice-undo").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenLastCalledWith("The server couldn't be reached. Check your connection and try again.");
+    expect(wrapper.find(".commit-notice-undo").exists()).toBe(true);
+
+    // taken back to review elsewhere meanwhile
+    api.uncommit.mockResolvedValueOnce({ data: null, error: { response: { status: 409, data: { detail: { code: "invalid_status", status: "ready" } } } } });
+    await wrapper.get(".commit-notice-undo").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenLastCalledWith("This card has changed since this page loaded. Reload it and try again.");
+    expect(wrapper.find(".commit-notice-undo").exists()).toBe(false);
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Added Banana Mug Cake");
+    expect(router.push).not.toHaveBeenCalled();
+  });
+
+  test("a notice without a card to undo has no Undo", async () => {
+    serverJobs = [job({ id: "c1", status: "committed", recipe: { id: "r1", slug: "banana-mug-cake" } })];
+    leaveRecipeIngestCommitNotice({ text: "That was the last card.", warning: null });
+    const wrapper = await mountList({ batchId: "b1" });
+    expect(wrapper.find(".commit-notice-undo").exists()).toBe(false);
+  });
+
   test("cards that arrive elsewhere show up: the counts are checked every 20 s, and a change reloads the list", async () => {
     vi.useFakeTimers();
     serverJobs = [job()];
@@ -476,7 +676,7 @@ describe("IngestBatchList", () => {
     await vi.advanceTimersByTimeAsync(20_000);
     expect(jobsCalls()).toEqual([
       { status: ["processing", "ready", "failed", "committing"], page: 1, perPage: 100 },
-      { status: "committed", perPage: 50 },
+      { status: "committed", committedSince: expect.any(Date), orderBy: "committedAt", page: 1, perPage: 50 },
     ]);
     expect(rowTitles(wrapper)).toContain("scan.jpg");
 
@@ -511,7 +711,7 @@ describe("IngestBatchList", () => {
     await flushPromises();
 
     expect(toast.error).toHaveBeenCalledExactlyOnceWith("This card has changed since this page loaded. Reload it and try again.");
-    expect(jobsCalls()).toContainEqual({ batchId: "b1", page: 1, perPage: 100 });
+    expect(jobsCalls()).toContainEqual({ batchId: "b1", perPage: -1 });
     expect(wrapper.get(".job-status").text()).toBe("Waiting to be read");
   });
 
@@ -574,7 +774,7 @@ describe("adding a batch's clean cards", () => {
   function commitAll() {
     api.commitClean.mockImplementation(async (_batchId: string, payload: { jobIds: string[] }) => {
       const recipe = (id: string) => ({ id: `r-${id}`, slug: `recipe-${id}` });
-      serverJobs = serverJobs.map(j => (payload.jobIds.includes(j.id) ? { ...j, status: "committed", recipe: recipe(j.id) } : j));
+      serverJobs = serverJobs.map(j => (payload.jobIds.includes(j.id) ? { ...j, status: "committed", committedAt: ago(0), recipe: recipe(j.id) } : j));
       return {
         data: { committed: payload.jobIds.map(id => ({ jobId: id, recipeId: `r-${id}`, slug: `recipe-${id}` })), skipped: [] },
         error: null,
@@ -659,7 +859,7 @@ describe("adding a batch's clean cards", () => {
   test("cards left out are listed with the reason", async () => {
     serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones"), clean("c", 2, "Fudge")];
     api.commitClean.mockImplementation(async () => {
-      serverJobs = serverJobs.map(j => (j.id === "a" ? { ...j, status: "committed", recipe: { id: "r-a", slug: "banana" } } : j));
+      serverJobs = serverJobs.map(j => (j.id === "a" ? { ...j, status: "committed", committedAt: ago(0), recipe: { id: "r-a", slug: "banana" } } : j));
       return {
         data: {
           committed: [{ jobId: "a", recipeId: "r-a", slug: "banana" }],

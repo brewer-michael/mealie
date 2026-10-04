@@ -40,6 +40,8 @@ import type {
   RecipeIngestionJobOut,
   RecipeIngestionJobState,
   RecipeIngestionJobSummary,
+  RecipeIngestionJobTask,
+  RegionHintOut,
   RereadRequest,
   RotateRequest,
 } from "~/lib/api/types/recipe-ingest";
@@ -59,9 +61,13 @@ export const HIGHLIGHTED_SEVERITIES: readonly CardFlagSeverity[] = ["error", "wa
 /** Errors that "Keep as written" resolves (the server's `flag_rules.KEEPABLE_KINDS`); every other error is fixed */
 export const KEEPABLE_KINDS: readonly CardFlagKind[] = ["illegible", "blank"];
 /** Flags about the parser's reading of a line, which the server drops once the line is edited (`flags.PARSE_KINDS`) */
-export const PARSE_KINDS: readonly CardFlagKind[] = ["check_parse", "unit_unclear", "shorthand_read"];
+export const PARSE_KINDS: readonly CardFlagKind[] = ["check_parse", "unit_unclear", "shorthand_read", "linked_fuzzy"];
 /** The two markers a card's reading holds (docs/ai/PHASE2.md §4.3) */
 export const MARKERS = { illegible: "[illegible]", blank: "[blank]" } as const;
+/** The most lines one "Parse with AI" takes (the server's `MAX_PARSE_LINES`) */
+export const MAX_PARSE_LINES = 50;
+/** The longest card text "Rebuild from this text" takes (the server's `MAX_TRANSCRIPTION`) */
+export const MAX_TRANSCRIPTION = 20_000;
 
 // ==========================================
 // Drafts
@@ -125,6 +131,35 @@ export function stableStringify(value: unknown): string {
 /** Whether two drafts hold the same content, whatever their key order */
 export function draftsEqual(a: CardDraft | null | undefined, b: CardDraft | null | undefined): boolean {
   return stableStringify(a ?? null) === stableStringify(b ?? null);
+}
+
+/**
+ * Takes the lines a save parsed (`CardDraftSaved.ingredients`: a line written as text, or kept around a marker, as
+ * the server stored it) into `draft`, in place: each where the draft's line is still the one in `sent`, so the page
+ * shows its amount, unit and food at once. A line typed over while the save was out keeps the reviewer's edit, which
+ * the next save sends. Returns the draft as the server now stores it: `sent` with the parsed lines.
+ */
+export function takeParsedLines(
+  draft: ReviewDraft,
+  sent: ReviewDraft,
+  parsed: readonly CardDraftIngredient[] | null | undefined,
+): ReviewDraft {
+  const stored = cloneDraft(sent);
+  for (const line of parsed ?? []) {
+    const ref = line.referenceId;
+    const sentIndex = ref ? stored.ingredients.findIndex(item => item.referenceId === ref) : -1;
+    if (sentIndex < 0) {
+      continue;
+    }
+    const ingredient = normalizeDraft({ ingredients: [line] }).ingredients[0]!;
+    const sentLine = stableStringify(stored.ingredients[sentIndex]);
+    stored.ingredients.splice(sentIndex, 1, cloneDraft(ingredient));
+    const index = draft.ingredients.findIndex(item => item.referenceId === ref);
+    if (index >= 0 && stableStringify(draft.ingredients[index]) === sentLine) {
+      draft.ingredients.splice(index, 1, cloneDraft(ingredient));
+    }
+  }
+  return stored;
 }
 
 const UNICODE_FRACTIONS: Record<string, number> = {
@@ -209,6 +244,23 @@ export interface IngestNamedOption {
 /** Whether a line was split into amount, unit and food, rather than kept as text in its note */
 export function isParsedIngredient(ingredient: CardDraftIngredient): boolean {
   return (ingredient.quantity ?? null) !== null || !!ingredient.unit?.name || !!ingredient.food?.name;
+}
+
+/** What's written on a line, as its row shows it: a parsed line's amount, unit, food and note, else its text */
+export function ingredientLineText(ingredient: CardDraftIngredient): string {
+  return (isParsedIngredient(ingredient) ? ingredient.display || ingredientDisplay(ingredient) : ingredient.note || ingredient.originalText || "").trim();
+}
+
+/**
+ * Whether a line is kept as written with nothing parsed, as the card's "Ingredients kept as text" (`not_parsed`)
+ * counts it (the server's `_kept_as_text`): not a line with a marker, which has a flag of its own, nor an empty one
+ */
+export function isTextLine(ingredient: CardDraftIngredient): boolean {
+  if (isParsedIngredient(ingredient) || (ingredient.parseConfidence ?? null) !== null) {
+    return false;
+  }
+  const text = ingredient.note || ingredient.originalText || "";
+  return !!text.trim() && !Object.values(MARKERS).some(marker => text.toLowerCase().includes(marker));
 }
 
 // ==========================================
@@ -621,6 +673,26 @@ export function fixIngredient(
 export function ingredientAsText(ingredient: CardDraftIngredient): CardDraftIngredient {
   const text = ingredient.originalText || ingredientDisplay(ingredient);
   return withDisplay({ ...ingredient, quantity: null, unit: null, food: null, note: text });
+}
+
+/**
+ * What "Keep as new food" (or unit) on "Check the link" (`linked_fuzzy`) names the food: the words on the card's line
+ * the server matched the linked name from ("rd onions" for "red onion", `params.start`/`end`). None when the flag
+ * doesn't say where they are, or they are the linked name itself (commit would link it again).
+ */
+export function unlinkedName(flag: CardFlag, ingredient: CardDraftIngredient | null | undefined): string | null {
+  const span = flagSpan(flag);
+  const linked = stringParam(flag, "name");
+  if (flag.kind !== "linked_fuzzy" || !span || !ingredient?.originalText) {
+    return null;
+  }
+  const words = ingredient.originalText.slice(span.start, span.end).trim();
+  return words && words.toLowerCase() !== (linked ?? "").trim().toLowerCase() ? words : null;
+}
+
+/** Which of the line's links a `linked_fuzzy` flag is about (`params.kind`): its food, unless it says its unit */
+export function linkKind(flag: CardFlag): "food" | "unit" {
+  return flag.params?.kind === "unit" ? "unit" : "food";
 }
 
 /** What the parser made of a line, as "Check this ingredient" shows it: "2 cup flour, to 3" */
@@ -1057,6 +1129,35 @@ export function regionFromCropResult(result: CropResultLike | null | undefined, 
 /** How far an arrow key moves or resizes the re-read selection, as a fraction of the page */
 export const REGION_KEY_STEP = 0.02;
 
+/**
+ * How long "Re-read an area" waits for where the line is on the card (`GET …/region-hint`, an answer from stored data)
+ * before its selection starts without it; a hint that came later isn't used, since a selection that jumped then
+ * would move under the reviewer's finger
+ */
+export const REGION_HINT_WAIT_MS = 1500;
+
+/**
+ * How far a re-read selection started from a region hint reaches past it on either side, as a fraction of the page:
+ * the hint is an estimate (a band across the card at the line's height), and a card's writing often starts nearer
+ * its edge than the band does, so the selection mustn't cut off the line's first or last letters
+ */
+export const HINT_SIDE_MARGIN = 0.05;
+
+/** Where a re-read selection starts for a region hint: its height, and its width with `HINT_SIDE_MARGIN` either side */
+export function regionFromHint(hint: Pick<RegionHintOut, "x" | "y" | "width" | "height">): PageRegion {
+  const left = Math.max(0, hint.x - HINT_SIDE_MARGIN);
+  const right = Math.min(1, hint.x + hint.width + HINT_SIDE_MARGIN);
+  return { x: left, y: hint.y, width: right - left, height: hint.height };
+}
+
+/**
+ * Whether the server can say where a re-read target's text is on the card: a single field, or an ingredient, step or
+ * note by its id. A new line has no text yet.
+ */
+export function canLocateTarget(option: RereadTargetOption | null | undefined): boolean {
+  return !!option && !option.kind.startsWith("new-");
+}
+
 /** A cropper selection in the page's pixels */
 export type RegionCoordinates = CropResultLike["coordinates"];
 
@@ -1288,6 +1389,24 @@ export function suggestEvalSlug(name: string | null | undefined): string {
 // ==========================================
 // The page's state
 
+/**
+ * What an extract task on a card being reviewed does (the server's `IngestTaskMode`): read the whole card again,
+ * rebuild the recipe from the reviewer's text ("Rebuild from this text"), or parse chosen lines ("Parse with AI")
+ */
+export type ExtractTaskMode = "reextract" | "rebuild" | "parse_lines";
+
+/** A task as the server describes it, with the mode of an extract task and the lines "Parse with AI" parses */
+type DescribedTask = RecipeIngestionJobTask & { mode?: ExtractTaskMode | null; refs?: string[] | null };
+
+/** What this page asked an extract task to do, while it runs: the draft version and lines as they were sent */
+interface StartedTask {
+  mode: Exclude<ExtractTaskMode, "reextract">;
+  version: number;
+  /** The lines "Parse with AI" parses, and each as it read when sent */
+  refs: string[];
+  lines: string[];
+}
+
 export type SaveState = "idle" | "saving" | "saved" | "error";
 export type LoadState = "loading" | "ready" | "not-found" | "failed";
 
@@ -1340,6 +1459,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const pendingAction = ref<string | null>(null);
   /** Re-reads waiting for the job to be idle, sent one at a time */
   const rereadQueue = ref<RereadRequest[]>([]);
+  /** The rebuild or "Parse with AI" this page started, until it ends (`settleStartedTask`) */
+  const startedTask = ref<StartedTask | null>(null);
   /** What the review bar says ("Re-read queued", "Added Banana Mug Cake" from the last card) */
   const notice = ref<ReviewNotice | null>(null);
   let unmounted = false;
@@ -1365,6 +1486,24 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
 
   const isDirty = computed(() => stableStringify(draft.value) !== savedDraft.value);
   const task = computed(() => job.value?.task ?? null);
+  /**
+   * What the extract task on this card being reviewed does; null for none. The server's task names its mode when it
+   * says so, else this page knows what it started; any other extract task reads the whole card again.
+   */
+  const taskMode = computed<ExtractTaskMode | null>(() => {
+    const current = task.value as DescribedTask | null;
+    if (!current || current.kind !== "extract" || job.value?.status !== "ready") {
+      return null;
+    }
+    return current.mode ?? startedTask.value?.mode ?? "reextract";
+  });
+  /** The lines "Parse with AI" is parsing now, which show their progress */
+  const parsingRefs = computed<string[]>(() => {
+    if (taskMode.value !== "parse_lines") {
+      return [];
+    }
+    return (task.value as DescribedTask).refs ?? startedTask.value?.refs ?? [];
+  });
   const status = computed(() => job.value?.status ?? null);
   const readOnly = computed(() =>
     status.value !== "ready" || task.value?.kind === "extract" || conflict.value || committing.value,
@@ -1608,7 +1747,6 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     saveSeq += 1;
     const seq = saveSeq;
     const sentDraft = cloneDraft(draft.value);
-    const sentJson = stableStringify(sentDraft);
     const sentFixes = fixCounter;
     const resolutions = Object.fromEntries(pendingResolutions);
     const proposalIds = [...pendingProposalIds];
@@ -1628,12 +1766,17 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
 
     if (data) {
       draftVersion.value = data.draftVersion;
-      savedDraft.value = sentJson;
+      // the lines the server parsed show as parsed, and count as saved (`takeParsedLines`)
+      savedDraft.value = stableStringify(takeParsedLines(draft.value, sentDraft, data.ingredients));
       if (job.value) {
         job.value.draftVersion = data.draftVersion;
         job.value.errorCount = data.errorCount ?? 0;
         job.value.warningCount = data.warningCount ?? 0;
         job.value.title = sentDraft.name;
+        // the possible-duplicate banner follows the name as saved
+        job.value.duplicateOf = data.duplicateOf ?? null;
+        job.value.duplicateJob = data.duplicateJob ?? null;
+        job.value.duplicateName = data.duplicateName ?? null;
         if (clearError) {
           job.value.error = null;
         }
@@ -1800,6 +1943,22 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       .forEach(item => markFixed(item));
   }
 
+  /**
+   * "Keep as new food" (or unit) on "Check the link": the line's food (or unit) is no longer linked to the group's
+   * near-miss, and takes the words written on the card (`unlinkedName`); commit adds it as a new one. The flag is
+   * done with (the server drops a line's parse flags once it's edited).
+   */
+  function keepAsNew(flag: CardFlag) {
+    const index = draft.value.ingredients.findIndex(item => item.referenceId === flag.ref);
+    const ingredient = index < 0 ? null : draft.value.ingredients[index]!;
+    const name = unlinkedName(flag, ingredient);
+    if (readOnly.value || !ingredient || !name) {
+      return;
+    }
+    draft.value.ingredients.splice(index, 1, withDisplay({ ...ingredient, [linkKind(flag)]: { id: null, name } }));
+    markFixed(flag);
+  }
+
   function settleProposal(proposal: CardProposal) {
     proposals.value = proposals.value.filter(item => item !== proposal && (!proposal.id || item.id !== proposal.id));
     if (proposal.id) {
@@ -1890,6 +2049,32 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     return false;
   }
 
+  /**
+   * Where on the card a target's text probably is (`GET …/region-hint`), for a re-read selection to start there. Null
+   * when the server has no hint (a 404, never shown), the request fails, or it takes longer than
+   * `REGION_HINT_WAIT_MS`: the selection then starts without it.
+   */
+  async function regionHint(target: ProposalTarget): Promise<RegionHintOut | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), REGION_HINT_WAIT_MS);
+    });
+    const asked = (async () => {
+      try {
+        return (await api.recipeIngest.regionHint(jobId, target)).data ?? null;
+      }
+      catch {
+        return null;
+      }
+    })();
+    try {
+      return await Promise.race([asked, late]);
+    }
+    finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Re-reads a region; while a task runs (or other re-reads wait) it joins the queue */
   async function requestReread(request: RereadRequest) {
     if (task.value || rereadQueue.value.length > 0) {
@@ -1926,6 +2111,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       const current = job.value;
       const known = new Set([...proposals.value.map(proposal => proposal.id), ...handledProposalIds]);
       const finishedExtract = current.task?.kind === "extract" && !data.task;
+      const stopped = !!current.task?.cancelRequested;
       const changed = data.status !== current.status
         || (!saving && data.draftVersion !== draftVersion.value)
         || (data.proposalIds ?? []).some(id => !known.has(id))
@@ -1934,6 +2120,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       current.task = data.task ?? null;
       if (changed) {
         await refresh();
+      }
+      if (finishedExtract) {
+        settleStartedTask(stopped);
       }
       if (!job.value?.task && job.value?.status === "ready" && rereadQueue.value.length > 0) {
         await sendNextReread();
@@ -1985,6 +2174,121 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       }
       return false;
     });
+  }
+
+  /**
+   * Before a rebuild or "Parse with AI", which read the stored draft: whether what's pending couldn't be saved (or the
+   * card moved on meanwhile). It says so; nothing is sent.
+   */
+  function unsavedBlocks(): boolean {
+    if (conflict.value || job.value?.status !== "ready") {
+      return true;
+    }
+    if (hasPendingChanges() && saveState.value === "error") {
+      notify("error", i18n.t("recipe-ingest.review.action-unsaved"));
+      return true;
+    }
+    return false;
+  }
+
+  /** A refused rebuild or parse: "busy" when another task runs, else why */
+  function notifyTaskRefused(error: unknown) {
+    if (!alreadyToasted(error) && errorCodeOf(error) === "busy") {
+      notify("info", text.ingestErrorText("busy"));
+    }
+    else {
+      notifyError(error);
+    }
+  }
+
+  /**
+   * "Rebuild from this text": the recipe is built again from the card's text as the reviewer corrected it (no photo
+   * is read). As with Read whole card again, an unedited draft is replaced; an edited one gets a whole-card proposal
+   * marked as a rebuild ("Rebuilt from your text"). What's pending is saved first, so the server knows it's edited.
+   */
+  async function rebuild(transcription: string): Promise<boolean> {
+    if (readOnly.value || !transcription.trim() || transcription.length > MAX_TRANSCRIPTION) {
+      return false;
+    }
+    return (await runAction("rebuild", async () => {
+      await save();
+      if (unsavedBlocks()) {
+        return false;
+      }
+      const version = draftVersion.value;
+      const { data, error } = await api.recipeIngest.rebuild(jobId, { transcription });
+      if (!data) {
+        notifyTaskRefused(error);
+        return false;
+      }
+      startedTask.value = { mode: "rebuild", version, refs: [], lines: [] };
+      applyState(data);
+      return true;
+    })) ?? false;
+  }
+
+  /** A line as "Parse with AI" compares it before and after */
+  function lineJson(ref: string): string {
+    return stableStringify(draft.value.ingredients.find(item => item.referenceId === ref) ?? null);
+  }
+
+  /**
+   * "Parse with AI": the AI ingredient parser reads these lines, in any language, each as it's stored: what's pending
+   * is saved first. The editor waits while it runs, as for a re-extract, and the lines show their progress; the
+   * parsed amount, unit and food land in each line still as it was sent (`finalize_parse_lines`), which the poll
+   * brings in.
+   */
+  async function parseWithAi(refs: readonly string[]): Promise<boolean> {
+    const lines = [...new Set(refs)]
+      .filter(ref => draft.value.ingredients.some(item => item.referenceId === ref))
+      .slice(0, MAX_PARSE_LINES);
+    if (readOnly.value || !lines.length) {
+      return false;
+    }
+    return (await runAction("parse", async () => {
+      await save();
+      if (unsavedBlocks()) {
+        return false;
+      }
+      const version = draftVersion.value;
+      const sent = lines.map(lineJson);
+      const { data, error } = await api.recipeIngest.parseLines(jobId, { refs: lines });
+      if (!data) {
+        notifyTaskRefused(error);
+        return false;
+      }
+      startedTask.value = { mode: "parse_lines", version, refs: lines, lines: sent };
+      applyState(data);
+      return true;
+    })) ?? false;
+  }
+
+  /**
+   * Once the rebuild or parse this page started has ended and the card is read again: what came of it. A failure has
+   * its banner, and a stopped task says nothing more. A rebuild of an edited card is its proposal's banner, else the
+   * replaced draft says "Rebuilt from your text"; a parse says whether the lines changed.
+   */
+  function settleStartedTask(stopped = false) {
+    const started = startedTask.value;
+    startedTask.value = null;
+    if (!started || stopped || !job.value || job.value.status !== "ready" || job.value.error) {
+      return;
+    }
+    if (started.mode === "rebuild") {
+      const proposed = proposals.value.some(proposal => proposal.kind === "full" && proposal.origin === "rebuild");
+      if (!proposed && draftVersion.value > started.version) {
+        notify("success", i18n.t("recipe-ingest.review.rebuilt"));
+      }
+      return;
+    }
+    const changed = draftVersion.value > started.version
+      && started.refs.some((ref, index) => lineJson(ref) !== started.lines[index]);
+    if (changed) {
+      notify("success", i18n.t("recipe-ingest.review.parsed"));
+    }
+    else {
+      notify("info", i18n.t("recipe-ingest.review.parse-unchanged", started.refs.length));
+    }
   }
 
   /** Turns a page clockwise, then offers to read the card again (a failed card from the start) */
@@ -2198,6 +2502,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       }
       applyState(data);
       if (!data.task) {
+        startedTask.value = null;
         await refresh();
         notify("info", i18n.t("recipe-ingest.review.read-cancelled"));
       }
@@ -2454,6 +2759,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     rereadQueue: readonly(rereadQueue),
     notice: readonly(notice),
     task,
+    taskMode,
+    parsingRefs,
     readOnly,
     position,
     attachCardPhoto,
@@ -2483,11 +2790,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     applyFlagAlternative,
     fillFlagBlank,
     keepIngredientAsText,
+    keepAsNew,
     useProposal,
     dismissProposal,
     dismissError,
     requestReread,
+    regionHint,
     reextract,
+    rebuild,
+    parseWithAi,
     rotate,
     retry,
     readWithCloud,

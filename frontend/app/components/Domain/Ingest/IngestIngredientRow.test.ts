@@ -28,6 +28,7 @@ const stubs = {
   },
   VTextField: field("text-field"),
   VCombobox: field("combobox"),
+  VProgressLinear: { template: "<div class=\"progress\" />" },
 };
 
 function oil(overrides: Partial<CardDraftIngredient> = {}): CardDraftIngredient {
@@ -55,6 +56,8 @@ interface RowProps {
   canMoveDown?: boolean;
   draggable?: boolean;
   canReread?: boolean;
+  canParse?: boolean;
+  parsing?: boolean;
 }
 
 function mountRow(ingredient: CardDraftIngredient, props: RowProps = {}) {
@@ -220,5 +223,24 @@ describe("IngestIngredientRow", () => {
   test("nothing moves or goes while read-only", () => {
     const wrapper = mountRow(oil(), { expanded: true, readonly: true, canMoveUp: true, canMoveDown: true });
     expect(wrapper.findAll("button")).toHaveLength(0);
+  });
+
+  test("open, a line with something on it can be parsed by the AI parser, while the card can be", async () => {
+    expect(mountRow(oil(), { expanded: true }).find(".ingest-ingredient__parse").exists()).toBe(false);
+    // an empty line has nothing to parse
+    const empty = oil({ originalText: "", quantity: null, unit: null, food: null, note: "", display: "" });
+    expect(mountRow(empty, { expanded: true, canParse: true }).find(".ingest-ingredient__parse").exists()).toBe(false);
+
+    const wrapper = mountRow(oil(), { expanded: true, canParse: true });
+    expect(wrapper.get(".ingest-ingredient__parse").text()).toBe("Parse with AI");
+    await wrapper.get(".ingest-ingredient__parse").trigger("click");
+    expect(wrapper.emitted("parse")).toHaveLength(1);
+  });
+
+  test("a line the AI parser is reading says so, open or not", () => {
+    expect(mountRow(oil()).find(".ingest-ingredient__parsing").exists()).toBe(false);
+    const wrapper = mountRow(oil(), { parsing: true });
+    expect(wrapper.get(".ingest-ingredient__parsing").text()).toBe("Parsing with AI…");
+    expect(wrapper.get(".ingest-ingredient__parsing").attributes("role")).toBe("status");
   });
 });

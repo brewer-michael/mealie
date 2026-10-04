@@ -12,7 +12,7 @@
     </div>
     <div class="ingest-proposal__text">
       <template v-if="proposal.kind === 'full'">
-        {{ $t("recipe-ingest.review.proposal-full") }}
+        {{ proposal.origin === "rebuild" ? $t("recipe-ingest.review.proposal-rebuild") : $t("recipe-ingest.review.proposal-full") }}
       </template>
       <template v-else-if="readable">
         {{ $t("recipe-ingest.review.proposal-region", { text: proposal.text ?? "" }) }}
@@ -97,7 +97,8 @@ import type { CardProposal } from "~/lib/api/types/recipe-ingest";
 
 /**
  * A re-read's result (docs/ai/PHASE2.md §6.6): a region re-read offers Replace / Add to the end / Dismiss (or, inside
- * its "Needs a look" item, Use / Dismiss); a whole-card re-read of an edited card offers Use the new reading / Keep mine.
+ * its "Needs a look" item, Use / Dismiss); a whole-card re-read of an edited card offers Use the new reading / Keep mine,
+ * as does a recipe rebuilt from the reviewer's text ("Rebuilt from your text").
  */
 const props = withDefaults(defineProps<{
   proposal: CardProposal;

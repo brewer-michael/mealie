@@ -1,11 +1,14 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import HouseholdNotifierAIEvents from "./HouseholdNotifierAIEvents.vue";
+import { resetRecipeIngestSettings, useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
+import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
   getNotifierEvents: vi.fn(),
   updateNotifierEvents: vi.fn(),
   testNotifierEvents: vi.fn(),
+  getSettings: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 
@@ -18,6 +21,30 @@ vi.mock("~/composables/use-toast", () => ({
 
 const wrappers: VueWrapper[] = [];
 
+/** The group's card settings, which say whether BASE_URL is set */
+function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIngestionSettingsOut {
+  return {
+    enabled: true,
+    canReadCards: true,
+    baseUrlSet: true,
+    readerRunning: true,
+    limits: {
+      maxUploadBytes: 104857600,
+      maxFileBytes: 31457280,
+      maxImagesPerRequest: 20,
+      maxPagesPerCard: 4,
+      maxPixels: 100000000,
+      maxJpegPixels: 256000000,
+    },
+    ...overrides,
+  };
+}
+
+/** A failed request as the API client answers a quiet one: the code, without the message */
+function failure(status: number, detail: Record<string, unknown>) {
+  return { data: null, error: Object.assign(new Error(String(status)), { response: { status, data: { detail } } }) };
+}
+
 function mountToggle(notifierId = "n1") {
   const wrapper = mount(HouseholdNotifierAIEvents, {
     props: { notifierId },
@@ -25,15 +52,17 @@ function mountToggle(notifierId = "n1") {
       mocks: { $globals: { icons: { testTube: "test-tube" } } },
       stubs: {
         VAlert: {
-          props: ["type"],
-          template: "<div class=\"alert\" :data-type=\"type\"><slot /></div>",
+          props: { type: String, closable: Boolean },
+          emits: ["click:close"],
+          template: `<div class="alert" :data-type="type"><slot />
+            <button v-if="closable" type="button" class="alert-close" aria-label="Close" @click="$emit('click:close')" /></div>`,
         },
         VBtn: {
           props: ["disabled", "loading"],
           template: "<button type=\"button\" :disabled=\"disabled\" :data-loading=\"loading\"><slot /></button>",
         },
         VSwitch: {
-          props: ["modelValue", "label", "hint", "disabled"],
+          props: ["modelValue", "label", "messages", "disabled"],
           emits: ["update:modelValue"],
           template: `
             <label class="switch">
@@ -43,7 +72,7 @@ function mountToggle(notifierId = "n1") {
                 :disabled="disabled"
                 @change="$emit('update:modelValue', $event.target.checked)"
               >
-              <span class="label">{{ label }}</span> <small class="hint">{{ hint }}</small>
+              <span class="label">{{ label }}</span> <small v-for="message in messages" :key="message" class="message">{{ message }}</small>
             </label>
           `,
         },
@@ -69,7 +98,9 @@ function checkbox(wrapper: VueWrapper) {
 describe("HouseholdNotifierAIEvents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRecipeIngestSettings();
     api.getNotifierEvents.mockResolvedValue({ data: { recipeIngestionReady: false }, error: null });
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
   });
 
   afterEach(() => {
@@ -87,8 +118,11 @@ describe("HouseholdNotifierAIEvents", () => {
     expect(api.getNotifierEvents).toHaveBeenCalledExactlyOnceWith("n7");
     expect(wrapper.get("h4").text()).toBe("Recipe cards");
     expect(wrapper.get(".label").text()).toBe("Recipe cards ready to review");
-    expect(wrapper.get(".hint").text())
-      .toBe("One notification when a batch of cards has been read, with a link to review them, and one when photos put in the inbox couldn't be added.");
+    // under it: what it sends, and that it doesn't wait for the notifier's Save
+    expect(wrapper.findAll(".message").map(message => message.text())).toEqual([
+      "One notification when a batch of cards has been read, with a link to review them, and one when photos put in the inbox couldn't be added.",
+      "Saved right away. The options above wait for Save.",
+    ]);
     expect(checkbox(wrapper).checked).toBe(true);
     expect(checkbox(wrapper).disabled).toBe(false);
   });
@@ -132,7 +166,7 @@ describe("HouseholdNotifierAIEvents", () => {
     expect(checkbox(wrapper).checked).toBe(false);
   });
 
-  test("sends a test notification", async () => {
+  test("sends a test notification, and says under its button that it was sent", async () => {
     api.testNotifierEvents.mockResolvedValue({ data: null, error: null });
     const wrapper = mountToggle("n3");
     await flushPromises();
@@ -140,36 +174,91 @@ describe("HouseholdNotifierAIEvents", () => {
     await button(wrapper, "Send test notification").trigger("click");
     await flushPromises();
 
-    expect(api.testNotifierEvents).toHaveBeenCalledExactlyOnceWith("n3");
-    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Test notification sent");
-  });
-
-  test("says when the test notification couldn't be sent", async () => {
-    api.testNotifierEvents.mockResolvedValue({ data: null, error: new Error("404") });
-    const wrapper = mountToggle();
-    await flushPromises();
-
-    await button(wrapper, "Send test notification").trigger("click");
-    await flushPromises();
-
-    expect(toast.error).toHaveBeenCalledExactlyOnceWith("Couldn't send the test notification");
+    // quiet: the outcome shows once, here, not as a toast that doesn't say which notifier
+    expect(api.testNotifierEvents).toHaveBeenCalledExactlyOnceWith("n3", { suppressAlert: true });
+    expect(wrapper.get(".test-result").text()).toBe("Test notification sent");
+    expect(wrapper.get(".test-result").attributes("data-type")).toBe("success");
     expect(toast.success).not.toHaveBeenCalled();
+
+    await wrapper.get(".test-result .alert-close").trigger("click");
+    expect(wrapper.find(".test-result").exists()).toBe(false);
   });
 
-  test("a notifier that didn't get the test is said once, by the server's message", async () => {
-    // a 502 `notification_failed`: the API client shows its message, so the card adds no second toast
-    const failed = Object.assign(new Error("502"), {
-      response: { status: 502, data: { detail: { code: "notification_failed", message: "The notifier didn't get it." } } },
-    });
-    api.testNotifierEvents.mockResolvedValue({ data: null, error: failed });
+  test("a notifier that didn't get the test (502): Test failed, and why", async () => {
+    api.testNotifierEvents.mockResolvedValue(failure(502, { code: "notification_failed" }));
     const wrapper = mountToggle();
     await flushPromises();
 
     await button(wrapper, "Send test notification").trigger("click");
     await flushPromises();
 
+    const result = wrapper.get(".test-result");
+    expect(result.attributes("data-type")).toBe("error");
+    expect(result.text()).toBe(
+      "Test failed: The notifier didn't get it. Check its URL, and that the service it sends to is running.",
+    );
     expect(toast.error).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  test("a test that failed otherwise says why too", async () => {
+    const wrapper = mountToggle();
+    await flushPromises();
+    const send = async () => {
+      await button(wrapper, "Send test notification").trigger("click");
+      await flushPromises();
+      return wrapper.get(".test-result").text();
+    };
+
+    api.testNotifierEvents.mockResolvedValueOnce(failure(404, { code: "not_found" }));
+    expect(await send()).toBe("Test failed: This notifier no longer exists.");
+    api.testNotifierEvents.mockResolvedValueOnce(failure(503, { code: "paused_for_restore" }));
+    expect(await send()).toBe("Test failed: Recipe cards are paused while a backup is restored. Try again in a minute.");
+    api.testNotifierEvents.mockResolvedValueOnce({ data: null, error: new Error("Network Error") });
+    expect(await send()).toBe("Test failed: The server couldn't be reached. Check your connection and try again.");
+    api.testNotifierEvents.mockResolvedValueOnce(failure(500, {}));
+    expect(await send()).toBe("Test failed: Something went wrong (500).");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("with BASE_URL left at localhost, warns that the links won't open on a phone, once notifications are on or tested", async () => {
+    api.getSettings.mockResolvedValue({ data: settings({ baseUrlSet: false }), error: null });
+    api.updateNotifierEvents.mockResolvedValue({ data: { recipeIngestionReady: true }, error: null });
+    api.testNotifierEvents.mockResolvedValue({ data: null, error: null });
+    const wrapper = mountToggle();
+    await flushPromises();
+    expect(api.getSettings).toHaveBeenCalledOnce();
+    // off and untested: these notifications aren't sent, so nothing to warn about
+    expect(wrapper.find(".base-url-unset").exists()).toBe(false);
+
+    await wrapper.get(".switch input").setValue(true);
+    await flushPromises();
+    expect(wrapper.get(".base-url-unset").text()).toBe(
+      "Links in notifications point to localhost, so they won't open on a phone. Set BASE_URL on the server to the address your phone uses.",
+    );
+    expect(wrapper.get(".base-url-unset").attributes("data-type")).toBe("warning");
+
+    const off = mountToggle("n2");
+    await flushPromises();
+    expect(off.find(".base-url-unset").exists()).toBe(false);
+    await button(off, "Send test notification").trigger("click");
+    await flushPromises();
+    expect(off.find(".base-url-unset").exists()).toBe(true);
+  });
+
+  test("no BASE_URL warning when it's set, or when the server doesn't take cards; settings loaded already aren't asked again", async () => {
+    await useRecipeIngestSettings().load();
+    api.getNotifierEvents.mockResolvedValue({ data: { recipeIngestionReady: true }, error: null });
+    const wrapper = mountToggle();
+    await flushPromises();
+    expect(api.getSettings).toHaveBeenCalledOnce();
+    expect(wrapper.find(".base-url-unset").exists()).toBe(false);
+
+    resetRecipeIngestSettings();
+    api.getSettings.mockResolvedValue({ data: settings({ enabled: false, baseUrlSet: false }), error: null });
+    const disabled = mountToggle("n2");
+    await flushPromises();
+    expect(disabled.find(".base-url-unset").exists()).toBe(false);
   });
 
   test("loads another notifier's switch when it's given one", async () => {

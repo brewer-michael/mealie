@@ -616,6 +616,8 @@ export function rememberRecipeIngestBatch(batch: RecipeIngestionBatchOut) {
 export interface RecipeIngestCommitNotice {
   text: string;
   warning: string | null;
+  /** The card just added: the cards list offers Undo, which takes it back to review */
+  undoJobId?: string | null;
 }
 
 /** A line in the cards list: what the review left for it, or what adding a batch's clean cards did */
@@ -627,6 +629,10 @@ export interface RecipeIngestQueueNotice {
   items: string[];
   /** The batch it's about: shown in that batch's section while there is one, else at the top of the list */
   batchId?: string | null;
+  /** The card it says was added: the line offers Undo */
+  undoJobId?: string | null;
+  /** A card the line is about: its "Open card" link */
+  cardPath?: string | null;
 }
 
 /** A notice older than this is about an earlier visit (the next card's page didn't open) */

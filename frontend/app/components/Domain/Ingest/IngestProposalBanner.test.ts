@@ -94,6 +94,17 @@ describe("IngestProposalBanner", () => {
     expect(wrapper.emitted("dismiss")).toHaveLength(1);
   });
 
+  test("a recipe rebuilt from the reviewer's text says so, and is used or kept the same way", async () => {
+    const rebuilt: CardProposal = { id: "p3", kind: "full", origin: "rebuild", draft: { name: "Banana Mug Cake" } };
+    const wrapper = mountBanner({ proposal: rebuilt });
+
+    expect(wrapper.text()).toContain("Rebuilt from your text, and you've edited the card since.");
+    expect(wrapper.text()).not.toContain("read again");
+    expect(buttons(wrapper)).toEqual(["Use the new reading", "Keep mine"]);
+    await click(wrapper, "Use the new reading");
+    expect(wrapper.emitted("use")).toEqual([["replace"]]);
+  });
+
   test("nothing can be used while the editor is read-only", () => {
     const wrapper = mountBanner({ proposal: region, readonly: true });
     expect(wrapper.findAll("button").every(b => b.attributes("disabled") !== undefined)).toBe(true);

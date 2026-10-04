@@ -385,8 +385,9 @@ export class RecipeIngestAPI extends BaseAPI {
     );
   }
 
-  async testNotifierEvents(notifierId: string) {
-    return await this.requests.post<null>(routes.notifiersIdEventsTest(notifierId), {});
+  /** 204 when the notifier got it; 502 `notification_failed` when it didn't (Apprise or the service refused) */
+  async testNotifierEvents(notifierId: string, config: RecipeIngestRequestConfig = {}) {
+    return await this.requests.post<null>(routes.notifiersIdEventsTest(notifierId), {}, requestOptions(config));
   }
 
   async getAbout() {

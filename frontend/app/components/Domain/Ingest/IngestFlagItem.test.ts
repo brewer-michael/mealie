@@ -55,9 +55,9 @@ const stubs = {
 
 const wrappers: VueWrapper[] = [];
 
-function mountItem(value: NeedsALookItem, readonly = false, canReread = true) {
+function mountItem(value: NeedsALookItem, readonly = false, canReread = true, extra: { canParse?: boolean; canCreateFoods?: boolean } = {}) {
   const wrapper = mount(IngestFlagItem, {
-    props: { item: value, readonly, canReread },
+    props: { item: value, readonly, canReread, ...extra },
     global: { mocks: { $globals: { icons: {} } }, stubs },
   });
   wrappers.push(wrapper);
@@ -250,7 +250,7 @@ describe("IngestFlagItem", () => {
       expect(wrapper.get(".ingest-flag-item__mark").text()).toBe("2-3");
       expect(wrapper.get(".ingest-flag-item__reading").text()).toBe("Read as: 2 cup flour, to 3");
       expect(wrapper.get(".ingest-flag-item__explanation").text()).toBe("The 3 of 2-3 is kept in the note.");
-      expect(buttonTexts(wrapper)).toEqual(["Re-read", "Looks right", "Keep as text", "Edit"]);
+      expect(buttonTexts(wrapper)).toEqual(["Re-read", "Looks right", "Keep as text", "Parse with AI", "Edit"]);
 
       await button(wrapper, "Keep as text").trigger("click");
       await button(wrapper, "Looks right").trigger("click");
@@ -278,17 +278,75 @@ describe("IngestFlagItem", () => {
     test("a line already kept as text, or another flag, has nothing to keep", () => {
       const kept = mountItem(itemFor(check("i3", { value: "1" })));
       expect(kept.find(".ingest-flag-item__reading").exists()).toBe(false);
-      expect(buttonTexts(kept)).toEqual(["Re-read", "Looks right", "Edit"]);
+      expect(buttonTexts(kept)).toEqual(["Re-read", "Looks right", "Parse with AI", "Edit"]);
 
       const unsure = flag({ id: "unsure:ingredients:i1", kind: "unsure", severity: "warning", source: "model", field: "ingredients", ref: "i1", params: { text: "2-3" } });
       const other = mountItem(itemFor(unsure));
       expect(other.find(".ingest-flag-item__reading").exists()).toBe(false);
       expect(buttonTexts(other)).not.toContain("Keep as text");
+      expect(buttonTexts(other)).not.toContain("Parse with AI");
+    });
+
+    test("Parse with AI asks for the line to be parsed again, when the card can be", async () => {
+      const range = check("i1", { value: "2-3", start: 0, end: 3 });
+      const idle = mountItem(itemFor(range), false, true, { canParse: true });
+      await button(idle, "Parse with AI").trigger("click");
+      expect(idle.emitted("parse")).toEqual([[range]]);
+
+      // a task running, or a group that can't read cards with AI
+      const busy = mountItem(itemFor(range), false, true, { canParse: false });
+      expect(button(busy, "Parse with AI").attributes("disabled")).toBeDefined();
     });
 
     test("Keep as text is off while the card is read again", () => {
       const wrapper = mountItem(itemFor(check("i1", { value: "2-3" })), true);
       expect(button(wrapper, "Keep as text").attributes("disabled")).toBeDefined();
+    });
+  });
+
+  describe("Check the link", () => {
+    const onions = normalizeDraft({
+      ingredients: [
+        { referenceId: "i1", originalText: "2 rd onions, diced", quantity: 2, unit: null, food: { id: "f-red", name: "red onion" }, note: "diced" },
+        { referenceId: "i2", originalText: "1 tbls butter", quantity: 1, unit: { id: "u-tbsp", name: "tablespoon" }, food: { id: "f-b", name: "butter" }, note: "" },
+      ],
+    });
+    const link = (ref: string, params: Record<string, unknown>, id = `linked_fuzzy:ingredients:${ref}`) => flag({
+      id,
+      kind: "linked_fuzzy",
+      severity: "warning",
+      source: "parser",
+      field: "ingredients",
+      ref,
+      params,
+    });
+    const itemFor = (f: CardFlag) => buildNeedsALook([f], [f], new Set(), onions, []).items[0]!;
+
+    test("says what it was linked to; Keep as new food names the food as the card writes it", async () => {
+      const fuzzy = link("i1", { name: "red onion", kind: "food", start: 2, end: 11 });
+      const wrapper = mountItem(itemFor(fuzzy), false, true, { canCreateFoods: true });
+
+      expect(wrapper.text()).toContain("Check the link");
+      expect(wrapper.text()).toContain("Linked to \"red onion\": check it's the same thing.");
+      expect(buttonTexts(wrapper)).toEqual(["Re-read", "Looks right", "Keep as new food", "Edit"]);
+      await button(wrapper, "Keep as new food").trigger("click");
+      await button(wrapper, "Looks right").trigger("click");
+      expect(wrapper.emitted("keep-as-new")).toEqual([[fuzzy]]);
+      expect(wrapper.emitted("resolve")).toEqual([[fuzzy, "dismissed"]]);
+    });
+
+    test("a unit linked by a near miss is kept as a new unit", () => {
+      const unit = link("i2", { name: "tablespoon", kind: "unit", start: 2, end: 6 }, "linked_fuzzy:ingredients:i2#unit");
+      const wrapper = mountItem(itemFor(unit), false, true, { canCreateFoods: true });
+      expect(buttonTexts(wrapper)).toContain("Keep as new unit");
+    });
+
+    test("nothing to keep without the words on the card, or for a member who can't add foods", () => {
+      const nowhere = mountItem(itemFor(link("i1", { name: "red onion", kind: "food" })), false, true, { canCreateFoods: true });
+      expect(buttonTexts(nowhere)).not.toContain("Keep as new food");
+
+      const member = mountItem(itemFor(link("i1", { name: "red onion", kind: "food", start: 2, end: 11 })));
+      expect(buttonTexts(member)).not.toContain("Keep as new food");
     });
   });
 

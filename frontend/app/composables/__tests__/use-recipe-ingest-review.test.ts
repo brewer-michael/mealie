@@ -28,6 +28,7 @@ import {
   parseLoss,
   parseQuantity,
   regionFromCropResult,
+  regionFromHint,
   rereadTargets,
   rereadTargetValue,
   sortFlags,
@@ -71,6 +72,9 @@ const api = vi.hoisted(() => ({
   getCounts: vi.fn(),
   getJobs: vi.fn(),
   cancel: vi.fn(),
+  regionHint: vi.fn(),
+  rebuild: vi.fn(),
+  parseLines: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }));
 
@@ -732,6 +736,14 @@ describe("drafts and proposals", () => {
 });
 
 describe("crop regions", () => {
+  test("a region hint starts the selection at its height, reaching a little past it either side", () => {
+    expect(regionFromHint({ x: 0.05, y: 0.2274, width: 0.9, height: 0.05 })).toEqual({ x: 0, y: 0.2274, width: 1, height: 0.05 });
+    const column = regionFromHint({ x: 0.5, y: 0.1, width: 0.3, height: 0.05 });
+    expect(column.x).toBeCloseTo(0.45);
+    expect(column.width).toBeCloseTo(0.4);
+    expect(column.y).toBe(0.1);
+  });
+
   test("a selection becomes fractions of the upright page", () => {
     const region = regionFromCropResult({
       coordinates: { left: 512, top: 1024, width: 1024, height: 256 },
@@ -2087,5 +2099,327 @@ describe("useRecipeIngestReview", () => {
 
     expect(await review.cancelTask()).toBe(false);
     expect(review.notice.value).toMatchObject({ kind: "error", text: "This card no longer exists." });
+  });
+
+  // ==========================================
+  // What a save parsed (FR-01)
+
+  /** "1 C. brown sugar" typed on a new line, as the server's save parses and stores it */
+  const typedSugar = { referenceId: "i4", title: null, originalText: "", quantity: null, unit: null, food: null, note: "1 C. brown sugar", display: "1 C. brown sugar" };
+  const parsedSugar = {
+    referenceId: "i4",
+    title: null,
+    originalText: "1 C. brown sugar",
+    quantity: 1,
+    unit: { id: "u-cup", name: "cup" },
+    food: { id: "f-sugar", name: "brown sugar" },
+    note: "",
+    display: "1 cup brown sugar",
+    parseConfidence: 0.92,
+    extractedHash: "hash-i4",
+  };
+  const sugarShorthand = flag({ id: "shorthand_read:ingredients:i4", kind: "shorthand_read", severity: "info", source: "parser", field: "ingredients", ref: "i4", params: { from: "C.", to: "cup" } });
+
+  test("a line typed as text shows what the save parsed: its amount, unit and food", async () => {
+    const { review } = await loaded();
+    review.draft.value.ingredients.push({ ...typedSugar });
+    await nextTick();
+
+    api.updateJob.mockResolvedValueOnce(ok({
+      draftVersion: 4,
+      flags: [blankFlag, unsureFlag, sugarShorthand],
+      errorCount: 1,
+      warningCount: 1,
+      ingredients: [parsedSugar],
+    }));
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+
+    expect(api.updateJob.mock.calls[0]![1].draft.ingredients[3]).toMatchObject({ note: "1 C. brown sugar", quantity: null });
+    expect(review.draft.value.ingredients[3]).toMatchObject({
+      referenceId: "i4",
+      originalText: "1 C. brown sugar",
+      quantity: 1,
+      unit: { id: "u-cup", name: "cup" },
+      food: { id: "f-sugar", name: "brown sugar" },
+      note: "",
+    });
+    // the flags the server raised describe the line the page now shows
+    expect(review.infoFlags.value.map(item => item.id)).toEqual(["shorthand_read:ingredients:i4"]);
+    // the parsed line is what the server stores: nothing is saved again
+    expect(review.isDirty.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledOnce();
+  });
+
+  test("a line edited again while its save was out keeps the edit, which is saved next", async () => {
+    const { review } = await loaded();
+    review.draft.value.ingredients.push({ ...typedSugar });
+    await nextTick();
+
+    let answerSave: (value: unknown) => void = () => {};
+    api.updateJob.mockImplementationOnce(() => new Promise((resolve) => {
+      answerSave = resolve;
+    }));
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(api.updateJob).toHaveBeenCalledOnce();
+
+    // typed over while the save was out; another line, untouched since, takes its parse
+    review.draft.value.ingredients[3]!.note = "1 C. packed brown sugar";
+    await nextTick();
+    const parsedSalt = { ...bananaDraft().ingredients![1]!, note: "fine" };
+    answerSave(ok({ draftVersion: 4, flags: [blankFlag], errorCount: 1, warningCount: 0, ingredients: [parsedSugar, parsedSalt] }));
+    await flushPromises();
+
+    expect(review.draft.value.ingredients[3]).toMatchObject({ note: "1 C. packed brown sugar", quantity: null, unit: null, food: null });
+    expect(review.draft.value.ingredients[1]).toMatchObject({ referenceId: "i2", note: "fine" });
+    expect(review.isDirty.value).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob).toHaveBeenCalledTimes(2);
+    const second = api.updateJob.mock.calls[1]![1];
+    expect(second.draftVersion).toBe(4);
+    expect(second.draft.ingredients[3]).toMatchObject({ note: "1 C. packed brown sugar", quantity: null });
+    expect(second.draft.ingredients[1]).toMatchObject({ note: "fine" });
+  });
+
+  // ==========================================
+  // Where a line is on the card (FR-03)
+
+  test("where a line is on the card comes from the server; no hint, a failure or a slow answer is none", async () => {
+    const { review } = await loaded();
+    const hint = { page: 0, x: 0.05, y: 0.31, width: 0.9, height: 0.06, source: "ocr" };
+
+    api.regionHint.mockResolvedValueOnce(ok(hint));
+    expect(await review.regionHint({ field: "ingredients", ref: "i2" })).toEqual(hint);
+    expect(api.regionHint).toHaveBeenCalledWith("j1", { field: "ingredients", ref: "i2" });
+
+    api.regionHint.mockResolvedValueOnce(apiError(404, { code: "not_found" }));
+    expect(await review.regionHint({ field: "name", ref: null })).toBeNull();
+    api.regionHint.mockRejectedValueOnce(new Error("offline"));
+    expect(await review.regionHint({ field: "name", ref: null })).toBeNull();
+
+    api.regionHint.mockImplementationOnce(() => new Promise(() => {}));
+    let answer: unknown = "waiting";
+    void review.regionHint({ field: "steps", ref: "s2" }).then((value) => {
+      answer = value;
+    });
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(answer).toBe("waiting");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(answer).toBeNull();
+    // nothing about it is said on the page
+    expect(review.notice.value).toBeNull();
+  });
+
+  // ==========================================
+  // Rebuild from this text (FR-22)
+
+  const extracting = { kind: "extract" as const, state: "queued" as const };
+
+  test("Rebuild from this text saves what's pending, sends the text, and the replaced draft says it was rebuilt", async () => {
+    const { review } = await loaded();
+    review.draft.value.attribution = "Grandma Jo";
+    await nextTick();
+
+    api.rebuild.mockResolvedValueOnce(ok(state({ draftVersion: 4, task: extracting })));
+    expect(await review.rebuild("Banana Mug Cake\n1 ripe banana")).toBe(true);
+    // the edit went first, so the server knows the draft was edited
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(api.rebuild).toHaveBeenCalledWith("j1", { transcription: "Banana Mug Cake\n1 ripe banana" });
+    expect(api.updateJob.mock.invocationCallOrder[0]!).toBeLessThan(api.rebuild.mock.invocationCallOrder[0]!);
+    expect(review.taskMode.value).toBe("rebuild");
+    expect(review.readOnly.value).toBe(true);
+
+    // done: a draft nobody edited is replaced
+    api.getJobState.mockResolvedValueOnce(ok(state({ draftVersion: 5 })));
+    api.getJob.mockResolvedValueOnce(ok(job({ draftVersion: 5, transcription: "Banana Mug Cake\n1 ripe banana", draft: bananaDraft({ name: "Banana Mug Cake" }), flags: [] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+
+    expect(review.taskMode.value).toBeNull();
+    expect(review.readOnly.value).toBe(false);
+    expect(review.job.value!.transcription).toBe("Banana Mug Cake\n1 ripe banana");
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "Rebuilt from your text" });
+  });
+
+  test("an edited card gets the rebuilt recipe as a proposal, whose banner says so", async () => {
+    const { review } = await loaded();
+    api.rebuild.mockResolvedValueOnce(ok(state({ task: extracting })));
+    await review.rebuild("Banana Mug Cake");
+
+    const rebuilt: CardProposal = { id: "p9", kind: "full", origin: "rebuild", draft: bananaDraft({ name: "Banana Cake" }) };
+    api.getJobState.mockResolvedValueOnce(ok(state({ proposalIds: ["p9"] })));
+    api.getJob.mockResolvedValueOnce(ok(job({ proposals: [rebuilt] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+
+    expect(review.otherProposals.value.map(proposal => proposal.id)).toEqual(["p9"]);
+    expect(review.draft.value.name).toBe("Banana Mug Cake");
+    expect(review.notice.value).toBeNull();
+  });
+
+  test("a rebuild that fails shows its banner; a stopped one says only that it stopped", async () => {
+    const { review } = await loaded();
+    api.rebuild.mockResolvedValueOnce(ok(state({ task: extracting })));
+    await review.rebuild("Banana Mug Cake");
+    api.getJobState.mockResolvedValueOnce(ok(state({ error: { code: "provider_failed", params: {} } })));
+    api.getJob.mockResolvedValueOnce(ok(job({ error: { code: "provider_failed", params: {} } })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(review.job.value!.error).toMatchObject({ code: "provider_failed" });
+    expect(review.notice.value).toBeNull();
+
+    // asked to stop: it stops within a heartbeat, and nothing says it was rebuilt
+    api.rebuild.mockResolvedValueOnce(ok(state({ task: { ...extracting, state: "running" } })));
+    await review.rebuild("Banana Mug Cake");
+    api.cancel.mockResolvedValueOnce(ok(state({ task: { ...extracting, state: "running", cancelRequested: true } })));
+    await review.cancelTask();
+    api.getJobState.mockResolvedValueOnce(ok(state()));
+    api.getJob.mockResolvedValueOnce(ok(job()));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(review.taskMode.value).toBeNull();
+    expect(review.notice.value).toBeNull();
+  });
+
+  test("a rebuild isn't sent while another task runs, nor with edits that couldn't be saved, nor for empty text", async () => {
+    const { review } = await loaded();
+    api.rebuild.mockResolvedValueOnce(apiError(409, { code: "busy" }));
+    expect(await review.rebuild("Banana Mug Cake")).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "This card is being read. Try again when it's done." });
+    expect(review.taskMode.value).toBeNull();
+
+    expect(await review.rebuild("   ")).toBe(false);
+    expect(api.rebuild).toHaveBeenCalledOnce();
+
+    api.updateJob.mockResolvedValueOnce(apiError(500, "Server error"));
+    review.draft.value.name = "Offline";
+    await nextTick();
+    expect(await review.rebuild("Banana Mug Cake")).toBe(false);
+    expect(api.rebuild).toHaveBeenCalledOnce();
+    expect(review.notice.value).toMatchObject({ kind: "error", text: "Your last changes aren't saved yet. Try again when they are." });
+  });
+
+  // ==========================================
+  // Parse with AI (FR-24) and Keep as new food (FR-25)
+
+  /** A line of a card in Spanish, kept as written */
+  const harina = { referenceId: "i4", originalText: "2 tazas de harina", quantity: null, unit: null, food: null, note: "2 tazas de harina", display: "2 tazas de harina" };
+  const harinaParsed = { ...harina, quantity: 2, unit: { id: "u-cup", name: "cup" }, food: { id: "f-flour", name: "harina" }, note: "", display: "2 cup harina", parseConfidence: 0.9 };
+
+  test("Parse with AI saves first, sends the line, shows it parsing, and the parsed line lands when it's done", async () => {
+    const draft = bananaDraft();
+    api.getJob.mockResolvedValueOnce(ok(job({ draft: { ...draft, ingredients: [...draft.ingredients!, harina] } })));
+    const { review } = await loaded();
+    review.draft.value.name = "Pastel de plátano";
+    await nextTick();
+
+    api.parseLines.mockResolvedValueOnce(ok(state({ draftVersion: 4, task: extracting })));
+    expect(await review.parseWithAi(["i4", "gone"])).toBe(true);
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(api.parseLines).toHaveBeenCalledWith("j1", { refs: ["i4"] });
+    expect(review.taskMode.value).toBe("parse_lines");
+    expect(review.parsingRefs.value).toEqual(["i4"]);
+    // the editor waits, as it does while the card is read again
+    expect(review.readOnly.value).toBe(true);
+
+    api.getJobState.mockResolvedValueOnce(ok(state({ draftVersion: 5 })));
+    api.getJob.mockResolvedValueOnce(ok(job({ draftVersion: 5, draft: { ...draft, name: "Pastel de plátano", ingredients: [...draft.ingredients!, harinaParsed] } })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+
+    expect(review.parsingRefs.value).toEqual([]);
+    expect(review.readOnly.value).toBe(false);
+    expect(review.draft.value.ingredients[3]).toMatchObject({ quantity: 2, unit: { name: "cup" }, food: { name: "harina" } });
+    expect(review.notice.value).toMatchObject({ kind: "success", text: "Parsed with AI" });
+  });
+
+  test("a parse that changed nothing says so; one that failed shows its banner", async () => {
+    const draft = bananaDraft();
+    api.getJob.mockResolvedValue(ok(job({ draft: { ...draft, ingredients: [...draft.ingredients!, harina] } })));
+    const { review } = await loaded();
+
+    api.parseLines.mockResolvedValueOnce(ok(state({ task: extracting })));
+    await review.parseWithAi(["i4"]);
+    api.getJobState.mockResolvedValueOnce(ok(state()));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "Parse with AI didn't change the line." });
+
+    api.parseLines.mockResolvedValueOnce(ok(state({ task: extracting })));
+    await review.parseWithAi(["i4", "i3"]);
+    api.getJobState.mockResolvedValueOnce(ok(state({ error: { code: "ai_not_enabled", params: {} } })));
+    api.getJob.mockResolvedValueOnce(ok(job({ draft: { ...draft, ingredients: [...draft.ingredients!, harina] }, error: { code: "ai_not_enabled", params: {} } })));
+    review.dismissNotice();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(review.job.value!.error).toMatchObject({ code: "ai_not_enabled" });
+    expect(review.notice.value).toBeNull();
+  });
+
+  test("Parse with AI isn't sent for lines the card hasn't, or while another task runs", async () => {
+    const { review } = await loaded();
+    expect(await review.parseWithAi(["gone"])).toBe(false);
+    expect(api.parseLines).not.toHaveBeenCalled();
+
+    api.parseLines.mockResolvedValueOnce(apiError(409, { code: "busy" }));
+    expect(await review.parseWithAi(["i1"])).toBe(false);
+    expect(review.notice.value).toMatchObject({ kind: "info", text: "This card is being read. Try again when it's done." });
+    expect(review.parsingRefs.value).toEqual([]);
+  });
+
+  test("Keep as new food unlinks the near miss and names the food as the card writes it", async () => {
+    const onion = { referenceId: "i4", originalText: "2 rd onions, diced", quantity: 2, unit: null, food: { id: "f-red", name: "red onion" }, note: "diced", display: "2 red onion diced" };
+    const fuzzy = flag({ id: "linked_fuzzy:ingredients:i4", kind: "linked_fuzzy", severity: "warning", source: "parser", field: "ingredients", ref: "i4", params: { name: "red onion", kind: "food", start: 2, end: 11 } });
+    const draft = bananaDraft();
+    api.getJob.mockResolvedValueOnce(ok(job({ draft: { ...draft, ingredients: [...draft.ingredients!, onion] }, flags: [blankFlag, fuzzy] })));
+    const { review } = await loaded();
+
+    review.keepAsNew(fuzzy);
+    await nextTick();
+    expect(review.draft.value.ingredients[3]).toMatchObject({ food: { id: null, name: "rd onions" }, quantity: 2, note: "diced", display: "2 rd onions diced" });
+    expect(review.needsALook.value.find(item => item.flag.id === fuzzy.id)!.state).toBe("fixed");
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft.ingredients[3].food).toEqual({ id: null, name: "rd onions" });
+  });
+
+  // ==========================================
+  // The possible-duplicate banner follows the saved name (FR-25)
+
+  test("a save's answer says which recipe or waiting card the saved name matches, and what commit would name it", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ duplicateOf: { id: "r0", slug: "banana-mug-cake", name: "Banana Mug Cake" }, duplicateName: "Banana Mug Cake (1)" })));
+    const { review } = await loaded();
+    expect(review.job.value!.duplicateName).toBe("Banana Mug Cake (1)");
+
+    // renamed away from the clash: the banner goes
+    api.updateJob.mockResolvedValueOnce(ok({ draftVersion: 4, flags: [blankFlag], duplicateOf: null, duplicateJob: null, duplicateName: null }));
+    review.draft.value.name = "Banana Bread";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(review.job.value).toMatchObject({ duplicateOf: null, duplicateJob: null, duplicateName: null });
+
+    // to a name another card waiting has, and a recipe holds twice already
+    api.updateJob.mockResolvedValueOnce(ok({
+      draftVersion: 5,
+      flags: [blankFlag],
+      duplicateOf: { id: "r1", slug: "scones", name: "Scones" },
+      duplicateJob: { id: "j7", title: "Scones" },
+      duplicateName: "Scones (2)",
+    }));
+    review.draft.value.name = "Scones";
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(review.job.value).toMatchObject({
+      duplicateOf: { slug: "scones" },
+      duplicateJob: { id: "j7" },
+      duplicateName: "Scones (2)",
+    });
   });
 });
