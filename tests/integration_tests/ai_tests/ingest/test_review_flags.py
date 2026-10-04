@@ -9,7 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
-from test_jobs_api import banana_draft, job_row, job_url, seed_job, set_columns
+from test_jobs_api import assert_code, banana_draft, job_row, job_url, seed_job, set_columns
 
 from mealie.db.db_setup import session_context
 from mealie.schema.recipe_ingest import (
@@ -220,3 +220,34 @@ def test_dismissing_a_whole_card_proposal_keeps_the_drafts_own_flags(
     assert _reading_flags(saved["flags"]) == []
     assert saved["errorCount"] == 0
     assert job_row(job_id)["proposals"] == []
+
+
+def test_a_proposal_dismissed_on_another_device_cant_be_accepted(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    The phone dismisses the whole-card proposal, which keeps `draftVersion`; the laptop still shows it and accepts it
+    with the version it read. Its reading flags are gone with the proposal, so the save is refused and the laptop
+    reloads, rather than storing the new reading with none of its flags.
+    """
+    user = unique_user_fn_scoped
+    job_id = _reextracted(user)
+    job = api_client.get(job_url(job_id), headers=user.token).json()
+    [proposal] = job["proposals"]
+    version = job["draftVersion"]
+
+    dismissed = _put(api_client, user, job_id, job["draft"], resolvedProposalIds=[proposal["id"]])
+    assert dismissed["draftVersion"] == version
+
+    response = api_client.put(
+        job_url(job_id),
+        json={"draftVersion": version, "draft": proposal["draft"], "resolvedProposalIds": [proposal["id"]]},
+        headers=user.token,
+    )
+    assert assert_code(response, 409, "version_conflict")["current"] == version
+    row = job_row(job_id)
+    assert row["draft"]["steps"][1]["text"] == "Microwave for 1 minute."
+    assert (row["draft_version"], row["proposals"]) == (version, [])
+
+    # a stale dismissal of it changes nothing, so it still lands
+    assert _put(api_client, user, job_id, job["draft"], resolvedProposalIds=[proposal["id"]])["draftVersion"] == version

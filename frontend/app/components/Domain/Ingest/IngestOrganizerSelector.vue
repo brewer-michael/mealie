@@ -1,7 +1,7 @@
 <template>
   <div class="ingest-organizer-selector" @keyup.enter.capture="keepEnterFromCreating">
     <RecipeOrganizerSelector
-      v-model="model"
+      v-model="selected"
       :selector-type="selectorType"
       :show-add="false"
       :input-attrs="{ disabled: readonly }"
@@ -12,6 +12,7 @@
 <script setup lang="ts">
 import RecipeOrganizerSelector from "~/components/Domain/Recipe/RecipeOrganizerSelector.vue";
 import type { CardDraftRef } from "~/lib/api/types/recipe-ingest";
+import type { RecipeTag } from "~/lib/api/types/recipe";
 
 /**
  * The review page's tag, category or tool selector (docs/ai/PHASE2.md §6.2): upstream's `RecipeOrganizerSelector`
@@ -25,6 +26,14 @@ withDefaults(defineProps<{
 });
 
 const model = defineModel<CardDraftRef[]>({ required: true });
+
+/** Upstream's selector types its value as whole organizers; the draft keeps each one's id and name, all it reads */
+const selected = computed({
+  get: () => model.value as RecipeTag[],
+  set: (value: CardDraftRef[] | undefined) => {
+    model.value = value ?? [];
+  },
+});
 
 /**
  * Upstream's selector creates an organizer when Enter goes up on text that matches none, whatever `showAdd` says, so

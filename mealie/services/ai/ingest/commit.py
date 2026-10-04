@@ -371,6 +371,16 @@ def draft_to_recipe(
         raise DraftInvalid.of(e) from e
 
 
+def _attribution_text(attribution: str, title: str) -> str:
+    """
+    The attribution as the note titled `title` ("From") holds it: a card's own leading "From" (or the title's word),
+    with or without a colon, isn't repeated, so "From Grandma Jo" reads "From: Grandma Jo", not "From: From Grandma Jo"
+    """
+    words = sorted({"from", title.strip().lower()} - {""}, key=len, reverse=True)
+    leading = re.compile(rf"^(?:{'|'.join(map(re.escape, words))})(?:\s*:\s*|\s+|$)", re.IGNORECASE)
+    return leading.sub("", attribution.strip(), count=1).strip()
+
+
 def _build_recipe(
     draft: CardDraft,
     name: str,
@@ -394,8 +404,9 @@ def _build_recipe(
             steps.append(RecipeStep(id=uuid5(recipe_id, f"step:{step.id}"), title=title, text=text))
 
     notes: list[RecipeNote] = []
-    if attribution := convert(draft.attribution).strip():
-        notes.append(RecipeNote(title=translator.t("recipe-ingest.note-from"), text=attribution))
+    note_from = translator.t("recipe-ingest.note-from")
+    if attribution := _attribution_text(convert(draft.attribution), note_from):
+        notes.append(RecipeNote(title=note_from, text=attribution))
     for note in draft.notes:
         title, text = convert(note.title).strip(), convert(note.text).strip()
         if title or text:

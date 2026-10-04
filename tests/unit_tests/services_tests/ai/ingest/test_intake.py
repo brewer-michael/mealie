@@ -25,7 +25,8 @@ from mealie.core.exceptions import NoEntryFound
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestJobsRepo, IngestRepos, utcnow
-from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate
+from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
+from mealie.schema.group.ai_routing import AIUsageLogCreate
 from mealie.schema.recipe_ingest import (
     IngestRejectReason,
     IngestSource,
@@ -598,6 +599,56 @@ def test_cloud_providers_over_their_limit_dont_make_local_only_cards_readable(
     )
     local_over = reading_readiness(db, group_id, household_id)
     assert local_over.can_read and local_over.local_ready
+
+
+@pytest.mark.parametrize("cloud_fallback", [False, True])
+def test_a_local_provider_over_its_limit_still_reads_local_only_cards(
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, cloud_fallback: bool
+):
+    # the router drops the local provider (over its limit) before the policy drops the cloud fallback (within its
+    # limit): that's still a month's limit, not "no provider on your network", whether or not a fallback is set
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    repos = user.repos
+    local = repos.group_ai_providers.create(
+        AIProviderCreate(
+            name="Ollama",
+            model="m",
+            api_key="k",
+            base_url="http://127.0.0.1:11434/v1",
+            runs_locally=True,
+            monthly_token_limit=100,
+        )
+    )
+    repos.group_ai_provider_settings.update(
+        repos.group_id,
+        AIProviderSettingsUpdate(default_provider_id=local.id, image_provider_id=local.id, audio_provider_id=None),
+    )
+    if cloud_fallback:
+        cloud = repos.group_ai_providers.create(AIProviderCreate(name="Cloud", model="m", api_key="k"))
+        repos.group_ai_provider_routes.replace_routes(
+            {AIProviderSlot.default: [local.id, cloud.id], AIProviderSlot.image: [local.id, cloud.id]}
+        )
+    IngestRepos(db, group_id, household_id).settings.upsert(RecipeIngestionSettingsUpdate(local_only=True))
+
+    within = reading_readiness(db, group_id, household_id)
+    assert (within.local_ready, within.limit_reached) == (True, False)
+
+    repos.group_ai_usage.create(
+        AIUsageLogCreate(
+            provider_id=local.id,
+            provider_name="Ollama",
+            model="m",
+            protocol=local.protocol,
+            slot=AIProviderSlot.default,
+            prompt_tokens=400,
+            completion_tokens=100,
+            success=True,
+        )
+    )
+    over = reading_readiness(db, group_id, household_id)
+    assert (over.can_read, over.local_ready, over.limit_reached) == (True, True, True)
 
 
 def test_source_names_and_the_duplicate_key(tmp_path: Path):

@@ -204,6 +204,24 @@ def test_flags_come_in_reading_order():
         ("Preheat oven to 35 degrees.", True),
         ("Put in a 35° oven until golden.", True),
         ("Let rise in a warm place (80°) until doubled, then bake at 35° for 30 minutes.", True),
+        # terse cards name no oven; a misread temperature is still caught
+        ("350° - 30 min.", False),
+        ("35° - 30 min.", True),
+        ("35° 30 min", True),
+        ("Pour into greased pan. 35° for 1 hr.", True),
+        ("Cover with foil; 35° for 2 hrs.", True),
+        ("Cook at 35° for 1 hour.", True),
+        ("Fry in deep fat at 37°.", True),
+        ("Let rise until doubled and bake at 37° for 30 min.", True),  # the nearest word says what it's for
+        ("Let rise 1 hr. 35° for 30 min.", True),
+        ("Bake at 3500°F for 40 minutes.", True),  # an invented digit
+        # cooling or rising, whatever the stop before it or the case after it
+        ("Bake at 350° for 1 hr; cool to 70°.", False),
+        ("bake 1 hr at 350°. cool to 70° before slicing", False),
+        ("Bake at 350° for 1 hr, then cool to room temp (70°).", False),
+        ("Let rise in oven (85°) until doubled.", False),
+        ("Dissolve 1 pkg. yeast in 1/4 c. 110°F water.", False),  # a measure's dot doesn't end the clause
+        ("Roast until internal temperature reaches 145°F.", False),
     ],
 )
 def test_implausible_temperatures(text: str, flagged: bool):
@@ -281,6 +299,50 @@ BANANA_LINES = [
         (ingredient("1 (16 oz.) can tomatoes", quantity=1, unit="can", food="tomatoes", confidence=0.909), "16"),
         (ingredient("1 (8 oz) pkg cream cheese", quantity=1, food="cream cheese", confidence=0.881), "8"),
         (ingredient("2 T. butter + 1 T. oil", quantity=2, unit="tablespoon", food="butter + 1 T. oil"), "1"),
+        # a second ingredient run into the food, its amount in the note, or the same amount twice
+        (
+            ingredient(
+                "2 c. flour (or 1 1/2 c. bread flour)",
+                quantity=2,
+                unit="cup",
+                food="flour bread flour",
+                note="or 1 1/2 c.",
+                confidence=0.946,
+                linked=False,
+            ),
+            "1 1/2",
+        ),
+        (
+            ingredient(
+                "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)",
+                quantity=1,
+                unit="cup",
+                food="buttermilk vinegar",
+                note="or 1 c. milk + 1 T.",
+                confidence=0.979,
+                linked=False,
+            ),
+            "1",
+        ),
+        (
+            ingredient(
+                "1 c. sugar, 1 c. flour", quantity=1, unit="cup", food="sugar flour", confidence=0.858, linked=False
+            ),
+            "1",
+        ),
+        (ingredient("1 c. sugar, 1 c. brown sugar", quantity=1, unit="cup", food="sugar", confidence=0.963), "1"),
+        (
+            ingredient(
+                "1 t. salt, 1 t. soda",
+                quantity=1,
+                unit="tsp",
+                food="salt soda",
+                note="1 t.",
+                confidence=0.89,
+                linked=False,
+            ),
+            "1",
+        ),
     ],
 )
 def test_an_amount_the_parsed_fields_lost_is_flagged(line: CardDraftIngredient, dropped: str):
@@ -309,6 +371,18 @@ def test_an_amount_the_parsed_fields_lost_is_flagged(line: CardDraftIngredient, 
         ingredient("Juice of 1 lemon", quantity=1, food="lemon", note="Juice of"),
         ingredient("1 doz. eggs", quantity=1, food="doz eggs", linked=False),  # unit_unclear says so instead
         ingredient("2 eggs, beaten", quantity=2, food="egg", note="beaten"),
+        ingredient("2-1/4 c. flour", quantity=2.25, unit="cup", food="flour"),  # a mixed number, not a range
+        # numbers that are part of the food's name, as the parser keeps them
+        ingredient("1 c. 2% milk", quantity=1, unit="cup", food="2% milk", linked=False),
+        ingredient("2 c. V8 juice", quantity=2, unit="cup", food="V8 juice", linked=False),
+        ingredient("1 c. 7-Up", quantity=1, unit="cup", food="7-Up", linked=False),
+        ingredient("1/2 tsp. 5-spice powder", quantity=0.5, unit="tsp", food="5-spice powder", linked=False),
+        ingredient('1 9" pie shell, baked', quantity=1, food='9" pie shell', note="baked", linked=False),
+        ingredient("1 lb. 80/20 ground beef", quantity=1, unit="pound", food="80/20 ground beef", linked=False),
+        # a substitution the note keeps, and two amounts of one food
+        ingredient("1 c. butter (or 1 c. margarine)", quantity=1, unit="cup", food="butter", note="or 1 c. margarine"),
+        ingredient("1 pkg. yeast (or 2 1/4 tsp.)", quantity=1, unit="package", food="yeast", note="or 2 1/4 tsps"),
+        ingredient("2 T. + 1 t. sugar", quantity=2, unit="tablespoon", food="sugar", note="(1 t)"),
     ],
 )
 def test_an_amount_the_parsed_fields_keep_is_not(line: CardDraftIngredient):
@@ -497,6 +571,28 @@ def test_a_kept_note_flag_stays_with_its_note():
     # likewise when notes are reordered
     card.notes = [CardDraftNote(text="Serve with [blank]"), CardDraftNote(text="Bake [blank] min")]
     assert count_unresolved(compute_flags(card, None, resolutions)) == (2, 0)
+
+
+def test_a_note_keeps_its_unsure_flag_when_a_note_above_it_is_deleted():
+    """A note's reading flags are found again by what it says, wherever it moved; a resolution stays with its id"""
+    card = draft(notes=[CardDraftNote(text="Double for a 9x13 pan"), CardDraftNote(text="Freezes for 3 months")])
+    extraction = ExtractionMeta(unsure=[ExtractionUnsure(text="3 months", alternatives=["8 months"], reason="faded")])
+    extracted = compute_flags(card, extraction, {})
+    unsure = only(extracted, CardFlagKind.unsure)
+    assert (unsure.field, unsure.ref, unsure.alternatives) == ("notes", "1", ["8 months"])
+    assert only(compute_flags(card, extraction, {}, previous=extracted), CardFlagKind.unsure) == unsure
+
+    # the reviewer deletes the first note: the second moves up, and its warning still needs a look
+    del card.notes[0]
+    saved = compute_flags(card, extraction, {unsure.id: FlagResolution.dismissed}, previous=extracted)
+    moved = only(saved, CardFlagKind.unsure)
+    assert (moved.field, moved.ref, moved.alternatives, moved.resolution) == ("notes", "0", ["8 months"], None)
+    assert count_unresolved(saved) == (0, 1)
+    assert compute_flags(card, extraction, {}, previous=saved) == saved  # and on the next save
+
+    # an edited note says what the reviewer typed
+    card.notes[0].text = "Freezes for 8 months"
+    assert CardFlagKind.unsure not in kinds(compute_flags(card, extraction, {}, previous=saved))
 
 
 def test_a_numbered_list_in_the_transcription_puts_no_number_on_the_card():

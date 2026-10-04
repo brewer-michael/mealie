@@ -7,8 +7,9 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   Windows (no directory-descriptor calls). Each scan creates every household's folder; unknown folders are logged once
   and ignored. Inbox jobs have no uploader.
 - **A file is one card; a first-level subfolder is one multi-page card** (pages in name order). Skipped: anything that
-  isn't a regular file or directory by `lstat` (symlinks included), names starting with `.` or `~`, partial-download
-  suffixes, `Thumbs.db`, `desktop.ini`, and the reserved `processed/`, `failed/` and `.mealie-claimed/`.
+  isn't a regular file or directory by `lstat` (symlinks included: each is logged once, since it stays for good), names
+  starting with `.` or `~`, partial-download suffixes, `Thumbs.db`, `desktop.ini`, and the reserved `processed/`,
+  `failed/` and `.mealie-claimed/`.
 - **Settled:** an entry is taken once its `(size, mtime_ns)` (every file's, for a subfolder) is unchanged since this
   process's previous scan and at least `INBOX_SETTLE` old: cameras, SMB and scanners write in place.
 - **Claim:** `os.rename` into `.mealie-claimed/<claim_ms>__<uuid>__<name>` beside it, on the share's own filesystem.
@@ -371,8 +372,19 @@ def _ignored_name(name: str) -> bool:
     )
 
 
-def _page_entries(dir_fd: int) -> list[tuple[str, os.stat_result]]:
-    """A card folder's pages: its regular files by `lstat` (not subfolders or links) not ignored by name, by name"""
+def _log_link(label: str) -> None:
+    """A link stays in the folder for good (it's never followed, moved or claimed), so it's logged once per name"""
+    _state.log_once(
+        f"link:{label}",
+        f"Skipped {label} in the recipe card inbox: links aren't followed. Put the photo itself in the folder.",
+    )
+
+
+def _page_entries(dir_fd: int, label: str | None = None) -> list[tuple[str, os.stat_result]]:
+    """
+    A card folder's pages: its regular files by `lstat` (not subfolders or links) not ignored by name, by name. With
+    the folder's `label`, a link among them is logged.
+    """
     pages = []
     with os.scandir(dir_fd) as entries:
         for entry in entries:
@@ -384,23 +396,28 @@ def _page_entries(dir_fd: int) -> list[tuple[str, os.stat_result]]:
                 continue
             if stat.S_ISREG(st.st_mode):
                 pages.append((entry.name, st))
+            elif stat.S_ISLNK(st.st_mode) and label is not None:
+                _log_link(f"{label}/{_display_name(entry.name)}")
     return sorted(pages, key=lambda page: page[0])
 
 
-def _signature(entry: os.DirEntry, dir_fd: int) -> tuple | None:
+def _signature(entry: os.DirEntry, dir_fd: int, label: str) -> tuple | None:
     """
     What has to stay the same between two scans for an entry to count as settled, with its newest mtime; None when the
-    entry isn't a card (not a regular file or directory by `lstat`, or a folder without pages)
+    entry isn't a card (not a regular file or directory by `lstat`, or a folder without pages). `label` names the
+    entry in the logs; a link is logged.
     """
     st = entry.stat(follow_symlinks=False)
     if stat.S_ISREG(st.st_mode):
         return (("", st.st_size, st.st_mtime_ns),)
+    if stat.S_ISLNK(st.st_mode):
+        _log_link(label)
     if not stat.S_ISDIR(st.st_mode):
         return None
 
     card_fd = _open_dir(entry.name, dir_fd, entry.name)
     try:
-        files = [(name, page.st_size, page.st_mtime_ns) for name, page in _page_entries(card_fd)]
+        files = [(name, page.st_size, page.st_mtime_ns) for name, page in _page_entries(card_fd, label)]
     finally:
         os.close(card_fd)
     return tuple(files) or None
@@ -417,7 +434,7 @@ def _settled_entries(dirs: _FolderDirs, now: float) -> list[str]:
                 if _ignored_name(entry.name):
                     continue
                 try:
-                    signature = _signature(entry, dirs.fd)
+                    signature = _signature(entry, dirs.fd, f"{folder.key}/{_display_name(entry.name)}")
                 except OSError:
                     continue  # gone, unreadable, or swapped for a link
                 if signature is None:

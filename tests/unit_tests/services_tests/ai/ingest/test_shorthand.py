@@ -2,7 +2,13 @@
 
 import pytest
 
-from mealie.services.ai.ingest.shorthand import SHORTHAND, UNITS, normalize_shorthand, split_size
+from mealie.services.ai.ingest.shorthand import (
+    SHORTHAND,
+    UNITS,
+    join_mixed_numbers,
+    normalize_shorthand,
+    split_size,
+)
 
 
 @pytest.mark.parametrize(
@@ -80,6 +86,16 @@ def test_only_the_token_after_the_leading_quantity_changes():
         ("1/2 Rounded tsp. baking powder", "1/2 tsp. baking powder", "Rounded"),
         ("- 2 heaping cups flour", "- 2 cups flour", "heaping"),  # any unit: "heaping cups" would be a new unit
         ("1 heaping", "1 heaping", None),  # nothing after it
+        # an item's size, abbreviated: "med onion" would be fuzzy-matched to the group's "red onion"
+        ("1 med onion", "1 onion", "med"),
+        ("2 med. onions, chopped", "2 onions, chopped", "med."),
+        ("1 md cabbage", "1 cabbage", "md"),
+        ("1 LG onion", "1 onion", "LG"),
+        ("1 lge onion", "1 onion", "lge"),
+        ("1 sml onion", "1 onion", "sml"),
+        ("1 sm. pkg. instant pudding", "1 pkg. instant pudding", "sm."),
+        ("1 med", "1 med", None),
+        ("1 medium onion", "1 medium onion", None),  # a word, which the parser reads as the note
         ("1 levelled t. salt", "1 levelled t. salt", None),
         ("2 large eggs", "2 large eggs", None),  # a size of the food, which the parser reads as the note
         ("Salt, a scant pinch", "Salt, a scant pinch", None),
@@ -94,6 +110,34 @@ def test_the_pattern_finds_shorthand_after_a_size_word():
     match = SHORTHAND.match("1 heaping T. flour")
     assert match is not None and (match.group("unit"), match.group("size")) == ("T", "heaping ")
     assert normalize_shorthand(split_size("1 heaping T. flour")[0]) == ("1 tbsp flour", True)
+    match = SHORTHAND.match("1 sm. pkg. instant pudding")
+    assert match is not None and (match.group("unit"), match.group("size")) == ("pkg", "sm. ")
+    assert normalize_shorthand(split_size("1 sm. pkg. instant pudding")[0]) == ("1 package instant pudding", True)
+
+
+@pytest.mark.parametrize(
+    "line, joined",
+    [
+        # printed recipes write mixed numbers with a dash; the parser would keep only the fraction
+        ("2-1/4 c. flour", "2 1/4 c. flour"),
+        ("1-1/2 tsp baking soda", "1 1/2 tsp baking soda"),
+        ("1 - 1/2 c. milk", "1 1/2 c. milk"),
+        ("1–1/2 c. oats", "1 1/2 c. oats"),
+        ("1-½ c. sugar", "1 ½ c. sugar"),
+        ("1 can (10-3/4 oz.) soup", "1 can (10 3/4 oz.) soup"),
+        ("Bake 1-1/2 hours", "Bake 1 1/2 hours"),
+        # ranges go up, so stay as they are
+        ("1/2-3/4 c. sugar", "1/2-3/4 c. sugar"),
+        ("2-3 lb. roast", "2-3 lb. roast"),
+        ("1-1 1/2 c. sugar", "1-1 1/2 c. sugar"),
+        ("3-5/4 c. water", "3-5/4 c. water"),
+        ("1 1/2 c. flour", "1 1/2 c. flour"),
+    ],
+)
+def test_a_mixed_number_written_with_a_dash_is_written_with_a_space(line: str, joined: str):
+    assert join_mixed_numbers(line) == joined
+    kept = join_mixed_numbers(line, keep_length=True)
+    assert len(kept) == len(line) and kept.split() == joined.split()
 
 
 def test_every_unit_the_pattern_matches_has_a_name():

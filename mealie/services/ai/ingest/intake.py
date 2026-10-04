@@ -18,7 +18,8 @@ Public interface:
 - `IntakeService(session, group_id, household_id)`: `ingest(card, options, *, confirm=None)` (blocking, takes one of
   the process's intake slots and the write lock; raises `IngestPaused`, `NoEntryFound` for an unknown batch,
   `ClaimLost`) and `ingest_async(...)`, which waits for a slot on the event loop and runs `ingest` in a worker thread.
-- `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots.
+- `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots, the inbox's
+  included.
 - `ClaimLost`: the inbox's claimed file moved away before the insert (another scanner retried it).
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
   local providers only or at all, its own local-only setting, its processing jobs (the upload's checks 3 and 4,
@@ -134,10 +135,16 @@ IntakeOutcome = IntakeAccepted | IntakeRejected
 
 async def in_intake_slot[T](work: Callable[[], T]) -> T:
     """
-    Runs an upload's memory-heavy blocking work (intake, or decoding a JSON body's images) in a worker thread once one
-    of the process's intake slots is free; until then the upload waits on the event loop
+    Runs an upload's other memory-heavy blocking work (decoding a JSON body's images) in a worker thread, under the
+    same bound as intake: once one of the process's intake slots is free (the upload waits on the event loop until
+    then), and holding one of the slots every caller of `ingest` takes, the inbox's scan included
     """
-    return await anyio.to_thread.run_sync(work, limiter=_intake_limiter)
+
+    def run() -> T:
+        with _intake_slots:
+            return work()
+
+    return await anyio.to_thread.run_sync(run, limiter=_intake_limiter)
 
 
 def source_name(prefix: str, name: str | None) -> str | None:
@@ -183,9 +190,9 @@ class IntakeService:
         """
 
         def run() -> IntakeOutcome:
-            return self.ingest(card, options, confirm=confirm)
+            return self.ingest(card, options, confirm=confirm)  # takes one of `_intake_slots` itself
 
-        return await in_intake_slot(run)
+        return await anyio.to_thread.run_sync(run, limiter=_intake_limiter)
 
     def ingest(
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
@@ -380,22 +387,23 @@ def _slot_usable(service: OpenAIService, slot: AIProviderSlot, over_limit: set[A
 
     try:
         return bool(service.runtime.candidates(slot))
-    except AIProviderLimitReachedError:
+    except AIProviderLimitReachedError, AIProviderLocalOnlyError:
+        # set up, just over this month's limit: a card read later fails `limit_reached` if it still is. The router
+        # drops providers over their limit before the policy filters, so under "local only" that holds only if a
+        # provider is local, and local ones all over their limit raise LocalOnly when a cloud fallback is left.
+        if current_policy().local_only:
+            primaries = {
+                AIProviderSlot.default: service.default_provider,
+                AIProviderSlot.image: service.image_provider,
+                AIProviderSlot.audio: service.audio_provider,
+            }
+            every = _EveryProvider(service.repos, primaries).candidates(slot)
+            if not any(is_local_provider(provider) for provider in every):
+                return False
         if over_limit is not None:
             over_limit.add(slot)
-        # set up, just over this month's limit: a card read later fails `limit_reached` if it still is. The router
-        # checks the limits before the policy filters, so under "local only" that holds only if a provider is local.
-        if not current_policy().local_only:
-            return True
-        primaries = {
-            AIProviderSlot.default: service.default_provider,
-            AIProviderSlot.image: service.image_provider,
-            AIProviderSlot.audio: service.audio_provider,
-        }
-        return any(
-            is_local_provider(provider) for provider in _EveryProvider(service.repos, primaries).candidates(slot)
-        )
-    except OpenAINotEnabledException, AIProviderLocalOnlyError:
+        return True
+    except OpenAINotEnabledException:
         return False
 
 

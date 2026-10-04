@@ -167,11 +167,15 @@ describe("IngestUploadQueue", () => {
     await flushPromises();
 
     expect(wrapper.get(".upload-status").text()).toBe("Retrying");
+    // it goes again by itself
     expect(wrapper.get(".upload-detail").text())
-      .toBe("Recipe cards are paused while a backup is restored. Try again in a minute.");
+      .toBe("Recipe cards are paused while a backup is restored. Trying again in a minute.");
 
     await vi.advanceTimersByTimeAsync(2000 + 4000 + 8000);
     expect(wrapper.get(".upload-status").text()).toBe("Upload failed");
+    // now it waits for Retry
+    expect(wrapper.get(".upload-detail").text())
+      .toBe("Recipe cards are paused while a backup is restored. Try again in a minute.");
 
     api.upload.mockResolvedValue({ data: accepted, error: null });
     await wrapper.get(".upload-retry").trigger("click");

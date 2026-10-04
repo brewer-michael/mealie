@@ -9,7 +9,7 @@ import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
 
-from ..shorthand import UNITS
+from ..shorthand import UNITS, join_mixed_numbers
 
 ILLEGIBLE = "[illegible]"
 BLANK = "[blank]"
@@ -22,10 +22,13 @@ _NUMBER = rf"(?:\d+\s*[{_GLYPHS}]|[{_GLYPHS}]|\d+\s+\d+/\d+|\d+/\d+|\d+(?:[.,]\d
 _NUMBER_RE = re.compile(rf"(?<![\d/.,])(?P<first>{_NUMBER})(?:\s*(?:-|–|—|to)\s*(?P<second>{_NUMBER}))?(?![\d/])")
 _UNIT_AFTER_NUMBER_RE = re.compile(rf"\s*(?P<unit>{'|'.join(sorted(UNITS, key=len, reverse=True))})\.?(?=\s|$|[,;)])")
 _TEMPERATURE_RE = re.compile(
-    r"(?<![\d/.,])(?P<value>\d{2,3})\s*"
+    r"(?<![\d/.,])(?P<value>\d{2,4})\s*"
     r"(?:[°º˚]\s*(?:(?P<unit>[FfCc])\b)?|degrees?\b(?:\s*(?P<unit2>[FfCc])\b)?|(?P<unit3>F)\b)"
 )
-"""`350°`, `350 °F`, `180°C`, `350 degrees F`, `350F`. A bare `C` after a number is cups ("12 C. flour")."""
+"""
+`350°`, `350 °F`, `180°C`, `350 degrees F`, `350F`, and a misread `3500°F`. A bare `C` after a number is cups ("12 C.
+flour").
+"""
 _LETTERS_RE = re.compile(r"[^\W\d_]+")
 LIST_MARKER_RE = re.compile(r"^[ \t]*\d{1,2}[.)][ \t]+", re.MULTILINE)
 """A numbered list's marker at the start of a line ("2. Microwave…"): a step's number, not an amount"""
@@ -86,9 +89,10 @@ class NumberMatch:
 
 
 def find_numbers(text: str | None) -> list[NumberMatch]:
-    """Every number and range in `text`, in order"""
+    """Every number and range in `text`, in order; "2-1/4" is the mixed number 2 1/4, not a range (it would go down)"""
+    text = text or ""
     found: list[NumberMatch] = []
-    for match in _NUMBER_RE.finditer(text or ""):
+    for match in _NUMBER_RE.finditer(join_mixed_numbers(text, keep_length=True)):
         first = _number_value(match.group("first"))
         if first is None:
             continue
@@ -100,7 +104,7 @@ def find_numbers(text: str | None) -> list[NumberMatch]:
             NumberMatch(
                 value=first[0],
                 end=second[0] if second else None,
-                text=match.group(0).strip(),
+                text=text[match.start() : match.end()].strip(),
                 parts=tuple(parts),
                 span=match.span(),
             )

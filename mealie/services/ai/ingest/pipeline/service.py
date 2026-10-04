@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.recipe_ingest import ExtractionUsage
 from mealie.services.ai.runtime import AIRuntime
-from mealie.services.ai.usage import AITokenUsage
+from mealie.services.ai.usage import AITokenUsage, record_ai_usage
 from mealie.services.openai import OpenAIService
 
 from .. import storage
@@ -56,21 +56,24 @@ class JobAIRuntime(AIRuntime):
         error: BaseException | None = None,
         error_type: str | None = None,
     ) -> None:
-        # While a backup restore pauses ingestion (§3.9) its tables may be dropped or half imported: the row would fail
-        # with a logged traceback, or be replaced by the restore anyway. The job's own tally below keeps the tokens.
-        if not storage.is_paused():
-            try:
-                super().record_attempt(
-                    provider,
-                    slot=slot,
-                    feature=feature,
-                    usage=usage,
-                    latency_ms=latency_ms,
-                    error=error,
-                    error_type=error_type,
-                )
-            finally:
-                end_transaction(self.service.repos.session)
+        # The base method's write, also while a backup restore pauses ingestion (§3.9): a restore that fails leaves the
+        # database in place, and the monthly token limits are summed from this log. Meanwhile the restore may have
+        # dropped the tables or be importing them, so a write that fails then is logged in one line, not a traceback.
+        paused = storage.is_paused()
+        try:
+            record_ai_usage(
+                self.service.repos,
+                provider,
+                slot=slot,
+                feature=feature,
+                usage=usage,
+                latency_ms=latency_ms,
+                error=error,
+                error_type=error_type,
+                expected_failure=lambda: paused or storage.is_paused(),
+            )
+        finally:
+            end_transaction(self.service.repos.session)
 
         self._tally(provider, slot, feature, usage, latency_ms, failed=error is not None or error_type is not None)
 

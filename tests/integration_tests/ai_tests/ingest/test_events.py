@@ -389,3 +389,37 @@ def test_housekeeping_carries_on_past_a_failing_notifier(
 
     assert batch_row(first)["notified_at"] is not None  # at most once: it isn't retried
     assert len(for_batch(published, second)) == 1
+
+
+def test_apprise_reads_the_event_data_and_the_notifiers_own_fields_back():
+    """
+    Home Assistant parses `document_data` with `from_json` (§8): its JSON must reach Apprise intact, and the user's own
+    `:field` and `+header` values (a literal `+` included) must arrive as written
+    """
+    import apprise
+
+    event = events.AIEvent(
+        message=events.EventBusMessage(title="Recipe cards ready", body="2 cards are ready to review."),
+        event_type=events.AIEventTypes.recipe_ingestion_ready,
+        integration_id=events.INTERNAL_INTEGRATION_ID,
+        document_data=events.EventIngestionReadyData(
+            batch_id=uuid4(),
+            job_ids=[uuid4()],
+            ready_count=2,
+            needs_attention_count=1,
+            failed_count=0,
+            review_url="http://mealie.local/g/home/recipes/cards/review?batch=x",
+        ),
+    )
+    own = "json://ha.local:8123/api/webhook/abc?:token=a+b%2Bc&+X-Key=d+e&:room=living%20room"
+    [url, other] = events.AIEventAppriseListener.update_urls_with_event_data([own, "mailto://user@example.com"], event)
+
+    assert other == "mailto://user@example.com"
+    notifier = apprise.Apprise.instantiate(url)
+    assert notifier is not None
+    extras = notifier.payload_extras
+    assert json.loads(extras["document_data"]) == json.loads(event.document_data.model_dump_json(by_alias=True))
+    assert extras["event_type"] == "recipe_ingestion_ready"
+    assert extras["token"] == "a+b+c"
+    assert extras["room"] == "living room"
+    assert notifier.headers["X-Key"] == "d+e"

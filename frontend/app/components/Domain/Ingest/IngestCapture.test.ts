@@ -132,6 +132,22 @@ describe("IngestCapture", () => {
     expect(wrapper.get(".cards-queued").text()).toBe("1 card queued");
   });
 
+  test("a card already scanned isn't counted as queued", async () => {
+    api.upload.mockResolvedValueOnce({
+      data: { batchId: "b1", jobs: [], rejected: [{ index: 0, reason: "duplicate", duplicateOf: "j0" }], summary: "" },
+      error: null,
+    });
+    const wrapper = mountCapture();
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+    expect(wrapper.find(".cards-queued").exists()).toBe(false);
+    expect(button(wrapper, ".take-photo").text()).toBe("Next card");
+
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+    expect(wrapper.get(".cards-queued").text()).toBe("1 card queued");
+  });
+
   test("front & back: Take photo, then Back side, then Next card", async () => {
     useRecipeIngestUploads().mode.value = "front-and-back";
     const wrapper = mountCapture();

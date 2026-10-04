@@ -432,6 +432,27 @@
         </template>
       </BaseDialog>
     </template>
+
+    <!-- what the last card's Commit & next said, above the review bar (upstream's toast would cover the header) -->
+    <v-snackbar
+      v-model="noticeOpen"
+      class="ingest-review__notice"
+      location="bottom"
+      :color="notice?.warning ? 'warning' : 'success'"
+      :timeout="notice?.warning ? 6000 : 2000"
+    >
+      <div class="ingest-review__notice-text">
+        {{ notice?.text }}
+      </div>
+      <div v-if="notice?.warning" class="text-body-2 ingest-review__notice-warning">
+        {{ notice.warning }}
+      </div>
+      <template #actions>
+        <v-btn variant="text" @click="noticeOpen = false">
+          {{ $t("general.close") }}
+        </v-btn>
+      </template>
+    </v-snackbar>
   </div>
 </template>
 
@@ -450,7 +471,7 @@ import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
 import RecipeNotes from "~/components/Domain/Recipe/RecipeNotes.vue";
-import { useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
+import { takeRecipeIngestCommitNotice, useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,
   fieldLabel,
@@ -495,6 +516,10 @@ onMounted(() => {
 });
 
 const queuePath = computed(() => review.queuePath());
+
+/** "Added Banana Mug Cake" (and what the commit left out), when the last card's Commit & next opened this one */
+const notice = takeRecipeIngestCommitNotice();
+const noticeOpen = ref(!!notice);
 
 // ==========================================
 // Header and checks line
@@ -744,5 +769,10 @@ whenever(() => keys.Escape!.value && regionDialog.value, () => {
 
 .ingest-review__editor {
   min-width: 0;
+}
+
+/* above the review bar, pinned (phones) or at the foot of the editor (desktop) */
+.ingest-review__notice {
+  margin-bottom: calc(64px + env(safe-area-inset-bottom));
 }
 </style>

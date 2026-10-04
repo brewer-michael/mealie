@@ -6,7 +6,7 @@ import pytest
 
 from mealie.lang.providers import get_locale_provider
 from mealie.schema.recipe.recipe import Recipe
-from mealie.schema.recipe.recipe_ingredient import RecipeIngredient
+from mealie.schema.recipe.recipe_ingredient import RecipeIngredient, SaveIngredientFood
 from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardFlagKind, CardFlagSeverity, ExtractionMeta
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
@@ -154,6 +154,62 @@ async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(uni
         "1 (16 oz.) can tomatoes": [(CardFlagKind.check_parse, {"value": "16"})],
     }
     assert all(CardFlagKind.unit_unclear in [kind for kind, _ in flags[line]] for line in unclear)
+
+
+@pytest.mark.asyncio
+async def test_mixed_numbers_names_and_second_ingredients_through_the_parser(unique_user_fn_scoped: TestUser):
+    """
+    A mixed number written with a dash is read whole, a number in a food's name is the food's, and a second
+    ingredient the parser runs into the food is checked, while a substitution its note keeps isn't
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    mixed = ["2-1/4 c. flour", "1-1/2 tsp baking soda", "1 - 1/2 c. milk", "1–1/2 c. oats", "3-1/2 oz. coconut"]
+    named = ["1 c. 2% milk", "2 c. V8 juice", "1 c. 7-Up", "1/2 tsp. 5-spice powder", '1 9" pie shell, baked']
+    named += ["1 lb. 80/20 ground beef"]
+    kept = ["1 c. butter (or 1 c. margarine)", "1 pkg. yeast (or 2 1/4 tsp.)"]
+    merged = {
+        "2 c. flour (or 1 1/2 c. bread flour)": "1 1/2",
+        "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)": "1",
+        "1 c. sugar, 1 c. flour": "1",
+        "1 c. sugar, 1 c. brown sugar": "1",
+        "1 stick butter or 1/2 c. oleo": "1/2",
+    }
+
+    parsed = await _normalize(user, mixed + named + kept + list(merged))
+    flags = _highlighted(parsed)
+
+    assert [line.quantity for line in parsed[: len(mixed)]] == [2.25, 1.5, 1.5, 1.5, 3.5]
+    assert [line.original_text for line in parsed[: len(mixed)]] == mixed
+    assert {line: flags[line] for line in mixed + named + kept} == {line: [] for line in mixed + named + kept}
+    assert {line: flags[line] for line in merged} == {
+        line: [(CardFlagKind.check_parse, {"value": value})] for line, value in merged.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_item_size_is_parsed_out_of_the_food(unique_user_fn_scoped: TestUser):
+    """ "1 med onion" isn't the food "med onion", which the group's "red onion" would match fuzzily, linked silently"""
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    for name, plural in [("onion", "onions"), ("red onion", "red onions"), ("cabbage", None), ("red cabbage", None)]:
+        user.repos.ingredient_foods.create(
+            SaveIngredientFood(name=name, plural_name=plural, group_id=user.repos.group_id)
+        )
+    lines = ["1 med onion", "2 med. onions, chopped", "1 med cabbage", "1 med red onion", "1 lg onion", "1 sml onion"]
+
+    parsed = await _normalize(user, lines)
+
+    assert [(line.food and line.food.name, line.food and line.food.id is not None, line.note) for line in parsed] == [
+        ("onion", True, "med"),
+        ("onion", True, "med., chopped"),
+        ("cabbage", True, "med"),
+        ("red onion", True, "med"),
+        ("onion", True, "lg"),
+        ("onion", True, "sml"),
+    ]
+    assert [line.original_text for line in parsed] == lines
+    assert _highlighted(parsed) == {line: [] for line in lines}
 
 
 @pytest.mark.asyncio

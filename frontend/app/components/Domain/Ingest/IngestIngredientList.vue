@@ -2,7 +2,7 @@
   <div class="ingest-ingredient-list">
     <template v-for="(ingredient, index) in model.ingredients" :key="ingredient.referenceId">
       <IngestIngredientRow
-        v-model="model.ingredients[index]"
+        :model-value="ingredient"
         :flags="flagsForField(flags, 'ingredients', ingredient.referenceId ?? null)"
         :infos="flagsForField(infoFlags, 'ingredients', ingredient.referenceId ?? null)"
         :expanded="expanded === ingredient.referenceId"
@@ -10,6 +10,7 @@
         :can-create-foods="canCreateFoods"
         :food-options="foodOptions"
         :unit-options="unitOptions"
+        @update:model-value="value => (model.ingredients[index] = value)"
         @toggle="toggle(ingredient.referenceId)"
         @remove="remove(index)"
       />

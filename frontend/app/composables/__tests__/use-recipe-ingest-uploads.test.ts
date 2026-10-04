@@ -181,7 +181,7 @@ describe("the queue reducer", () => {
   }
   const blob = new Blob(["x"]);
   const add = (key: string, batchKey = "B"): UploadQueueAction =>
-    ({ type: "add-card", key, batchKey, photos: [blob], localOnly: false });
+    ({ type: "add-card", key, batchKey, photos: [blob] });
 
   test("cards get capture positions in their batch, and join the open batch", () => {
     const state = run(add("c1"), add("c2"), { type: "seal-requested", batchKey: "B" }, add("c3", "C"));
@@ -508,6 +508,26 @@ describe("the upload queue", () => {
     expect(queue.uploadedCount.value).toBe(0);
   });
 
+  test("cards already scanned or refused for good aren't counted as queued", async () => {
+    api.upload
+      .mockImplementationOnce(() => ok({ batchId: "b1", jobs: [], rejected: [{ index: 0, reason: "duplicate", duplicateOf: "j0" }], summary: "" }))
+      .mockImplementationOnce(() => ok({ batchId: "b1", jobs: [], rejected: [{ index: 0, reason: "unreadable_image" }], summary: "" }))
+      .mockImplementationOnce(() => failed(400, { code: "ai_not_enabled", message: "AI isn't set up" }))
+      .mockImplementation(() => ok(accepted()));
+    const queue = useRecipeIngestUploads();
+    [photo(), photo(), photo(), photo()].forEach(queue.takePhoto);
+    await flushPromises();
+
+    expect(queue.cards.value.map(card => [card.status, card.retryable])).toEqual([
+      ["done", false],
+      ["failed", false],
+      ["failed", true],
+      ["done", false],
+    ]);
+    // the card that can be retried may still be taken
+    expect(queue.openBatchCardCount.value).toBe(2);
+  });
+
   test("a card goes to the batch a 202 names, and so do the cards after it", async () => {
     api.upload.mockImplementationOnce(() => ok(accepted("b2")));
     const queue = useRecipeIngestUploads();
@@ -667,7 +687,7 @@ describe("the upload queue", () => {
     queue.takePhoto(photo());
     await flushPromises();
     expect(uploadOptions(0).localOnly).toBe(true);
-    expect(queue.openBatch.value?.localOnly).toBe(true);
+    expect(queue.cards.value[0]?.localOnly).toBe(true);
   });
 
   test("keeping cards on this server after some have gone finishes their batch; the next card starts a new one", async () => {
@@ -693,7 +713,6 @@ describe("the upload queue", () => {
     await flushPromises();
     expect([0, 1, 2, 3].map(n => uploadOptions(n).localOnly)).toEqual([false, false, false, true]);
     expect(uploadOptions(3)).toMatchObject({ batchId: "b2", position: 0 });
-    expect(queue.openBatch.value).toMatchObject({ localOnly: true });
     expect(queue.openBatch.value?.key).not.toBe(first);
 
     queue.done();
@@ -708,13 +727,121 @@ describe("the upload queue", () => {
     await flushPromises();
     expect(queue.cards.value[0]?.status).toBe("retrying");
 
+    const batch = queue.openBatch.value?.key;
     queue.localOnly.value = true;
     expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
-    expect(queue.openBatch.value).toMatchObject({ localOnly: true });
+    expect(queue.openBatch.value?.key).toBe(batch);
 
     await vi.advanceTimersByTimeAsync(2000);
     expect([0, 1].map(n => uploadOptions(n).localOnly)).toEqual([false, true]);
     expect(api.sealBatch).not.toHaveBeenCalled();
+  });
+
+  describe("every card not sent yet takes the switch's setting, whatever batch it's in", () => {
+    /** Holds the first two uploads, so two cards are on their way and the others wait */
+    function holdFirstTwo() {
+      const held = [deferred<unknown>(), deferred<unknown>()];
+      let n = 0;
+      api.upload.mockImplementation((_files, options: { batchId: string }) =>
+        (n < 2 ? held[n++]!.promise : ok(accepted(options.batchId))));
+      return () => held.forEach(h => h.resolve({ data: accepted(), error: null }));
+    }
+    const sentLocalOnly = () => api.upload.mock.calls.map(call => (call[1] as { localOnly: boolean }).localOnly);
+
+    test("switched off and straight back on mid-batch: no card goes to the cloud", async () => {
+      const release = holdFirstTwo();
+      const queue = useRecipeIngestUploads();
+      queue.localOnly.value = true;
+      queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
+      queue.uploadDrafts();
+      await flushPromises();
+      expect(queue.cards.value.map(card => card.status))
+        .toEqual(["uploading", "uploading", "waiting", "waiting", "waiting"]);
+
+      // the two on their way stay on this server, and their batch is finished
+      queue.localOnly.value = false;
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(2);
+      expect(queue.openBatch.value).toBeNull();
+      // back on: the waiting cards of the finished batch take it too, and nothing went with the other setting
+      queue.localOnly.value = true;
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+
+      release();
+      await flushPromises();
+      expect(sentLocalOnly()).toEqual([true, true, true, true, true]);
+    });
+
+    test("switched on after Done: the cards still waiting stay on this server", async () => {
+      const release = holdFirstTwo();
+      const queue = useRecipeIngestUploads();
+      queue.addPhotos([photo(), photo(), photo(), photo(), photo()]);
+      queue.uploadDrafts();
+      queue.done();
+      await flushPromises();
+
+      queue.localOnly.value = true;
+      // the two on their way went with the cloud setting
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(2);
+
+      release();
+      await flushPromises();
+      expect(sentLocalOnly()).toEqual([false, false, true, true, true]);
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(2);
+    });
+
+    test("a card that failed, retried after the switch changed, goes with the new setting", async () => {
+      api.upload.mockImplementationOnce(() => failed(400, { code: "ai_not_enabled", message: "AI isn't set up" }));
+      const queue = useRecipeIngestUploads();
+      queue.takePhoto(photo());
+      queue.done();
+      await flushPromises();
+      expect(queue.cards.value[0]).toMatchObject({ status: "failed", retryable: true });
+      expect(api.sealBatch).toHaveBeenCalledOnce();
+
+      queue.localOnly.value = true;
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+      queue.retry(queue.cards.value[0]!.key);
+      await flushPromises();
+      expect(sentLocalOnly()).toEqual([false, true]);
+    });
+
+    test("a card on its way when the switch changed goes again with the new setting when that attempt fails", async () => {
+      vi.useFakeTimers();
+      const held = deferred<unknown>();
+      api.upload.mockImplementationOnce(() => held.promise).mockImplementation(() => ok(accepted()));
+      const queue = useRecipeIngestUploads();
+      queue.takePhoto(photo());
+      queue.done();
+      await flushPromises();
+
+      queue.localOnly.value = true;
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(1);
+      held.resolve({ data: null, error: { message: "Network Error" } });
+      await flushPromises();
+      // it never reached the server, so no card went with the cloud setting
+      expect(queue.cards.value[0]?.status).toBe("retrying");
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sentLocalOnly()).toEqual([false, true]);
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+    });
+
+    test("a card still waiting for its batch when the switch changed goes with the new setting", async () => {
+      const batch = deferred<unknown>();
+      api.createBatch.mockImplementationOnce(() => batch.promise);
+      const queue = useRecipeIngestUploads();
+      queue.takePhoto(photo());
+      queue.done();
+      await flushPromises();
+      expect(queue.cards.value[0]?.status).toBe("uploading");
+
+      queue.localOnly.value = true;
+      expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+      batch.resolve({ data: { id: "b1", source: "app" }, error: null });
+      await flushPromises();
+      expect(sentLocalOnly()).toEqual([true]);
+    });
   });
 
   test("leaving the page warns while photos are pending", async () => {

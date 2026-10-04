@@ -11,7 +11,13 @@ import type { AxiosProgressEvent } from "axios";
 import { computed, effectScope, markRaw, readonly, ref, shallowRef, watch } from "vue";
 import type { EffectScope } from "vue";
 import { useUserApi } from "~/composables/api";
-import { errorCodeOf, errorStatusOf, resetRecipeIngestCounts, useRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import {
+  errorCodeOf,
+  errorStatusOf,
+  resetRecipeIngestCounts,
+  resetRecipeIngestReviewState,
+  useRecipeIngestCounts,
+} from "~/composables/use-recipe-ingest";
 import type { IngestedJob, IngestRejected, IngestResponse } from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestAPI } from "~/lib/api/user/recipe-ingest";
 
@@ -156,8 +162,6 @@ export interface UploadBatch {
   serverId: string | null;
   /** Every server batch this batch's cards went to, oldest first: Done seals each of them */
   serverIds: string[];
-  /** Keep this batch's cards on this server */
-  localOnly: boolean;
   /** Done was tapped: seal once every card has settled */
   sealing: boolean;
   /** Server batches already sealed */
@@ -176,6 +180,11 @@ export interface UploadCard {
   status: UploadCardStatus;
   /** Upload progress, 0 to 1 */
   progress: number;
+  /**
+   * "Keep these cards on this server" as the card's current upload request carried it; null until the request goes.
+   * The server stores it with the card, so the switch only reaches cards that haven't gone yet.
+   */
+  localOnly: boolean | null;
   /** Automatic retries used */
   retries: number;
   /** When a `retrying` card is due (ms since the epoch) */
@@ -203,8 +212,9 @@ export interface UploadQueueState {
 }
 
 export type UploadQueueAction
-  = | { type: "add-card"; key: string; batchKey: string; photos: readonly Blob[]; localOnly: boolean }
+  = | { type: "add-card"; key: string; batchKey: string; photos: readonly Blob[] }
     | { type: "start"; key: string }
+    | { type: "sending"; key: string; localOnly: boolean }
     | { type: "progress"; key: string; progress: number }
     | { type: "re-encoding"; key: string }
     | { type: "re-encoded"; key: string; photos: readonly Blob[] }
@@ -216,8 +226,7 @@ export type UploadQueueAction
     | { type: "retry"; key: string }
     | { type: "remove"; key: string }
     | { type: "seal-requested"; batchKey: string }
-    | { type: "sealed"; batchKey: string; serverId: string }
-    | { type: "set-local-only"; batchKey: string; localOnly: boolean };
+    | { type: "sealed"; batchKey: string; serverId: string };
 
 export function emptyUploadQueue(): UploadQueueState {
   return { batches: [], cards: [], openBatchKey: null };
@@ -226,6 +235,11 @@ export function emptyUploadQueue(): UploadQueueState {
 /** Uploaded, or failed for good (until the user taps Retry) */
 export function isSettled(card: UploadCard): boolean {
   return card.status === "done" || card.status === "failed";
+}
+
+/** Failed for good: none of its photos could be used, and sending them again won't change that */
+export function isRefused(card: UploadCard): boolean {
+  return card.status === "failed" && !card.retryable;
 }
 
 /** Whether a card uploaded with something to show: an earlier scan, or photos the server didn't use */
@@ -320,7 +334,6 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
           key: action.batchKey,
           serverId: null,
           serverIds: [],
-          localOnly: action.localOnly,
           sealing: false,
           sealedIds: [],
           nextPosition: 0,
@@ -334,6 +347,7 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
         photos: action.photos,
         status: "waiting",
         progress: 0,
+        localOnly: null,
         retries: 0,
         retryAt: null,
         reencoded: false,
@@ -351,7 +365,9 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
       };
     }
     case "start":
-      return updateCard(state, action.key, c => ({ ...c, status: "uploading", progress: 0, retryAt: null }));
+      return updateCard(state, action.key, c => ({ ...c, status: "uploading", progress: 0, retryAt: null, localOnly: null }));
+    case "sending":
+      return updateCard(state, action.key, c => ({ ...c, localOnly: action.localOnly }));
     case "progress":
       return updateCard(state, action.key, c => ({ ...c, progress: Math.min(Math.max(action.progress, 0), 1) }));
     case "re-encoding":
@@ -410,8 +426,6 @@ export function reduceUploadQueue(state: UploadQueueState, action: UploadQueueAc
         : { ...b, sealedIds: [...b.sealedIds, action.serverId] }));
       return pruneSealed(next, action.batchKey);
     }
-    case "set-local-only":
-      return updateBatch(state, action.batchKey, b => ({ ...b, localOnly: action.localOnly }));
   }
 }
 
@@ -531,14 +545,14 @@ const drafts = shallowRef<DraftCard[]>([]);
 /** The front of a two-sided card, waiting for its back */
 const pendingFront = shallowRef<Blob | null>(null);
 const modeRef = ref<CaptureMode | null>(null);
-/** Keep the open batch's cards (and the next batch's) on this server */
+/** "Keep these cards on this server": every upload request carries it as it is when the request goes */
 const localOnlyRef = ref(false);
 /** Counts successful uploads, so the job list can reload at once */
 const uploadedCount = ref(0);
 /** The server batch of the last successful upload */
 const lastUploadBatchId = ref<string | null>(null);
-/** Cards that had left with the other setting when "Keep these cards on this server" last changed mid-batch */
-const sentBeforeLocalOnlyChange = ref(0);
+/** The cards that had gone with the other setting when "Keep these cards on this server" last changed */
+const sentBeforeChange = shallowRef<ReadonlySet<string>>(new Set());
 
 let api: RecipeIngestAPI | null = null;
 let refreshCounts: (() => Promise<unknown>) | null = null;
@@ -559,6 +573,7 @@ const hasPending = computed(
 
 function dispatch(action: UploadQueueAction) {
   state.value = reduceUploadQueue(state.value, action);
+  forgetResentCards();
   releaseUnusedPreviews();
 }
 
@@ -766,7 +781,9 @@ async function runCard(key: string) {
       return;
     }
 
-    const localOnly = findBatch(card.batchKey)?.localOnly ?? false;
+    // the switch as it is now: a card that hasn't gone yet takes its setting, whatever batch it's in
+    const localOnly = localOnlyRef.value;
+    dispatch({ type: "sending", key, localOnly });
     const controller = new AbortController();
     uploadsInFlight.add(controller);
     let answer: Awaited<ReturnType<RecipeIngestAPI["upload"]>>;
@@ -896,7 +913,6 @@ function enqueueCard(photos: readonly Blob[]) {
     key: newKey("card"),
     batchKey: state.value.openBatchKey ?? newKey("batch"),
     photos: photos.map(photo => markRaw(photo)),
-    localOnly: localOnlyRef.value,
   });
   pump();
 }
@@ -996,34 +1012,54 @@ function done() {
   if (batchKey) {
     dispatch({ type: "seal-requested", batchKey });
   }
-  sentBeforeLocalOnlyChange.value = 0;
+  sentBeforeChange.value = new Set();
   pump();
 }
 
+/** The card went to the server with `localOnly`, which keeps it with the card: it's on its way, or queued as a job */
+function wentWith(card: UploadCard, localOnly: boolean): boolean {
+  return card.localOnly === localOnly
+    && (card.status === "uploading" || (card.status === "done" && card.jobs.length > 0));
+}
+
 /**
- * "Keep these cards on this server" for the open batch and the cards after it. The server stores the setting with
- * each card when it arrives, so cards that already left keep theirs: a batch with such cards is finished (as with
- * Done) and the next photo starts a new batch, so a batch's setting describes the cards sent with it. Cards of the
- * finished batch that haven't gone yet (waiting, about to retry, failed) take the new setting.
+ * "Keep these cards on this server". Every card that hasn't gone yet takes the new setting when it goes, whatever
+ * batch it's in: waiting, about to retry, failed (for Retry), or one whose attempt fails and goes again. The server
+ * stores the setting with each card when it arrives, so the cards already on their way or uploaded keep theirs (they
+ * are counted for the note), and the open batch with such cards is finished (as with Done), so the next photo starts
+ * a new batch.
  */
 function setLocalOnly(localOnly: boolean) {
   if (localOnly === localOnlyRef.value) {
     return;
   }
   localOnlyRef.value = localOnly;
-  const batchKey = state.value.openBatchKey;
-  if (!batchKey) {
-    return;
-  }
-  dispatch({ type: "set-local-only", batchKey, localOnly });
-  // uploaded or on its way; a card waiting, about to retry or failed takes the new setting when it goes
-  const sent = state.value.cards
-    .filter(card => card.batchKey === batchKey && (card.status === "uploading" || card.status === "done"))
-    .length;
-  sentBeforeLocalOnlyChange.value = sent;
-  if (sent > 0) {
+  const current = state.value;
+  // the cards of batches still in progress; a finished batch's cards stay listed only for their notes
+  const inProgress = new Set(current.batches.filter(batch => !isBatchFinished(current, batch)).map(batch => batch.key));
+  const gone = current.cards.filter(card => inProgress.has(card.batchKey) && wentWith(card, !localOnly));
+  sentBeforeChange.value = new Set(gone.map(card => card.key));
+  const batchKey = current.openBatchKey;
+  if (batchKey && gone.some(card => card.batchKey === batchKey)) {
     dispatch({ type: "seal-requested", batchKey });
     pump();
+  }
+}
+
+/**
+ * A card counted for the note whose attempt failed doesn't keep the other setting: it goes again with the switch's
+ * (or not at all). An uploaded card forgotten once its batch was sealed still counts.
+ */
+function forgetResentCards() {
+  if (!sentBeforeChange.value.size) {
+    return;
+  }
+  const kept = [...sentBeforeChange.value].filter((key) => {
+    const card = findCard(key);
+    return !card || wentWith(card, !localOnlyRef.value);
+  });
+  if (kept.length < sentBeforeChange.value.size) {
+    sentBeforeChange.value = new Set(kept);
   }
 }
 
@@ -1054,14 +1090,16 @@ export function useRecipeIngestUploads() {
     cards: computed(() => state.value.cards),
     batches: computed(() => state.value.batches),
     openBatch,
-    /** Cards captured in the open batch */
-    openBatchCardCount: computed(() => state.value.cards.filter(c => c.batchKey === state.value.openBatchKey).length),
+    /** Cards of the open batch the server took or may still take: not one already scanned, nor one refused for good */
+    openBatchCardCount: computed(() => state.value.cards
+      .filter(card => card.batchKey === state.value.openBatchKey && !card.duplicateOf && !isRefused(card))
+      .length),
     drafts: computed(() => drafts.value),
     pendingFront: computed(() => pendingFront.value),
     mode: computed<CaptureMode>({ get: () => modeRef.value ?? "one-side", set: setMode }),
     localOnly: computed<boolean>({ get: () => localOnlyRef.value, set: setLocalOnly }),
     /** Cards already sent with the other setting when `localOnly` last changed (they keep it); 0 after Done */
-    sentBeforeLocalOnlyChange: readonly(sentBeforeLocalOnlyChange),
+    sentBeforeLocalOnlyChange: computed(() => sentBeforeChange.value.size),
     /** Photos not uploaded yet, or not yet sent */
     hasPending,
     /** Cards waiting, uploading or about to retry */
@@ -1111,7 +1149,7 @@ export function resetRecipeIngestUploads() {
   localOnlyRef.value = false;
   uploadedCount.value = 0;
   lastUploadBatchId.value = null;
-  sentBeforeLocalOnlyChange.value = 0;
+  sentBeforeChange.value = new Set();
   batchRequests.clear();
   sealsInFlight.clear();
   sealFailures.clear();
@@ -1122,10 +1160,11 @@ export function resetRecipeIngestUploads() {
 
 /**
  * Forgets what recipe card ingestion keeps for the signed-in user: the upload queue, with its photos, retries and
- * open batch, and the card counts. Called on logout (`clearComposableCaches`), so the next user of the device
- * neither sees the photos nor sends them.
+ * open batch, the card counts, and what review pages carry over. Called on logout (`clearComposableCaches`), so the
+ * next user of the device neither sees the photos nor sends them.
  */
 export function resetRecipeIngestState() {
   resetRecipeIngestUploads();
   resetRecipeIngestCounts();
+  resetRecipeIngestReviewState();
 }

@@ -5,18 +5,26 @@ counts.
 """
 
 import base64
+import io
 import json
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
+from tempfile import SpooledTemporaryFile
 from typing import Any
+from uuid import UUID
 
 import anyio
+import anyio.to_thread
 import pytest
 from fastapi.testclient import TestClient
 
+from mealie.db.db_setup import session_context
+from mealie.schema.recipe_ingest import IngestRejectReason, IngestSource
 from mealie.services.ai.ingest import limits
 from mealie.services.ai.ingest import upload as upload_service
+from mealie.services.ai.ingest.intake import IntakeCard, IntakeOptions, IntakePage, IntakeRejected, IntakeService
 from mealie.services.ai.ingest.settings import IngestSettings
 from tests.integration_tests.ai_tests.ingest.test_upload_api import (
     INGEST,
@@ -180,7 +188,7 @@ def test_json_bodies_are_decoded_two_at_a_time(monkeypatch: pytest.MonkeyPatch):
     lock = threading.Lock()
     real_decode = upload_service._decode_json_images
 
-    def decode(payload: Any) -> Any:
+    def decode(payload: Any, opened: list[Any]) -> Any:
         nonlocal running, most
         with lock:
             running += 1
@@ -188,7 +196,7 @@ def test_json_bodies_are_decoded_two_at_a_time(monkeypatch: pytest.MonkeyPatch):
         time.sleep(0.2)
         with lock:
             running -= 1
-        return real_decode(payload)
+        return real_decode(payload, opened)
 
     monkeypatch.setattr(upload_service, "_decode_json_images", decode)
     payload = json.dumps({"images": [base64.b64encode(jpeg()).decode()]}).encode()
@@ -205,5 +213,89 @@ def test_json_bodies_are_decoded_two_at_a_time(monkeypatch: pytest.MonkeyPatch):
     anyio.run(main)
     assert most == limits.INTAKE_CONCURRENCY
     assert all(len(body.images) == 1 and body.images[0].file is not None for body in bodies)
+    for body in bodies:
+        body.close()
+
+
+def test_decoded_json_images_wait_on_disk(monkeypatch: pytest.MonkeyPatch):
+    # a decoded image waits for its intake in a spooled file, not in memory: uploads queued for a slot hold only their
+    # files, and the request's end closes them
+    photo = os.urandom(upload_service.SPOOL_MAX_BYTES + 1)
+    payload = json.dumps({"images": [{"data": base64.b64encode(photo).decode(), "filename": "front.jpg"}]}).encode()
+
+    body = anyio.run(upload_service._read_json, _Body(payload), limits.MAX_JSON_BODY_BYTES, {})  # type: ignore[arg-type]
+    (image,) = body.images
+    assert isinstance(image.file, SpooledTemporaryFile)
+    assert image.file._rolled  # type: ignore[attr-defined]
+    assert (image.filename, image.index, image.file.read()) == ("front.jpg", 0, photo)
+
+    body.close()
+    assert image.file.closed
+
+
+def test_a_bad_json_option_closes_the_decoded_images(monkeypatch: pytest.MonkeyPatch):
+    opened: list[Any] = []
+    real_spool = upload_service.SpooledTemporaryFile
+
+    def spool(*args: Any, **kwargs: Any) -> Any:
+        opened.append(real_spool(*args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(upload_service, "SpooledTemporaryFile", spool)
+    payload = json.dumps({"images": [base64.b64encode(jpeg()).decode()], "position": "first"}).encode()
+    with pytest.raises(upload_service.UploadRefused):
+        anyio.run(upload_service._read_json, _Body(payload), limits.MAX_JSON_BODY_BYTES, {})  # type: ignore[arg-type]
+    assert len(opened) == 2  # the body and the image
+    assert all(file.closed for file in opened)
+
+
+def test_json_decoding_and_the_inbox_share_the_intake_slots(monkeypatch: pytest.MonkeyPatch, reader: TestUser):
+    # the inbox's scan calls `ingest` directly, without the event loop's limiter: a JSON body's decoding takes one of
+    # the same slots, so together they hold at most INTAKE_CONCURRENCY photos in memory
+    running = 0
+    most = 0
+    lock = threading.Lock()
+
+    def busy() -> None:
+        nonlocal running, most
+        with lock:
+            running += 1
+            most = max(most, running)
+        time.sleep(0.2)
+        with lock:
+            running -= 1
+
+    real_decode = upload_service._decode_json_images
+
+    def decode(payload: Any, opened: list[Any]) -> Any:
+        busy()
+        return real_decode(payload, opened)
+
+    def normalize_and_insert(self: IntakeService, *args: Any) -> Any:
+        busy()
+        return IntakeRejected(0, None, IngestRejectReason.unreadable_image)
+
+    monkeypatch.setattr(upload_service, "_decode_json_images", decode)
+    monkeypatch.setattr(IntakeService, "_normalize_and_insert", normalize_and_insert)
+    payload = json.dumps({"images": [base64.b64encode(jpeg()).decode()]}).encode()
+    bodies: list[Any] = []
+
+    def inbox_card() -> None:
+        with session_context() as session:
+            service = IntakeService(session, UUID(reader.group_id), UUID(reader.household_id))
+            service.ingest(IntakeCard([IntakePage(io.BytesIO(b""))]), IntakeOptions(source=IngestSource.inbox))
+
+    async def read_one() -> None:
+        bodies.append(await upload_service._read_json(_Body(payload), limits.MAX_JSON_BODY_BYTES, {}))  # type: ignore[arg-type]
+
+    async def main() -> None:
+        async with anyio.create_task_group() as group:
+            for _ in range(limits.INTAKE_CONCURRENCY):
+                group.start_soon(read_one)
+            for _ in range(limits.INTAKE_CONCURRENCY):
+                group.start_soon(anyio.to_thread.run_sync, inbox_card)
+
+    anyio.run(main)
+    assert most == limits.INTAKE_CONCURRENCY
     for body in bodies:
         body.close()

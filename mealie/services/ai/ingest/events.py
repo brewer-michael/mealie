@@ -16,7 +16,7 @@ route's threadpool), never on the event loop, and no database transaction stays 
 
 from datetime import datetime, timedelta
 from enum import Enum
-from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote_plus, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -108,21 +108,33 @@ class AIEventAppriseListener(AppriseEventListener):
     @staticmethod
     def update_urls_with_event_data(urls: list[str], event: Event) -> list[str]:
         """
-        Upstream's, with the query percent-encoded: upstream's `urlencode` writes a space as `+`, which Apprise doesn't
-        read back (it decodes `:key` values with `unquote`), so Home Assistant got a `document_data` with `+` between
-        its JSON tokens, which `from_json` can't parse (§8)
+        Upstream's, with the event's fields percent-encoded and the notifier's own query left as the user wrote it.
+        Upstream's `urlencode` writes a space as `+`, which Apprise doesn't read back (it decodes `:key` values with
+        `unquote`), so Home Assistant got a `document_data` with `+` between its JSON tokens, which `from_json` can't
+        parse (§8). Re-encoding the whole query instead would turn a literal `+` in the user's own values into a space.
         """
-        return [
-            urlunsplit(
-                parts._replace(
-                    query=urlencode(parse_qs(parts.query, keep_blank_values=True), doseq=True, quote_via=quote)
-                )
-            )
-            if AppriseEventListener.is_custom_url(url)
-            else url
-            for url in AppriseEventListener.update_urls_with_event_data(urls, event)
-            for parts in [urlsplit(url)]
-        ]
+        updated: list[str] = []
+        for url, merged in zip(urls, AppriseEventListener.update_urls_with_event_data(urls, event), strict=True):
+            if not AppriseEventListener.is_custom_url(url):
+                updated.append(url)
+                continue
+
+            # upstream wrote the event's fields with `quote_plus`, so reading `+` as a space here is right
+            fields = [(k, v) for k, v in parse_qsl(urlsplit(merged).query, keep_blank_values=True) if k in _EVENT_KEYS]
+            parts = urlsplit(url)
+            own = [
+                part
+                for part in parts.query.split("&")
+                if part and unquote_plus(part.split("=", 1)[0]) not in _EVENT_KEYS
+            ]
+            query = "&".join([*own, urlencode(fields, quote_via=quote)])
+            updated.append(urlunsplit(parts._replace(query=query)))
+
+        return updated
+
+
+_EVENT_KEYS = {":event_type", ":integration_id", ":document_data", ":event_id", ":timestamp"}
+"""The fields upstream's `AppriseEventListener.update_urls_with_event_data` adds to a custom (form, json, xml) URL"""
 
 
 def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier_ids: list[UUID]) -> list[str]:

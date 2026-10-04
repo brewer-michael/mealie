@@ -126,9 +126,17 @@ function severityIcon(field: string, icons: Record<string, string>) {
   return level === "error" ? icons.alertCircle : icons.alert;
 }
 
-function setText(field: Exclude<LineField, "description"> | Exclude<DetailField, "recipeServings">, value: string | null) {
+function setText(field: LineField | DetailField, value: string | null) {
+  if (field === "description" || field === "recipeServings") {
+    // their own inputs set them
+    return;
+  }
+  if (field === "name") {
+    model.value.name = value ?? "";
+    return;
+  }
   // optional fields go back to null when emptied, so an untouched field and a cleared one save alike
-  model.value[field] = field === "name" ? value ?? "" : value || null;
+  model.value[field] = value || null;
 }
 
 // typed as text ("4", "1 1/2") and stored as a number; text that isn't one yet ("4-") stays in the box

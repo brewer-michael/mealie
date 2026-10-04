@@ -6,6 +6,7 @@
 
 <script setup lang="ts">
 import { useUserApi } from "~/composables/api";
+import { rememberRecipeIngestBatch } from "~/composables/use-recipe-ingest";
 import { firstCardToReview } from "~/composables/use-recipe-ingest-review";
 
 /**
@@ -39,6 +40,8 @@ onMounted(async () => {
     await router.replace(queue);
     return;
   }
+  // the card opens showing its place in the batch at once
+  rememberRecipeIngestBatch(data);
   const first = firstCardToReview(data.jobs ?? []);
   await router.replace(first ? `${queue}/${first}` : `${queue}?batch=${encodeURIComponent(batchId)}`);
 });

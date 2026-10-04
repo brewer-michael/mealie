@@ -7,7 +7,8 @@ The upload's only parameter is `request: Request`, so FastAPI reads no body befo
 
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Request, status
+from fastapi import APIRouter, BackgroundTasks, Request, Response, status
+from starlette.requests import ClientDisconnect
 
 from mealie.core.root_logger import get_logger
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
@@ -77,7 +78,7 @@ class RecipeIngestUploadController(IngestController):
             }
         },
     )
-    async def ingest(self, request: Request) -> IngestResponse:
+    async def ingest(self, request: Request) -> IngestResponse | Response:
         """
         Uploads one recipe card (front first), or with `split=true` one card per image, as a multipart form (any file
         field, `files` by convention; text fields `batchId`, `position`, `split`, `localOnly`, `allowDuplicate`), a
@@ -88,6 +89,11 @@ class RecipeIngestUploadController(IngestController):
         handler = UploadHandler(request, self.session, self.user, self.integration_id)
         try:
             return await handler.handle()
+        except ClientDisconnect:
+            # the client went away mid-body (a phone losing signal, a logout aborting the queue): nothing was stored,
+            # and nobody is left to read the answer
+            logger.debug("A recipe card upload ended: the client disconnected before its body arrived")
+            return Response(status_code=status.HTTP_400_BAD_REQUEST)
         except UploadRefused as e:
             raise ingest_error(
                 e.status_code,

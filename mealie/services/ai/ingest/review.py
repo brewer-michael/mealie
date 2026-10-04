@@ -14,6 +14,7 @@ and the write only makes the save re-read and retry, while a stale `draftVersion
 callers hold.
 """
 
+import asyncio
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from mealie.repos.repository_recipe_ingest import IngestRepos, JobConflict
 from mealie.schema.recipe.recipe import create_recipe_slug
 from mealie.schema.recipe_ingest import (
     CardDraft,
+    CardDraftIngredient,
     CardDraftSaved,
     CardDraftUpdate,
     CardFlag,
@@ -66,7 +68,11 @@ from mealie.schema.recipe_ingest import (
 from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.ingest import flag_rules, images, limits, storage
 from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
+from mealie.services.ai.ingest.i18n import translator_for
+from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline import flags as card_flags
+from mealie.services.ai.ingest.pipeline.cardtext import markers_in
+from mealie.services.ai.ingest.pipeline.ingredients import IngredientLine, normalize_lines
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
 
 logger = get_logger(__name__)
@@ -257,6 +263,30 @@ def _adopted_reading_flags(
         if ids & proposed_ids or (not proposed_ids and proposed == draft):
             flags.extend(card_flags.compute_flags(proposed, extraction, {}, transcription=transcription))
     return flags
+
+
+def _has_parts(ingredient: CardDraftIngredient) -> bool:
+    """Whether a line has an amount, unit or food (the page's `isParsedIngredient`), rather than only its text"""
+    return (
+        ingredient.quantity is not None
+        or bool(ingredient.unit and ingredient.unit.name.strip())
+        or bool(ingredient.food and ingredient.food.name.strip())
+    )
+
+
+def _text_to_parse(ingredient: CardDraftIngredient, stored: Mapping[UUID, CardDraftIngredient]) -> str | None:
+    """
+    The text of a line the reviewer wrote as text, to parse as a freshly read line: a line with no amount, unit or
+    food whose text (its note) isn't the stored line's, since a blank was filled, the text edited or the line added.
+    None for anything else: the reviewer's own amount, unit or food, a line nobody changed, a marker still in it.
+    """
+    text = ingredient.note.strip()
+    if _has_parts(ingredient) or not text or markers_in(text):
+        return None
+    before = stored.get(ingredient.reference_id)
+    if before is not None and before.note.strip() == text:
+        return None
+    return text
 
 
 def _stored_form(draft: CardDraft) -> Any:
@@ -533,12 +563,19 @@ class ReviewService:
         recomputes the flags (§6.6). A stale `draft_version` is a 409 `version_conflict`; a change to the row that
         isn't a draft save (a task's proposal) is retried on the server. `draft_version` is bumped only when the draft
         changed (§3.3): a save that only resolves flags or proposals, or dismisses the banner, keeps it, so the draft
-        still counts as unedited for a re-extract and another device's next save doesn't conflict.
+        still counts as unedited for a re-extract and another device's next save doesn't conflict. A save that changes
+        the draft and uses a proposal that is no longer there (another device settled it) is a 409 too.
         """
-        draft = _with_unique_ids(update.draft)
+        draft = self._parse_text_lines(job_id, _with_unique_ids(update.draft), update.draft_version)
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
 
-        def mutate(row: RowMapping) -> dict[str, Any]:
+        def mutate(row: RowMapping) -> dict[str, Any] | None:
+            changed = _stored_form(draft) != row["draft"]
+            if changed and resolved_proposals - {str(p.get("id")) for p in row["proposals"] or []}:
+                # it uses a proposal another device already settled, which kept `draft_version`: that proposal (and
+                # with it a whole-card reading's flags) is gone, so this is a 409 and the client reloads
+                return None
+
             stored_flags = parse_flags(row["flags"])
             resolutions: dict[str, FlagResolution] = {
                 flag.id: flag.resolution for flag in stored_flags if flag.resolution is not None
@@ -555,7 +592,6 @@ class ReviewService:
             previous = [*stored_flags, *_adopted_reading_flags(draft, adopted, extraction, transcription)]
             flags = resolve_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
             errors, warnings = flag_rules.count_unresolved(flags)
-            changed = _stored_form(draft) != row["draft"]
             values: dict[str, Any] = {
                 "draft": draft,
                 "flags": flags,
@@ -590,6 +626,59 @@ class ReviewService:
             error_count=written.values["error_count"],
             warning_count=written.values["warning_count"],
         )
+
+    def _parse_text_lines(self, job_id: UUID, draft: CardDraft, draft_version: int) -> CardDraft:
+        """
+        `draft` with each line the reviewer wrote as text (`_text_to_parse`) parsed and linked as extraction does (§5):
+        the shorthand written out, then the NLP parser with the group's foods and units. A line the parser can't split
+        stays as sent, and nothing is parsed on a card that isn't in English, or for a save that will be refused.
+
+        The page keeps the line as it typed it until it reloads, and sends that with its next saves: it differs from
+        the stored (parsed) line's note, so it's parsed again into the same line, and the draft doesn't change.
+        Blocking: the parse runs here, before the draft's write.
+        """
+        job = self.repos.jobs.get(job_id)
+        if self.session.in_transaction():
+            self.session.commit()  # the write reads the row again: no snapshot stays open meanwhile
+        if job is None or job.status != IngestStatus.ready.value or job.draft_version != draft_version:
+            return draft
+        extraction = _parse_extraction(job.extraction)
+        language = extraction.language if extraction else None
+        if not card_flags.is_english(language):
+            return draft
+
+        stored_draft = _parse_draft(job.draft)
+        stored = {line.reference_id: line for line in stored_draft.ingredients} if stored_draft else {}
+        lines = [
+            IngredientLine(text=text, title=ingredient.title, reference_id=ingredient.reference_id)
+            for ingredient in draft.ingredients
+            if (text := _text_to_parse(ingredient, stored)) is not None
+        ]
+        if not lines:
+            return draft
+
+        repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
+        try:
+            parsed = asyncio.run(
+                normalize_lines(
+                    lines,
+                    repos=repos,
+                    translator=translator_for(job.locale),
+                    matcher=IngestMatcher(repos),
+                    language=language,
+                )
+            )
+        except Exception:
+            # the lines are saved as they were written; the parse is a help, never a reason to lose an edit
+            logger.exception(f"Couldn't parse the ingredient lines edited on recipe card job {job_id}")
+            if self.session.in_transaction():
+                self.session.rollback()
+            return draft
+        by_ref = {line.reference_id: line for line in parsed if _has_parts(line)}
+        if not by_ref:
+            return draft
+        ingredients = [by_ref.get(ingredient.reference_id, ingredient) for ingredient in draft.ingredients]
+        return draft.model_copy(update={"ingredients": ingredients})
 
     # ==========================================
     # Tasks

@@ -1,5 +1,6 @@
 """Recording AI provider attempts in the usage log (docs/ai/PHASE1.md §4)"""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from mealie.core.root_logger import get_logger
@@ -32,6 +33,7 @@ def record_ai_usage(
     latency_ms: int,
     error: BaseException | None = None,
     error_type: str | None = None,
+    expected_failure: Callable[[], bool] | None = None,
 ) -> None:
     """
     Logs one provider attempt, which failed if there's an `error` or an `error_type` (for a failure that
@@ -39,6 +41,9 @@ def record_ai_usage(
     ignored: the usage log must never break the AI call it describes.
 
     The row records the recipe card job the current call policy is for, if any (`mealie.services.ai.policy`).
+
+    `expected_failure` is asked when the write fails: if it says the failure was expected (a recipe card task's write
+    while a backup restore replaces the tables, docs/ai/PHASE2.md §3.9), it's logged in one line, without a traceback.
     """
     if error is not None and error_type is None:
         error_type = type(error).__name__
@@ -60,5 +65,11 @@ def record_ai_usage(
                 job_id=current_policy().job_id,
             )
         )
-    except Exception:
-        logger.exception(f"Failed to record AI usage for provider '{provider.name}'")
+    except Exception as e:
+        if expected_failure is not None and expected_failure():
+            # Phase 2 (recipe cards): the restore has the tables; the tokens are still in the job's own tally
+            logger.info(
+                f"AI usage for provider '{provider.name}' wasn't recorded during a backup restore: {type(e).__name__}"
+            )
+        else:
+            logger.exception(f"Failed to record AI usage for provider '{provider.name}'")

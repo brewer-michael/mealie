@@ -9,6 +9,7 @@ easy to merge.
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -69,10 +70,14 @@ async def close_client(client: object) -> None:
     """
     Closes an OpenAI client on the event loop that used it. Recipe card tasks run in threads with their own loops
     (docs/ai/PHASE2.md §3.2); an unclosed client is freed by the cyclic garbage collector, whose `__del__` schedules
-    `aclose()` on whatever loop is running then, and logs "Event loop is closed". Test doubles may have no `close`.
+    `aclose()` on whatever loop is running then, and logs "Event loop is closed". Never raises: it runs in `finally`
+    blocks, where it would hide the call's own error (and test doubles may have no awaitable `close`).
     """
-    if (close := getattr(client, "close", None)) is not None:
-        await close()
+    try:
+        if (close := getattr(client, "close", None)) is not None and inspect.isawaitable(result := close()):
+            await result
+    except Exception as e:
+        logger.debug(f"Closing an AI client failed: {e!r}")
 
 
 async def get_claude_response[T: OpenAIBase](

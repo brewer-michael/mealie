@@ -158,7 +158,7 @@ def test_commit_creates_the_recipe(api_client: TestClient, unique_user_fn_scoped
         "Microwave for ___ minutes.",
     ]
     assert recipe["notes"][0]["title"] == "From"
-    assert recipe["notes"][0]["text"] == "From Grandma Jo"
+    assert recipe["notes"][0]["text"] == "Grandma Jo"  # not "From: From Grandma Jo"
 
     # foods and units created (the committer can organize) and linked
     lines = recipe["recipeIngredient"]
@@ -191,6 +191,29 @@ def test_commit_creates_the_recipe(api_client: TestClient, unique_user_fn_scoped
         {"slug": "banana-mug-cake", "household_id": UUID(user.household_id), "message": published[0]["message"]}
     ]
     assert "Banana Mug Cake" in published[0]["message"]
+
+
+@pytest.mark.parametrize(
+    "attribution, text",
+    [
+        ("From Grandma Jo", "Grandma Jo"),
+        ("from: Aunt May's kitchen", "Aunt May's kitchen"),
+        ("FROM:Aunt May", "Aunt May"),
+        ("Fromage Farm newsletter", "Fromage Farm newsletter"),
+        ("Grandma Jo", "Grandma Jo"),
+        ("From:", None),
+    ],
+)
+def test_the_attribution_note_doesnt_repeat_its_title(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, attribution: str, text: str | None
+):
+    # the note is titled "From" already, so the card's own "From" isn't repeated in its text
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user, draft=banana_draft(attribution=attribution))
+    response = commit(api_client, user, job_id)
+    assert response.status_code == 201, response.text
+    notes = recipe_of(api_client, user, response.json()["slug"])["notes"]
+    assert [(note["title"], note["text"]) for note in notes] == ([("From", text)] if text else [])
 
 
 def test_the_recipe_takes_only_the_drafts_fields(api_client: TestClient, unique_user_fn_scoped: TestUser):

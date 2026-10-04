@@ -16,7 +16,8 @@ resolution stored by id then never moves to another note when one above it is de
   drop off once the line is edited: each ingredient keeps an `extracted_hash` of its parsed fields.
 - *Reading flags* compare the draft with what was read: `unsure`, `not_on_card`, `marker_dropped`, and the cross-read's
   `read_disagreement` and `blank`. Typing a number into a blank must not raise them, so on a save (`previous` given)
-  a reading flag is kept only where it was raised before and still holds; only an extraction raises new ones.
+  a reading flag is kept only where it was raised before and still holds; only an extraction raises new ones. A
+  note's is found again by its digest wherever the note moved, and comes back unresolved.
 
 **Alternatives.** `unsure` alternatives replace `params.text` (the uncertain words) in the line; `implausible_amount`'s
 replace `params.value`; `read_disagreement`'s single alternative is the second reading's whole line (`params.text`).
@@ -26,6 +27,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -46,7 +48,7 @@ from mealie.schema.recipe_ingest import (
 )
 
 from ..flag_rules import KEEPABLE_KINDS, REVIEW_CONFIDENCE
-from ..shorthand import QTY, SHORTHAND, UNITS
+from ..shorthand import ITEM_SIZE_WORDS, QTY, SHORTHAND, UNITS
 from .cardtext import (
     BLANK,
     card_numbers,
@@ -54,8 +56,8 @@ from .cardtext import (
     find_numbers,
     find_temperatures,
     format_number,
+    letters_only,
     markers_in,
-    number_set,
 )
 from .crossread import align_ingredient, align_step, compare
 
@@ -108,19 +110,35 @@ SPOON_AND_CUP_UNITS = frozenset(
 FAHRENHEIT_RANGE = (200, 550)
 CELSIUS_RANGE = (90, 290)
 """
-Oven temperatures, checked in a sentence about the oven. Elsewhere ("let rise in a warm place (80°)", "cool to 70°",
-"warm water (110°F)") only the upper ends apply.
+Oven temperatures (frying and candy temperatures fall within them too), checked in every step: a card's terse
+"350° - 30 min." names no oven, and its misread "35°" must still be caught. Only where the nearest word before the
+temperature in its clause says it's for rising, cooling, warm liquids or a thermometer ("let rise in a warm place
+(80°)", "cool to 70°", "warm water (110°F)", "until a thermometer reads 160°") do just the upper ends apply.
 """
-_OVEN_WORDS = re.compile(r"\b(?:bak(?:e|es|ed|ing)|oven|preheat\w*|roast\w*|broil\w*)\b", re.IGNORECASE)
-_OVEN_AFTER = re.compile(r"\s*\)?\s*oven\b", re.IGNORECASE)
-"""A temperature followed by "oven": "a 350° oven" """
-_SENTENCE_END = re.compile(r"[.!?;]\s+(?=[A-Z])")
-"""A sentence ends at a stop before a capital: "Bake 1 hr. Cool to 70°", but not "Bake 30 min. at 350°" """
+_TEMPERATURE_CONTEXT = re.compile(
+    r"\b(?:(?P<oven>bak(?:e|es|ed|ing)|preheat\w*|roast\w*|broil\w*|(?:deep[- ])?fr(?:y|ies|ied|ying)|water[- ]bath)"
+    r"|ris(?:e|es|en|ing)|proof\w*|cool\w*|chill\w*|refrigerat\w*|room\s+temp\w*|lukewarm|warm(?:\s+oven)?|water|milk"
+    r"|yeast|scald\w*|thermometer|internal|reach(?:es|ed)?|reads?)\b",
+    re.IGNORECASE,
+)
+"""
+Words that say what a temperature after them is for: the oven's (or the fryer's), or anything else. "Oven" itself
+isn't one: "let rise in oven (85°)" is still about rising, and "preheat oven to" about the oven.
+"""
+_CLAUSE_END = re.compile(r"(?P<stop>[.!?;:])(?=\s)|\bthen\b|\n", re.IGNORECASE)
+"""
+Where what a temperature is for stops carrying over, whatever the case after it: "Bake at 350° for 1 hr; cool to
+70°", "cool, then bake at 35°". A stop after a measure ("in 1/4 c. 110° water") isn't one.
+"""
+_MEASURE_ABBREVIATIONS = frozenset(
+    {*(unit.lower() for unit in UNITS), "oz", "lb", "lbs", "pt", "qt", "gal", "doz", "sq", "env", "pkgs"}
+)
+_WORD_BEFORE = re.compile(r"[^\W\d_]+$")
 
 _FRACTION_TYPO = re.compile(r"(?<![\d/.,])(?P<whole>[1-9])(?P<numerator>[1-9])/(?P<denominator>[2348])(?![\d/])")
 """`11/2` for "1 1/2": a whole number run into a proper fraction"""
 _LEADING_QUANTITY = re.compile(rf"^\s*[-•*]?\s*{QTY}(?:\s*(?:-|to)\s*{QTY})?\s*(?P<token>[^\W\d_]+)(?P<dot>\.)?")
-_NOT_UNIT_WORDS = frozenset({"or", "and", "to", "of", "x", "lg", "lge", "sm", "med", "md"})
+_NOT_UNIT_WORDS = frozenset({"or", "and", "to", "of", "x", *ITEM_SIZE_WORDS})
 """Short words after a quantity that aren't a lost unit: joins ("2 or 3 eggs") and sizes ("1 lg onion")"""
 _FOOD_WORDS = frozenset("bay bbq bok egg fig ham hot ice jam oat old pea pie red rye sea soy sun tea yam".split())
 """
@@ -129,6 +147,10 @@ aren't a lost unit when written without a dot; the first words of Mealie's own s
 """
 _MULTIPLIER_WORDS = frozenset({"dozen", "doz"})
 """Words after a quantity that multiply it, which the parser drops: "1 dozen eggs" is read as 1 egg"""
+_JOINER = r"(?:[+&,;]|\b(?:and|or|plus)\b)"
+"""What joins a second amount to a line: "butter + 1 T. oil", "flour (or 1 1/2 c. bread flour)", "sugar, 1 c. flour" """
+_AFTER_JOINER = re.compile(rf"{_JOINER}\s*\(?\s*$", re.IGNORECASE)
+_JOINED_AMOUNT = re.compile(rf"{_JOINER}\s*\(?\s*(?P<amount>{QTY})", re.IGNORECASE)
 
 _SEVERITY = {
     CardFlagKind.illegible: CardFlagSeverity.error,
@@ -385,20 +407,62 @@ def _fraction_typo(ingredient: CardDraftIngredient, line: str) -> tuple[str, str
     return match.group(0), f"{whole} {numerator}/{denominator}"
 
 
+def _amounts(text: str, *, in_a_name: bool = False) -> list[Fraction]:
+    """
+    The amounts in `text`: each number, and a range's end. `in_a_name`: only the numbers that are part of a unit or
+    food name ("2% milk", "V8 juice", "7-Up", '9" pie shell'), not a second amount run into it ("butter + 1 T. oil").
+    """
+    return [
+        value
+        for number in find_numbers(text)
+        if not (in_a_name and _AFTER_JOINER.search(text, 0, number.span[0]))
+        for value in (number.value, number.end)
+        if value is not None
+    ]
+
+
+def _merged_amount(ingredient: CardDraftIngredient) -> str | None:
+    """
+    A second amount whose ingredient the parser ran into the food, as written: "2 c. flour (or 1 1/2 c. bread flour)"
+    read as the food "flour bread flour", "1 c. sugar, 1 c. flour" as "sugar flour". The food takes words from before
+    the joined amount and from only after it; "2 T. + 1 t. sugar" or "1 pkg. yeast (or 2 1/4 tsp.)" don't.
+    """
+    food = set(letters_only(ingredient.food.name).split()) if ingredient.food else set()
+    text = ingredient.original_text
+    for joined in _JOINED_AMOUNT.finditer(text):
+        before = set(letters_only(text[: joined.start()]).split())
+        after = set(letters_only(text[joined.end() :]).split())
+        if food & before and (food - before) & after:
+            return joined.group("amount").strip()
+    return None
+
+
 def _dropped_amount(ingredient: CardDraftIngredient) -> str | None:
     """
     An amount on the card's line that the parsed fields lost, as written: the parser keeps one quantity, so a range's
-    end ("2-3 T. milk" is read as 2), a second number ("2 or 3 eggs", the "16 oz." of "1 (16 oz.) can") or a "dozen"
-    would be gone from the recipe commit writes from the fields
+    end ("2-3 T. milk" is read as 2), a second number ("2 or 3 eggs", the "16 oz." of "1 (16 oz.) can", the second
+    "1" of "1 c. sugar, 1 c. brown sugar"), a second ingredient run into the food or a "dozen" would be gone from the
+    recipe commit writes from the fields. The amounts are counted: the quantity and each number the note or a name
+    keeps account for one each.
     """
     quantity = ingredient.quantity
-    in_note = number_set(ingredient.note)
+    in_fields = Counter(_amounts(ingredient.note))
+    for ref in (ingredient.unit, ingredient.food):
+        if ref:
+            in_fields.update(_amounts(ref.name, in_a_name=True))
     for number in find_numbers(ingredient.original_text):
         for value in (number.value, number.end):
-            if value is None or value in in_note:
+            if value is None:
                 continue
-            if quantity is None or not math.isclose(float(value), quantity, abs_tol=1e-3):
+            if quantity is not None and math.isclose(float(value), quantity, abs_tol=1e-3):
+                quantity = None  # the parsed quantity accounts for this one
+            elif in_fields[value]:
+                in_fields[value] -= 1
+            else:
                 return number.text
+
+    if merged := _merged_amount(ingredient):
+        return merged
 
     lead = _LEADING_QUANTITY.match(ingredient.original_text)
     if lead and lead.group("token").lower() in _MULTIPLIER_WORDS:
@@ -488,11 +552,16 @@ def _ingredient_flags(flags: _Flags, target: _Target) -> None:
 
 def _about_the_oven(text: str, span: tuple[int, int]) -> bool:
     """
-    Whether the sentence holding a temperature (at `span`) is about the oven before it ("Bake at", "Preheat oven
-    to"), or names the oven right after it ("a 350° oven")
+    Whether a temperature (at `span`) may be the oven's: unless the nearest word before it in its clause says it's for
+    something else ("let rise in a warm place (80°)", "bake at 350° for 1 hr; cool to 70°")
     """
-    sentence_start = max((match.end() for match in _SENTENCE_END.finditer(text, 0, span[0])), default=0)
-    return bool(_OVEN_WORDS.search(text, sentence_start, span[0]) or _OVEN_AFTER.match(text, span[1]))
+    clause_start = 0
+    for end in _CLAUSE_END.finditer(text, 0, span[0]):
+        word = _WORD_BEFORE.search(text, 0, end.start()) if end.group("stop") == "." else None
+        if not (word and word.group(0).lower() in _MEASURE_ABBREVIATIONS):
+            clause_start = end.end()
+    context = list(_TEMPERATURE_CONTEXT.finditer(text, clause_start, span[0]))
+    return not context or context[-1].group("oven") is not None
 
 
 def _temperature_flags(flags: _Flags, target: _Target) -> None:
@@ -505,7 +574,7 @@ def _temperature_flags(flags: _Flags, target: _Target) -> None:
             case _:
                 low, high = CELSIUS_RANGE[0], FAHRENHEIT_RANGE[1]
         if not _about_the_oven(target.text, temperature.span):
-            low = 0  # rising, cooling or a candy thermometer: only too hot is implausible
+            low = 0  # rising, cooling, warm liquids or a thermometer: only too hot is implausible
         if not low <= temperature.value <= high:
             flags.add(
                 CardFlagKind.implausible_temperature,
@@ -517,24 +586,29 @@ def _temperature_flags(flags: _Flags, target: _Target) -> None:
             return
 
 
-def _cross_read_flags(flags: _Flags, target: _Target, lines: Sequence[str]) -> None:
+def _cross_read_flags(flags: _Flags, target: _Target, lines: Sequence[str], after: int) -> int | None:
+    """
+    The cross-read's flags for a target; for an ingredient, returns the transcript line it aligned with, which the
+    next ingredient's alignment prefers to be after (`after`)
+    """
     if not target.text.strip() or target.field not in (FIELD_INGREDIENTS, FIELD_STEPS):
-        return
+        return None
 
+    index: int | None = None
     if target.is_step:
         window = align_step(target.text, lines)
         if window is None:
-            return
+            return None
         aligned = " ".join(lines[window[0] : window[1]])
     else:
-        index = align_ingredient(target.text, lines)
+        index = align_ingredient(target.text, lines, after)
         if index is None:
-            return
+            return None
         aligned = lines[index]
 
     disagreement = compare(target.text, aligned)
     if disagreement is None:
-        return
+        return index
 
     missing = disagreement.missing
     numbers = [token for token in missing if token[0] in ("number", "range")]
@@ -558,6 +632,7 @@ def _cross_read_flags(flags: _Flags, target: _Target, lines: Sequence[str]) -> N
             params={"text": aligned, "value": describe_token(missing[0])},
             alternatives=[aligned],
         )
+    return index
 
 
 def _reading_flags(
@@ -571,6 +646,7 @@ def _reading_flags(
     unsure = _unsure_targets(extraction.unsure, targets) if extraction else {}
     on_card = card_numbers(transcription) if transcription is not None else None
     lines = extraction.cross_read_lines if extraction else None
+    last_ingredient = -1  # the transcript line the ingredient before aligned with
 
     for index, target in enumerate(targets):
         if entry := unsure.get(index):
@@ -601,7 +677,9 @@ def _reading_flags(
                     params={"value": value},
                 )
         if lines:
-            _cross_read_flags(flags, target, lines)
+            aligned = _cross_read_flags(flags, target, lines, last_ingredient)
+            if aligned is not None:
+                last_ingredient = aligned
 
     if transcription is not None:
         read = len(markers_in(transcription))
@@ -612,6 +690,16 @@ def _reading_flags(
 
 def _is_reading_flag(flag: CardFlag) -> bool:
     return flag.kind in READING_KINDS or (flag.kind == CardFlagKind.blank and flag.source == CardFlagSource.cross_read)
+
+
+def _reading_key(flag: CardFlag) -> tuple[str, ...]:
+    """
+    What a reading flag raised before is matched by on a save: its id, but for a note its digest without the position,
+    so a note's flag stays raised when a note above it is deleted (its resolution, stored by id, doesn't follow it)
+    """
+    if flag.field == FIELD_NOTES and "#" in flag.id:
+        return (flag.kind.value, FIELD_NOTES, flag.id.rpartition("#")[2], flag.source.value)
+    return (flag.id, flag.source.value)
 
 
 def _still_holds(flag: CardFlag, targets: Sequence[_Target]) -> bool:
@@ -684,12 +772,15 @@ def compute_flags(
     if previous is None:
         reading_flags = list(reading.flags.values())
     else:
-        before = {(flag.id, flag.source): flag for flag in previous if _is_reading_flag(flag)}
-        reading_flags = [flag for flag in reading.flags.values() if (flag.id, flag.source) in before]
+        before = {_reading_key(flag): flag for flag in previous if _is_reading_flag(flag)}
+        reading_flags = [flag for flag in reading.flags.values() if _reading_key(flag) in before]
         if transcription is None:
             # the transcription-based flags can't be recomputed: carry them over while their line still says so
-            for key, flag in before.items():
-                if flag.kind in (CardFlagKind.not_on_card, CardFlagKind.marker_dropped) and key[0] not in reading.flags:
+            for flag in before.values():
+                if (
+                    flag.kind in (CardFlagKind.not_on_card, CardFlagKind.marker_dropped)
+                    and flag.id not in reading.flags
+                ):
                     if _still_holds(flag, targets):
                         reading_flags.append(flag.model_copy(update={"resolution": None}, deep=True))
 

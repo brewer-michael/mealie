@@ -156,7 +156,7 @@
               </v-list-item-title>
               <v-list-item-subtitle class="d-flex align-center flex-wrap ga-2 mt-1">
                 <code>{{ evalCase.slug }}</code>
-                <span>{{ $t("recipe-ingest.eval.pages", evalCase.pageCount) }}</span>
+                <span>{{ $t("recipe-ingest.eval.pages", evalCase.pageCount ?? 0) }}</span>
                 <v-chip v-if="evalCase.verified" size="x-small" color="success" variant="tonal" class="verified">
                   {{ $t("recipe-ingest.eval.verified-chip") }}
                 </v-chip>

@@ -10,6 +10,7 @@ import base64
 import fcntl
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from mealie.core.exceptions import NoEntryFound
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestRepos
@@ -431,9 +433,7 @@ def test_split_makes_each_image_a_card_and_partial_success_is_202(api_client: Te
     body = response.json()
     assert len(body["jobs"]) == 2
     assert body["rejected"] == [{"index": 1, "filename": "b.pdf", "reason": "pdf_not_supported", "duplicateOf": None}]
-    assert body["summary"] == (
-        "2 recipe cards queued. You'll be notified when they're ready. 1 photo couldn't be used."
-    )
+    assert body["summary"] == ("2 recipe cards queued. You'll be notified when they're ready. 1 card couldn't be used.")
     jobs = [job_row(item["id"]) for item in body["jobs"]]
     assert {str(job.batch_id) for job in jobs} == {body["batchId"]}
     assert [job.position for job in jobs] == [0, 1]
@@ -451,7 +451,7 @@ def test_nothing_accepted_is_400_with_the_same_body(api_client: TestClient, read
     assert detail["rejected"] == [
         {"index": 0, "filename": "photo-0.jpg", "reason": "unreadable_image", "duplicateOf": None}
     ]
-    assert detail["summary"] == "No recipe cards were queued. 1 photo couldn't be used."
+    assert detail["summary"] == "No recipe cards were queued. 1 card couldn't be used."
     assert job_dirs(reader) == before  # nothing left in DATA_DIR
 
 
@@ -513,6 +513,34 @@ def test_duplicates_are_found_by_the_ordered_page_hashes(api_client: TestClient,
         session.commit()
     assert post_card(api_client, reader, front).status_code == 400
     assert post_card(api_client, reader, front, allowDuplicate=True).status_code == 202
+
+
+def test_the_summary_counts_cards_and_says_which_were_already_scanned(api_client: TestClient, reader: TestUser):
+    # a Shortcut shows only the summary: a two-sided card sent again is one card, already scanned
+    front, back = jpeg(), jpeg()
+    assert post_card(api_client, reader, front, back).status_code == 202
+    again = post_card(api_client, reader, front, back)
+    assert again.status_code == 400
+    assert again.json()["detail"]["summary"] == "No recipe cards were queued. 1 card was already scanned."
+
+    other = jpeg()
+    assert post_card(api_client, reader, other).status_code == 202
+    response = api_client.post(
+        INGEST,
+        files=files(jpeg(), b"%PDF-1.7\n...", other, b"not an image", jpeg()),
+        data={"split": "true"},
+        headers=reader.token,
+    )
+    assert response.status_code == 202, response.text
+    assert [item["reason"] for item in response.json()["rejected"]] == [
+        "pdf_not_supported",
+        "duplicate",
+        "unsupported_format",
+    ]
+    assert response.json()["summary"] == (
+        "2 recipe cards queued. You'll be notified when they're ready. 1 card was already scanned. "
+        "2 cards couldn't be used."
+    )
 
 
 # ==================================================================================================================
@@ -608,7 +636,24 @@ def test_an_unknown_or_foreign_batch_is_404(api_client: TestClient, reader: Test
     for batch_id in (str(theirs), "4f9c6b8e-0000-4000-8000-000000000000", "not-a-batch"):
         response = post_card(api_client, reader, jpeg(), batchId=batch_id)
         assert response.status_code == 404, batch_id
-        assert response.json()["detail"] == {"code": "not_found"}
+        # a Shortcut's notification shows the message; the PWA's queue drops it and starts another batch
+        assert response.json()["detail"] == {
+            "code": "not_found",
+            "message": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one.",
+        }
+
+
+def test_a_batch_gone_before_the_insert_is_404_with_its_message(
+    api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    def gone(*args: Any, **kwargs: Any) -> Any:
+        raise NoEntryFound("the batch was discarded meanwhile")
+
+    monkeypatch.setattr(intake.IntakeService, "ingest", gone)
+    response = post_card(api_client, reader, jpeg())
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "not_found"
+    assert response.json()["detail"]["message"].startswith("That batch of recipe cards wasn't found.")
 
 
 # ==================================================================================================================
@@ -672,7 +717,62 @@ def test_error_bodies_carry_a_code_and_a_message_only_where_the_page_doesnt_hand
     shown = api_client.post(INGEST, content=b"x", headers={**reader.token, "Content-Type": "text/plain"})
     assert set(shown.json()["detail"]) == {"code", "message"}
 
-    handled = post_card(api_client, reader, jpeg(), batchId="4f9c6b8e-0000-4000-8000-000000000001")
-    assert set(handled.json()["detail"]) == {"code"}
+    handled = post_card(api_client, reader, b"not an image")
+    assert handled.status_code == 400
+    assert set(handled.json()["detail"]) == {"code", "batchId", "jobs", "rejected", "summary"}
 
     assert json.dumps(post_card(api_client, reader, jpeg()).json()).count('"message"') == 0
+
+
+# ==================================================================================================================
+# A client that goes away
+
+
+@pytest.mark.parametrize(
+    "content_type, start",
+    [
+        (
+            "multipart/form-data; boundary=card",
+            b'--card\r\nContent-Disposition: form-data; name="files"; filename="a.jpg"',
+        ),
+        ("image/jpeg", b"\xff\xd8\xff\xe0"),
+        ("application/json", b'{"images": [{"data": "/9j/4AAQ'),
+    ],
+    ids=["multipart", "raw", "json"],
+)
+def test_a_client_gone_mid_upload_stores_nothing_and_logs_no_traceback(
+    api_client: TestClient, reader: TestUser, caplog: pytest.LogCaptureFixture, content_type: str, start: bytes
+):
+    # a phone losing signal, or a logout aborting the queue: the body stops and the server is told the client left
+    jobs, dirs = job_count(reader), job_dirs(reader)
+    messages: list[dict[str, Any]] = [{"type": "http.request", "body": start, "more_body": True}]
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = {**reader.token, "Content-Type": content_type, "Content-Length": str(10 * 1024 * 1024)}
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": INGEST,
+        "raw_path": INGEST.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(name.lower().encode(), value.encode()) for name, value in headers.items()],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    caplog.set_level(logging.DEBUG)
+    asyncio.run(api_client.app(scope, receive, send))
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 400
+    assert (job_count(reader), job_dirs(reader)) == (jobs, dirs)
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING or record.exc_info] == []

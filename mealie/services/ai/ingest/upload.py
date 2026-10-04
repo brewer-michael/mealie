@@ -14,8 +14,9 @@ byte-capped body stream, and the three body shapes (multipart, a raw image, JSON
 Multipart is parsed by Starlette's `MultiPartParser` over the capped stream; its file parts spool to the system temp
 directory (never `DATA_DIR`) and go to intake as open file objects, closed when the request ends. A raw image body is
 spooled the same way, and so is a JSON body, which is then decoded in one of the process's intake slots (it takes about
-three times its size in memory): leniently (line breaks, a `data:` prefix, URL-safe letters) into `BytesIO`s. Each
-card then goes through `IntakeService.ingest_async`.
+three times its size in memory): leniently (line breaks, a `data:` prefix, URL-safe letters), each image into a spooled
+file of its own, so cards waiting for intake hold no decoded images in memory. Each card then goes through
+`IntakeService.ingest_async`.
 
 The answer is `202 IngestResponse`, whose `summary` is in the request's language for a Shortcut's notification and
 which has nothing named `message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
@@ -24,7 +25,6 @@ Refusals are `UploadRefused`, which the route turns into `{"detail": {"code", "m
 
 import base64
 import binascii
-import io
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -244,7 +244,7 @@ def _parse_batch_id(value: Any) -> UUID | Literal["new"] | None:
     try:
         return UUID(str(value).strip())
     except ValueError:
-        raise UploadRefused(404, NOT_FOUND) from None  # an unknown batch, as far as the client is concerned
+        raise _unknown_batch() from None  # an unknown batch, as far as the client is concerned
 
 
 def _parse_position(value: Any) -> int | None:
@@ -319,6 +319,11 @@ async def _capped(request: Request, limit: int) -> AsyncIterator[bytes]:
             yield chunk
 
 
+def _unknown_batch() -> UploadRefused:
+    """404 `not_found`: a `batchId` that isn't one of the household's batches (the PWA starts another one)"""
+    return UploadRefused(404, NOT_FOUND, message_key="recipe-ingest.errors.unknown-batch")
+
+
 def _invalid_body() -> UploadRefused:
     """400 `invalid_body`: a body of a supported type that can't be read (a broken form, bad JSON, a bad option)"""
     return UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.invalid-body")
@@ -381,7 +386,11 @@ async def _read_raw(request: Request, limit: int, query: Mapping[str, str]) -> U
     return body
 
 
-def _decode_json_images(payload: Any) -> list[UploadedImage]:
+def _decode_json_images(payload: Any, opened: list[Any]) -> list[UploadedImage]:
+    """
+    The body's images, each decoded into a spooled file (added to `opened`), so a card waiting for its intake holds
+    its images on disk rather than in memory
+    """
     if not isinstance(payload, dict) or not isinstance(payload.get("images"), list):
         raise _invalid_body()
     items = payload["images"]
@@ -405,15 +414,21 @@ def _decode_json_images(payload: Any) -> list[UploadedImage]:
         elif len(raw) > limits.MAX_FILE_BYTES:
             decoded.append(UploadedImage(None, filename, index, rejected=IngestRejectReason.too_large))
         else:
-            decoded.append(UploadedImage(io.BytesIO(raw), filename, index))
+            spooled: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
+            opened.append(spooled)
+            spooled.write(raw)
+            spooled.seek(0)
+            decoded.append(UploadedImage(spooled, filename, index))  # type: ignore[arg-type]
+        del raw
     return decoded
 
 
 async def _read_json(request: Request, limit: int, query: Mapping[str, str]) -> UploadBody:
     spooled: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
     body = UploadFile(spooled)  # type: ignore[arg-type]
+    result = UploadBody()
 
-    def decode() -> tuple[Any, list[UploadedImage]]:
+    def decode() -> Any:
         spooled.seek(0)
         try:
             payload = json.loads(spooled.read())
@@ -421,31 +436,41 @@ async def _read_json(request: Request, limit: int, query: Mapping[str, str]) -> 
             raise _invalid_body() from e
         finally:
             spooled.close()
-        return payload, _decode_json_images(payload)
+        result.images = _decode_json_images(payload, result._open)
+        return payload
 
     try:
         async for chunk in _capped(request, limit):
             await body.write(chunk)
-        # the body waits on disk, and only INTAKE_CONCURRENCY are decoded in memory at once
-        payload, decoded = await in_intake_slot(decode)
+        # the body waits on disk, and only INTAKE_CONCURRENCY are decoded in memory at once; the decoded images wait
+        # on disk too
+        payload = await in_intake_slot(decode)
+        result.options = UploadOptions.parse({**query, **{k: v for k, v in payload.items() if k != "images"}})
+    except BaseException:
+        result.close()
+        raise
     finally:
         spooled.close()
-    options = UploadOptions.parse({**query, **{k: v for k, v in payload.items() if k != "images"}})
-    return UploadBody(images=decoded, options=options)
+    return result
 
 
 # ==================================================================================================================
 # The handler
 
 
-def _summary(translator: Translator, accepted: int, rejected: int) -> str:
+def _summary(translator: Translator, accepted: int, rejected: list[IngestRejected]) -> str:
+    """For a Shortcut's notification: the cards queued, then those already scanned, then those refused for another
+    reason (each counted once, however many photos it had)"""
     parts = [
         translator.t("recipe-ingest.upload-summary", count=accepted)
         if accepted
         else translator.t("recipe-ingest.upload-summary-none")
     ]
-    if rejected:
-        parts.append(translator.t("recipe-ingest.upload-summary-rejected", count=rejected))
+    duplicates = sum(1 for item in rejected if item.reason == IngestRejectReason.duplicate)
+    if duplicates:
+        parts.append(translator.t("recipe-ingest.upload-summary-duplicate", count=duplicates))
+    if others := len(rejected) - duplicates:
+        parts.append(translator.t("recipe-ingest.upload-summary-rejected", count=others))
     return " ".join(parts)
 
 
@@ -559,7 +584,7 @@ class UploadHandler:
             if self.session.in_transaction():
                 self.session.commit()
         if not exists:
-            raise UploadRefused(404, NOT_FOUND)
+            raise _unknown_batch()
 
     async def handle(self) -> IngestResponse:
         """The whole request; raises `UploadRefused` for every refusal"""
@@ -625,7 +650,7 @@ class UploadHandler:
             except IngestPaused as e:
                 raise self._paused() from e
             except NoEntryFound as e:
-                raise UploadRefused(404, NOT_FOUND) from e
+                raise _unknown_batch() from e
 
             if isinstance(outcome, IntakeAccepted):
                 # the request's further cards join the same batch, in order
@@ -654,7 +679,7 @@ class UploadHandler:
             batch_id=batch_id if jobs and isinstance(batch_id, UUID) else None,
             jobs=jobs,
             rejected=rejected,
-            summary=_summary(self.translator, len(jobs), len(rejected)),
+            summary=_summary(self.translator, len(jobs), rejected),
         )
         if not jobs:
             raise UploadRefused(400, NOTHING_ACCEPTED, **response.model_dump(mode="json", by_alias=True))

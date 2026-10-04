@@ -2,7 +2,12 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import ReviewPage from "./[jobId].vue";
 import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vue";
-import { resetRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import {
+  leaveRecipeIngestCommitNotice,
+  resetRecipeIngestCounts,
+  resetRecipeIngestReviewState,
+  takeRecipeIngestCommitNotice,
+} from "~/composables/use-recipe-ingest";
 import type { CardFlag, RecipeIngestionJobOut } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
@@ -176,6 +181,14 @@ const stubs = {
   },
   VSelect: slot(),
   VCheckbox: slot(),
+  VSnackbar: {
+    props: ["modelValue", "location", "color", "timeout"],
+    template: `
+      <div v-if="modelValue" class="snackbar" :class="$attrs.class" :data-location="location" :data-color="color">
+        <slot /><slot name="actions" />
+      </div>
+    `,
+  },
 };
 
 const route = { params: { groupSlug: "home", jobId: "j1" }, query: {}, fullPath: "/g/home/recipes/cards/j1" };
@@ -220,6 +233,7 @@ describe("the recipe card review page", () => {
     vi.clearAllMocks();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     resetRecipeIngestCounts();
+    resetRecipeIngestReviewState();
     scrolled.length = 0;
     Element.prototype.scrollIntoView = function (this: Element) {
       scrolled.push(this.id);
@@ -304,7 +318,47 @@ describe("the recipe card review page", () => {
     expect(api.updateJob.mock.calls[0]![1].draft.steps[1].text).toBe("Microwave on high for 2 minutes.");
     expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 4 });
     expect(router.replace).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j2");
-    expect(toast.success).toHaveBeenCalledWith("Added Banana Mug Cake");
+    // said by the next card's page, not by a toast over its header
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(takeRecipeIngestCommitNotice()).toEqual({ text: "Added Banana Mug Cake", warning: null });
+  });
+
+  test("the card opened by Commit & next says what was added, at the bottom above the review bar", async () => {
+    leaveRecipeIngestCommitNotice({ text: "Added Lemon Bars", warning: null });
+    const wrapper = await mountPage();
+
+    const notice = wrapper.get(".ingest-review__notice");
+    expect(notice.attributes("data-location")).toBe("bottom");
+    expect(notice.attributes("data-color")).toBe("success");
+    expect(notice.text()).toContain("Added Lemon Bars");
+    expect(toast.success).not.toHaveBeenCalled();
+
+    // once only
+    wrappers.forEach(w => w.unmount());
+    wrappers.length = 0;
+    expect((await mountPage()).find(".ingest-review__notice").exists()).toBe(false);
+  });
+
+  test("a notice the next card never showed isn't shown on a card opened later", async () => {
+    leaveRecipeIngestCommitNotice({ text: "Added Lemon Bars", warning: null });
+    const later = Date.now() + 60_000;
+    vi.spyOn(Date, "now").mockReturnValue(later);
+    try {
+      const wrapper = await mountPage();
+      expect(wrapper.find(".ingest-review__notice").exists()).toBe(false);
+    }
+    finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("what the commit left out is said with it", async () => {
+    leaveRecipeIngestCommitNotice({ text: "Added Lemon Bars", warning: "The tag \"Desserts\" no longer exists, so it wasn't added." });
+    const wrapper = await mountPage();
+
+    const notice = wrapper.get(".ingest-review__notice");
+    expect(notice.attributes("data-color")).toBe("warning");
+    expect(notice.get(".ingest-review__notice-warning").text()).toBe("The tag \"Desserts\" no longer exists, so it wasn't added.");
   });
 
   test("a stale version shows the Reload this card dialog, which loads the stored card", async () => {
@@ -337,7 +391,7 @@ describe("the recipe card review page", () => {
     const dialog = wrapper.getComponent(IngestRegionDialog);
     expect(dialog.props("modelValue")).toBe(true);
     expect(dialog.props("initialTarget")).toBe("steps:s2");
-    expect(dialog.props("targets").map((option: { value: string }) => option.value)).toContain("ingredients:i1");
+    expect(dialog.props("targets")!.map((option: { value: string }) => option.value)).toContain("ingredients:i1");
   });
 
   test("the ⋯ menu reads the card again and shows what it says", async () => {

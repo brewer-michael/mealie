@@ -248,7 +248,9 @@ def test_files_still_being_written_wait(root: Path, reader: TestUser):
     assert fresh.exists()
 
 
-def test_symlinks_hidden_files_and_partial_downloads_are_skipped(root: Path, reader: TestUser, tmp_path: Path):
+def test_symlinks_hidden_files_and_partial_downloads_are_skipped(
+    root: Path, reader: TestUser, tmp_path: Path, warnings: list[str]
+):
     folder = _folder(root, reader)
     outside = tmp_path / "outside.jpg"
     outside.write_bytes(_jpeg())
@@ -261,10 +263,20 @@ def test_symlinks_hidden_files_and_partial_downloads_are_skipped(root: Path, rea
     before = len(_jobs(reader))
 
     assert _scan_twice() == 0
+    assert inbox.scan_once() == 0
     assert len(_jobs(reader)) == before
     for name in [*names, "link.jpg", "inner-link.jpg", "pipe.jpg"]:
         assert os.path.lexists(folder / name), name
     assert outside.exists()
+    assert (folder / "link.jpg").is_symlink() and (folder / "inner-link.jpg").is_symlink()
+
+    # a link stays where it is, so it's logged, once per name, rather than skipped silently forever
+    group_slug, household_slug = _slugs(reader)
+    assert sorted(message for message in warnings if "link" in message) == [
+        f"Skipped {group_slug}/{household_slug}/{name} in the recipe card inbox: links aren't followed. Put the "
+        "photo itself in the folder."
+        for name in ("inner-link.jpg", "link.jpg")
+    ]
 
 
 def test_a_subfolder_is_one_card_with_its_pages_in_name_order(root: Path, reader: TestUser):
@@ -362,7 +374,9 @@ def test_at_most_twenty_files_a_scan(root: Path, reader: TestUser, monkeypatch: 
     assert inbox.scan_once() == 1
 
 
-def test_a_card_folder_skips_nested_folders_and_links(root: Path, reader: TestUser, tmp_path: Path):
+def test_a_card_folder_skips_nested_folders_and_links(
+    root: Path, reader: TestUser, tmp_path: Path, warnings: list[str]
+):
     # a NAS's media indexer adds `@eaDir/` to every folder; neither it nor a link is a page
     folder = _folder(root, reader)
     card = folder / "grandmas-pie"
@@ -379,6 +393,11 @@ def test_a_card_folder_skips_nested_folders_and_links(root: Path, reader: TestUs
     assert [PageMeta.model_validate(page).original_filename for page in job.pages] == ["1-front.jpg", "2-back.jpg"]
     assert (folder / "processed" / _month() / "grandmas-pie" / "@eaDir").is_dir()
     assert outside.exists()
+    group_slug, household_slug = _slugs(reader)
+    assert [message for message in warnings if "link" in message] == [
+        f"Skipped {group_slug}/{household_slug}/grandmas-pie/3-link.jpg in the recipe card inbox: links aren't "
+        "followed. Put the photo itself in the folder."
+    ]
 
 
 def test_a_card_folder_with_too_many_pages_is_refused_before_any_is_opened(

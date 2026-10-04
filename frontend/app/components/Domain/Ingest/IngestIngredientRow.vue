@@ -72,7 +72,7 @@
         />
         <v-combobox
           class="ingest-ingredient__unit"
-          :model-value="model.unit ?? null"
+          :model-value="asOption(model.unit)"
           :items="unitOptions"
           item-title="name"
           item-value="name"
@@ -87,7 +87,7 @@
         />
         <v-combobox
           class="ingest-ingredient__food"
-          :model-value="model.food ?? null"
+          :model-value="asOption(model.food)"
           :items="foodOptions"
           item-title="name"
           item-value="name"
@@ -239,6 +239,11 @@ function toDraftRef(value: unknown, options: IngestNamedOption[]): CardDraftRef 
   }
   const item = value as { id?: string | null; name?: string };
   return item.name ? { id: item.id ?? null, name: item.name } : null;
+}
+
+/** The draft's unit or food as the combobox's items are typed (it may not be linked to one of them) */
+function asOption(value: CardDraftRef | null | undefined): IngestNamedOption | null {
+  return (value ?? null) as IngestNamedOption | null;
 }
 
 function setRef(kind: "unit" | "food", value: unknown) {

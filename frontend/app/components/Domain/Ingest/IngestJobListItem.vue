@@ -118,7 +118,15 @@ const emit = defineEmits<{
 const i18n = useI18n();
 const { ingestErrorText, progressText } = useRecipeIngestText();
 
-const title = computed(() => props.job.title || i18n.t("recipe-ingest.queue.untitled"));
+/** A card not read yet (or that couldn't be) has no name: its place in the batch tells it apart */
+const title = computed(() => {
+  if (props.job.title) {
+    return props.job.title;
+  }
+  return props.job.status === "processing" || props.job.status === "failed"
+    ? i18n.t("recipe-ingest.capture.card-number", { number: props.job.position + 1 })
+    : i18n.t("recipe-ingest.queue.untitled");
+});
 const jobLink = computed(() => `/g/${props.groupSlug}/recipes/cards/${props.job.id}`);
 const recipeLink = computed(() => {
   const slug = props.job.status === "committed" ? props.job.recipe?.slug : null;

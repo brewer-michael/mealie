@@ -155,7 +155,8 @@
     "recipe-ingest": {
         "upload-summary": "{count} recipe card queued. You'll be notified when it's ready. | {count} recipe cards queued. You'll be notified when they're ready.",
         "upload-summary-none": "No recipe cards were queued.",
-        "upload-summary-rejected": "{count} photo couldn't be used. | {count} photos couldn't be used.",
+        "upload-summary-duplicate": "{count} card was already scanned. | {count} cards were already scanned.",
+        "upload-summary-rejected": "{count} card couldn't be used. | {count} cards couldn't be used.",
         "notification-title": "Recipe cards ready",
         "notification-ready": "No cards are ready to review | {count} card is ready to review | {count} cards are ready to review",
         "notification-needs-attention": "{count} needs a look | {count} need a look",
@@ -180,7 +181,8 @@
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",
             "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
             "busy-restore": "Recipe card ingestion is busy writing files. Try the restore again in a minute.",
-            "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again."
+            "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again.",
+            "unknown-batch": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one."
         }
     }
 }

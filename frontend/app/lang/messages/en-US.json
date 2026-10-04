@@ -1414,6 +1414,8 @@
       "upload-failed": "Upload failed",
       "retry": "Retry",
       "retrying": "Retrying",
+      "retrying-paused": "Recipe cards are paused while a backup is restored. Trying again in a minute.",
+      "retrying-busy": "Too many recipe cards are waiting to be read. Trying again shortly.",
       "re-encoding": "Making the photo smaller",
       "already-scanned": "Already scanned",
       "open-earlier": "Open the earlier card",
@@ -1708,7 +1710,7 @@
       "local-reader": "Read by {name} on your network",
       "group-local": "Your group keeps recipe cards on this server.",
       "keep-local": "Keep these cards on this server",
-      "keep-local-hint": "Only AI providers on your network read the cards in this batch.",
+      "keep-local-hint": "Only AI providers on your network read the cards sent from now on.",
       "already-sent": "{count} card already sent isn't affected. | {count} cards already sent aren't affected.",
       "local-unavailable": "No AI provider on your network can read cards.",
       "no-reader": "AI isn't set up to read recipe cards."

@@ -2,7 +2,7 @@
   <div class="ingest-capture">
     <v-btn-toggle
       v-model="mode"
-      class="capture-mode mb-4"
+      class="capture-mode mb-3 mb-sm-4"
       color="primary"
       density="comfortable"
       variant="outlined"
@@ -235,7 +235,7 @@ const cameraLabel = computed(() => {
   if (pendingFront.value) {
     return i18n.t("recipe-ingest.capture.back-side");
   }
-  return openBatchCardCount.value ? i18n.t("recipe-ingest.capture.next-card") : i18n.t("recipe-ingest.capture.take-photo");
+  return openBatch.value ? i18n.t("recipe-ingest.capture.next-card") : i18n.t("recipe-ingest.capture.take-photo");
 });
 
 const canFinish = computed(() => !!openBatch.value || !!pendingFront.value || drafts.value.length > 0);

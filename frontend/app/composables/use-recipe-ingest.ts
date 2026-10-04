@@ -9,6 +9,7 @@ import type {
   CardFlagKind,
   IngestErrorCode,
   IngestRejectReason,
+  RecipeIngestionBatchOut,
   RecipeIngestionJobCounts,
   RecipeIngestionSettingsOut,
   RecipeIngestionSettingsUpdate,
@@ -326,6 +327,54 @@ export function useRecipeIngestCounts() {
 export function resetRecipeIngestCounts() {
   sharedCounts.value = null;
   countsRequest = null;
+}
+
+// ==========================================
+// Carried from one review page to the next (each card remounts the page)
+
+/** How many batches `rememberRecipeIngestBatch` keeps */
+const REMEMBERED_BATCHES = 20;
+const rememberedBatches = new Map<string, RecipeIngestionBatchOut>();
+
+/** The batch as last fetched, so the next card shows "Card 3 of 10" at once, before its own fetch answers */
+export function rememberedRecipeIngestBatch(batchId: string): RecipeIngestionBatchOut | null {
+  return rememberedBatches.get(batchId) ?? null;
+}
+
+export function rememberRecipeIngestBatch(batch: RecipeIngestionBatchOut) {
+  rememberedBatches.delete(batch.id);
+  rememberedBatches.set(batch.id, batch);
+  if (rememberedBatches.size > REMEMBERED_BATCHES) {
+    rememberedBatches.delete(rememberedBatches.keys().next().value as string);
+  }
+}
+
+/** What Commit & next said: "Added Banana Mug Cake", and what the commit left out */
+export interface RecipeIngestCommitNotice {
+  text: string;
+  warning: string | null;
+}
+
+/** A notice older than this is about an earlier visit (the next card's page didn't open) */
+const COMMIT_NOTICE_MAX_AGE_MS = 10_000;
+let commitNotice: { notice: RecipeIngestCommitNotice; at: number } | null = null;
+
+/** Left for the next card's page, which shows it above its review bar (a toast would cover its header on phones) */
+export function leaveRecipeIngestCommitNotice(notice: RecipeIngestCommitNotice) {
+  commitNotice = { notice, at: Date.now() };
+}
+
+/** The notice the last commit left, once, while it's fresh */
+export function takeRecipeIngestCommitNotice(): RecipeIngestCommitNotice | null {
+  const left = commitNotice;
+  commitNotice = null;
+  return left && Date.now() - left.at <= COMMIT_NOTICE_MAX_AGE_MS ? left.notice : null;
+}
+
+/** Forgets what review pages carry over (on logout, and between tests) */
+export function resetRecipeIngestReviewState() {
+  rememberedBatches.clear();
+  commitNotice = null;
 }
 
 /** The text helpers bound to the component's i18n */

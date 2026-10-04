@@ -12,9 +12,12 @@ aligned text lacks. `flags.compute_flags` turns that into `read_disagreement` an
 
 Alignment first filters by a score that forgives the two reads wrapping or wording a line differently
 (`token_set_ratio`, `partial_ratio`), then picks the candidate most like the whole line (`ratio`), and an ingredient
-prefers a line that starts with an amount as it does. Ranking by the forgiving score alone picks any text the line
-contains, or that contains the line: a step line that mentions "eggs" for the ingredient "2 eggs", or one short line
-of a wrapped step, which lacks the step's numbers.
+prefers a line shaped as it is: starting with an amount as it does, or saying nothing it doesn't (its own line, read
+without the amount). Ranking by the forgiving score alone picks any text the line contains, or that contains the
+line: a step line that mentions "eggs" for the ingredient "2 eggs", or one short line of a wrapped step, which lacks
+the step's numbers. Lines that read the same but for their amounts ("1 c. sugar" for the cake, "1/2 c. sugar" for
+the frosting) are told apart by order: the ingredients are aligned in the draft's order, each preferring a line after
+the previous one's.
 """
 
 import re
@@ -40,8 +43,8 @@ of those by the mean of `token_set_ratio` and `ratio` wins
 """
 STEP_MIN_SCORE = 70
 """
-A step can align with a window of transcript lines whose `partial_ratio` on letters only is at least this; the best
-of those by `ratio` wins
+A step can align with a window of transcript lines whose `partial_ratio` on letters only is at least this (`ratio`,
+for a window of more than `STEP_MAX_LINES` lines); the best of those by `ratio` wins
 """
 STEP_MAX_LINES = 4
 """A step's window has up to this many lines, or more while it's still shorter than the step"""
@@ -88,14 +91,18 @@ def _amount_first(text: str) -> bool:
     return bool(_AMOUNT_FIRST.match(LIST_MARKER_RE.sub("", text, count=1)))
 
 
-def align_ingredient(line: str, lines: Sequence[str]) -> int | None:
-    """The index of the transcript line an ingredient line reads as, or None if none is close enough"""
+def align_ingredient(line: str, lines: Sequence[str], after: int = -1) -> int | None:
+    """
+    The index of the transcript line an ingredient line reads as, or None if none is close enough. `after` is the line
+    the ingredient before it aligned with: of lines that read alike, the first one after it wins.
+    """
     target = letters_only(line)
     if not target:
         return None
 
     shape = _amount_first(line)
-    best: tuple[bool, float, float, int] | None = None
+    target_words = set(target.split())
+    best: tuple[bool, float, float, bool, bool, int] | None = None
     for index, candidate in enumerate(lines):
         words = letters_only(candidate)
         if not words:
@@ -105,20 +112,29 @@ def align_ingredient(line: str, lines: Sequence[str]) -> int | None:
             continue
         # `token_set_ratio` is 100 for any line holding all the ingredient's words, so a step's "Add eggs" would beat
         # the ingredient's own line read as "2 egg": a line shaped like the ingredient comes first, then `ratio`
-        # prefers the line that says that and little more
-        score = (_amount_first(candidate) == shape, (token_set + fuzz.ratio(target, words)) / 2, token_set, -index)
+        # prefers the line that says that and little more. A line saying nothing the ingredient doesn't is its own
+        # line read without the amount ("c. sugar" for "1 c. sugar"), never "1 c. brown sugar"
+        same_shape = _amount_first(candidate) == shape
+        shaped = same_shape or set(words.split()) <= target_words
+        # lines that read alike but for their amounts ("1 c. sugar", "1/2 c. sugar"): the next one in order
+        score = (shaped, (token_set + fuzz.ratio(target, words)) / 2, token_set, same_shape, index > after, -index)
         if best is None or score > best:
             best = score
 
-    return None if best is None else -best[3]
+    return None if best is None else -best[5]
 
 
 def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     """
-    The transcript lines a step reads as, `(start, end)`, or None. Windows of up to `STEP_MAX_LINES` lines (more while
-    still shorter than the step) whose `partial_ratio` reaches `STEP_MIN_SCORE` are candidates, and the one most like
-    the whole step by `ratio` wins: by `partial_ratio` alone, any one line of a wrapped step that both reads word for
-    word scores 100, and beats the whole step's window when the reads differ by a word elsewhere in it.
+    The transcript lines a step reads as, `(start, end)`, or None. Windows of up to `STEP_MAX_LINES` lines whose
+    `partial_ratio` reaches `STEP_MIN_SCORE`, and longer ones (grown only while still shorter than the step) whose
+    `ratio` does, are candidates, and the one most like the whole step by `ratio` wins: by `partial_ratio` alone, any
+    one line of a wrapped step that both reads word for word scores 100, and beats the whole step's window when the
+    reads differ by a word elsewhere in it.
+
+    It runs on every save, so the work stays near linear in the transcript, however long the step: a longer window is
+    compared whole, by `ratio` alone (`partial_ratio` on strings that long takes far more than linear time), and a
+    window whose length alone keeps its `ratio` below what it needs (the best so far, or `STEP_MIN_SCORE`) is skipped.
     """
     target = letters_only(text)
     if not target:
@@ -128,17 +144,30 @@ def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     best: tuple[float, float, int, int] | None = None
     best_window: tuple[int, int] | None = None
     for start in range(len(lines)):
-        window = ""
+        length = 0  # of the window's text: its lines' words, joined by spaces
         for end in range(start + 1, len(lines) + 1):
-            if end - start > STEP_MAX_LINES and len(window) >= len(target):
+            longer = end - start > STEP_MAX_LINES
+            if longer and length >= len(target):
                 break
+            if words[end - 1]:
+                length += len(words[end - 1]) + (1 if length else 0)
+            if not length:
+                continue
+            # candidates rank by `ratio` first, which is at most what the two lengths allow
+            needed = max(best[0] if best else 0, STEP_MIN_SCORE if longer else 0)
+            if 200 * min(length, len(target)) / (length + len(target)) < needed - 1e-9:
+                continue
             window = " ".join(word for word in words[start:end] if word)
-            if not window:
+            ratio = fuzz.ratio(target, window, score_cutoff=needed)
+            if ratio < needed:
                 continue
-            partial = fuzz.partial_ratio(target, window)
-            if partial < STEP_MIN_SCORE:
-                continue
-            score = (fuzz.ratio(target, window), partial, -(end - start), -start)
+            if longer:
+                partial = ratio
+            else:
+                partial = fuzz.partial_ratio(target, window, score_cutoff=STEP_MIN_SCORE)
+                if partial < STEP_MIN_SCORE:
+                    continue
+            score = (ratio, partial, -(end - start), -start)
             if best is None or score > best:
                 best, best_window = score, (start, end)
 

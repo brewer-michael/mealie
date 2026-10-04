@@ -97,11 +97,14 @@ describe("IngestJobListItem", () => {
     expect(status(mountItem(job({ status: "processing", task: { kind: "extract", state: "running" } }))))
       .toBe("Reading");
 
-    const untitled = mountItem(job({ status: "processing", title: null, thumbUrl: null }));
-    expect(untitled.get(".job-title").text()).toBe("Untitled card");
+    // not read yet: no name, so its place in the batch
+    const untitled = mountItem(job({ status: "processing", position: 2, title: null, thumbUrl: null }));
+    expect(untitled.get(".job-title").text()).toBe("Card 3");
     expect(untitled.find("img").exists()).toBe(false);
     expect(untitled.find(".spinner").exists()).toBe(true);
     expect(untitled.find(".job-review").exists()).toBe(false);
+    // a card read without a name is untitled until the reviewer names it
+    expect(mountItem(job({ title: null })).get(".job-title").text()).toBe("Untitled card");
   });
 
   test("a failed card says why, and offers Retry", async () => {

@@ -12,7 +12,7 @@
         variant="underlined"
         density="compact"
         hide-details
-        class="ingest-step__title"
+        class="ingest-step__title mb-3"
         :label="$t('recipe-ingest.review.section-title')"
         :readonly="readonly"
         @update:model-value="value => (step.title = value || null)"

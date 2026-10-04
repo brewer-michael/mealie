@@ -7,7 +7,15 @@ import { useDebounceFn, useEventListener, useIntervalFn } from "@vueuse/core";
 import { computed, onBeforeUnmount, readonly, ref, toValue, watch, type MaybeRefOrGetter } from "vue";
 import { useUserApi } from "~/composables/api";
 import { useFraction } from "~/composables/recipes/use-fraction";
-import { errorCodeOf, errorStatusOf, useRecipeIngestCounts, useRecipeIngestText } from "~/composables/use-recipe-ingest";
+import {
+  errorCodeOf,
+  errorStatusOf,
+  leaveRecipeIngestCommitNotice,
+  rememberedRecipeIngestBatch,
+  rememberRecipeIngestBatch,
+  useRecipeIngestCounts,
+  useRecipeIngestText,
+} from "~/composables/use-recipe-ingest";
 import type { TranslateFn } from "~/composables/use-recipe-ingest";
 import { alert } from "~/composables/use-toast";
 import { uuid4 } from "~/composables/use-utils";
@@ -55,7 +63,7 @@ export type ReviewDraft = CardDraft & {
   useCardAsCover: boolean;
   ingredients: CardDraftIngredient[];
   steps: CardDraftStep[];
-  notes: CardDraftNote[];
+  notes: (CardDraftNote & { title: string; text: string })[];
   tags: CardDraftRef[];
   categories: CardDraftRef[];
   tools: CardDraftRef[];
@@ -895,6 +903,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   const handledProposalIds = new Set<string>();
   let pendingClearError = false;
   let saving: Promise<void> | null = null;
+  /** Bumped by every save as it goes out, so a read can tell whether a save overlapped it */
+  let saveSeq = 0;
+  /** The last save that dismissed the error banner */
+  let clearedErrorSeq = 0;
   let fixCounter = 0;
   /** Flags fixed with one tap since the last save, by the fix's sequence number */
   const fixedFlags = ref(new Map<string, number>());
@@ -954,10 +966,16 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   // ==========================================
   // Loading
 
-  function applyJob(data: RecipeIngestionJobOut, initial: boolean) {
-    // a read from before a save this page made (draft versions only grow): its draft and flags are out of date,
-    // the rest (proposals, status, task, error) isn't
-    const stale = !initial && data.draftVersion < draftVersion.value;
+  /**
+   * Takes a read of the job. `overlap` says which of this page's saves were in flight while it was read: such a read
+   * may come from before them.
+   */
+  function applyJob(data: RecipeIngestionJobOut, initial: boolean, overlap = { save: false, clearedError: false }) {
+    // a read from before a save this page made: its draft and flags are out of date, the rest (proposals, status,
+    // task) isn't. Draft versions only grow, but a save that only resolves flags or proposals, or dismisses the
+    // banner, keeps the version, so a read at the same version that overlapped a save may predate it too.
+    const stale = !initial
+      && (data.draftVersion < draftVersion.value || (overlap.save && data.draftVersion === draftVersion.value));
     if (stale) {
       proposals.value = (data.proposals ?? []).filter(proposal => !proposal.id || !handledProposalIds.has(proposal.id));
       const current = job.value;
@@ -970,8 +988,11 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
             errorCount: current.errorCount,
             warningCount: current.warningCount,
             title: current.title,
+            // the banner a save dismissed meanwhile may still be in the read
+            error: overlap.clearedError ? current.error : data.error,
           }
         : data;
+      keepDismissedError();
       return;
     }
     const versionChanged = data.draftVersion !== draftVersion.value;
@@ -996,6 +1017,14 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     }
     proposals.value = (data.proposals ?? []).filter(proposal => !proposal.id || !handledProposalIds.has(proposal.id));
     job.value = data;
+    keepDismissedError();
+  }
+
+  /** A banner dismissed here stays dismissed while that waits to be saved, as resolutions do */
+  function keepDismissedError() {
+    if (pendingClearError && job.value) {
+      job.value.error = null;
+    }
   }
 
   async function loadBatch() {
@@ -1006,6 +1035,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     const { data } = await api.recipeIngest.getBatch(batchId);
     if (data) {
       batch.value = data;
+      rememberRecipeIngestBatch(data);
     }
     return data;
   }
@@ -1018,12 +1048,16 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       return;
     }
     applyJob(data, true);
+    // the batch as the last card saw it shows this card's place at once; the fetch brings it up to date
+    batch.value ??= rememberedRecipeIngestBatch(data.batchId);
     loadState.value = "ready";
     void loadBatch();
   }
 
   /** Fetches the job again without dropping unsaved edits */
   async function refresh() {
+    // the first save that may overlap the read: the one in flight now, else the next
+    const firstOverlapping = saving ? saveSeq : saveSeq + 1;
     const { data, error } = await api.recipeIngest.getJob(jobId);
     if (!data) {
       if (errorStatusOf(error) === 404) {
@@ -1036,7 +1070,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     while (saving) {
       await saving;
     }
-    applyJob(data, false);
+    applyJob(data, false, { save: saveSeq >= firstOverlapping, clearedError: clearedErrorSeq >= firstOverlapping });
   }
 
   /** "Reload this card": drops the unsaved edits and loads the stored card */
@@ -1053,6 +1087,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   // Saving
 
   async function sendSave() {
+    saveSeq += 1;
+    const seq = saveSeq;
     const sentDraft = cloneDraft(draft.value);
     const sentJson = stableStringify(sentDraft);
     const sentFixes = fixCounter;
@@ -1083,6 +1119,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         if (clearError) {
           job.value.error = null;
         }
+      }
+      if (clearError) {
+        clearedErrorSeq = seq;
       }
       setFlags(data.flags ?? [], sentFixes);
       saveState.value = "saved";
@@ -1182,7 +1221,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       }
     }
     else {
+      const before = stableStringify(draft.value);
       applyProposal(draft.value, proposal, mode);
+      if (mode === "replace" && proposal.target && stableStringify(draft.value) !== before) {
+        // the new reading took the flagged text's place: its flags show as fixed at once, and the save's answer
+        // confirms that (or opens them again when the server still raises them)
+        flagsForField(flags.value, proposal.target.field, proposal.target.ref ?? null)
+          .filter(isHighlighted)
+          .forEach(flag => markFixed(flag));
+      }
     }
     settleProposal(proposal);
   }
@@ -1509,10 +1556,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       const warnings = (data.warnings ?? [])
         .map(warning => text.commitWarningText(warning))
         .filter((warning): warning is string => !!warning);
+      const warning = warnings.length ? warnings.join(" ") : null;
       // after the batch's last card the queue opens on the batch, whose own line sums it up
-      const { path } = await nextPath(data.nextJobId);
-      if (warnings.length) {
-        alert.warning(warnings.join(" "), added);
+      const { path, last } = await nextPath(data.nextJobId);
+      if (!last) {
+        // the next card's page says it above its review bar: a toast would cover that page's header on phones
+        leaveRecipeIngestCommitNotice({ text: added, warning });
+      }
+      else if (warning) {
+        alert.warning(warning, added);
       }
       else {
         alert.success(added);

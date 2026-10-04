@@ -1,8 +1,10 @@
 <template>
   <v-container class="ingest-cards-page narrow-container">
-    <BasePageTitle divider>
+    <!-- phones: no icon, a smaller description and tighter spacing, so the capture buttons sit in the top half -->
+    <BasePageTitle divider class="ingest-cards-page__title">
       <template #header>
         <v-icon
+          class="d-none d-sm-flex"
           :icon="mdiCardTextOutline"
           size="64"
           color="primary"
@@ -11,7 +13,7 @@
       <template #title>
         {{ $t("recipe-ingest.capture.title") }}
       </template>
-      {{ $t("recipe-ingest.capture.description") }}
+      <span class="ingest-cards-page__description">{{ $t("recipe-ingest.capture.description") }}</span>
     </BasePageTitle>
 
     <v-progress-linear v-if="!settingsLoaded && settingsLoading" class="mb-4" indeterminate />
@@ -56,7 +58,7 @@
       </v-alert>
       <IngestPrivacyChip
         v-model:local-only="localOnly"
-        class="mb-4"
+        class="mb-3 mb-sm-4"
         :settings="settings"
         :already-sent="sentBeforeLocalOnlyChange"
       />
@@ -114,3 +116,21 @@ const inboxFolder = computed(() => (settings.value?.inbox?.enabled && settings.v
 
 onMounted(loadSettings);
 </script>
+
+<style scoped>
+@media (max-width: 599.98px) {
+  .ingest-cards-page__title :deep(h2) {
+    margin: 0 0 4px;
+  }
+
+  .ingest-cards-page__title :deep(h3) {
+    margin: 0;
+  }
+
+  .ingest-cards-page__description {
+    display: block;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+  }
+}
+</style>

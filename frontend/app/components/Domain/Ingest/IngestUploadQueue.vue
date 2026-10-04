@@ -107,6 +107,11 @@ const { ingestErrorText, rejectReasonText } = useRecipeIngestText();
 const { cards, batches, previewUrl, retry, remove } = useRecipeIngestUploads();
 
 const KNOWN_CODES = new Set<string>([...INGEST_ERROR_CODES, ...INGEST_API_ERROR_CODES]);
+/** Why a card waits to go again, where the error's own text asks the user to try again */
+const RETRYING_TEXT: Record<string, string> = {
+  paused_for_restore: "recipe-ingest.capture.retrying-paused",
+  too_many_jobs: "recipe-ingest.capture.retrying-busy",
+};
 
 /** Everything but cards uploaded with nothing more to say */
 const visibleCards = computed(() => cards.value.filter(card => card.status !== "done" || hasNote(card)));
@@ -144,6 +149,10 @@ function statusText(card: UploadCard): string {
 function detailText(card: UploadCard): string | null {
   if ((card.status !== "failed" && card.status !== "retrying") || !card.error || card.rejected.length) {
     return null;
+  }
+  const retrying = card.status === "retrying" ? RETRYING_TEXT[card.error] : undefined;
+  if (retrying) {
+    return i18n.t(retrying);
   }
   return KNOWN_CODES.has(card.error) ? ingestErrorText(card.error) : null;
 }

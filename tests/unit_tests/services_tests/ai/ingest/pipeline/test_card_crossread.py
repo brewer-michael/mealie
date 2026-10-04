@@ -1,21 +1,28 @@
 """The second reading's alignment and comparison (docs/ai/PHASE2.md §4.5), and the card text it reads"""
 
+import textwrap
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import pytest
+from rapidfuzz import fuzz
 
+from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardDraftStep, CardFlagSource, ExtractionMeta
+from mealie.services.ai.ingest.pipeline import crossread
 from mealie.services.ai.ingest.pipeline.cardtext import (
     canonical_markers,
     card_numbers,
     find_numbers,
     find_temperatures,
     format_number,
+    letters_only,
     markers_in,
     number_set,
     salient_tokens,
 )
 from mealie.services.ai.ingest.pipeline.crossread import (
+    STEP_MAX_LINES,
     CrossReadFailed,
     align_ingredient,
     align_step,
@@ -23,6 +30,7 @@ from mealie.services.ai.ingest.pipeline.crossread import (
     read_transcript,
     transcript_lines,
 )
+from mealie.services.ai.ingest.pipeline.flags import compute_flags
 from mealie.services.ai.ingest.pipeline.service import JobOpenAIService
 from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import (
     BANANA_TRANSCRIPT,
@@ -46,11 +54,28 @@ def test_numbers_read_the_same_however_they_are_written():
     assert format_number(find_numbers("11/2")[0].value) == "5 1/2"
 
 
+def test_a_mixed_number_written_with_a_dash_is_one_number():
+    """Printed recipes write 2 1/4 cups as "2-1/4 c.": a range never goes down to a proper fraction"""
+    (mixed,) = find_numbers("2-1/4 c. flour")
+    assert (mixed.value, mixed.end, mixed.text, mixed.span) == (Fraction(9, 4), None, "2-1/4", (0, 5))
+    assert [(number.value, number.text) for number in find_numbers("Bake 1 - 1/2 hrs, or 1–1/2 to 2")] == [
+        (Fraction(3, 2), "1 - 1/2"),
+        (Fraction(3, 2), "1–1/2 to 2"),
+    ]
+    assert find_numbers("1/2-3/4 c. sugar")[0].end == Fraction(3, 4)  # ranges go up
+    assert find_numbers("2-3 lb. roast")[0].end == 3
+    # the two readings agree however the mixed number is written
+    assert salient_tokens("2-1/4 c. flour") == salient_tokens("2 1/4 c. flour") == [("number", "9/4"), ("unit", "cup")]
+    assert compare("2-1/4 c. flour", "2 1/4 c. flour") is None
+
+
 def test_markers_and_temperatures():
     assert canonical_markers("a [ Illegible ] b [BLANK]") == "a [illegible] b [blank]"
     assert markers_in("for [blank] min, [illegible]") == ["blank", "illegible"]
     found = [(t.value, t.unit) for t in find_temperatures("350°, 180 °C, 400 degrees F, 425F, 12 C. flour")]
     assert found == [(350, None), (180, "C"), (400, "F"), (425, "F")]
+    # a digit too many is still a temperature, and flagged as one
+    assert [(t.value, t.unit, t.text) for t in find_temperatures("Bake at 3500°F")] == [(3500, "F", "3500°F")]
 
 
 def test_list_numbers_are_not_numbers_on_the_card():
@@ -100,6 +125,78 @@ def test_an_ingredient_read_differently_aligns_with_its_line_not_a_step_that_nam
     index = align_ingredient(line, transcript)
     assert index is not None and transcript[index].split()[0][0].isdigit()
     assert compare(line, transcript[index]) is None
+
+
+@pytest.mark.parametrize(
+    ("line", "transcript", "expected"),
+    [
+        # the second reading lost the amount: the ingredient's own line, not another that holds all its words
+        ("1 c. sugar", ["c. sugar", "1 c. brown sugar"], "c. sugar"),
+        ("1 t. salt", ["salt", "1 t. garlic salt"], "salt"),
+        ("1 c. milk", ["c. milk", "1 c. buttermilk"], "c. milk"),
+        ("1 c. sugar", ["c. sugar", "2 c. brown sugar"], "c. sugar"),
+        # a line that says more is still the ingredient's, and a step that names it still isn't
+        ("2 eggs", ["2 eggs, beaten", "Add eggs"], "2 eggs, beaten"),
+        ("1 c. butter", ["c. butter", "1 c. flour"], "c. butter"),
+        ("2 eggs", ["Eggs", "2 eggs"], "2 eggs"),  # a line that reads the same with the amount wins
+    ],
+)
+def test_an_ingredient_read_without_its_amount_aligns_with_its_own_line(
+    line: str, transcript: list[str], expected: str
+):
+    index = align_ingredient(line, transcript)
+    assert index is not None and transcript[index] == expected
+
+
+CAKE_AND_FROSTING = ["Cake", "1 c. sugar", "2 eggs", "Frosting", "1/2 c. sugar", "2 T. butter"]
+
+
+def test_lines_that_read_alike_align_in_order():
+    """By letters, "1 c. sugar" and "1/2 c. sugar" read the same: the first one after the line before wins"""
+    assert align_ingredient("1 c. sugar", CAKE_AND_FROSTING) == 1
+    assert align_ingredient("1/2 c. sugar", CAKE_AND_FROSTING) == 1  # alone, the first
+    assert align_ingredient("1/2 c. sugar", CAKE_AND_FROSTING, after=2) == 4
+    assert align_ingredient("1 c. sugar", CAKE_AND_FROSTING, after=4) == 1  # none after: the first again
+    assert align_ingredient("2 T. butter", CAKE_AND_FROSTING, after=4) == 5
+
+
+def _ingredient(text: str) -> CardDraftIngredient:
+    return CardDraftIngredient(original_text=text, note=text)
+
+
+def _cross_read(ingredients: list[str], transcript: list[str]) -> list[tuple[int, str, dict, list[str]]]:
+    """The cross-read's flags on a draft of these ingredient lines: (the line's position, kind, params, alternatives)"""
+    draft = CardDraft(
+        name="Cake", ingredients=[_ingredient(text) for text in ingredients], steps=[CardDraftStep(text="Mix.")]
+    )
+    positions = {str(line.reference_id): position for position, line in enumerate(draft.ingredients)}
+    flags = compute_flags(draft, ExtractionMeta(language="English", cross_read_lines=transcript), {})
+    return [
+        (positions[flag.ref or ""], flag.kind.value, flag.params, flag.alternatives)
+        for flag in flags
+        if flag.source == CardFlagSource.cross_read
+    ]
+
+
+def test_the_same_food_in_two_sections_is_compared_with_its_own_line():
+    # both readings agree: the frosting's "1/2 c. sugar" isn't held against the cake's "1 c. sugar"
+    assert _cross_read(["1 c. sugar", "2 eggs", "1/2 c. sugar", "2 T. butter"], CAKE_AND_FROSTING) == []
+    assert _cross_read(["1/2 c. sugar", "1 c. sugar"], ["Frosting", "1/2 c. sugar", "Cake", "1 c. sugar"]) == []
+    assert (
+        _cross_read(["1/2 tsp. salt", "1 c. flour", "1/4 tsp. salt"], ["1/2 tsp. salt", "1 c. flour", "1/4 tsp. salt"])
+        == []
+    )
+
+    # the main reading copied the cake's amount into the frosting: the second reading's frosting line says otherwise
+    assert _cross_read(["1 c. sugar", "2 eggs", "1 c. sugar", "2 T. butter"], CAKE_AND_FROSTING) == [
+        (2, "read_disagreement", {"text": "1/2 c. sugar", "value": "1"}, ["1/2 c. sugar"])
+    ]
+
+
+def test_an_amount_the_second_reading_lacks_is_flagged_on_the_ingredients_own_line():
+    assert _cross_read(["1 c. sugar", "1 c. brown sugar"], ["c. sugar", "1 c. brown sugar"]) == [
+        (0, "read_disagreement", {"text": "c. sugar", "value": "1"}, ["c. sugar"])
+    ]
 
 
 def test_a_wrapped_step_aligns_with_its_whole_window():
@@ -167,6 +264,85 @@ def test_a_step_longer_than_four_lines_aligns_whole():
 
     assert align_step(step, lines) == (1, 7)
     assert compare(step, " ".join(lines[1:7])) is None
+
+
+# A printed page: long steps, each wrapped over many lines of the second reading
+PAGE_STEPS = [
+    "Preheat the oven to 350 degrees and grease a 9 by 5 inch loaf pan. In a large bowl, cream 1/2 cup of softened "
+    "butter with 3/4 cup of brown sugar for about 3 minutes, until light and fluffy. Beat in 2 eggs one at a time, "
+    "scraping down the bowl after each, then stir in 1 teaspoon of vanilla and 3 ripe mashed bananas until just "
+    "blended; a few small lumps of banana are fine.",
+    "In a separate bowl, whisk together 2 cups of flour, 1 teaspoon of baking soda, 1/2 teaspoon of salt and 1/2 "
+    "teaspoon of cinnamon. Add the dry ingredients to the banana mixture in three parts, alternating with 1/3 cup of "
+    "buttermilk, and mix on low speed only until no streaks of flour remain. Fold in 3/4 cup of chopped walnuts.",
+    "Scrape the batter into the pan and smooth the top. Bake on the middle rack for 55 to 65 minutes, until a skewer "
+    "inserted into the center comes out clean. If the top browns too quickly, tent it loosely with foil for the last "
+    "15 minutes. Cool in the pan for 10 minutes, then turn out onto a rack and cool completely, at least 1 hour.",
+]
+PAGE_INGREDIENTS = ["1/2 c. butter", "3/4 c. brown sugar", "2 eggs", "1 tsp. vanilla", "3 bananas", "2 c. flour"]
+PAGE = ["Banana Bread", *PAGE_INGREDIENTS, *(line for step in PAGE_STEPS for line in textwrap.wrap(step, 36))]
+TYPED_STEP = (
+    "Meanwhile toast the pecans in a dry skillet over medium heat, stirring often, for 5 to 7 minutes until fragrant "
+    "and a shade darker; let them cool and chop them coarsely before folding them in at the very end."
+)
+
+
+class _CountingFuzz:
+    """rapidfuzz's scorers, keeping the windows `partial_ratio` is given"""
+
+    def __init__(self) -> None:
+        self.partial_windows: list[str] = []
+
+    def partial_ratio(self, target: str, window: str, **kwargs: Any) -> float:
+        self.partial_windows.append(window)
+        return fuzz.partial_ratio(target, window, **kwargs)
+
+    def ratio(self, *args: Any, **kwargs: Any) -> float:
+        return fuzz.ratio(*args, **kwargs)
+
+    def token_set_ratio(self, *args: Any, **kwargs: Any) -> float:
+        return fuzz.token_set_ratio(*args, **kwargs)
+
+
+def test_long_steps_align_whole_and_partial_ratio_only_sees_short_windows(monkeypatch: pytest.MonkeyPatch):
+    """
+    The alignment runs on every save. `partial_ratio` takes far more than linear time on long strings, so it only
+    ever compares windows of up to `STEP_MAX_LINES` lines, a bounded number of them; a longer window (a long step's
+    whole text) is compared by `ratio`. Comparing every longer window by `partial_ratio` made one save of this page
+    take seconds.
+    """
+    counting = _CountingFuzz()
+    monkeypatch.setattr(crossread, "fuzz", counting)
+    words = [letters_only(line) for line in PAGE]
+    short_windows = {
+        " ".join(word for word in words[start:end] if word)
+        for start in range(len(PAGE))
+        for end in range(start + 1, min(start + STEP_MAX_LINES, len(PAGE)) + 1)
+    }
+
+    windows = [align_step(step, PAGE) for step in PAGE_STEPS]
+
+    first = len(PAGE_INGREDIENTS) + 1
+    assert windows == [(first, first + 11), (first + 11, first + 21), (first + 21, len(PAGE))]
+    for step, window in zip(PAGE_STEPS, windows, strict=True):
+        assert window is not None and compare(step, " ".join(PAGE[window[0] : window[1]])) is None
+    assert set(counting.partial_windows) <= short_windows
+    assert len(counting.partial_windows) <= len(PAGE_STEPS) * STEP_MAX_LINES * len(PAGE)
+
+    # the page's extraction, then a save once the reviewer typed a step the transcript lacks: the same way
+    counting.partial_windows.clear()
+    draft = CardDraft(
+        name="Banana Bread",
+        ingredients=[_ingredient(text) for text in PAGE_INGREDIENTS],
+        steps=[CardDraftStep(text=text) for text in PAGE_STEPS],
+    )
+    extraction = ExtractionMeta(language="English", cross_read_lines=PAGE)
+    extracted = compute_flags(draft, extraction, {})
+    assert [flag for flag in extracted if flag.source == CardFlagSource.cross_read] == []
+    draft.steps.append(CardDraftStep(text=TYPED_STEP))
+    compute_flags(draft, extraction, {}, previous=extracted)
+    assert set(counting.partial_windows) <= short_windows
+    assert len(counting.partial_windows) <= (2 * len(PAGE_STEPS) + 1) * STEP_MAX_LINES * len(PAGE)
 
 
 def test_compare_lists_what_the_second_reading_lacks():
