@@ -447,3 +447,30 @@ def test_a_failed_card_being_merged_into_isnt_purged_under_the_merge(seeder: See
 
     assert _row(failed) is not None
     assert (seeder.dir(failed) / "pages" / "1" / "page.jpg").is_file()
+
+
+@pytest.mark.parametrize("kind", ["failed", "committed", "orphan"])
+def test_a_folder_the_purge_removes_gives_back_the_page_a_stopped_merge_left_there(seeder: Seeder, kind: str):
+    """
+    A merge cut short after moving another card's page into this card's folder (its commit failed, or a stop) leaves
+    the page there, with the merge's note, until it's settled: the purge settles it before the folder goes, so the
+    other card keeps its photo
+    """
+    from mealie.services.ai.ingest import review
+
+    retention_days = get_ingest_settings().RETENTION_DAYS
+    if kind == "orphan":
+        target = UUID(_orphan(seeder.group_id, age_seconds=0).name)
+    else:
+        target = seeder.job(IngestStatus(kind), age=timedelta(days=retention_days + 1))
+    back = seeder.job(IngestStatus.ready)
+    with storage.ingest_write():
+        review._MergeMarker.write(seeder.group_id, back, target, [(0, 1)])
+        os.rename(storage.page_dir(seeder.group_id, back, 0), storage.page_dir(seeder.group_id, target, 1))
+    stale = time.time() - limits.ORPHAN_DIR_AGE - 60
+    os.utime(seeder.dir(target), (stale, stale))
+
+    retention.purge_once(utcnow())
+    assert not seeder.dir(target).exists()
+    assert (storage.page_dir(seeder.group_id, back, 0) / "page.jpg").read_bytes() == b"jpeg"
+    assert _row(back)["status"] == IngestStatus.ready.value

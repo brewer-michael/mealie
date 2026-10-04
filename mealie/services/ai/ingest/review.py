@@ -660,12 +660,24 @@ def _title(draft: CardDraft) -> str | None:
 
 def recipes_public(household: HouseholdInDB | None) -> bool:
     """
-    New recipes in the household can be seen without a login, so a card photo on one could be too: upstream's explore
-    routes need both a household that isn't private and recipes that are public by default. A new install has a private
-    household whose recipes are "public", so the card is attached there.
+    New recipes in the household can be seen without a login now, so a card photo on one could be too: upstream's
+    explore routes need both a household that isn't private and recipes created public. What the review page's warning
+    says (`household_recipes_public`); the photo switches' defaults follow `recipes_created_public`.
     """
     preferences = household.preferences if household else None
     return bool(preferences and not preferences.private_household and preferences.recipe_public)
+
+
+def recipes_created_public(household: HouseholdInDB | None) -> bool:
+    """
+    The household's new recipes are created public (`recipe_public`, which commit copies into the recipe's settings),
+    so a card photo on one is seen without a login once the household isn't private, now or later: the explore routes
+    check the household when a recipe is read, and nothing makes a recipe private again when the household changes.
+    Upstream creates a private household with `recipe_public` off (a new install's included), so the card photo and
+    cover are on by default there.
+    """
+    preferences = household.preferences if household else None
+    return bool(preferences and preferences.recipe_public)
 
 
 def _slug(name: str) -> str | None:
@@ -750,22 +762,22 @@ class PossibleDuplicates:
 def attaches_card_photo(draft: CardDraft, household: HouseholdInDB | None) -> bool:
     """
     Whether commit attaches the card's photos to the recipe: the draft's switch, else the household's default, which
-    keeps them off recipes that are public when created (assets are served without a login)
+    keeps them off recipes created public (`recipes_created_public`: assets are served without a login)
     """
     if draft.attach_card_photo is not None:
         return draft.attach_card_photo
-    return not recipes_public(household)
+    return not recipes_created_public(household)
 
 
 def uses_card_as_cover(draft: CardDraft, household: HouseholdInDB | None) -> bool:
     """
     Whether commit makes the front of the card the recipe's image: the draft's switch, else the household's default,
-    which keeps the card off recipes that are public when created (the image is served without a login, as the assets
-    are), whether the card was reviewed or added with its batch's clean cards
+    which keeps the card off recipes created public (`recipes_created_public`: the image is served without a login, as
+    the assets are), whether the card was reviewed or added with its batch's clean cards
     """
     if draft.use_card_as_cover is not None:
         return draft.use_card_as_cover
-    return not recipes_public(household)
+    return not recipes_created_public(household)
 
 
 # ==========================================
@@ -1050,6 +1062,31 @@ def settle_merges(repos: IngestRepos, job: RecipeIngestionJob) -> RecipeIngestio
     if current is None:
         raise not_found()
     return current
+
+
+def settle_merges_into(session: Session, group_id: UUID, job_id: UUID, *, locked: UUID | None = None) -> None:
+    """
+    Settles what a stop left of merges into the card `job_id` before the card or its folder is deleted (a discard, the
+    purge): each note in its folder (`_settle_marker`), so a source card that is still there gets its pages back rather
+    than losing them with the folder. The card's row may be gone already (a folder without one).
+
+    `locked` is the household whose merge lock (`household_merge_lock`) the caller holds, the card's: a merge's two
+    cards are of one household. Without it, each note is settled under the merge lock of its source's household, taken
+    here; a note whose source is gone has nothing to give back (its pages go with the folder). Callers hold
+    `storage.ingest_write()`, with nothing pending in `session`.
+    """
+    for path in sorted(storage.job_dir(group_id, job_id).glob(f"{MERGE_MARKER_PREFIX}*.json")):
+        if (marker := _MergeMarker.read(path)) is None:
+            continue
+        if locked is not None:
+            _settle_marker(IngestRepos(session, group_id, locked), marker)
+            continue
+        source = sa.select(Job.household_id).where(Job.id == marker.source_id, Job.group_id == group_id)
+        household_id = session.execute(source).scalar_one_or_none()
+        session.commit()
+        if household_id is not None:
+            with household_merge_lock(session, household_id):
+                _settle_marker(IngestRepos(session, group_id, household_id), marker)
 
 
 # ==========================================
@@ -1353,9 +1390,13 @@ class ReviewService:
         return RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name)
 
     @cached_property
-    def _household_recipes_public(self) -> bool:
+    def _household(self) -> HouseholdInDB | None:
         repos = get_repositories(self.session, group_id=self.group_id, household_id=self.household_id)
-        return recipes_public(repos.households.get_one(self.household_id))
+        return repos.households.get_one(self.household_id)
+
+    @property
+    def _household_recipes_public(self) -> bool:
+        return recipes_public(self._household)
 
     def get_job(self, job_id: UUID) -> RecipeIngestionJobOut:
         """The whole job for the review page, with its permissions and the possible duplicate"""
@@ -1376,8 +1417,8 @@ class ReviewService:
             duplicate_of=duplicates.recipe,
             duplicate_job=duplicates.job,
             duplicate_name=duplicates.name,
-            card_photo_default=not self._household_recipes_public,
-            card_cover_default=not self._household_recipes_public,
+            card_photo_default=not recipes_created_public(self._household),
+            card_cover_default=not recipes_created_public(self._household),
         )
         return out
 
@@ -1844,8 +1885,9 @@ class ReviewService:
         """
         Deletes the job's row and its files (§3.1, §9): the uploader, anyone for an inbox card, otherwise the
         household's managers. Deleting the row clears any task with it, so a running one stops within a heartbeat.
-        Holds the household's merge lock, so a merge never moves pages into a folder being deleted. The caller holds the
-        ingest write lock.
+        Holds the household's merge lock, so a merge never moves pages into a folder being deleted, and a merge into
+        the card that a stop left half done gives the other card its pages back first (`settle_merges_into`). The
+        caller holds the ingest write lock.
         """
         with household_merge_lock(self.session, self.household_id):
             job = self.job(job_id)
@@ -1855,6 +1897,7 @@ class ReviewService:
             if job.status not in discardable:
                 raise invalid_status(job.status)
 
+            settle_merges_into(self.session, self.group_id, job_id, locked=self.household_id)
             if not self.repos.jobs.delete(job_id, where=[Job.status.in_(discardable)]):
                 current = self.job(job_id)
                 raise invalid_status(current.status)

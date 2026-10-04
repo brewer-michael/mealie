@@ -368,5 +368,5 @@ def test_a_draft_stored_before_notes_had_ids(api_client: TestClient, unique_user
     assert saved.status_code == 200
     assert saved.json()["draftVersion"] == 1  # nothing was edited: the card still counts as unedited
     row = job_row(job_id)
-    assert row["draft"]["schema_version"] == 2
+    assert row["draft"]["schema_version"] == 3
     assert [note["id"] for note in row["draft"]["notes"]] == ids

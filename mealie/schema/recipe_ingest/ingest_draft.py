@@ -14,8 +14,11 @@ from pydantic import UUID4, ConfigDict, Field, model_validator
 
 from mealie.schema._mealie import MealieModel
 
-CARD_DRAFT_SCHEMA_VERSION = 2
-"""The current `CardDraft.schema_version`. Version 2 gave notes an `id`."""
+CARD_DRAFT_SCHEMA_VERSION = 3
+"""
+The current `CardDraft.schema_version`. Version 2 gave notes an `id`; version 3 made `use_card_as_cover` optional (unset
+is the household's default), which versions 1 and 2 set on every draft.
+"""
 
 NOTE_ID_NAMESPACE = UUID("6f1d2b8e-4c3a-4e57-9a0d-2b5c7e9f1a34")
 """The `uuid5` namespace of the ids a note sent or stored without one is given (`note_id_for`)"""
@@ -88,12 +91,12 @@ class CardDraft(MealieModel):
     use_card_as_cover: bool | None = None
     """
     Whether commit makes the front of the card the recipe's image; None means the household's default (the card is the
-    image unless the household's recipes are public: the image is served without a login, like the assets)
+    image unless the household's new recipes are created public: the image is served without a login, like the assets)
     """
     attach_card_photo: bool | None = None
     """
     Whether commit attaches the card's photos to the recipe as assets; None means the household's default (attached
-    unless the household's recipes are public)
+    unless the household's new recipes are created public)
     """
     ingredients: list[CardDraftIngredient] = Field(default_factory=list)
     steps: list[CardDraftStep] = Field(default_factory=list)
@@ -117,6 +120,11 @@ class CardDraft(MealieModel):
 
         Version 2 gave notes an `id`. A note without one (stored by version 1, or new on a page that sent none) gets
         `note_id_for` its position and text, so reading the same draft twice gives the same ids until it's saved.
+
+        Version 3 made `use_card_as_cover` optional. Versions 1 and 2 stored `true` on every draft (their default), so
+        a `true` from them (or from a draft without a version, read as version 1) says nothing: it reads as unset, the
+        household's default (`review.uses_card_as_cover`), which keeps the card off recipes created public. `false`
+        was always the reviewer's choice. `attach_card_photo` was optional from the start.
         """
         if not isinstance(data, dict):
             return data
@@ -124,6 +132,10 @@ class CardDraft(MealieModel):
         if not isinstance(version, int) or version < CARD_DRAFT_SCHEMA_VERSION:
             data = {**data, "schema_version": CARD_DRAFT_SCHEMA_VERSION}
             data.pop("schemaVersion", None)
+        if not isinstance(version, int) or version < 3:
+            for key in ("use_card_as_cover", "useCardAsCover"):
+                if data.get(key) is True:
+                    data[key] = None
 
         notes = data.get("notes")
         if isinstance(notes, list) and any(isinstance(note, dict) and not note.get("id") for note in notes):

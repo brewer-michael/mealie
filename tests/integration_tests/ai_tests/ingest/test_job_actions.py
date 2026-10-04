@@ -442,6 +442,49 @@ def test_the_page_of_a_card_discarded_after_a_stop_left_its_merge_goes(
     assert _merge_notes(user, front) == []
 
 
+def test_discarding_the_card_a_failed_merge_left_a_page_in_gives_the_page_back(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A merge whose commit fails leaves the back's page in the front's folder, with its note, until it's settled:
+    discarding the front settles it first, so the back keeps its photo rather than losing it with the front's folder
+    """
+    from sqlalchemy.orm import Session
+
+    from mealie.services.ai.ingest import review
+
+    user = unique_user_fn_scoped
+    front, back = seed_job(user, created_by=user.user_id), seed_job(user, created_by=user.user_id, position=1)
+    real_write, real_commit = review.ReviewService._write_merge, Session.commit
+    written: list[bool] = []
+
+    def write_merge(self: Any, *args: Any) -> bool:
+        written.append(True)
+        return real_write(self, *args)
+
+    def commit(self: Session) -> None:
+        if written:
+            written.clear()
+            raise RuntimeError("the database went away")
+        real_commit(self)
+
+    monkeypatch.setattr(review.ReviewService, "_write_merge", write_merge)
+    monkeypatch.setattr(Session, "commit", commit)
+    with pytest.raises(RuntimeError):
+        _merge(api_client, user, back, front)
+    monkeypatch.setattr(Session, "commit", real_commit)
+    assert job_row(back)["status"] == "ready"
+    assert _pages_on_disk(user, back) == [] and _pages_on_disk(user, front) == ["0", "1"]
+    assert _merge_notes(user, front) == [f".merge-{back}.json"]
+
+    assert api_client.delete(job_url(front), headers=user.token).status_code == 204
+    assert job_row(front) == {}
+    assert not storage.job_dir(UUID(user.group_id), front).exists()
+    assert _pages_on_disk(user, back) == ["0"]
+    _every_listed_page_on_disk(user, back)
+    assert api_client.get(job_url(back, "pages", 0, "view"), headers=user.token).status_code == 200
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_a_card_kept_local_keeps_the_card_it_joins_local(
     api_client: TestClient, admin_token: dict, unique_user_fn_scoped: TestUser, failed: bool
@@ -815,3 +858,37 @@ def test_clean_cards_added_in_a_public_household_dont_show_the_card(
         assert not (recipe_dir(item["recipeId"]) / "images" / "original.webp").exists()
         anonymous = api_client.get(f"/api/media/recipes/{item['recipeId']}/images/original.webp")
         assert anonymous.status_code == 404
+
+
+def test_a_card_stored_with_the_old_cover_default_doesnt_show_the_card_in_a_public_household(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    Drafts stored before version 3 hold `use_card_as_cover: true` whether or not anyone chose it (the old default):
+    in a household whose recipes are public, such a card becomes neither the image of the recipe added with its
+    batch's clean cards nor of one added on its own
+    """
+    user = unique_user_fn_scoped
+    preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
+    preferences.update({"privateHousehold": False, "recipePublic": True})
+    assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
+    batch_id = _batch(user)
+    cards = [ready_to_commit(user, batch_id=batch_id, draft=banana_draft(name=f"Old {n}")) for n in range(2)]
+    for job_id in cards:
+        stored = job_row(job_id)["draft"]  # as the version 2 schema stored every draft
+        set_columns(job_id, draft={**stored, "schema_version": 2, "use_card_as_cover": True})
+
+    job = api_client.get(job_url(cards[0]), headers=user.token).json()
+    assert (job["cardCoverDefault"], job["draft"]["useCardAsCover"], job["draft"]["schemaVersion"]) == (False, None, 3)
+
+    out = _commit_clean(api_client, user, batch_id, {cards[0]: 1}).json()
+    assert [item["jobId"] for item in out["committed"]] == [str(cards[0])]
+    alone = commit(api_client, user, cards[1])
+    assert alone.status_code == 201, alone.text
+    for recipe_id, slug in (
+        (out["committed"][0]["recipeId"], out["committed"][0]["slug"]),
+        (alone.json()["recipeId"], alone.json()["slug"]),
+    ):
+        recipe = api_client.get(api_routes.recipes_slug(slug), headers=user.token).json()
+        assert (recipe["image"], recipe["assets"], recipe["settings"]["public"]) == (None, [], True)
+        assert api_client.get(f"/api/media/recipes/{recipe_id}/images/original.webp").status_code == 404

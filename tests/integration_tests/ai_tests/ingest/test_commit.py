@@ -721,10 +721,13 @@ def test_missing_card_files_return_the_job_to_ready(
 # The cover (a portrait card is letterboxed) and the card photo switch
 
 
-def _set_recipes_public(api_client: TestClient, user: TestUser, public: bool) -> None:
-    """The household's new recipes seen without a login or not, with their assets hidden by default"""
+def _set_household(api_client: TestClient, user: TestUser, *, private: bool, recipe_public: bool) -> None:
+    """
+    The household private or not, and its new recipes created public or not (`recipe_public`, which commit copies into
+    the recipe's settings), with their assets hidden by default
+    """
     preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
-    preferences.update({"privateHousehold": not public, "recipePublic": public, "recipeShowAssets": False})
+    preferences.update({"privateHousehold": private, "recipePublic": recipe_public, "recipeShowAssets": False})
     assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
 
 
@@ -780,12 +783,22 @@ def test_a_landscape_card_is_the_cover_as_it_is(tmp_path: Any):
         assert abs(red - 30) < 12 and abs(green - 90) < 12 and abs(blue - 200) < 12
 
 
-def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
+def test_the_card_photo_is_attached_unless_new_recipes_are_public(
     api_client: TestClient, unique_user_fn_scoped: TestUser
 ):
-    """Assets and the recipe image are served without a login, so in a household whose recipes are public the card
-    photo and the cover are off unless the reviewer turns them on; elsewhere they're on unless they turn them off"""
+    """
+    Assets and the recipe image are served without a login, so where the household's new recipes are created public
+    (`recipe_public`) the card photo and the cover are off unless the reviewer turns them on; elsewhere they're on
+    unless they turn them off. That follows the recipe made, not whether the household is private now: a recipe
+    created public shows on the household's public pages once the household stops being private. The review page's
+    warning (`householdRecipesPublic`) says whether recipes are seen without a login now.
+    """
     user = unique_user_fn_scoped
+
+    def defaults() -> tuple[bool, bool, bool]:
+        job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
+        assert (job["draft"]["attachCardPhoto"], job["draft"]["useCardAsCover"]) == (None, None)
+        return job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]
 
     def committed(draft: Any) -> tuple[dict[str, Any], list[str]]:
         job_id = ready_to_commit(user, draft=draft)
@@ -795,18 +808,31 @@ def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
         files = sorted(path.name for path in assets.glob("recipe-card-*")) if assets.exists() else []
         return recipe, files
 
-    # a new install: a private household whose recipes are "public" by default keeps the card (set here: a test
-    # user's registration picks the household's privacy at random)
-    preferences = api_client.get(api_routes.households_preferences, headers=user.token).json()
-    preferences.update({"privateHousehold": True, "recipePublic": True})
-    assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
-    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (False, True, True)
+    # a new install, and every household upstream creates since: private, with recipes created private
+    _set_household(api_client, user, private=True, recipe_public=False)
+    assert defaults() == (False, True, True)
+    recipe, files = committed(banana_draft(name="Private default"))
+    assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
+    assert len(files) == 1
+    assert recipe["image"]
+    assert recipe["settings"]["public"] is False
 
-    _set_recipes_public(api_client, user, True)
-    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (True, False, False)
-    assert (job["draft"]["attachCardPhoto"], job["draft"]["useCardAsCover"]) == (None, None)
+    recipe, files = committed(banana_draft(name="Private detached", attach_card_photo=False, use_card_as_cover=False))
+    assert (recipe["assets"], files) == ([], [])
+    assert recipe["image"] is None
+
+    # recipes created public in a household that is private for now: the card is off, as it would be seen once the
+    # household is made public; nothing is seen without a login yet, so the page doesn't warn
+    _set_household(api_client, user, private=True, recipe_public=True)
+    assert defaults() == (False, False, False)
+    recipe, files = committed(banana_draft(name="Public later"))
+    assert (recipe["assets"], files, recipe["image"]) == ([], [], None)
+    assert recipe["settings"]["public"] is True
+    assert not (recipe_dir(recipe["id"]) / "images" / "original.webp").exists()
+
+    # a household whose recipes are seen without a login
+    _set_household(api_client, user, private=False, recipe_public=True)
+    assert defaults() == (True, False, False)
     listed = api_client.get("/api/ai/ingest/jobs", headers=user.token).json()["items"]
     assert {item["householdRecipesPublic"] for item in listed} == {True}  # for the batch's "Add clean cards"
 
@@ -826,18 +852,13 @@ def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
     assert (recipe["assets"], files) == ([], [])
     assert recipe["image"]
 
-    _set_recipes_public(api_client, user, False)
-    job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (False, True, True)
-
-    recipe, files = committed(banana_draft(name="Private default"))
-    assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
+    # a public household whose new recipes are private: they're never seen without a login, so the card is on
+    _set_household(api_client, user, private=False, recipe_public=False)
+    assert defaults() == (False, True, True)
+    recipe, files = committed(banana_draft(name="Private recipe"))
     assert len(files) == 1
     assert recipe["image"]
-
-    recipe, files = committed(banana_draft(name="Private detached", attach_card_photo=False, use_card_as_cover=False))
-    assert (recipe["assets"], files) == ([], [])
-    assert recipe["image"] is None
+    assert recipe["settings"]["public"] is False
 
 
 def test_a_resumed_commit_that_no_longer_attaches_removes_the_written_assets(
@@ -972,6 +993,68 @@ def test_two_housekeepers_send_a_late_event_once(unique_user_fn_scoped: TestUser
 
     assert sorted(counts) == [0, 1]
     assert len(published) == 1
+
+
+def test_a_send_that_starts_after_housekeeping_took_over_sends_nothing(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, published: list, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The request's own send runs after the response, holding the claim its finish took. When it only starts once the
+    claim's lease has passed (a bulk commit's sends queued behind slow notifiers), housekeeping has sent the event
+    meanwhile, and the late send sends nothing rather than repeating it
+    """
+    user = unique_user_fn_scoped
+    real = card_commit._send_recipe_created
+    meanwhile: list[int] = []
+
+    def late(session: Any, **kwargs: Any) -> None:
+        if session is None:  # the request's background send, which got its turn only now
+            later = utcnow() + card_commit.RECIPE_EVENT_LEASE + timedelta(minutes=1)
+            meanwhile.append(card_commit.resend_recipe_events(later))
+        real(session, **kwargs)
+
+    monkeypatch.setattr(card_commit, "_send_recipe_created", late)
+    job_id = ready_to_commit(user)
+    assert commit(api_client, user, job_id).status_code == 201
+    assert len(meanwhile) == 1 and meanwhile[0] >= 1
+    assert [event["slug"] for event in published if str(event["household_id"]) == user.household_id] == [
+        "banana-mug-cake"
+    ]
+    assert job_row(job_id)["recipe_event_sent_at"] is not None
+
+
+def test_a_send_that_starts_late_keeps_housekeeping_away_while_it_runs(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, published: list, monkeypatch: pytest.MonkeyPatch
+):
+    """A send that starts before housekeeping took over renews the claim, so housekeeping doesn't send it as well"""
+    user = unique_user_fn_scoped
+    real = card_commit._send_recipe_created
+    job_id = ready_to_commit(user)
+    meanwhile: list[int] = []
+
+    def slow(session: Any, **kwargs: Any) -> None:
+        if session is None:
+            # its turn comes four minutes after the finish, and the notifiers take two more
+            set_columns(
+                job_id, recipe_event_claimed_at=job_row(job_id)["recipe_event_claimed_at"] - timedelta(minutes=4)
+            )
+            kwargs["claim"] = job_row(job_id)["recipe_event_claimed_at"]
+            dispatch = EventBusService.dispatch
+
+            def slow_dispatch(self: EventBusService, *args: Any, **kw: Any) -> None:
+                if not meanwhile:  # housekeeping runs while the notifiers are busy
+                    meanwhile.append(card_commit.resend_recipe_events(utcnow() + timedelta(minutes=2)))
+                dispatch(self, *args, **kw)
+
+            monkeypatch.setattr(EventBusService, "dispatch", slow_dispatch)
+        real(session, **kwargs)
+
+    monkeypatch.setattr(card_commit, "_send_recipe_created", slow)
+    assert commit(api_client, user, job_id).status_code == 201
+    assert len(meanwhile) == 1
+    assert [event["slug"] for event in published if str(event["household_id"]) == user.household_id] == [
+        "banana-mug-cake"
+    ]
 
 
 def test_late_events_skip_old_commits_and_deleted_recipes(

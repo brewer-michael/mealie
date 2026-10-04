@@ -12,9 +12,9 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    row, and creating it again would only clash.
 4. **Files** into `recipes/<id>/`, once a page turn a stop left half done is settled (`review.settle_turns`): each
    `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is attached (`attaches_card_photo`: the
-   draft's switch, else not in a household whose recipes are public), and the front's `view.jpg` as the cover when the
-   card is the recipe's image (`uses_card_as_cover`, by the same rule), a portrait card letterboxed to 4:3
-   (`cover_image`).
+   draft's switch, else not in a household whose new recipes are created public), and the front's `view.jpg` as the
+   cover when the card is the recipe's image (`uses_card_as_cover`, by the same rule), a portrait card letterboxed to
+   4:3 (`cover_image`).
 5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): a line kept as written with a marker
    that no save parsed parsed around it (`review.parse_kept_lines`), ingredients re-linked through a fresh
    `IngestMatcher` (§5), organizers looked up in the group by id (or created by name, for a committer who can
@@ -26,7 +26,9 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
 7. **Finish:** `committing → committed` with `recipe_id`; whichever call wins it publishes `recipe_created`, holding
    `recipe_event_claimed_at` from the finish, and records `recipe_event_sent_at` once it went out. Housekeeping sends
    it for a committed card whose event wasn't recorded a minute on (`resend_recipe_events`), so it's sent at least
-   once, even when the process stops between the finish and the send.
+   once, even when the process stops between the finish and the send. The winner's send renews the claim the finish
+   took as it starts, and sends nothing when that claim is no longer there (`_claim_event`): a send that only starts
+   once housekeeping has taken over (a bulk commit's sends queued behind slow notifiers) doesn't repeat the event.
 
 A validation error before `create_one` returns the job to `ready` with `commit_invalid` (and removes `recipes/<id>`
 when no recipe has that id), and so does a `create_one` that fails without making the recipe (`commit_interrupted`).
@@ -74,7 +76,7 @@ from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.lang.providers import Translator
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
-from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, IngestRepos, utcnow
+from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, IngestRepos, naive_utc, utcnow
 from mealie.schema.household.household import HouseholdInDB
 from mealie.schema.recipe.recipe import Recipe, RecipeCategory, RecipeTag, RecipeTool, create_recipe_slug
 from mealie.schema.recipe.recipe_asset import RecipeAsset
@@ -936,6 +938,18 @@ def _publish_recipe_created(
     return True
 
 
+def _claim_event(session: Session, job_id: UUID, claim: datetime) -> bool:
+    """
+    Renews the claim on `recipe_created` that this caller's finish took (`claim`), right before it sends the event;
+    whether it still had it. Housekeeping takes over an event whose claim is older than `RECIPE_EVENT_LEASE`
+    (`resend_recipe_events`), so a send that starts after that, or after the event went out, sends nothing; the renewed
+    claim keeps housekeeping away while this send runs.
+    """
+    unsent = [Job.id == job_id, Job.recipe_event_sent_at.is_(None), Job.recipe_event_claimed_at == claim]
+    renewed = max(utcnow(), naive_utc(claim))
+    return _update(session, sa.update(Job).where(*unsent).values(recipe_event_claimed_at=renewed))
+
+
 def _mark_event_sent(session: Session, job_id: UUID) -> None:
     """Records that the committed recipe's `recipe_created` went out"""
     unsent = [Job.id == job_id, Job.recipe_event_sent_at.is_(None)]
@@ -952,10 +966,12 @@ def _send_recipe_created(
     name: str,
     translator: Translator,
     integration_id: str,
+    claim: datetime | None = None,
 ) -> None:
     """
     Publishes `recipe_created` and records it as sent, with `session` or (from a request's background task, after the
-    response) a session of its own
+    response) a session of its own. `claim` is the event's claim the caller's finish took: the event is sent only while
+    the caller still holds it (`_claim_event`). Housekeeping, which sends right after its own claim, passes none.
     """
     if session is None:
         with session_context() as own:
@@ -968,8 +984,11 @@ def _send_recipe_created(
                 name=name,
                 translator=translator,
                 integration_id=integration_id,
+                claim=claim,
             )
         return
+    if claim is not None and not _claim_event(session, job_id, claim):
+        return  # housekeeping took it over, or it went out meanwhile
     published = _publish_recipe_created(
         session,
         group_id=group_id,
@@ -1005,6 +1024,8 @@ class _Outcome:
     name: str
     published: bool
     """This call won the finish, so it publishes `recipe_created` (once the write lock is released)"""
+    event_claim: datetime | None = None
+    """The claim on `recipe_created` the finish took (`recipe_event_claimed_at`), which the send is fenced on"""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -1111,8 +1132,11 @@ def _run(
 
     _set_cover_key(session, job, cover, slug)
     _mark_card_recipe(session, job)
-    published = _finish(session, job, lease, utcnow())
-    return _Outcome(recipe_id=recipe_id, slug=slug, name=name, published=published, warnings=warnings)
+    finished_at = utcnow()
+    published = _finish(session, job, lease, finished_at)
+    return _Outcome(
+        recipe_id=recipe_id, slug=slug, name=name, published=published, event_claim=finished_at, warnings=warnings
+    )
 
 
 def _announce(
@@ -1126,7 +1150,7 @@ def _announce(
 ) -> None:
     """
     `recipe_created` for the call that won the finish, sent once the ingest write lock is released: after the response
-    for a request (`background`), else in this thread
+    for a request (`background`), else in this thread; either way only while the finish's claim on it holds
     """
     if not outcome.published:
         return
@@ -1139,6 +1163,7 @@ def _announce(
         name=outcome.name,
         translator=translator,
         integration_id=integration_id,
+        claim=outcome.event_claim,
     )
     if background is not None:
         background.add_task(send, None)

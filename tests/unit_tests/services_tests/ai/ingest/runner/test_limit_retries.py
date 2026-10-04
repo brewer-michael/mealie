@@ -184,6 +184,78 @@ def test_a_card_that_fails_again_after_a_lift_waits_for_a_new_check(jobs: Jobs, 
     assert jobs.row(job_id)["status"] == IngestStatus.failed
 
 
+class _Clock:
+    """`time.monotonic()` as `retries` reads it, moved on by the test"""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _read_and_over_the_limit_again(job_id: UUID) -> None:
+    """The card a lift queued is read, and fails `limit_reached` again: finalize puts it back to waiting"""
+    token = uuid4()
+    with session_context() as session:
+        assert IngestQueue(session).claim(job_id, token=token, owner="test", now=utcnow(), group_cap=0)
+        finalize_failure(session, job_id, token, IngestErrorCode.limit_reached)
+
+
+def test_a_card_a_lift_doesnt_help_is_read_again_less_and_less_often(
+    jobs: Jobs, limit: LimitChecks, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A "lifted" answer that doesn't help the card (OCR stands in for an image slot over its limit, but finds no text on
+    the card, so it fails `limit_reached` again while the check keeps saying "lifted") queues it again only after
+    `LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT`: not at every run until the reset
+    """
+    clock = _Clock()
+    monkeypatch.setattr(retries, "time", clock)
+    interval = limits.LIMIT_RECHECK_INTERVAL
+    monkeypatch.setattr(retries, "LIFT_RETRY_MAX_WAIT", 3 * interval)
+    job_id = _waiting(jobs)
+    limit.set(False)
+
+    assert retry_waiting(utcnow()) == 1
+    for wait in (interval, 2 * interval, 3 * interval):  # doubled each time, up to the longest wait
+        _read_and_over_the_limit_again(job_id)
+        queued_at = clock.now
+        while clock.now + limits.HOUSEKEEPING_INTERVAL < queued_at + wait:  # every run until then
+            clock.now += limits.HOUSEKEEPING_INTERVAL
+            assert retry_waiting(utcnow()) == 0
+            assert jobs.row(job_id)["status"] == IngestStatus.failed
+        clock.now = queued_at + wait
+        assert retry_waiting(utcnow()) == 1
+        assert _queued_again(jobs, job_id)
+
+    # its reset has come: read again whatever the last lift said
+    _read_and_over_the_limit_again(job_id)
+    assert retry_waiting(utcnow() + timedelta(days=40)) == 1
+
+
+def test_a_lifts_wait_goes_with_the_card_no_longer_waiting(
+    jobs: Jobs, limit: LimitChecks, monkeypatch: pytest.MonkeyPatch
+):
+    clock = _Clock()
+    monkeypatch.setattr(retries, "time", clock)
+    read, waiting = _waiting(jobs), _waiting(jobs)
+    limit.set(False)
+    assert retry_waiting(utcnow()) == 2
+    assert set(retries._lift_waits) >= {read, waiting}
+
+    # one is read at last, the other fails again; once their waits are over, only the waiting card's is kept
+    jobs.update(read, status=IngestStatus.ready.value, task_kind=None, task_state=None)
+    _read_and_over_the_limit_again(waiting)
+    clock.now += limits.LIMIT_RECHECK_INTERVAL
+    limit.set(True)  # and the limit applies again
+    assert retry_waiting(utcnow()) == 0
+    assert read not in retries._lift_waits
+    assert waiting in retries._lift_waits
+    retries.forget_checks()
+    assert retries._lift_waits == {}
+
+
 def test_a_lift_is_checked_once_per_tick_for_a_groups_cards(jobs: Jobs, limit: LimitChecks):
     first, second = _waiting(jobs), _waiting(jobs)
     limit.set(False)

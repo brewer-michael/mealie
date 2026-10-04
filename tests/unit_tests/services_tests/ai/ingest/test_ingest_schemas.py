@@ -46,7 +46,7 @@ V1_DRAFT = {
 def test_a_version_1_draft_gets_the_same_note_ids_on_every_read():
     first, second = CardDraft.model_validate(V1_DRAFT), CardDraft.model_validate(dict(V1_DRAFT))
 
-    assert first.schema_version == CARD_DRAFT_SCHEMA_VERSION == 2
+    assert first.schema_version == CARD_DRAFT_SCHEMA_VERSION == 3
     assert [note.id for note in first.notes] == [note.id for note in second.notes]
     # the same text at another position is another note
     assert len({note.id for note in first.notes}) == 3
@@ -56,7 +56,7 @@ def test_a_version_1_draft_gets_the_same_note_ids_on_every_read():
 
 def test_a_camel_case_draft_from_the_page_is_migrated_too():
     draft = CardDraft.model_validate({"schemaVersion": 1, "name": "X", "notes": [{"title": "", "text": "a"}]})
-    assert draft.schema_version == 2
+    assert draft.schema_version == 3
     assert draft.notes[0].id == note_id_for(0, {"title": "", "text": "a"})
 
 
@@ -72,9 +72,35 @@ def test_a_draft_round_trips_through_its_stored_form():
     again = CardDraft.model_validate(_stored(draft))
     assert again == draft
     assert _stored(again) == _stored(draft)
-    assert _stored(again)["schema_version"] == 2
+    assert _stored(again)["schema_version"] == 3
     assert again.attach_card_photo is False
     assert CardDraft().attach_card_photo is None
+
+
+def test_a_cover_stored_before_version_3_is_the_households_default():
+    """
+    Versions 1 and 2 stored `use_card_as_cover: true` on every draft (their default), which can't tell a choice from
+    the default: it reads as unset, so a household whose recipes are public doesn't publish the card as their image
+    """
+    for version in (1, 2):
+        assert (
+            CardDraft.model_validate({"schema_version": version, "use_card_as_cover": True}).use_card_as_cover is None
+        )
+        assert CardDraft.model_validate({"schemaVersion": version, "useCardAsCover": True}).use_card_as_cover is None
+    assert CardDraft.model_validate({"use_card_as_cover": True}).use_card_as_cover is None  # no version: version 1
+    # turning it off was always a choice; from version 3 on, so is turning it on
+    assert CardDraft.model_validate({"schema_version": 2, "use_card_as_cover": False}).use_card_as_cover is False
+    assert CardDraft.model_validate({"schema_version": 3, "use_card_as_cover": True}).use_card_as_cover is True
+    assert CardDraft.model_validate({"schemaVersion": 3, "useCardAsCover": True}).use_card_as_cover is True
+    # the card photo's switch was optional from the start
+    assert CardDraft.model_validate({"schema_version": 2, "attach_card_photo": True}).attach_card_photo is True
+
+    # a stored proposal's draft is read the same way, and a migrated draft is stored as version 3
+    stored = {"kind": "full", "draft": {"schema_version": 2, "name": "X", "use_card_as_cover": True}}
+    proposal = CardProposal.model_validate(stored)
+    assert proposal.draft is not None and proposal.draft.use_card_as_cover is None
+    assert _stored(proposal.draft)["schema_version"] == 3
+    assert CardDraft.model_validate(_stored(proposal.draft)).use_card_as_cover is None
 
 
 def test_a_draft_from_a_newer_version_is_read_as_it_is():

@@ -75,8 +75,12 @@ def _purge_committed(session: Session, cutoff: datetime) -> int:
     """
     Committed cards past retention: their card text is cleared, the row stays, and then their files go. The row first:
     a card an undo took back to review since it was picked keeps its photos, as the update no longer matches it (and
-    an undo after it finds the card purged). Files left by a removal that failed go with the orphan folders.
+    an undo after it finds the card purged). Files left by a removal that failed go with the orphan folders. Like
+    every folder the purge removes, a merge into the card that a stop left half done is settled first
+    (`review.settle_merges_into`), so the other card keeps its pages.
     """
+    from .review import settle_merges_into
+
     stmt = sa.select(Job.id, Job.group_id, Job.pages, Job.row_version).where(
         Job.status == IngestStatus.committed.value,
         sa.func.coalesce(Job.committed_at, Job.update_at) < cutoff,
@@ -103,6 +107,7 @@ def _purge_committed(session: Session, cutoff: datetime) -> int:
             if _execute(session, update) == 1:
                 purged += 1
                 try:
+                    settle_merges_into(session, row.group_id, row.id)
                     storage.remove_job_dir(row.group_id, row.id)
                 except OSError:
                     logger.exception(
@@ -130,9 +135,10 @@ def failed_card_expires_at(job: RecipeIngestionJob) -> datetime | None:
 def _purge_failed(session: Session, cutoff: datetime) -> int:
     """
     Failed cards past retention: row and files. A card waiting for the monthly limits to reset is kept until
-    `RETENTION_DAYS` after its automatic retry, which reads it again before then.
+    `RETENTION_DAYS` after its automatic retry, which reads it again before then. A merge into the card that a stop
+    left half done is settled first (`review.settle_merges_into`), so the other card keeps its pages.
     """
-    from .review import household_merge_lock
+    from .review import household_merge_lock, settle_merges_into
 
     stmt = sa.select(Job.id, Job.group_id, Job.household_id).where(
         Job.status == IngestStatus.failed.value,
@@ -147,6 +153,7 @@ def _purge_failed(session: Session, cutoff: datetime) -> int:
         # under the household's merge lock: a merge into this card moving a page into its folder meanwhile either
         # finished first (and changed the card, which the delete then no longer matches) or finds it gone
         with storage.ingest_write(), household_merge_lock(session, row.household_id):
+            settle_merges_into(session, row.group_id, row.id, locked=row.household_id)
             delete = sa.delete(Job).where(
                 Job.id == row.id,
                 Job.status == IngestStatus.failed.value,
@@ -209,8 +216,11 @@ def _purge_orphan_dirs(session: Session, now: datetime) -> int:
     """
     Job directories with no row, untouched for `ORPHAN_DIR_AGE` (a crash before the insert, a discard racing a task, a
     restore mismatch), or a slimmed committed card's that `_purge_committed` couldn't remove. The age keeps an intake
-    that is still inserting its row safe.
+    that is still inserting its row safe. A merge into the folder's card that a stop left half done is settled first
+    (`review.settle_merges_into`), so a card still there gets its pages back.
     """
+    from .review import settle_merges_into
+
     oldest = now.replace(tzinfo=UTC).timestamp() - limits.ORPHAN_DIR_AGE
     candidates = [(group_id, job_id) for group_id, job_id, mtime in _job_dirs() if mtime < oldest]
     if not candidates:
@@ -223,10 +233,12 @@ def _purge_orphan_dirs(session: Session, now: datetime) -> int:
             continue
         with storage.ingest_write():
             # a job inserted since the first look keeps its directory
-            if session.execute(sa.select(Job.id).where(Job.id == job_id, sa.not_(_slimmed()))).first() is None:
+            orphan = session.execute(sa.select(Job.id).where(Job.id == job_id, sa.not_(_slimmed()))).first() is None
+            session.commit()
+            if orphan:
+                settle_merges_into(session, group_id, job_id)
                 shutil.rmtree(storage.job_dir(group_id, job_id), ignore_errors=True)
                 removed += 1
-            session.commit()
     return removed
 
 
