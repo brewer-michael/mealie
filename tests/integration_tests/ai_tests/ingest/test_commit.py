@@ -25,6 +25,7 @@ from test_jobs_api import (
 
 from mealie.core.config import get_app_dirs
 from mealie.db.db_setup import session_context
+from mealie.lang.providers import get_locale_provider
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.recipe.recipe_category import TagSave
@@ -40,6 +41,7 @@ from mealie.schema.recipe_ingest import (
     IngestStatus,
 )
 from mealie.schema.response.pagination import PaginationQuery
+from mealie.services.ai.ingest import commit as card_commit
 from mealie.services.ai.ingest import storage
 from mealie.services.event_bus_service.event_bus_service import EventBusService
 from mealie.services.event_bus_service.event_types import EventTypes
@@ -250,6 +252,30 @@ def test_keep_as_written_conversions(api_client: TestClient, unique_user_fn_scop
     assert recipe["notes"][1] == {**recipe["notes"][1], "title": "Tip", "text": "Use (unreadable) bananas"}
 
 
+@pytest.mark.parametrize("locale", ["de-DE", "en-GB"])
+def test_a_language_without_the_forks_texts_gets_them_in_english(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, locale: str
+):
+    """Only en-US carries the fork's texts: a commit in another language writes them in English, never their keys"""
+    user = unique_user_fn_scoped
+    draft = banana_draft(steps=[CardDraftStep(text="Bake at [illegible] degrees.")])
+    job_id = ready_to_commit(user, draft=draft, locale=locale)
+
+    response = api_client.post(
+        job_url(job_id, "commit"), json={"draftVersion": 1}, headers={**user.token, "Accept-Language": locale}
+    )
+    assert response.status_code == 201, response.text
+    recipe = recipe_of(api_client, user, response.json()["slug"])
+    written = [
+        recipe["notes"][0]["title"],
+        recipe["recipeInstructions"][0]["text"],
+        *(asset["name"] for asset in recipe["assets"]),
+    ]
+    assert not any("recipe-ingest" in text for text in written), written
+    if get_locale_provider(locale).t("recipe-ingest.note-from") == "recipe-ingest.note-from":
+        assert written == ["From", "Bake at (unreadable) degrees.", "Recipe card"]
+
+
 # ==================================================================================================================
 # Linking at commit
 
@@ -346,6 +372,93 @@ def test_a_member_who_cant_organize_keeps_new_foods_as_text(
     assert recipe["userId"] == str(member.user_id)  # the committer owns the recipe
 
 
+def test_markers_kept_in_unit_and_food_names_stay_text(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """A unit or food name with a kept marker never becomes one of the group's units or foods"""
+    user = unique_user_fn_scoped
+    draft = banana_draft(
+        ingredients=[
+            CardDraftIngredient(
+                original_text="1 [blank] cup [illegible] flour",
+                quantity=1,
+                unit=CardDraftRef(name="[blank] cup"),
+                food=CardDraftRef(name="[illegible] flour"),
+            ),
+            CardDraftIngredient(
+                original_text="2 cups [illegible] sugar",
+                quantity=2,
+                unit=CardDraftRef(name="cup"),
+                food=CardDraftRef(name="[illegible] sugar"),
+                note="sifted",
+            ),
+        ]
+    )
+    response = commit(api_client, user, ready_to_commit(user, draft=draft))
+    assert response.status_code == 201, response.text
+
+    flour, sugar = recipe_of(api_client, user, response.json()["slug"])["recipeIngredient"]
+    assert (flour["quantity"], flour["unit"], flour["food"], flour["note"]) == (
+        1,
+        None,
+        None,
+        "___ cup (unreadable) flour",
+    )
+    assert (sugar["quantity"], sugar["unit"]["name"], sugar["food"]) == (2, "cup", None)
+    assert sugar["note"] == "(unreadable) sugar, sifted"
+    with session_context() as session:
+        repos = get_repositories(session, group_id=UUID(user.group_id), household_id=None)
+        foods = [food.name for food in repos.ingredient_foods.page_all(_all()).items]
+        units = [unit.name for unit in repos.ingredient_units.page_all(_all()).items]
+    assert foods == []
+    assert units == ["cup"]
+
+
+@pytest.mark.parametrize("kind", ["food", "unit"])
+def test_a_food_or_unit_another_commit_just_created_is_linked(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, kind: str
+):
+    """Two cards with the same new food committed at once: the second finds the first's (the name is unique)"""
+    user = unique_user_fn_scoped
+    draft = banana_draft(
+        ingredients=[
+            CardDraftIngredient(
+                original_text="1 scoop dragonfruit",
+                quantity=1,
+                unit=CardDraftRef(name="scoop"),
+                food=CardDraftRef(name="dragonfruit"),
+            )
+        ]
+    )
+    job_id = ready_to_commit(user, draft=draft)
+
+    real = getattr(card_commit.IngredientLinker, kind)
+    created: list[Any] = []
+
+    def linked_after_another_commit(self: card_commit.IngredientLinker, ref: CardDraftRef) -> Any:
+        if not created:
+            # the matcher was loaded before another member's commit made the same name
+            self.matcher.foods_by_alias, self.matcher.units_by_alias  # noqa: B018
+            with session_context() as other:
+                repos = get_repositories(other, group_id=UUID(user.group_id), household_id=None)
+                if kind == "food":
+                    created.append(
+                        repos.ingredient_foods.create(SaveIngredientFood(name="dragonfruit", group_id=user.group_id))
+                    )
+                else:
+                    created.append(
+                        repos.ingredient_units.create(SaveIngredientUnit(name="scoop", group_id=user.group_id))
+                    )
+        return real(self, ref)
+
+    monkeypatch.setattr(card_commit.IngredientLinker, kind, linked_after_another_commit)
+    response = commit(api_client, user, job_id)
+    assert response.status_code == 201, response.text
+
+    [line] = recipe_of(api_client, user, response.json()["slug"])["recipeIngredient"]
+    assert line[kind]["id"] == str(created[0].id)
+    assert len(foods_named(user, "dragonfruit")) == len(units_named(user, "scoop")) == 1
+    assert job_row(job_id)["status"] == "committed"
+
+
 # ==================================================================================================================
 # The job
 
@@ -413,6 +526,22 @@ def test_a_commit_can_carry_the_final_draft(api_client: TestClient, unique_user_
 
     stale = seed_job(user)
     assert_code(commit(api_client, user, stale, version=3, draft=draft), 409, "version_conflict")
+
+
+def test_a_draft_over_the_size_limits_is_a_422(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """The limits a PUT checks apply to a draft sent with the commit: refused, nothing saved or claimed"""
+    user = unique_user_fn_scoped
+    job_id = ready_to_commit(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    draft["notes"] = [{"title": "", "text": f"note {i}"} for i in range(501)]
+    assert (
+        api_client.put(job_url(job_id), json={"draftVersion": 1, "draft": draft}, headers=user.token).status_code == 422
+    )
+
+    detail = assert_code(commit(api_client, user, job_id, draft=draft), 422, "commit_invalid")
+    assert detail["fields"] == ["draft"]
+    row = job_row(job_id)
+    assert (row["status"], row["draft_version"], row["commit_recipe_id"], row["error_code"]) == ("ready", 1, None, None)
 
 
 def test_a_draft_that_no_longer_validates_goes_back_to_ready(

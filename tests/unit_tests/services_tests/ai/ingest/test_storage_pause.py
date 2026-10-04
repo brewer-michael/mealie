@@ -3,6 +3,8 @@
 import errno
 import fcntl
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -355,6 +357,76 @@ def test_without_file_locks_the_marker_alone_applies(
     assert not storage.is_paused()
     warnings = [record for record in caplog.records if "File locks aren't supported" in record.getMessage()]
     assert len(warnings) == 1
+
+
+# ==========================================
+# Locks that belong to the process (NFS)
+
+
+@pytest.fixture()
+def process_locks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `flock` as Linux NFS clients emulate it: POSIX record locks (flock(2), "NFS details"). Those belong to the
+    process, not to the open file, so two threads never conflict, and closing any descriptor of the file drops every
+    lock the process holds on it. `lockf` gives exactly that on a local filesystem.
+    """
+    monkeypatch.setattr(fcntl, "flock", fcntl.lockf)
+
+
+def _exclusive_from_another_process(path: Path) -> bool:
+    """Whether another process could take the lock exclusively right now (a restore in another worker)"""
+    script = (
+        "import fcntl, os, sys\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+        "try:\n"
+        "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "except OSError:\n"
+        "    sys.exit(1)\n"
+        "sys.exit(0)\n"
+    )
+    return subprocess.run([sys.executable, "-c", script, str(path)], timeout=30).returncode == 0
+
+
+def test_with_process_locks_a_restore_still_waits_for_its_own_processs_writer(
+    data_dir: Path, fast_pause: None, process_locks: None
+):
+    release, inside, done = threading.Event(), threading.Event(), threading.Event()
+    writer = _write_in_thread(release, inside, done)
+    events: list[str] = []
+
+    @storage.pauses_ingest
+    def restore() -> None:
+        events.append("restore" if done.is_set() else "restore while writing")
+
+    restoring = threading.Thread(target=restore)
+    restoring.start()
+    try:
+        time.sleep(0.2)
+        assert events == []
+        with pytest.raises(IngestPaused), storage.ingest_write():
+            pass
+    finally:
+        release.set()
+        writer.join(5)
+        restoring.join(5)
+
+    assert events == ["restore"]
+    assert not storage.is_paused()
+
+
+def test_with_process_locks_a_section_ending_doesnt_drop_another_ones_lock(data_dir: Path, process_locks: None):
+    release, inside, done = threading.Event(), threading.Event(), threading.Event()
+    writer = _write_in_thread(release, inside, done)
+    try:
+        with storage.ingest_write():
+            pass  # ends while the other thread is still writing
+        assert not _exclusive_from_another_process(data_dir / storage.LOCK_FILE_NAME)
+    finally:
+        release.set()
+        writer.join(5)
+
+    assert done.is_set()
+    assert _exclusive_from_another_process(data_dir / storage.LOCK_FILE_NAME)
 
 
 def test_lock_support_is_detected(data_dir: Path):

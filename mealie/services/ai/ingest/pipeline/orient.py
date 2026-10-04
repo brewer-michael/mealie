@@ -19,7 +19,8 @@ def orient_page(page: CardPage) -> PageMeta:
     """
     Turns a page upright when Tesseract is available and sure enough (`ORIENT_MIN_RATIO`), rewriting its files
     inside the ingest write lock, and records the OCR text it read. Returns the page's new metadata, with `oriented`
-    set. Without Tesseract nothing is settled and the metadata comes back unchanged (the review page offers Rotate).
+    set. Without Tesseract nothing is settled and the metadata comes back unchanged (the review page offers Rotate),
+    as when Tesseract times out or fails: the next extraction tries again, and the OCR fallback reads the page itself.
     Blocking (Tesseract); run it in a thread from async code.
 
     Raises `IngestPaused` when a backup restore holds the write lock, and `FileNotFoundError` when the page is gone.
@@ -31,6 +32,8 @@ def orient_page(page: CardPage) -> PageMeta:
         raise FileNotFoundError(page.page_path)
 
     result = ocr.extract_text(page.page_path, min_ratio=limits.ORIENT_MIN_RATIO)
+    if result.failed:
+        return page.meta
     if result.rotation:
         with storage.ingest_write():
             meta = images.rotate_page_files(page.dir, page.meta, result.rotation, PageRotationSource.ocr)

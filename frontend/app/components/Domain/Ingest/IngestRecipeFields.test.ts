@@ -6,11 +6,12 @@ import { normalizeDraft, type ReviewDraft } from "~/composables/use-recipe-inges
 import type { CardFlag } from "~/lib/api/types/recipe-ingest";
 
 const field = {
-  props: ["modelValue", "label", "appendInnerIcon", "readonly"],
+  props: ["modelValue", "label", "appendInnerIcon", "readonly", "errorMessages"],
   emits: ["update:modelValue"],
   template: `
     <label class="field" :data-icon="appendInnerIcon">{{ label }}
       <input :value="modelValue" :readonly="readonly" @input="$emit('update:modelValue', $event.target.value)">
+      <small v-if="errorMessages" class="error-message">{{ errorMessages }}</small>
     </label>
   `,
 };
@@ -34,8 +35,8 @@ function draft(): ReviewDraft {
   }));
 }
 
-function mountWith<T>(component: T, model: ReviewDraft, flags: CardFlag[] = [], readonly = false) {
-  const wrapper = mount(component as never, {
+function mountWith(component: typeof IngestRecipeFields, model: ReviewDraft, flags: CardFlag[] = [], readonly = false) {
+  const wrapper = mount(component, {
     props: { modelValue: model, flags, readonly },
     global: { mocks: { $globals: { icons } }, stubs },
   });
@@ -79,6 +80,21 @@ describe("IngestRecipeFields", () => {
     await input(wrapper, "Servings").get("input").setValue("2-");
     expect(model.recipeServings).toBeNull();
     expect((input(wrapper, "Servings").get("input").element as HTMLInputElement).value).toBe("2-");
+  });
+
+  test("servings that aren't one number say they won't be kept, and point to Yield for a range", async () => {
+    const model = draft();
+    const wrapper = mountWith(IngestRecipeFields, model);
+
+    await input(wrapper, "Servings").get("input").setValue("4-6");
+    expect(model.recipeServings).toBeNull();
+    expect(input(wrapper, "Servings").get(".error-message").text()).toBe("Type a number. For a range like 4 to 6, use Yield.");
+
+    await input(wrapper, "Servings").get("input").setValue("4");
+    expect(model.recipeServings).toBe(4);
+    expect(input(wrapper, "Servings").find(".error-message").exists()).toBe(false);
+    await input(wrapper, "Servings").get("input").setValue("");
+    expect(input(wrapper, "Servings").find(".error-message").exists()).toBe(false);
   });
 
   test("a flagged field gets its colour and icon, whatever case the server names it in", () => {

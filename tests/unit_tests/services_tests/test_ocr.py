@@ -96,7 +96,7 @@ def test_an_unreadable_image_gives_an_empty_result(fake_tesseract: None, tmp_pat
     not_an_image = tmp_path / "recipe.jpg"
     not_an_image.write_text("not an image")
 
-    assert ocr.extract_text(not_an_image) == ocr.OCRResult()
+    assert ocr.extract_text(not_an_image) == ocr.OCRResult(failed=True)
 
 
 @pytest.mark.parametrize(
@@ -118,7 +118,8 @@ def test_a_failing_tesseract_gives_an_empty_result(
     image_path = tmp_path / "recipe.png"
     Image.new("RGB", (200, 100), "white").save(image_path)
 
-    assert ocr.extract_text(image_path) == ocr.OCRResult()
+    # empty, and marked as a failure rather than an image with no text (fork: orientation tries again later)
+    assert ocr.extract_text(image_path) == ocr.OCRResult(failed=True)
 
 
 @pytest.mark.parametrize(("configured", "expected"), [(None, "1"), ("4", "4")])

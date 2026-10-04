@@ -11,7 +11,7 @@ import type { AxiosProgressEvent } from "axios";
 import { computed, effectScope, markRaw, readonly, ref, shallowRef, watch } from "vue";
 import type { EffectScope } from "vue";
 import { useUserApi } from "~/composables/api";
-import { errorCodeOf, errorStatusOf, useRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import { errorCodeOf, errorStatusOf, resetRecipeIngestCounts, useRecipeIngestCounts } from "~/composables/use-recipe-ingest";
 import type { IngestedJob, IngestRejected, IngestResponse } from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestAPI } from "~/lib/api/user/recipe-ingest";
 
@@ -537,6 +537,8 @@ const localOnlyRef = ref(false);
 const uploadedCount = ref(0);
 /** The server batch of the last successful upload */
 const lastUploadBatchId = ref<string | null>(null);
+/** Cards that had left with the other setting when "Keep these cards on this server" last changed mid-batch */
+const sentBeforeLocalOnlyChange = ref(0);
 
 let api: RecipeIngestAPI | null = null;
 let refreshCounts: (() => Promise<unknown>) | null = null;
@@ -544,6 +546,8 @@ const batchRequests = new Map<string, Promise<BatchResult>>();
 const sealsInFlight = new Set<string>();
 const sealFailures = new Map<string, number>();
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
+/** The uploads in flight, aborted by a reset (logout), so no photo leaves after its user has gone */
+const uploadsInFlight = new Set<AbortController>();
 /** Bumped by a reset, so requests still in flight change nothing */
 let generation = 0;
 let scope: EffectScope | null = null;
@@ -669,7 +673,8 @@ async function ensureBatch(batchKey: string, gen: number): Promise<BatchResult> 
   if (!request) {
     request = (async (): Promise<BatchResult> => {
       try {
-        const { data, error } = await client().createBatch();
+        // the card that waits for the batch shows why it failed
+        const { data, error } = await client().createBatch({ suppressAlert: true });
         if (data?.id) {
           if (gen === generation) {
             dispatch({ type: "batch-created", batchKey, serverId: data.id });
@@ -740,7 +745,7 @@ async function handleFailure(key: string, error: unknown, batchId: string | null
     dispatch({ type: "attempt-failed", key, error: code, retryAt });
     return;
   }
-  // Errors that carry a `detail.message` were already toasted by the axios interceptor: the card just says so
+  // Uploads don't toast (every attempt would): the card says why it failed
   dispatch({ type: "failed", key, error: code, retryable: true });
 }
 
@@ -762,17 +767,29 @@ async function runCard(key: string) {
     }
 
     const localOnly = findBatch(card.batchKey)?.localOnly ?? false;
-    const { data, error } = await client().upload(
-      card.photos,
-      { batchId: batch.id, position: card.position, localOnly },
-      {
-        onUploadProgress: (event: AxiosProgressEvent) => {
-          if (event.total && gen === generation) {
-            dispatch({ type: "progress", key, progress: event.loaded / event.total });
-          }
+    const controller = new AbortController();
+    uploadsInFlight.add(controller);
+    let answer: Awaited<ReturnType<RecipeIngestAPI["upload"]>>;
+    try {
+      answer = await client().upload(
+        card.photos,
+        { batchId: batch.id, position: card.position, localOnly },
+        {
+          onUploadProgress: (event: AxiosProgressEvent) => {
+            if (event.total && gen === generation) {
+              dispatch({ type: "progress", key, progress: event.loaded / event.total });
+            }
+          },
+          signal: controller.signal,
+          // attempts retry on their own, and the card shows why the last one failed
+          suppressAlert: true,
         },
-      },
-    );
+      );
+    }
+    finally {
+      uploadsInFlight.delete(controller);
+    }
+    const { data, error } = answer;
     if (gen !== generation) {
       return;
     }
@@ -806,7 +823,7 @@ async function sealBatch(batchKey: string, serverId: string) {
   const gen = generation;
   sealsInFlight.add(serverId);
   try {
-    const { error } = await client().sealBatch(serverId);
+    const { error } = await client().sealBatch(serverId, { suppressAlert: true });
     if (gen !== generation) {
       return;
     }
@@ -979,14 +996,34 @@ function done() {
   if (batchKey) {
     dispatch({ type: "seal-requested", batchKey });
   }
+  sentBeforeLocalOnlyChange.value = 0;
   pump();
 }
 
+/**
+ * "Keep these cards on this server" for the open batch and the cards after it. The server stores the setting with
+ * each card when it arrives, so cards that already left keep theirs: a batch with such cards is finished (as with
+ * Done) and the next photo starts a new batch, so a batch's setting describes the cards sent with it. Cards of the
+ * finished batch that haven't gone yet (waiting, about to retry, failed) take the new setting.
+ */
 function setLocalOnly(localOnly: boolean) {
+  if (localOnly === localOnlyRef.value) {
+    return;
+  }
   localOnlyRef.value = localOnly;
   const batchKey = state.value.openBatchKey;
-  if (batchKey) {
-    dispatch({ type: "set-local-only", batchKey, localOnly });
+  if (!batchKey) {
+    return;
+  }
+  dispatch({ type: "set-local-only", batchKey, localOnly });
+  // uploaded or on its way; a card waiting, about to retry or failed takes the new setting when it goes
+  const sent = state.value.cards
+    .filter(card => card.batchKey === batchKey && (card.status === "uploading" || card.status === "done"))
+    .length;
+  sentBeforeLocalOnlyChange.value = sent;
+  if (sent > 0) {
+    dispatch({ type: "seal-requested", batchKey });
+    pump();
   }
 }
 
@@ -1023,6 +1060,8 @@ export function useRecipeIngestUploads() {
     pendingFront: computed(() => pendingFront.value),
     mode: computed<CaptureMode>({ get: () => modeRef.value ?? "one-side", set: setMode }),
     localOnly: computed<boolean>({ get: () => localOnlyRef.value, set: setLocalOnly }),
+    /** Cards already sent with the other setting when `localOnly` last changed (they keep it); 0 after Done */
+    sentBeforeLocalOnlyChange: readonly(sentBeforeLocalOnlyChange),
     /** Photos not uploaded yet, or not yet sent */
     hasPending,
     /** Cards waiting, uploading or about to retry */
@@ -1054,6 +1093,8 @@ export function useRecipeIngestUploads() {
 /** Forgets the queue (between tests, and on logout); requests still in flight then change nothing */
 export function resetRecipeIngestUploads() {
   generation += 1;
+  uploadsInFlight.forEach(controller => controller.abort());
+  uploadsInFlight.clear();
   if (retryTimer !== null) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -1070,10 +1111,21 @@ export function resetRecipeIngestUploads() {
   localOnlyRef.value = false;
   uploadedCount.value = 0;
   lastUploadBatchId.value = null;
+  sentBeforeLocalOnlyChange.value = 0;
   batchRequests.clear();
   sealsInFlight.clear();
   sealFailures.clear();
   releaseUnusedPreviews();
   api = null;
   refreshCounts = null;
+}
+
+/**
+ * Forgets what recipe card ingestion keeps for the signed-in user: the upload queue, with its photos, retries and
+ * open batch, and the card counts. Called on logout (`clearComposableCaches`), so the next user of the device
+ * neither sees the photos nor sends them.
+ */
+export function resetRecipeIngestState() {
+  resetRecipeIngestUploads();
+  resetRecipeIngestCounts();
 }

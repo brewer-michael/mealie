@@ -103,6 +103,8 @@ class AdminBackupController(BaseAdminController):
 
     @router.post("/{file_name}/restore", response_model=SuccessResponse)
     def import_one(self, file_name: str):
+        from mealie.services.ai.errors import IngestBusyError  # fork: docs/ai/PHASE2.md §3.9
+        from mealie.services.ai.ingest.i18n import with_fallback  # fork
         from mealie.services.backups_v2.backup_v2 import BackupSchemaMismatch, BackupV2
 
         backup = BackupV2()
@@ -116,6 +118,10 @@ class AdminBackupController(BaseAdminController):
                 status.HTTP_400_BAD_REQUEST,
                 ErrorResponse.respond("database backup schema version does not match current database"),
             ) from e
+        except IngestBusyError as e:
+            # fork: recipe card ingestion kept writing files, so nothing was restored; retrying works (PHASE2.md §3.9)
+            message = with_fallback(self.translator).t("recipe-ingest.errors.busy-restore")
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, ErrorResponse.respond(message)) from e
         except Exception as e:
             logger.exception(e)
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR) from e

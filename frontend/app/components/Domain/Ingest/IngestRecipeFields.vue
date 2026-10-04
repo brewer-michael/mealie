@@ -46,6 +46,7 @@
           :label="$t(field.label)"
           :readonly="readonly"
           :append-inner-icon="severityIcon(field.key, $globals.icons)"
+          :error-messages="servingsError"
           hide-details="auto"
           @update:model-value="setServings"
         />
@@ -91,6 +92,8 @@ const props = withDefaults(defineProps<{
 });
 
 const model = defineModel<ReviewDraft>({ required: true });
+
+const i18n = useI18n();
 
 const lineFields: { key: LineField; label: string }[] = [
   { key: "name", label: "recipe-ingest.review.name" },
@@ -141,6 +144,13 @@ function setServings(value: string | null) {
   servingsText.value = value ?? "";
   model.value.recipeServings = parseQuantity(value);
 }
+
+/** Servings are one number: text that isn't one ("4-6") is saved as no servings, so the field says so */
+const servingsError = computed(() =>
+  servingsText.value.trim() && parseQuantity(servingsText.value) === null
+    ? i18n.t("recipe-ingest.review.servings-not-a-number")
+    : undefined,
+);
 </script>
 
 <style scoped>

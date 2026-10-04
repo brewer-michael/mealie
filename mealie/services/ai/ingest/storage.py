@@ -11,15 +11,21 @@ or file created between the delete and the copy aborts it after the database was
 
 - `is_paused()`: the marker `DATA_DIR/.ai-ingest-paused` exists and was refreshed less than `PAUSE_TTL` ago. It's a
   root-level file, which a restore leaves alone, and every worker process sees it.
-- `ingest_write()`: the only way fork code writes under `groups/` or `recipes/`. It checks the marker, takes a shared
-  `flock` on `DATA_DIR/.ai-ingest-lock` without waiting, checks the marker again, and raises `IngestPaused` if any of
-  that fails. Writers never block on the lock.
+- `ingest_write()`: the only way fork code writes under `groups/` or `recipes/`. It checks the marker, joins the
+  process's shared `flock` on `DATA_DIR/.ai-ingest-lock` without waiting, checks the marker again, and raises
+  `IngestPaused` if any of that fails. Writers never block on the lock.
 - `pauses_ingest`: the decorator on `BackupV2.restore`. It writes the marker (refreshed every `PAUSE_REFRESH` by a
-  daemon thread), then waits up to `RESTORE_LOCK_WAIT` for an exclusive `flock`, which in-flight writers hold off
-  until they finish. If they don't, it raises `IngestBusyError` before the restore has touched anything.
+  daemon thread), then waits up to `RESTORE_LOCK_WAIT` for its own process's write sections to end and for an
+  exclusive `flock`, which other processes' in-flight writers hold off until they finish. If they don't, it raises
+  `IngestBusyError` before the restore has touched anything.
 
-`flock` locks belong to an open file, so they work between threads as well as processes. Where the filesystem doesn't
-support them (`ENOLCK`, `EOPNOTSUPP`), one warning is logged and the marker alone applies.
+**One shared lock per process, and a gate in it.** The first write section a process opens takes the shared `flock`
+and the last one to end releases it; a restore waits for its own process's sections through an in-process gate, not
+the lock. So it also works where locks belong to the process rather than to an open file: Linux NFS clients emulate
+`flock` with POSIX record locks (flock(2), "NFS details"), which never conflict between threads and are all dropped
+when any descriptor of the file is closed. Where the filesystem doesn't support locks at all (`ENOLCK`,
+`EOPNOTSUPP`), one warning is logged; the marker and the gate still apply, but a restore can't wait for other worker
+processes' writes.
 
 This module imports only the standard library and `mealie.core`, since the backup service imports it.
 """
@@ -202,8 +208,8 @@ def _warn_lock_unsupported(error: OSError) -> None:
         _lock_warning_logged = True
     logger.warning(
         f"File locks aren't supported for {lock_path()} ({errno.errorcode.get(error.errno or 0, error.errno)}): "
-        "a backup restore pauses recipe card ingestion with its marker file only, and can't wait for writes "
-        "already in progress"
+        "a backup restore pauses recipe card ingestion with its marker file, and can't wait for other worker "
+        "processes' writes already in progress"
     )
 
 
@@ -211,23 +217,87 @@ def _open_lock_file() -> int:
     return os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
 
 
+_gate = threading.Condition()
+"""Guards the process's write sections and its restore (below)"""
+_writers = 0
+"""Write sections open in this process"""
+_writers_fd: int | None = None
+"""The process's shared lock, held while `_writers > 0`; None where locks aren't supported"""
+_restoring = False
+"""A restore in this process holds the lock exclusively: none of the process's write sections may start"""
+
+
 def flock_supported() -> bool:
     """Whether `flock` works on `DATA_DIR`; logs one warning when it doesn't. For a startup check."""
+    with _gate:
+        if _writers or _restoring:
+            # the process holds the lock: closing another descriptor of the file could drop it (POSIX locks)
+            return not _lock_warning_logged
+        fd = _open_lock_file()
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True  # a restore holds it: locks work
+            except OSError as e:
+                if e.errno in _UNSUPPORTED_LOCK_ERRORS:
+                    _warn_lock_unsupported(e)
+                    return False
+                raise
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        finally:
+            os.close(fd)
+
+
+def _take_shared_lock() -> int | None:
+    """
+    The process's shared lock, without waiting: its descriptor, or None where locks aren't supported.
+    `IngestPaused` when a restore holds the lock. Called under `_gate` by the first write section.
+    """
     fd = _open_lock_file()
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True  # a restore holds it: locks work
-        except OSError as e:
-            if e.errno in _UNSUPPORTED_LOCK_ERRORS:
-                _warn_lock_unsupported(e)
-                return False
-            raise
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return True
-    finally:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError as e:
         os.close(fd)
+        raise IngestPaused() from e
+    except OSError as e:
+        os.close(fd)
+        if e.errno not in _UNSUPPORTED_LOCK_ERRORS:
+            raise
+        _warn_lock_unsupported(e)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _enter_write_section() -> None:
+    global _writers, _writers_fd
+    with _gate:
+        if _restoring:
+            raise IngestPaused()
+        if _writers == 0:
+            _writers_fd = _take_shared_lock()
+        _writers += 1
+
+
+def _leave_write_section() -> None:
+    global _writers, _writers_fd
+    with _gate:
+        _writers -= 1
+        if _writers > 0:
+            return
+        fd, _writers_fd = _writers_fd, None
+        try:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        finally:
+            _gate.notify_all()
 
 
 @contextmanager
@@ -239,29 +309,14 @@ def ingest_write() -> Iterator[None]:
     if is_paused():
         raise IngestPaused()
 
-    fd = _open_lock_file()
+    _enter_write_section()
     try:
-        locked = True
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError as e:
-            raise IngestPaused() from e
-        except OSError as e:
-            if e.errno not in _UNSUPPORTED_LOCK_ERRORS:
-                raise
-            _warn_lock_unsupported(e)
-            locked = False
-
-        try:
-            # a restore may have written its marker while this one was taking the lock
-            if is_paused():
-                raise IngestPaused()
-            yield
-        finally:
-            if locked:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+        # a restore may have written its marker while this one was taking the lock
+        if is_paused():
+            raise IngestPaused()
+        yield
     finally:
-        os.close(fd)
+        _leave_write_section()
 
 
 _pause_guard = threading.Lock()
@@ -277,13 +332,12 @@ def _refresh_marker(stop: threading.Event) -> None:
             logger.exception("Couldn't refresh the recipe card ingestion pause marker")
 
 
-def _take_exclusive_lock() -> int | None:
+def _lock_exclusively(deadline: float) -> int | None:
     """
-    Waits up to `RESTORE_LOCK_WAIT` for the exclusive lock and returns its file descriptor, or None where locks
-    aren't supported. Raises `IngestBusyError` if writers still hold it.
+    Waits until `deadline` for the exclusive lock (other processes' writers holding it shared) and returns its file
+    descriptor, or None where locks aren't supported. Raises `IngestBusyError` if writers still hold it.
     """
     fd = _open_lock_file()
-    deadline = time.monotonic() + limits.RESTORE_LOCK_WAIT
     try:
         while True:
             try:
@@ -307,12 +361,44 @@ def _take_exclusive_lock() -> int | None:
         raise
 
 
+def _end_restoring() -> None:
+    global _restoring
+    with _gate:
+        _restoring = False
+        _gate.notify_all()
+
+
+def _take_exclusive_lock() -> int | None:
+    """
+    Waits up to `RESTORE_LOCK_WAIT` for this process's write sections to end (and any other restore of this process),
+    closes the gate to new ones, then waits for the exclusive lock within the same limit. Returns its file
+    descriptor, or None where locks aren't supported; the caller then ends with `_end_restoring`. Raises
+    `IngestBusyError`, holding nothing, if writers are still busy.
+    """
+    global _restoring
+    deadline = time.monotonic() + limits.RESTORE_LOCK_WAIT
+    with _gate:
+        while _writers > 0 or _restoring:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IngestBusyError()
+            _gate.wait(min(remaining, limits.RESTORE_LOCK_POLL))
+        _restoring = True
+
+    try:
+        return _lock_exclusively(deadline)
+    except BaseException:
+        _end_restoring()
+        raise
+
+
 def pauses_ingest[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     """
     Pauses recipe card ingestion around `func` (a backup restore): writes the pause marker and keeps it fresh, waits
-    for in-flight writers by taking the write lock exclusively, then calls `func`. However `func` ends, the marker is
-    removed (once no other pause in this process needs it) and the lock released. Raises `IngestBusyError`, without
-    calling `func`, when writers still hold the lock after `RESTORE_LOCK_WAIT`.
+    for in-flight writers (this process's through the gate, other processes' by taking the write lock exclusively),
+    then calls `func`. However `func` ends, the marker is removed (once no other pause in this process needs it) and
+    the lock released. Raises `IngestBusyError`, without calling `func`, when writers are still busy after
+    `RESTORE_LOCK_WAIT`.
     """
 
     @functools.wraps(func)
@@ -325,9 +411,11 @@ def pauses_ingest[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         stop = threading.Event()
         refresher = threading.Thread(target=_refresh_marker, args=(stop,), name="ai-ingest-pause", daemon=True)
         refresher.start()
+        locked = False
         fd: int | None = None
         try:
             fd = _take_exclusive_lock()
+            locked = True
             return func(*args, **kwargs)
         finally:
             stop.set()
@@ -336,8 +424,12 @@ def pauses_ingest[**P, R](func: Callable[P, R]) -> Callable[P, R]:
                 _active_pauses -= 1
                 if _active_pauses == 0:
                     pause_marker_path().unlink(missing_ok=True)
-            if fd is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+            if locked:
+                try:
+                    if fd is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        os.close(fd)
+                finally:
+                    _end_restoring()
 
     return wrapper

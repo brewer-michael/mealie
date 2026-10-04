@@ -4,8 +4,11 @@ deadline, rate-limit backoff and shutdown.
 """
 
 import asyncio
+import math
 import threading
+import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,10 +19,12 @@ from mealie.core import exceptions
 from mealie.repos.repository_recipe_ingest import TASK_CLEARED, CancelOutcome, IngestQueue, cancel_task, utcnow
 from mealie.schema.recipe_ingest import IngestErrorCode, IngestStatus, IngestTaskKind, IngestTaskState
 from mealie.services.ai.ingest import limits
+from mealie.services.ai.ingest.runner import dispatcher as dispatcher_module
 from mealie.services.ai.ingest.runner.classify import rate_limit_delay
-from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
+from mealie.services.ai.ingest.runner.dispatcher import Claim, IngestDispatcher, _RunningTask, claim_tasks
 from mealie.services.ai.ingest.runner.sweep import sweep_expired
 from mealie.services.ai.ingest.runner.types import TaskContext
+from mealie.services.ai.ingest.runner.worker import CancelReason
 
 
 def _seconds_from_now(value: datetime) -> float:
@@ -240,6 +245,80 @@ def test_a_cleared_token_cancels_its_task_and_nothing_is_written(
     run(scenario())
 
 
+def test_a_cancel_asked_while_the_task_ran_survives_its_requeue(
+    dispatcher: IngestDispatcher, db: Session, jobs: Jobs, handlers: FakeHandlers
+):
+    """
+    The reviewer cancels a running card and every provider answers 429 before the next heartbeat: the task goes back
+    to the queue still asked to stop, so it's ended as cancelled instead of being read (and paid for) again
+    """
+    gate = threading.Event()
+
+    async def rate_limited(ctx: TaskContext) -> None:
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        raise exceptions.RateLimitError("every provider answered 429")
+
+    job_id = jobs.create()
+    handlers.default = rate_limited
+
+    async def scenario() -> None:
+        await dispatcher.run_once()
+        await wait_for(lambda: len(handlers.calls) == 1)
+        assert cancel_task(db, job_id) == CancelOutcome.requested
+        gate.set()
+        await settle(dispatcher)
+        assert jobs.row(job_id)["task_state"] == IngestTaskState.queued
+        jobs.update(job_id, not_before=None)  # its backoff is over
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    run(scenario())
+    assert len(handlers.calls) == 1
+    row = jobs.row(job_id)
+    assert (row["status"], row["error_code"], row["task_state"], row["cancel_requested"], row["draft"]) == (
+        IngestStatus.failed,
+        IngestErrorCode.cancelled,
+        None,
+        False,
+        None,
+    )
+
+
+def test_a_task_given_back_after_a_cancel_was_asked_is_never_claimed_and_the_sweep_ends_it(db: Session, jobs: Jobs):
+    """
+    A shutdown, a pause, the sweep or a rate limit can give a task back before the heartbeat that would have stopped
+    it: it's never claimed again, and the next sweep ends it the way cancelling a queued task does
+    """
+    processing = jobs.create()
+    reread = jobs.ready(kind=IngestTaskKind.reread, state=IngestTaskState.queued)
+    for job_id in (processing, reread):
+        token = _claim(db, job_id)
+        assert cancel_task(db, job_id) == CancelOutcome.requested
+        assert IngestQueue(db).release(job_id, token)
+        assert jobs.row(job_id)["cancel_requested"]
+
+    assert claim_tasks(db, owner="test", general_slots=5, reread_slots=1).claims == []
+
+    result = sweep_expired(db, utcnow())
+    assert sorted(result.cancelled) == sorted([processing, reread])
+    failed = jobs.row(processing)
+    assert (failed["status"], failed["error_code"], failed["task_state"], failed["cancel_requested"]) == (
+        IngestStatus.failed,
+        IngestErrorCode.cancelled,
+        None,
+        False,
+    )
+    ready = jobs.row(reread)
+    assert (ready["status"], ready["error_code"], ready["task_state"], ready["cancel_requested"]) == (
+        IngestStatus.ready,
+        None,
+        None,
+        False,
+    )
+    assert sweep_expired(db, utcnow()).cancelled == []
+
+
 def test_a_task_past_its_deadline_fails_with_timeout(
     dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, monkeypatch: pytest.MonkeyPatch
 ):
@@ -336,3 +415,61 @@ def test_shutdown_releases_the_leases_it_holds(dispatcher: IngestDispatcher, job
             0,
             None,
         )
+
+
+def test_shutdown_during_a_claim_gives_back_what_it_claimed(
+    dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Shutdown cancels the dispatcher's loop while a claim is in flight (its `UPDATE` committed, the claim phase not yet
+    back): the claimed task is still started, stopped and released, not left `running` with an attempt used
+    """
+    monkeypatch.setattr(dispatcher_module, "STOP_WAIT", 0.05)
+    claimed = threading.Event()
+    claim = IngestQueue.claim
+
+    def slow_claim(self: IngestQueue, job_id: UUID, **kwargs: Any) -> bool:
+        won = claim(self, job_id, **kwargs)
+        claimed.set()
+        time.sleep(0.5)  # e.g. SQLite busy on the next statement
+        return won
+
+    monkeypatch.setattr(IngestQueue, "claim", slow_claim)
+    job_id = jobs.create()
+    handlers.default = blocking(threading.Event())
+
+    async def scenario() -> None:
+        await dispatcher.start()
+        await wait_for(claimed.is_set)
+        await dispatcher.stop()
+
+    run(scenario())
+    assert dispatcher.running_tasks == []
+    row = jobs.row(job_id)
+    assert (row["status"], row["task_state"], row["lease_token"], row["attempts"]) == (
+        IngestStatus.processing,
+        IngestTaskState.queued,
+        None,
+        0,
+    )
+
+
+def test_a_cancellation_before_the_task_thread_attached_is_delivered_when_it_does():
+    handle = _RunningTask(Claim(uuid4(), uuid4(), reread_slot=False), deadline=math.inf)
+    assert handle.cancel(CancelReason.shutdown)  # its thread has started, but its loop isn't running yet
+    stopped: list[CancelReason | None] = []
+
+    async def task() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        handle.attach(asyncio.get_running_loop(), current)
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            stopped.append(handle.reason())
+            raise
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(task())
+    assert stopped == [CancelReason.shutdown]
+    assert not handle.cancel(CancelReason.shutdown)  # delivered once

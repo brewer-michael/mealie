@@ -263,12 +263,28 @@ async def test_markers_survive_the_cleaner(
         None,
     )
     assert draft.notes[0].text == "From the [illegible] cookbook"
-    ids = {flag.id for flag in result.flags}
+    targets = {(flag.kind, flag.field, flag.ref) for flag in result.flags}
     assert {
-        f"illegible:ingredients:{flour.reference_id}",
-        f"blank:steps:{draft.steps[0].id}",
-        "illegible:notes:0",
-    } <= ids
+        (CardFlagKind.illegible, "ingredients", str(flour.reference_id)),
+        (CardFlagKind.blank, "steps", str(draft.steps[0].id)),
+        (CardFlagKind.illegible, "notes", "0"),
+    } <= targets
+
+
+@pytest.mark.asyncio
+async def test_the_attribution_s_markers_are_written_as_everywhere_else(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The review page fills, and commit converts, exactly `[illegible]`; the reader may write `[Illegible]`"""
+    user = unique_user_fn_scoped
+    _vision_and_text(user)
+    transcription = {**BANANA_TRANSCRIPTION, "attribution": " From [ Illegible ] "}
+    FakeCardAI(banana_answers(OpenAIRecipeCardTranscription=transcription)).install(monkeypatch)
+
+    result = await _extract(user, make_pages(tmp_path), CardPipelineOptions(suggest_organizers=False))
+
+    assert result.draft.attribution == result.extraction.attribution == "From [illegible]"
+    assert any(flag.kind == CardFlagKind.illegible and flag.field == "attribution" for flag in result.flags)
 
 
 # ==========================================

@@ -3,7 +3,8 @@
 byte-capped body stream, and the three body shapes (multipart, a raw image, JSON with base64 images).
 
 **Order** (the route's only parameter is `request: Request`, so FastAPI reads nothing before the controller's auth):
-1. the controller's auth; then the `Authorization` header must be present: a cookie alone is `401` (F18);
+1. the controller's auth; then the `Authorization` header must carry a Bearer token: a cookie alone is `401`, even
+   beside a header of another scheme (F18);
 2. `503 paused_for_restore` (with `Retry-After`) while a restore pauses ingestion; `503 ingest_disabled`;
 3. `400 ai_not_enabled` / `local_only_unavailable`, and 4. `429` at 200 processing jobs: one worker-thread call
    (`intake.reading_readiness`), so provider settings, address lookups and the count never block the event loop;
@@ -12,8 +13,9 @@ byte-capped body stream, and the three body shapes (multipart, a raw image, JSON
 
 Multipart is parsed by Starlette's `MultiPartParser` over the capped stream; its file parts spool to the system temp
 directory (never `DATA_DIR`) and go to intake as open file objects, closed when the request ends. A raw image body is
-spooled the same way; base64 JSON is decoded leniently (line breaks, a `data:` prefix, URL-safe letters) into
-`BytesIO`s. Each card then goes through `IntakeService.ingest_async`.
+spooled the same way, and so is a JSON body, which is then decoded in one of the process's intake slots (it takes about
+three times its size in memory): leniently (line breaks, a `data:` prefix, URL-safe letters) into `BytesIO`s. Each
+card then goes through `IntakeService.ingest_async`.
 
 The answer is `202 IngestResponse`, whose `summary` is in the request's language for a Shortcut's notification and
 which has nothing named `message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
@@ -53,6 +55,7 @@ from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.errors import IngestPaused
 
 from . import limits, storage
+from .i18n import DEFAULT_LOCALE, FallbackTranslator
 from .images import sanitize_filename
 from .intake import (
     IntakeAccepted,
@@ -61,16 +64,19 @@ from .intake import (
     IntakePage,
     IntakeService,
     ReadingReadiness,
+    in_intake_slot,
     reading_readiness,
     source_name,
 )
 from .settings import get_ingest_settings
 
-DEFAULT_LOCALE = "en-US"
 SPOOL_MAX_BYTES = 1024 * 1024
-"""A raw image body is kept in memory up to this size, then in an unnamed file in the system temp directory"""
+"""A raw image or JSON body is kept in memory up to this size, then in an unnamed file in the system temp directory"""
 
 _TRUE = {"1", "true", "yes", "on"}
+_LANGUAGE_ALIASES = {"nb": "no", "nn": "no"}
+"""Languages Mealie keys under another code: Norwegian Bokmål and Nynorsk are its `no-NO`"""
+_TRADITIONAL_CHINESE_REGIONS = {"tw", "hk", "mo"}
 _DATA_URL = re.compile(r"^data:[^,]*,", re.IGNORECASE)
 _NOT_BASE64 = re.compile(r"[^A-Za-z0-9+/=]")
 
@@ -153,12 +159,26 @@ def resolve_locale(accept_language: str | None) -> str:
 
 
 def _match_locale(tag: str) -> str | None:
+    """
+    A supported locale for one language tag: the exact tag; else its language and region, whatever script sits between
+    them (`pt-Latn-BR`); Chinese by script, then by the regions that write Traditional Chinese (`zh-Hant`, `zh-HK` →
+    `zh-TW`); else the language's usual locale
+    """
     wanted = tag.replace("_", "-").lower()
     by_lower = {key.lower(): key for key in LOCALE_CONFIG}
     if wanted in by_lower:
         return by_lower[wanted]
 
-    language = wanted.split("-", 1)[0]
+    language, *subtags = wanted.split("-")
+    language = _LANGUAGE_ALIASES.get(language, language)
+    script = next((subtag for subtag in subtags if len(subtag) == 4 and subtag.isalpha()), None)
+    region = next((subtag for subtag in subtags if len(subtag) == 2 or (len(subtag) == 3 and subtag.isdigit())), None)
+    if language == "zh":
+        traditional = script == "hant" or (script != "hans" and region in _TRADITIONAL_CHINESE_REGIONS)
+        region = "tw" if traditional else "cn"
+    if region and f"{language}-{region}" in by_lower:
+        return by_lower[f"{language}-{region}"]
+
     same_language = [key for key in LOCALE_CONFIG if key.lower().split("-", 1)[0] == language]
     if not same_language:
         return None
@@ -389,41 +409,32 @@ def _decode_json_images(payload: Any) -> list[UploadedImage]:
 
 
 async def _read_json(request: Request, limit: int, query: Mapping[str, str]) -> UploadBody:
-    data = bytearray()
-    async for chunk in _capped(request, limit):
-        data.extend(chunk)
+    spooled: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
+    body = UploadFile(spooled)  # type: ignore[arg-type]
 
     def decode() -> tuple[Any, list[UploadedImage]]:
+        spooled.seek(0)
         try:
-            payload = json.loads(bytes(data))
+            payload = json.loads(spooled.read())
         except ValueError as e:  # bad JSON or bad UTF-8
             raise _invalid_body() from e
+        finally:
+            spooled.close()
         return payload, _decode_json_images(payload)
 
-    payload, decoded = await anyio.to_thread.run_sync(decode)
+    try:
+        async for chunk in _capped(request, limit):
+            await body.write(chunk)
+        # the body waits on disk, and only INTAKE_CONCURRENCY are decoded in memory at once
+        payload, decoded = await in_intake_slot(decode)
+    finally:
+        spooled.close()
     options = UploadOptions.parse({**query, **{k: v for k, v in payload.items() if k != "images"}})
     return UploadBody(images=decoded, options=options)
 
 
 # ==================================================================================================================
 # The handler
-
-
-class FallbackTranslator:
-    """
-    The request's language, falling back to en-US for a text that language doesn't have yet: only en-US is edited
-    here, and the other locales gain the fork's texts later through Crowdin (a missing key would show as the key).
-    """
-
-    def __init__(self, primary: Translator, fallback: Translator) -> None:
-        self.primary = primary
-        self.fallback = fallback
-
-    def t(self, key: str, default: Any = None, **kwargs: Any) -> str:
-        text = self.primary.t(key, default, **kwargs)
-        if text == key and self.fallback is not self.primary:
-            return self.fallback.t(key, default, **kwargs)
-        return text
 
 
 def _summary(translator: Translator, accepted: int, rejected: int) -> str:
@@ -462,8 +473,10 @@ class UploadHandler:
 
     def _check_before_body(self) -> None:
         """Checks 1 and 2, made on the event loop: cheap, and no database"""
-        # 1. the controller authenticated the request; a cookie alone isn't enough (F18)
-        if not self.request.headers.get("authorization"):
+        # 1. the controller authenticated the request; a cookie alone isn't enough (F18). Any other scheme (a proxy's
+        # Basic credentials, which browsers add to a cross-site post) leaves the cookie authenticating it.
+        scheme, _, token = self.request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
             raise UploadRefused(401, AUTHORIZATION_REQUIRED, message_key="recipe-ingest.errors.authorization-required")
         # 2. a restore pausing ingestion, or ingestion switched off
         if storage.is_paused():

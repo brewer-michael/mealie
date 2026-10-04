@@ -37,6 +37,13 @@ MAX_DIMENSION = 3000
 
 ROTATIONS = (0, 90, 180, 270)
 
+MIN_TURN_SCORE = 500.0
+"""
+Fork: with a margin (`min_ratio` over 1), the best rotation must also score at least this much to win. A blank or
+nearly blank page reads as a few specks whichever way up, and any ratio over an upright score of 0 would turn it;
+the sideways banana card's wrong readings score about 300, its right one over 8000 (docs/ai/PHASE2.md F7).
+"""
+
 OMP_THREAD_LIMIT = "1"
 """
 Threads each Tesseract process may use, unless the environment already sets `OMP_THREAD_LIMIT`.
@@ -67,6 +74,12 @@ class OCRResult:
     """
     Fork: how well the image read at each rotation it was probed at (see `_orientation_score`), so a caller can see
     how sure the chosen rotation was. Empty when nothing was probed.
+    """
+
+    failed: bool = False
+    """
+    Fork: Tesseract timed out or failed, so the empty result says nothing about the image (a caller that settles
+    something for good, like a page's orientation, tries again later)
     """
 
 
@@ -188,9 +201,12 @@ def _choose_rotation(scores: dict[int, float], min_ratio: float = 1.0) -> int:
     """
     The best-scoring rotation, but only when it scores at least `min_ratio` times the upright one; otherwise 0.
     Handwriting scores low every way up, so a caller that turns the image for good (rather than just reading it)
-    asks for a margin. Fork: the margin (docs/ai/PHASE2.md §4.4); with the default of 1 the best rotation wins.
+    asks for a margin. Fork: the margin (docs/ai/PHASE2.md §4.4), which also needs `MIN_TURN_SCORE`; with the
+    default of 1 the best rotation wins.
     """
     best = max(scores, key=scores.__getitem__)
+    if min_ratio > 1 and scores[best] < MIN_TURN_SCORE:
+        return 0
     if best and scores[best] >= min_ratio * scores.get(0, 0.0):
         return best
     return 0
@@ -238,13 +254,13 @@ def extract_text(path: Path, *, min_ratio: float = 1.0) -> OCRResult:
             words = read(_fit(_rotate(image, rotation), long_side))
     except subprocess.TimeoutExpired:
         logger.warning(f"OCR timed out reading {path.name}")
-        return OCRResult()
+        return OCRResult(failed=True)
     except subprocess.CalledProcessError as e:
         logger.warning(f"Tesseract failed to read {path.name}: {(e.stderr or '').strip()}")
-        return OCRResult()
+        return OCRResult(failed=True)
     except Exception:
         logger.exception(f"Failed to read {path.name} with OCR")
-        return OCRResult()
+        return OCRResult(failed=True)
 
     if not words:
         return OCRResult(rotation=rotation, rotation_scores=scores)

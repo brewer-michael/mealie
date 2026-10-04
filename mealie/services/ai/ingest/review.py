@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from fastapi import status
 from pydantic import ValidationError
+from pydantic_core import to_jsonable_python
 from sqlalchemy.engine import RowMapping
 
 from mealie.core.root_logger import get_logger
@@ -39,6 +40,7 @@ from mealie.schema.recipe_ingest import (
     CardFlag,
     CardFlagSeverity,
     CardProposal,
+    CardProposalKind,
     ExtractionMeta,
     FlagResolution,
     IngestErrorCode,
@@ -198,13 +200,20 @@ def resolve_flags(
     draft: CardDraft,
     extraction: ExtractionMeta | None,
     resolutions: Mapping[str, FlagResolution],
+    *,
+    transcription: str | None = None,
+    previous: Sequence[CardFlag] | None = None,
 ) -> list[CardFlag]:
     """
     The draft's flags with the reviewer's resolutions applied (§4.6), as stored and returned on every save. Only
     errors of the kinds that can be kept as written can be `kept`, and only warnings can be `dismissed`; anything else
     is dropped, as are resolutions of flags the draft no longer raises.
+
+    `transcription` and `previous` are the job's stored transcription and flags, as `compute_flags` takes them on a
+    save: the checks against what the card says (`not_on_card`, `marker_dropped`) are made again, and reading flags
+    are kept only where they were raised before, so the reviewer's own edits never raise one.
     """
-    flags = card_flags.compute_flags(draft, extraction, resolutions)
+    flags = card_flags.compute_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
     resolved: list[CardFlag] = []
     for flag in flags:
         resolution = flag.resolution or resolutions.get(flag.id)
@@ -216,6 +225,37 @@ def resolve_flags(
             resolution = None
         resolved.append(flag if flag.resolution == resolution else flag.model_copy(update={"resolution": resolution}))
     return resolved
+
+
+def _adopted_reading_flags(
+    draft: CardDraft,
+    proposals: Iterable[CardProposal],
+    extraction: ExtractionMeta | None,
+    transcription: str | None,
+) -> list[CardFlag]:
+    """
+    The flags of each whole-card proposal (a re-extract of an edited draft) that `draft` took up, computed as the
+    re-extract computed them: against the job's transcription and extraction, which are that reading's. A save that
+    accepts the proposal passes them as `previous`, so the new reading's reading flags are raised on the draft it
+    became (its ingredient and step ids are new, so none of the stored flags matches them). Accepting keeps the
+    proposal's ingredient and step ids; a dismissed one shares none with the draft.
+    """
+    flags: list[CardFlag] = []
+    ids = {ingredient.reference_id for ingredient in draft.ingredients} | {step.id for step in draft.steps}
+    for proposal in proposals:
+        proposed = proposal.draft
+        if proposal.kind != CardProposalKind.full or proposed is None:
+            continue
+        proposed_ids = {ingredient.reference_id for ingredient in proposed.ingredients}
+        proposed_ids |= {step.id for step in proposed.steps}
+        if ids & proposed_ids or (not proposed_ids and proposed == draft):
+            flags.extend(card_flags.compute_flags(proposed, extraction, {}, transcription=transcription))
+    return flags
+
+
+def _stored_form(draft: CardDraft) -> Any:
+    """The draft as the `draft` column stores it (and reads it back)"""
+    return to_jsonable_python(draft, by_alias=False, inf_nan_mode="null")
 
 
 def _with_unique_ids(draft: CardDraft) -> CardDraft:
@@ -465,14 +505,17 @@ class ReviewService:
         """
         Saves the review page's draft with its flag resolutions, removes the proposals it used or dismissed, and
         recomputes the flags (§6.6). A stale `draft_version` is a 409 `version_conflict`; a change to the row that
-        isn't a draft save (a task's proposal) is retried on the server.
+        isn't a draft save (a task's proposal) is retried on the server. `draft_version` is bumped only when the draft
+        changed (§3.3): a save that only resolves flags or proposals, or dismisses the banner, keeps it, so the draft
+        still counts as unedited for a re-extract and another device's next save doesn't conflict.
         """
         draft = _with_unique_ids(update.draft)
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
 
         def mutate(row: RowMapping) -> dict[str, Any]:
+            stored_flags = parse_flags(row["flags"])
             resolutions: dict[str, FlagResolution] = {
-                flag.id: flag.resolution for flag in parse_flags(row["flags"]) if flag.resolution is not None
+                flag.id: flag.resolution for flag in stored_flags if flag.resolution is not None
             }
             for flag_id, resolution in update.flag_resolutions.items():
                 if resolution is None:
@@ -480,15 +523,20 @@ class ReviewService:
                 else:
                     resolutions[flag_id] = resolution
 
-            flags = resolve_flags(draft, _parse_extraction(row["extraction"]), resolutions)
+            extraction = _parse_extraction(row["extraction"])
+            transcription = row["transcription"]
+            adopted = [p for p in _parse_proposals(row["proposals"]) if str(p.id) in resolved_proposals]
+            previous = [*stored_flags, *_adopted_reading_flags(draft, adopted, extraction, transcription)]
+            flags = resolve_flags(draft, extraction, resolutions, transcription=transcription, previous=previous)
             errors, warnings = flag_rules.count_unresolved(flags)
+            changed = _stored_form(draft) != row["draft"]
             values: dict[str, Any] = {
                 "draft": draft,
                 "flags": flags,
                 "title": _title(draft),
                 "error_count": errors,
                 "warning_count": warnings,
-                "draft_version": row["draft_version"] + 1,
+                "draft_version": row["draft_version"] + 1 if changed else row["draft_version"],
             }
             if resolved_proposals:
                 proposals = row["proposals"] or []

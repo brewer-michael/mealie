@@ -44,6 +44,7 @@ from mealie.schema.recipe_ingest import (
     IngestStatus,
     IngestTaskKind,
     IngestTaskState,
+    RecipeIngestionSettingsUpdate,
 )
 from mealie.services.ai.errors import (
     AIProviderLimitReachedError,
@@ -409,6 +410,42 @@ def test_the_worker_sets_the_locale_and_policy_and_notifies_after_a_first_extrac
     assert current_policy().job_id is None  # nothing leaks out of the task
     assert phases.notified == [jobs.batch_id]
     assert jobs.row(job_id)["status"] == IngestStatus.ready
+
+
+@pytest.mark.parametrize("kind", [IngestTaskKind.extract, IngestTaskKind.reread])
+def test_the_groups_local_only_setting_covers_cards_from_before_it_was_switched_on(
+    dispatcher: IngestDispatcher, jobs: Jobs, handlers: FakeHandlers, kind: IngestTaskKind
+):
+    """
+    A manager switches on "Keep recipe card photos and text on this server": a card still queued from before, and a
+    re-read or re-extract of an older card, are read under the local-only policy too (§10: a later change never
+    loosens a job, but it does tighten it)
+    """
+    seen: list[tuple[bool, bool]] = []
+
+    async def handler(ctx: TaskContext) -> Any:
+        seen.append((ctx.local_only, current_policy().local_only))
+        return reread_result() if ctx.kind == IngestTaskKind.reread else extract_result()
+
+    if kind == IngestTaskKind.reread:
+        jobs.ready(kind=kind, state=IngestTaskState.queued, local_only=False)
+    else:
+        jobs.create(local_only=False)
+    handlers.default = handler
+
+    settings = jobs.repos.settings
+    before = settings.get()
+    settings.upsert(RecipeIngestionSettingsUpdate(local_only=True, cross_read=before.cross_read))
+
+    async def scenario() -> None:
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    try:
+        run(scenario())
+    finally:
+        settings.upsert(before)
+    assert seen == [(True, True)]
 
 
 def test_rereads_and_reextracts_dont_notify(

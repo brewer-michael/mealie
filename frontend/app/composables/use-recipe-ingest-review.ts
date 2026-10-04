@@ -223,6 +223,16 @@ function isTextField(field: string): field is TextField {
   return (TEXT_FIELDS as readonly string[]).includes(field);
 }
 
+/** Sets a single-value field from text: servings, the one number among them, as a number (null when it isn't one) */
+function setTextField(draft: ReviewDraft, field: TextField, value: string) {
+  if (field === "recipeServings") {
+    draft.recipeServings = parseQuantity(value);
+  }
+  else {
+    draft[field] = value;
+  }
+}
+
 /** The id of the element that edits a field (or one ingredient or step), for scrolling to it */
 export function fieldAnchorId(field: string, ref?: string | null): string {
   const key = normalizeField(field);
@@ -260,7 +270,12 @@ export function fieldLabel(t: TranslateFn, field: string, line?: number | null):
   return FIELD_LABELS[key] ? t(FIELD_LABELS[key]) : null;
 }
 
-/** The text a field (or one ingredient or step) holds now, as the "Needs a look" item shows it */
+/** A note's position from a flag's or proposal's `ref` (the server keys notes by index); null without one */
+export function noteIndex(ref: string | null | undefined): number | null {
+  return ref && /^\d+$/.test(ref) ? Number(ref) : null;
+}
+
+/** The text a field (or one ingredient, step or note) holds now, as the "Needs a look" item shows it */
 export function fieldText(draft: CardDraft, field: string, ref?: string | null): string {
   const key = normalizeField(field);
   if (key === "ingredients") {
@@ -276,7 +291,9 @@ export function fieldText(draft: CardDraft, field: string, ref?: string | null):
     return draft.steps?.find(step => step.id === ref)?.text ?? "";
   }
   if (key === "notes") {
-    return (draft.notes ?? []).map(note => note.text ?? "").join("\n");
+    const index = noteIndex(ref);
+    const notes = index === null ? draft.notes ?? [] : (draft.notes ?? []).slice(index, index + 1);
+    return notes.map(note => [note.title, note.text].filter(Boolean).join("\n")).join("\n");
   }
   if (isTextField(key)) {
     const value = draft[key];
@@ -466,7 +483,7 @@ export function editFlaggedText(
       return false;
     }
     const fixed = fixIngredient(draft.ingredients[index]!, flag, replacement, mode);
-    const changed = !draftsEqual(fixed, draft.ingredients[index]);
+    const changed = stableStringify(fixed) !== stableStringify(draft.ingredients[index]);
     draft.ingredients.splice(index, 1, fixed);
     return changed;
   }
@@ -481,13 +498,19 @@ export function editFlaggedText(
     return changed;
   }
   if (field === "notes") {
-    const note = draft.notes.find(item => !flagFragment(flag) || (item.text ?? "").includes(fragment));
+    // the flag's note by its index; without one, the first note holding the flagged part
+    const index = noteIndex(flag.ref);
+    const note = index === null
+      ? draft.notes.find(item => (item.text ?? "").includes(fragment) || (item.title ?? "").includes(fragment))
+      : draft.notes[index];
     if (!note) {
       return false;
     }
-    const text = fix(note.text ?? "");
-    const changed = text !== note.text;
-    note.text = text;
+    // the marker can be in the note's title (the server checks both); otherwise the text changes
+    const part = !(note.text ?? "").includes(fragment) && (note.title ?? "").includes(fragment) ? "title" : "text";
+    const text = fix(note[part] ?? "");
+    const changed = text !== (note[part] ?? "");
+    note[part] = text;
     return changed;
   }
   if (field === "recipeServings") {
@@ -500,7 +523,7 @@ export function editFlaggedText(
     const current = draft[field];
     const text = fix(current === null || current === undefined ? "" : String(current));
     const changed = text !== (current ?? "");
-    (draft as Record<string, unknown>)[field] = text;
+    setTextField(draft, field, text);
     return changed;
   }
   return false;
@@ -516,6 +539,9 @@ function readingOrderKey(flag: CardFlag, draft: CardDraft): [number, number, num
   }
   else if (field === "steps") {
     line = draft.steps?.findIndex(item => item.id === flag.ref) ?? -1;
+  }
+  else if (field === "notes") {
+    line = noteIndex(flag.ref) ?? 0;
   }
   const severity = flag.severity === "error" ? 0 : flag.severity === "warning" ? 1 : 2;
   return [fieldIndex < 0 ? FIELD_ORDER.length : fieldIndex, line < 0 ? Number.MAX_SAFE_INTEGER : line, severity];
@@ -583,6 +609,10 @@ export function buildNeedsALook(
     }
     else if (field === "steps") {
       line = draft.steps?.findIndex(item => item.id === flag.ref) ?? -1;
+    }
+    else if (field === "notes") {
+      const index = noteIndex(flag.ref);
+      line = index !== null && index < (draft.notes?.length ?? 0) ? index : null;
     }
     return {
       flag,
@@ -670,7 +700,7 @@ export function applyProposal(draft: ReviewDraft, proposal: CardProposal, mode: 
     draft.recipeServings = parseQuantity(text) ?? draft.recipeServings ?? null;
   }
   else if (isTextField(field)) {
-    (draft as Record<string, unknown>)[field] = join(draft[field] as string | null | undefined, field === "description" ? "\n" : " ");
+    setTextField(draft, field, join(fieldText(draft, field), field === "description" ? "\n" : " "));
   }
   return draft;
 }
@@ -931,6 +961,25 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   // Loading
 
   function applyJob(data: RecipeIngestionJobOut, initial: boolean) {
+    // a read from before a save this page made (draft versions only grow): its draft and flags are out of date,
+    // the rest (proposals, status, task, error) isn't
+    const stale = !initial && data.draftVersion < draftVersion.value;
+    if (stale) {
+      proposals.value = (data.proposals ?? []).filter(proposal => !proposal.id || !handledProposalIds.has(proposal.id));
+      const current = job.value;
+      job.value = current
+        ? {
+            ...data,
+            draftVersion: current.draftVersion,
+            draft: current.draft,
+            flags: current.flags,
+            errorCount: current.errorCount,
+            warningCount: current.warningCount,
+            title: current.title,
+          }
+        : data;
+      return;
+    }
     const versionChanged = data.draftVersion !== draftVersion.value;
     const becameReady = job.value?.status !== "ready" && data.status === "ready";
     if (initial || becameReady || versionChanged) {
@@ -987,6 +1036,11 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         loadState.value = "not-found";
       }
       return;
+    }
+    // a save that overlapped the read lands first, so the read's version is compared with the one it returned:
+    // the read may have seen that save, which isn't a change from somewhere else (docs/ai/PHASE2.md §6.6)
+    while (saving) {
+      await saving;
     }
     applyJob(data, false);
   }
@@ -1395,7 +1449,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         alert.success(i18n.t("recipe-ingest.eval.saved", { slug: data.slug }));
         return "saved" as const;
       }
-      if (errorStatusOf(error) === 409) {
+      // the dialog says so for a name that's taken; the other refusals (not_exportable, files_missing) are toasted
+      if (errorCodeOf(error) === "eval_case_exists") {
         return "exists" as const;
       }
       notifyError(error);
@@ -1456,8 +1511,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       job.value.status = "committed";
       void counts.refresh();
       const added = i18n.t("recipe-ingest.review.added", { name: name || data.slug });
+      // what commit left out (an organizer deleted since it was chosen)
+      const warnings = (data.warnings ?? [])
+        .map(warning => text.commitWarningText(warning))
+        .filter((warning): warning is string => !!warning);
       const { path, last } = await nextPath(data.nextJobId);
-      if (last) {
+      if (warnings.length) {
+        alert.warning(warnings.join(" "), added);
+      }
+      else if (last) {
         const progress = batchProgress(batch.value?.jobs ?? []);
         alert.success(i18n.t("recipe-ingest.queue.batch-summary", progress), added);
       }

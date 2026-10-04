@@ -6,7 +6,10 @@ A failure it understands is raised as `TaskFailed`.
 
 The one write is orientation's: a page Tesseract turned has new files on disk at once, so its new metadata is written
 straight away, fenced on the task's lease like every write by a running task (§3.3). A later failure (a rate limit,
-say) would otherwise leave the row describing the page as it was before it turned.
+say) would otherwise leave the row describing the page as it was before it turned. Turning a page and storing its
+metadata are one step (`_orient_page`): one write section, in one thread, awaited to its end even when the task is
+cancelled meanwhile; if the fence fails, the page's files are put back as they were. So a shutdown, a cancel, a lost
+lease or a later page's failure never leaves a turned page described as it was before it turned.
 
 Each handler's AI session (`JobOpenAIService` on `get_repositories(session, group_id=…, household_id=…)`) is only used
 for reading the job, routing reads, the usage log and read-only lookups, and no transaction stays open across an
@@ -14,6 +17,7 @@ await (F11).
 """
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
@@ -37,7 +41,7 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services import ocr
 
-from . import storage
+from . import images, storage
 from .images import Region
 from .matching import IngestMatcher
 from .pipeline import CardPage, extract_card, options_for_group, orient_page, reread_region
@@ -74,35 +78,89 @@ def _card_pages(ctx: TaskContext, job: RecipeIngestionJob) -> list[CardPage]:
     return pages
 
 
-def _save_pages(ctx: TaskContext, pages: list[CardPage]) -> None:
-    """Writes the pages' metadata to the job, fenced on the task's lease; `TaskFailed` if the lease is gone"""
+_PAGE_FILES = (images.VIEW_FILE, images.THUMB_FILE, images.PAGE_FILE)
+"""A page's files, in the order they're written back: `page.jpg` last, as its hash says the page changed"""
 
-    def mutate(_: RowMapping) -> dict[str, Any]:
-        return {"pages": [page.meta.model_dump(mode="json") for page in pages]}
 
-    with session_context() as session:
-        written = IngestQueue(session).update_job_json(ctx.job_id, mutate, where=IngestQueue.fence(ctx.token))
-    if written is None:
-        # cancelled, swept or discarded meanwhile: the runner's fenced finalize drops the result too
-        raise TaskFailed(IngestErrorCode.interrupted)
+def _put_back(page: CardPage, files: dict[str, bytes]) -> None:
+    """Writes a page's files back as they were before it turned (inside the same write section)"""
+    try:
+        for name in _PAGE_FILES:
+            storage.atomic_write_bytes(page.dir / name, files[name])
+    except FileNotFoundError:
+        pass  # the job was discarded meanwhile: nothing left to put back
+
+
+def _orient_page(ctx: TaskContext, page: CardPage) -> PageMeta:
+    """
+    Orients one page and stores its new metadata, fenced on the task's lease, as one step inside one write section
+    (§3.9). If the fence fails (the task was cancelled, swept or discarded meanwhile) or the write does, the page's
+    files are put back byte for byte, so they never disagree with the stored metadata. `TaskFailed(interrupted)` when
+    the lease is gone. Blocking (Tesseract).
+    """
+    with storage.ingest_write():
+        with session_context() as session:
+            if not IngestQueue(session).holds(ctx.job_id, ctx.token):
+                raise TaskFailed(IngestErrorCode.interrupted)
+
+        before = {name: (page.dir / name).read_bytes() for name in _PAGE_FILES}
+        meta = orient_page(page)
+        if meta == page.meta:
+            return meta
+        turned = meta.page_sha256 != page.meta.page_sha256
+
+        def mutate(row: RowMapping) -> dict[str, Any] | None:
+            stored = [dict(entry) for entry in row["pages"] or []]
+            for position, entry in enumerate(stored):
+                if entry.get("index") == meta.index:
+                    stored[position] = meta.model_dump(mode="json")
+                    return {"pages": stored}
+            return None
+
+        try:
+            with session_context() as session:
+                written = IngestQueue(session).update_job_json(ctx.job_id, mutate, where=IngestQueue.fence(ctx.token))
+        except BaseException:
+            if turned:
+                _put_back(page, before)
+            raise
+        if written is None:
+            # cancelled, swept or discarded meanwhile: the runner's fenced finalize drops the result too
+            if turned:
+                _put_back(page, before)
+            raise TaskFailed(IngestErrorCode.interrupted)
+    return meta
+
+
+async def _to_thread_to_the_end[T](func: Callable[..., T], *args: Any) -> T:
+    """
+    `func(*args)` in a thread, awaited to its end even when the task is cancelled meanwhile; the cancellation is then
+    raised (whatever `func` did). For a step whose files and stored metadata mustn't be split: the thread would carry
+    on after the task stopped waiting, and its write would race the runner's finalize or the shutdown's release.
+    """
+    step = asyncio.ensure_future(asyncio.to_thread(func, *args))
+    cancelled = False
+    while not step.done():
+        try:
+            await asyncio.wait({step})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not step.cancelled():
+            step.exception()  # the cancellation wins; retrieved so it isn't logged as never retrieved
+        raise asyncio.CancelledError()
+    return step.result()
 
 
 async def _orient(ctx: TaskContext, pages: list[CardPage]) -> None:
-    """Turns the pages not yet oriented upright (Tesseract, in a thread), saving their metadata if any changed"""
+    """Turns the pages not yet oriented upright (Tesseract, in a thread), saving each one's metadata as it goes"""
     waiting = [page for page in pages if not page.meta.oriented]
     if not waiting or not ocr.is_available():
         return
 
     await ctx.report_progress(PROGRESS_ORIENTING)
-    changed = False
     for page in waiting:
-        meta = await asyncio.to_thread(orient_page, page)
-        if meta != page.meta:
-            page.meta = meta
-            changed = True
-
-    if changed:
-        _save_pages(ctx, pages)
+        page.meta = await _to_thread_to_the_end(_orient_page, ctx, page)
 
 
 async def handle_extract(ctx: TaskContext) -> ExtractResult:

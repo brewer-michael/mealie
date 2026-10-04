@@ -7,10 +7,17 @@ that can. `read_transcript` asks for it on the image slot of the same `ai` as th
 same policy and, in the eval, pinned to the same provider), concurrently with the main read.
 
 The rest is pure: the transcript is split into lines, each draft ingredient is aligned with its best line and each
-step with a window of up to 4 consecutive lines (steps wrap), and `compare` says which of the draft line's salient
-tokens the aligned text lacks. `flags.compute_flags` turns that into `read_disagreement` and `blank` flags.
+step with a window of consecutive lines (steps wrap), and `compare` says which of the draft line's salient tokens the
+aligned text lacks. `flags.compute_flags` turns that into `read_disagreement` and `blank` flags.
+
+Alignment first filters by a score that forgives the two reads wrapping or wording a line differently
+(`token_set_ratio`, `partial_ratio`), then picks the candidate most like the whole line (`ratio`), and an ingredient
+prefers a line that starts with an amount as it does. Ranking by the forgiving score alone picks any text the line
+contains, or that contains the line: a step line that mentions "eggs" for the ingredient "2 eggs", or one short line
+of a wrapped step, which lacks the step's numbers.
 """
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -19,7 +26,7 @@ from rapidfuzz import fuzz
 from mealie.services.openai import OpenAIService
 
 from .attachments import CardImage
-from .cardtext import BLANK, SalientToken, canonical_markers, letters_only, salient_tokens
+from .cardtext import BLANK, LIST_MARKER_RE, SalientToken, canonical_markers, letters_only, salient_tokens
 from .compilers import page_label
 from .llm_schemas import OpenAIRecipeCardTranscript
 from .models import CardPage
@@ -27,10 +34,19 @@ from .models import CardPage
 CARD_TRANSCRIBE_PROMPT = "recipes.card-transcribe"
 
 INGREDIENT_MIN_SCORE = 60
-"""An ingredient aligns with its best transcript line by `token_set_ratio` on letters only, if it scores this much"""
+"""
+An ingredient can align with a transcript line whose `token_set_ratio` on letters only is at least this; the best
+of those by the mean of `token_set_ratio` and `ratio` wins
+"""
 STEP_MIN_SCORE = 70
-"""A step aligns with its best window of transcript lines by `partial_ratio`, if it scores this much"""
+"""
+A step can align with a window of transcript lines whose `partial_ratio` on letters only is at least this; the best
+of those by `ratio` wins
+"""
 STEP_MAX_LINES = 4
+"""A step's window has up to this many lines, or more while it's still shorter than the step"""
+
+_AMOUNT_FIRST = re.compile(r"^\s*[-•*]?\s*[\d½⅓⅔¼¾⅛⅜⅝⅞\[]")
 
 
 class CrossReadFailed(Exception):
@@ -64,31 +80,45 @@ async def read_transcript(pages: Sequence[CardPage], *, ai: OpenAIService) -> li
     return lines
 
 
+def _amount_first(text: str) -> bool:
+    """
+    Whether a line starts with an amount, or a gap or unreadable spot where one would be, as ingredient lines do and
+    steps don't (a numbered step's "2." isn't an amount)
+    """
+    return bool(_AMOUNT_FIRST.match(LIST_MARKER_RE.sub("", text, count=1)))
+
+
 def align_ingredient(line: str, lines: Sequence[str]) -> int | None:
     """The index of the transcript line an ingredient line reads as, or None if none is close enough"""
     target = letters_only(line)
     if not target:
         return None
 
-    best: tuple[float, float, int] | None = None
+    shape = _amount_first(line)
+    best: tuple[bool, float, float, int] | None = None
     for index, candidate in enumerate(lines):
         words = letters_only(candidate)
         if not words:
             continue
-        score = (fuzz.token_set_ratio(target, words), fuzz.ratio(target, words), -index)
+        token_set = fuzz.token_set_ratio(target, words)
+        if token_set < INGREDIENT_MIN_SCORE:
+            continue
+        # `token_set_ratio` is 100 for any line holding all the ingredient's words, so a step's "Add eggs" would beat
+        # the ingredient's own line read as "2 egg": a line shaped like the ingredient comes first, then `ratio`
+        # prefers the line that says that and little more
+        score = (_amount_first(candidate) == shape, (token_set + fuzz.ratio(target, words)) / 2, token_set, -index)
         if best is None or score > best:
             best = score
 
-    if best is None or best[0] < INGREDIENT_MIN_SCORE:
-        return None
-    return -best[2]
+    return None if best is None else -best[3]
 
 
 def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     """
-    The transcript lines a step reads as, `(start, end)`, or None. Among windows of up to `STEP_MAX_LINES` lines,
-    the best `partial_ratio` wins, and between equals the one closest to the whole step (a single line that is only
-    part of a wrapped step scores as well by `partial_ratio`).
+    The transcript lines a step reads as, `(start, end)`, or None. Windows of up to `STEP_MAX_LINES` lines (more while
+    still shorter than the step) whose `partial_ratio` reaches `STEP_MIN_SCORE` are candidates, and the one most like
+    the whole step by `ratio` wins: by `partial_ratio` alone, any one line of a wrapped step that both reads word for
+    word scores 100, and beats the whole step's window when the reads differ by a word elsewhere in it.
     """
     target = letters_only(text)
     if not target:
@@ -98,16 +128,20 @@ def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     best: tuple[float, float, int, int] | None = None
     best_window: tuple[int, int] | None = None
     for start in range(len(lines)):
-        for end in range(start + 1, min(start + STEP_MAX_LINES, len(lines)) + 1):
+        window = ""
+        for end in range(start + 1, len(lines) + 1):
+            if end - start > STEP_MAX_LINES and len(window) >= len(target):
+                break
             window = " ".join(word for word in words[start:end] if word)
             if not window:
                 continue
-            score = (fuzz.partial_ratio(target, window), fuzz.ratio(target, window), -(end - start), -start)
+            partial = fuzz.partial_ratio(target, window)
+            if partial < STEP_MIN_SCORE:
+                continue
+            score = (fuzz.ratio(target, window), partial, -(end - start), -start)
             if best is None or score > best:
                 best, best_window = score, (start, end)
 
-    if best is None or best[0] < STEP_MIN_SCORE:
-        return None
     return best_window
 
 

@@ -22,6 +22,14 @@ A validation error before `create_one` returns the job to `ready` with `commit_i
 when no recipe has that id). Once `create_one` has been called the job never goes back to `ready`: any failure leaves
 it `committing`, and the next request for it or the dispatcher's housekeeping resumes it at step 3 once its lease
 (`COMMIT_LEASE`) has passed.
+
+**The lease fences every write after the claim.** `commit_started_at` is set by the claim, by each takeover and by
+the renewal after the files, and the caller keeps the value it set: the renewal, the return to `ready` (and the
+removal of `recipes/<id>` with it) and the finish all match that value. A committer that stalled past its lease and
+was taken over therefore can't undo the new owner's commit or delete its files; it answers 409 `invalid_status`.
+
+`recipe_created` is published after the write lock is released: notifiers and webhooks may take a while, and a
+restore waits for that lock.
 """
 
 import re
@@ -38,6 +46,7 @@ import sqlalchemy as sa
 from fastapi import BackgroundTasks, status
 from pydantic import ValidationError
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mealie.core.config import get_app_dirs, get_app_settings
@@ -47,7 +56,7 @@ from mealie.db.models._model_utils.guid import GUID
 from mealie.db.models.recipe.ingredient import IngredientFoodModel, IngredientUnitModel
 from mealie.db.models.recipe.recipe import RecipeModel
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
-from mealie.lang.providers import Translator, get_locale_provider
+from mealie.lang.providers import Translator
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
 from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, IngestRepos, utcnow
@@ -81,6 +90,7 @@ from mealie.schema.user.user import DEFAULT_INTEGRATION_ID, PrivateUser
 from mealie.services import urls
 from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import images, limits, storage
+from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.review import (
     COMMIT_INVALID,
@@ -171,7 +181,8 @@ class IngredientLinker:
     Links a draft's foods and units to the group's again at commit, with a fresh matcher: an id that isn't one of the
     group's becomes a name, and names are matched exactly (name, plural or alias), so foods and units created since
     extraction, or by a commit that crashed, are found rather than created twice. A missing unit is created; a missing
-    food only when the committer can organize, otherwise its name is kept as text.
+    food only when the committer can organize, otherwise its name is kept as text. A food or unit another commit
+    created since the matcher was loaded (the name is unique per group) is looked up again rather than failing.
     """
 
     def __init__(self, repos: AllRepositories, group_id: UUID, *, can_create_foods: bool) -> None:
@@ -195,9 +206,15 @@ class IngredientLinker:
 
         key = IngredientUnitModel.normalize(name)
         if key not in self._new_units:
-            self._new_units[key] = self.repos.ingredient_units.create(
-                SaveIngredientUnit(name=name, group_id=self.group_id)
-            )
+            try:
+                self._new_units[key] = self.repos.ingredient_units.create(
+                    SaveIngredientUnit(name=name, group_id=self.group_id)
+                )
+            except IntegrityError:
+                # `create` has rolled back: another commit in the group created it just now
+                if (unit := self._reloaded().exact_unit(name)) is None:
+                    raise
+                self._new_units[key] = unit
         return self._new_units[key]
 
     def food(self, ref: CardDraftRef | None) -> tuple[IngredientFood | None, str | None]:
@@ -216,10 +233,24 @@ class IngredientLinker:
 
         key = IngredientFoodModel.normalize(name)
         if key not in self._new_foods:
-            self._new_foods[key] = self.repos.ingredient_foods.create(
-                SaveIngredientFood(name=name, group_id=self.group_id)
-            )
+            try:
+                self._new_foods[key] = self.repos.ingredient_foods.create(
+                    SaveIngredientFood(name=name, group_id=self.group_id)
+                )
+            except IntegrityError:
+                # `create` has rolled back: another commit in the group created it just now
+                if (food := self._reloaded().exact_food(name)) is None:
+                    raise
+                self._new_foods[key] = food
         return self._new_foods[key], None
+
+    def _reloaded(self) -> IngestMatcher:
+        self.matcher = IngestMatcher(self.repos)
+        return self.matcher
+
+
+def _has_marker(ref: CardDraftRef | None) -> bool:
+    return ref is not None and _MARKER.search(ref.name) is not None
 
 
 def _ingredient(
@@ -229,10 +260,25 @@ def _ingredient(
     title = convert(line.title).strip()
     note = convert(line.note).strip()
 
-    unit = linker.unit(line.unit) if linker else None
-    food, kept_as_text = linker.food(line.food) if linker else (None, None)
-    if kept_as_text:
-        note = _lead_note(convert(kept_as_text), note)
+    # A unit or food name holding a marker the reviewer kept is never linked or created (it would become one of the
+    # group's units or foods): the names stay as text at the head of the note, the unit's first, as the line reads.
+    as_text: list[str] = []
+    unit: IngredientUnit | None = None
+    food: IngredientFood | None = None
+    if line.unit is not None and _has_marker(line.unit):
+        as_text.append(line.unit.name.strip())
+    elif linker:
+        unit = linker.unit(line.unit)
+
+    food_name = line.food.name.strip() if line.food else ""
+    if food_name and (as_text or _has_marker(line.food)):
+        as_text.append(food_name)
+    elif linker:
+        food, kept_as_text = linker.food(line.food)
+        if kept_as_text:
+            as_text.append(kept_as_text)
+    if as_text:
+        note = _lead_note(convert(" ".join(as_text)), note)
 
     quantity = line.quantity
     if unit is None and food is None and not note and original:
@@ -428,8 +474,16 @@ def _update(session: Session, stmt: sa.Update) -> bool:
     return updated
 
 
+def _lease_fence(job_id: UUID, lease: datetime) -> list[sa.ColumnElement[bool]]:
+    """Still `committing`, under the lease this caller set (`commit_started_at`): the fence of every later write"""
+    return [Job.id == job_id, Job.status == IngestStatus.committing.value, Job.commit_started_at == lease]
+
+
 def _claim(session: Session, job_id: UUID, household_id: UUID, user_id: UUID, version: int, now: datetime) -> bool:
-    """Step 2: `ready → committing`, with the recipe id and asset token kept from an earlier attempt or made now"""
+    """
+    Step 2: `ready → committing`, with the recipe id and asset token kept from an earlier attempt or made now. The
+    commit's lease is `now`.
+    """
     stmt = (
         sa.update(Job)
         .where(
@@ -456,8 +510,12 @@ def _claim(session: Session, job_id: UUID, household_id: UUID, user_id: UUID, ve
     return _update(session, stmt)
 
 
-def _win_lease(session: Session, job_id: UUID, now: datetime) -> bool:
-    """Takes over a commit whose lease has passed (§7); whether this caller won it"""
+def _win_lease(session: Session, job_id: UUID, now: datetime, *, lease: datetime | None = None) -> datetime | None:
+    """
+    Takes over a commit whose lease had passed by `now` (§7), with the new lease `lease` (default `now`): the lease
+    when this caller won it, else None
+    """
+    lease = lease or now
     cutoff = now - timedelta(seconds=limits.COMMIT_LEASE)
     stmt = (
         sa.update(Job)
@@ -466,23 +524,29 @@ def _win_lease(session: Session, job_id: UUID, now: datetime) -> bool:
             Job.status == IngestStatus.committing.value,
             sa.or_(Job.commit_started_at.is_(None), Job.commit_started_at < cutoff),
         )
-        .values(commit_started_at=now)
+        .values(commit_started_at=lease)
     )
-    return _update(session, stmt)
+    return lease if _update(session, stmt) else None
 
 
-def _renew_lease(session: Session, job: RecipeIngestionJob) -> None:
-    """Restarts the commit's lease after its slow part (the files), so housekeeping doesn't take over a live commit"""
+class _LeaseLost(Exception):
+    """The commit was taken over while this caller wrote its files"""
+
+
+def _renew_lease(session: Session, job: RecipeIngestionJob, lease: datetime) -> datetime:
+    """
+    Restarts the commit's lease after its slow part (the files), so housekeeping doesn't take over a live commit: the
+    new lease, always later than `lease`. Raises `_LeaseLost` when the lease is no longer this caller's.
+    """
+    renewed = max(utcnow(), lease + timedelta(microseconds=1))
     stmt = (
         sa.update(Job)
-        .where(
-            Job.id == job.id,
-            Job.status == IngestStatus.committing.value,
-            Job.commit_recipe_id == job.commit_recipe_id,
-        )
-        .values(commit_started_at=utcnow())
+        .where(*_lease_fence(job.id, lease), Job.commit_recipe_id == job.commit_recipe_id)
+        .values(commit_started_at=renewed)
     )
-    _update(session, stmt)
+    if not _update(session, stmt):
+        raise _LeaseLost()
+    return renewed
 
 
 def _recipe_dir_without_row(session: Session, recipe_id: UUID) -> None:
@@ -493,14 +557,18 @@ def _recipe_dir_without_row(session: Session, recipe_id: UUID) -> None:
         shutil.rmtree(get_app_dirs().RECIPE_DATA_DIR / str(recipe_id), ignore_errors=True)
 
 
-def _back_to_ready(session: Session, job: RecipeIngestionJob, code: str, params: dict[str, Any] | None) -> None:
-    """A commit that stopped before `create_one`: the job is `ready` again, with the reason as its error"""
+def _back_to_ready(
+    session: Session, job: RecipeIngestionJob, lease: datetime, code: str, params: dict[str, Any] | None
+) -> bool:
+    """
+    A commit that stopped before `create_one`: the job is `ready` again, with the reason as its error; whether it is.
+    Nothing changes (and no file is removed) when the commit has been taken over since.
+    """
     reserved = job.commit_recipe_id
     stmt = (
         sa.update(Job)
         .where(
-            Job.id == job.id,
-            Job.status == IngestStatus.committing.value,
+            *_lease_fence(job.id, lease),
             Job.commit_recipe_id.is_(None) if reserved is None else Job.commit_recipe_id == reserved,
         )
         .values(
@@ -511,9 +579,23 @@ def _back_to_ready(session: Session, job: RecipeIngestionJob, code: str, params:
             row_version=Job.row_version + 1,
         )
     )
-    _update(session, stmt)
+    if not _update(session, stmt):
+        return False
     if reserved is not None:
         _recipe_dir_without_row(session, reserved)
+    return True
+
+
+def _refused(
+    session: Session, job: RecipeIngestionJob, lease: datetime, status_code: int, code: str, **params: Any
+) -> JobActionError:
+    """
+    Returns the job to `ready` with `code` as its error, and the refusal to answer; a commit taken over meanwhile is
+    left to its new owner (409 `invalid_status`, `committing`)
+    """
+    if _back_to_ready(session, job, lease, code, params or None):
+        return JobActionError(status_code, code, **params)
+    return invalid_status(IngestStatus.committing.value)
 
 
 def _write_files(job: RecipeIngestionJob, draft: CardDraft, pages: Sequence[PageMeta], token: str) -> None:
@@ -550,15 +632,11 @@ def _set_cover_key(session: Session, job: RecipeIngestionJob, draft: CardDraft |
         recipes.update_image(slug)
 
 
-def _finish(session: Session, job: RecipeIngestionJob, now: datetime) -> bool:
+def _finish(session: Session, job: RecipeIngestionJob, lease: datetime, now: datetime) -> bool:
     """Step 7: `committing → committed`; whether this call won it (and so publishes `recipe_created`)"""
     stmt = (
         sa.update(Job)
-        .where(
-            Job.id == job.id,
-            Job.status == IngestStatus.committing.value,
-            Job.commit_recipe_id == job.commit_recipe_id,
-        )
+        .where(*_lease_fence(job.id, lease), Job.commit_recipe_id == job.commit_recipe_id)
         .values(
             status=IngestStatus.committed.value,
             recipe_id=job.commit_recipe_id,
@@ -600,8 +678,8 @@ def _publish_recipe_created(
 
 
 def _job_translator(job: RecipeIngestionJob) -> Translator:
-    """The job's language (the uploader's; en-US for the inbox)"""
-    return get_locale_provider(job.locale or "en-US")
+    """The job's language (the uploader's; en-US for the inbox), falling back to en-US for the fork's texts"""
+    return translator_for(job.locale)
 
 
 def _committer(session: Session, job: RecipeIngestionJob) -> PrivateUser | None:
@@ -618,8 +696,9 @@ def _committer(session: Session, job: RecipeIngestionJob) -> PrivateUser | None:
 class _Outcome:
     recipe_id: UUID
     slug: str
+    name: str
     published: bool
-    """This call won the finish"""
+    """This call won the finish, so it publishes `recipe_created` (once the write lock is released)"""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -627,21 +706,21 @@ def _run(
     session: Session,
     job: RecipeIngestionJob,
     *,
+    lease: datetime,
     user: PrivateUser | None,
     translator: Translator,
-    integration_id: str,
-    background: BackgroundTasks | None,
 ) -> _Outcome:
     """
-    Steps 3 to 7 for a claimed (or taken over) commit. The caller holds the ingest write lock.
+    Steps 3 to 7 for a claimed (or taken over) commit, fenced on its `lease`. The caller holds the ingest write lock,
+    and publishes `recipe_created` after releasing it when `published`.
 
-    Raises `JobActionError` (`commit_invalid`, `commit_interrupted`) when the job went back to `ready`.
+    Raises `JobActionError`: `commit_invalid` or `commit_interrupted` when the job went back to `ready`, and
+    `invalid_status` (`committing`) when the commit was taken over meanwhile.
     """
     recipe_id, token = job.commit_recipe_id, job.commit_asset_token
     if recipe_id is None or token is None:
         # never left by a claim, which reserves both; nothing can have been created
-        _back_to_ready(session, job, COMMIT_INTERRUPTED, None)
-        raise JobActionError(status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED)
+        raise _refused(session, job, lease, status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED)
 
     draft = CardDraft.model_validate(job.draft) if job.draft else None
     group_repos = get_repositories(session, group_id=job.group_id, household_id=None)
@@ -650,8 +729,7 @@ def _run(
 
     if existing is None:
         if user is None:
-            _back_to_ready(session, job, COMMIT_INTERRUPTED, None)
-            raise JobActionError(status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED)
+            raise _refused(session, job, lease, status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED)
 
         repos = get_repositories(session, group_id=job.group_id, household_id=job.household_id)
         household = repos.households.get_one(job.household_id)
@@ -672,21 +750,24 @@ def _run(
             settings = recipe_settings(household)
             build(draft, settings=settings, linker=None)  # validates before anything is written or created
             _write_files(job, draft, pages, token)
-            _renew_lease(session, job)
+            lease = _renew_lease(session, job, lease)
             linker = IngredientLinker(repos, job.group_id, can_create_foods=bool(user.can_organize))
             recipe, warnings = build(draft, settings=settings, linker=linker)
+        except _LeaseLost as e:
+            # taken over while this caller wrote the files: the new owner finishes the commit
+            raise invalid_status(IngestStatus.committing.value) from e
         except DraftInvalid as e:
-            _back_to_ready(session, job, COMMIT_INVALID, {"fields": e.fields})
-            raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, COMMIT_INVALID, fields=e.fields) from e
+            raise _refused(
+                session, job, lease, status.HTTP_422_UNPROCESSABLE_CONTENT, COMMIT_INVALID, fields=e.fields
+            ) from e
         except OSError as e:
             # a card file missing or unwritable: nothing was created, so the job can simply be committed again
             session.rollback()
             logger.error(f"Recipe card job {job.id}: couldn't write the recipe's files ({type(e).__name__})")
-            _back_to_ready(session, job, COMMIT_INTERRUPTED, None)
-            raise JobActionError(status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED) from e
+            raise _refused(session, job, lease, status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED) from e
         except Exception:
             session.rollback()
-            _back_to_ready(session, job, COMMIT_INTERRUPTED, None)
+            _back_to_ready(session, job, lease, COMMIT_INTERRUPTED, None)
             raise
 
         # from here on the job never goes back to ready: a failure leaves it committing, to be resumed
@@ -696,19 +777,31 @@ def _run(
         slug, name = existing.slug, existing.name or ""
 
     _set_cover_key(session, job, draft, slug)
-    published = _finish(session, job, utcnow())
-    if published:
+    published = _finish(session, job, lease, utcnow())
+    return _Outcome(recipe_id=recipe_id, slug=slug, name=name, published=published, warnings=warnings)
+
+
+def _announce(
+    session: Session,
+    job: RecipeIngestionJob,
+    outcome: _Outcome,
+    *,
+    translator: Translator,
+    integration_id: str,
+    background: BackgroundTasks | None,
+) -> None:
+    """`recipe_created` for the call that won the finish, sent once the ingest write lock is released"""
+    if outcome.published:
         _publish_recipe_created(
             session,
             group_id=job.group_id,
             household_id=job.household_id,
-            slug=slug,
-            name=name,
+            slug=outcome.slug,
+            name=outcome.name,
             translator=translator,
             integration_id=integration_id,
             background=background,
         )
-    return _Outcome(recipe_id=recipe_id, slug=slug, published=published, warnings=warnings)
 
 
 # ==========================================
@@ -762,18 +855,17 @@ def _take_over(
 ) -> CommitResult:
     """A request for a job still `committing`: 409 while its lease runs, else it resumes the commit as its committer"""
     session = review.session
-    now = utcnow()
     with storage.ingest_write():
-        if not _win_lease(session, job.id, now):
+        lease = _win_lease(session, job.id, utcnow())
+        if lease is None:
             raise invalid_status(IngestStatus.committing.value)
         job = review.job(job.id)
         if job.committed_by == user.id:
             committer: PrivateUser | None = user
         else:
             committer, translator = _committer(session, job), _job_translator(job)
-        outcome = _run(
-            session, job, user=committer, translator=translator, integration_id=integration_id, background=background
-        )
+        outcome = _run(session, job, lease=lease, user=committer, translator=translator)
+    _announce(session, job, outcome, translator=translator, integration_id=integration_id, background=background)
 
     return CommitResult(
         out=CommitOut(
@@ -803,6 +895,7 @@ def commit_job(
     Raises `JobActionError` (404, 409 `version_conflict` / `invalid_status` / `commit_interrupted`, 422
     `unresolved_flags` / `commit_invalid`) and `IngestPaused` while a backup restore holds ingestion.
     """
+    translator = with_fallback(translator)
     review = ReviewService(repos, user)
     job = review.job(job_id)
 
@@ -817,7 +910,13 @@ def commit_job(
 
     version = request.draft_version
     if request.draft is not None:
-        version = review.save_draft(job_id, CardDraftUpdate(draft_version=version, draft=request.draft)).draft_version
+        try:
+            update = CardDraftUpdate(draft_version=version, draft=request.draft)
+        except ValidationError as e:
+            # the limits of a saved draft (which a PUT checks as it reads its body): nothing is saved or claimed
+            fields = DraftInvalid.of(e).fields
+            raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, COMMIT_INVALID, fields=fields) from e
+        version = review.save_draft(job_id, update).draft_version
         job = review.job(job_id)
     elif job.draft_version != version:
         raise version_conflict(job.draft_version)
@@ -827,17 +926,12 @@ def commit_job(
         raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNRESOLVED_FLAGS, flags=unresolved)
 
     with storage.ingest_write():
-        if not _claim(review.session, job_id, review.household_id, user.id, version, utcnow()):
+        lease = utcnow()
+        if not _claim(review.session, job_id, review.household_id, user.id, version, lease):
             return _refusal(review, job_id, version)
         job = review.job(job_id)
-        outcome = _run(
-            review.session,
-            job,
-            user=user,
-            translator=translator,
-            integration_id=integration_id,
-            background=background,
-        )
+        outcome = _run(review.session, job, lease=lease, user=user, translator=translator)
+    _announce(review.session, job, outcome, translator=translator, integration_id=integration_id, background=background)
 
     return CommitResult(
         out=CommitOut(
@@ -852,10 +946,11 @@ def commit_job(
 
 def resume_stale_commits(now: datetime) -> int:
     """
-    Resumes commits whose lease (`commit_started_at`) is older than `COMMIT_LEASE`: the number resumed. Each one
-    runs as its committer, in the job's language, inside the ingest write lock, and publishes `recipe_created`
-    inline if it wins the finish. A commit whose committer is gone and that created no recipe goes back to `ready`
-    with `commit_interrupted`. Stops at once while a backup restore holds ingestion.
+    Resumes commits whose lease (`commit_started_at`) was older than `COMMIT_LEASE` at `now`: the number resumed.
+    Each one runs as its committer, in the job's language, inside the ingest write lock, with a lease taken when it
+    starts (not at `now`, which may be a while back for the last of several), and publishes `recipe_created` in this
+    thread, after the lock is released, if it wins the finish. A commit whose committer is gone and that created no
+    recipe goes back to `ready` with `commit_interrupted`. Stops at once while a backup restore holds ingestion.
     """
     cutoff = now - timedelta(seconds=limits.COMMIT_LEASE)
     resumed = 0
@@ -875,20 +970,23 @@ def resume_stale_commits(now: datetime) -> int:
         for job_id in job_ids:
             try:
                 with storage.ingest_write():
-                    if not _win_lease(session, job_id, now):
+                    lease = _win_lease(session, job_id, now, lease=max(now, utcnow()))
+                    if lease is None:
                         continue
                     job = queue.get(job_id)
                     if job is None:
                         continue
                     resumed += 1
-                    _run(
-                        session,
-                        job,
-                        user=_committer(session, job),
-                        translator=_job_translator(job),
-                        integration_id=DEFAULT_INTEGRATION_ID,
-                        background=None,
-                    )
+                    translator = _job_translator(job)
+                    outcome = _run(session, job, lease=lease, user=_committer(session, job), translator=translator)
+                _announce(
+                    session,
+                    job,
+                    outcome,
+                    translator=translator,
+                    integration_id=DEFAULT_INTEGRATION_ID,
+                    background=None,
+                )
             except IngestPaused:
                 break
             except JobActionError as e:

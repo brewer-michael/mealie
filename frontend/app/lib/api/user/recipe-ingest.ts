@@ -1,6 +1,8 @@
-import type { AxiosProgressEvent, AxiosRequestConfig } from "axios";
+import axios from "axios";
+import type { AxiosProgressEvent, AxiosRequestConfig, AxiosResponseTransformer } from "axios";
 import { BaseAPI } from "../base/base-clients";
 import { type QueryValue, route } from "../base/route";
+import type { PaginationData } from "../types/non-generated";
 import type {
   AINotifierEventsOut,
   AINotifierEventsUpdate,
@@ -18,8 +20,8 @@ import type {
   RecipeIngestionBatchOut,
   RecipeIngestionJobCounts,
   RecipeIngestionJobOut,
-  RecipeIngestionJobPagination,
   RecipeIngestionJobState,
+  RecipeIngestionJobSummary,
   RecipeIngestionSettingsOut,
   RecipeIngestionSettingsUpdate,
   RereadRequest,
@@ -69,11 +71,17 @@ export interface RecipeIngestUploadOptions {
   allowDuplicate?: boolean;
 }
 
-export interface RecipeIngestUploadConfig {
+export interface RecipeIngestRequestConfig {
+  /**
+   * Don't toast the answer's message, on success or failure: the caller shows the outcome itself (the upload queue,
+   * whose attempts retry and whose cards show why they failed)
+   */
+  suppressAlert?: boolean;
+}
+
+export interface RecipeIngestUploadConfig extends RecipeIngestRequestConfig {
   onUploadProgress?: (event: AxiosProgressEvent) => void;
   signal?: AbortSignal;
-  /** Don't toast the error's `detail.message` (for an attempt that will be retried) */
-  suppressAlert?: boolean;
 }
 
 export interface RecipeIngestJobsQuery {
@@ -81,6 +89,30 @@ export interface RecipeIngestJobsQuery {
   batchId?: string | null;
   page?: number;
   perPage?: number;
+}
+
+/** Drops `detail.message` from an error's body, after the default transforms have parsed it */
+const dropErrorMessage: AxiosResponseTransformer = (data: unknown, _headers, status) => {
+  const detail = (data as { detail?: unknown } | null)?.detail;
+  if (!status || status < 400 || !detail || typeof detail !== "object" || !("message" in detail)) {
+    return data;
+  }
+  const { message: _message, ...rest } = detail as Record<string, unknown>;
+  return { ...(data as Record<string, unknown>), detail: rest };
+};
+
+/**
+ * The axios options for `RecipeIngestRequestConfig`. `suppressAlert` covers a success's message; the interceptor's
+ * error branch toasts any `detail.message` regardless, so a quiet request's error body loses its message instead (the
+ * caller reads `detail.code`).
+ */
+export function requestOptions(config: RecipeIngestRequestConfig = {}): AxiosRequestConfig {
+  if (!config.suppressAlert) {
+    return {};
+  }
+  const defaults = axios.defaults.transformResponse;
+  const transforms = Array.isArray(defaults) ? defaults : defaults ? [defaults] : [];
+  return { suppressAlert: true, transformResponse: [...transforms, dropErrorMessage] };
 }
 
 /** The form a card's photos are sent as: one `files` part per photo, front first, and the options as text fields */
@@ -118,18 +150,18 @@ export class RecipeIngestAPI extends BaseAPI {
     const requestConfig: AxiosRequestConfig = {
       onUploadProgress: config.onUploadProgress,
       signal: config.signal,
-      suppressAlert: config.suppressAlert,
+      ...requestOptions(config),
     };
     return await this.requests.post<IngestResponse>(routes.ingest, buildIngestForm(files, options), requestConfig);
   }
 
-  async createBatch() {
-    return await this.requests.post<RecipeIngestionBatchOut>(routes.batches, {});
+  async createBatch(config: RecipeIngestRequestConfig = {}) {
+    return await this.requests.post<RecipeIngestionBatchOut>(routes.batches, {}, requestOptions(config));
   }
 
   /** Marks a batch done; send it once every card of the batch has uploaded or failed for good */
-  async sealBatch(id: string) {
-    return await this.requests.post<RecipeIngestionBatchOut>(routes.batchesIdSeal(id), {});
+  async sealBatch(id: string, config: RecipeIngestRequestConfig = {}) {
+    return await this.requests.post<RecipeIngestionBatchOut>(routes.batchesIdSeal(id), {}, requestOptions(config));
   }
 
   async getBatch(id: string) {
@@ -154,7 +186,8 @@ export class RecipeIngestAPI extends BaseAPI {
     if (query.perPage) {
       params.perPage = query.perPage;
     }
-    return await this.requests.get<RecipeIngestionJobPagination>(route(routes.jobs, params));
+    // the generator emits no type for a `PaginationBase` subclass: its JSON is upstream's pagination
+    return await this.requests.get<PaginationData<RecipeIngestionJobSummary>>(route(routes.jobs, params));
   }
 
   async getCounts() {

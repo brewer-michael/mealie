@@ -22,6 +22,7 @@ from mealie.services.recipe.import_workflow.compilers.base import SourceCompiler
 from mealie.services.recipe.import_workflow.context import WorkflowContext
 
 from .attachments import CardImage
+from .cardtext import canonical_markers
 from .context import CardWorkflowContext
 from .llm_schemas import OpenAIRecipeCardTranscription
 from .service import end_transaction
@@ -102,7 +103,8 @@ def _compiled(
         return None
 
     ctx.read_path = read_path
-    ctx.attribution = (response.attribution or "").strip() or None
+    # markers written exactly as the review page and commit look for them, as in every other field of the draft
+    ctx.attribution = canonical_markers((response.attribution or "").strip()) or None
     ctx.unsure = [
         ExtractionUnsure(
             text=entry.text.strip(),

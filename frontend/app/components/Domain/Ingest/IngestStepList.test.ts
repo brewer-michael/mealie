@@ -34,8 +34,8 @@ function draft(): ReviewDraft {
   }));
 }
 
-function mountWith<T>(component: T, model: ReviewDraft, flags: CardFlag[] = [], readonly = false) {
-  const wrapper = mount(component as never, {
+function mountWith(component: typeof IngestStepList, model: ReviewDraft, flags: CardFlag[] = [], readonly = false) {
+  const wrapper = mount(component, {
     props: { modelValue: model, flags, readonly },
     global: { mocks: { $globals: { icons } }, stubs },
   });

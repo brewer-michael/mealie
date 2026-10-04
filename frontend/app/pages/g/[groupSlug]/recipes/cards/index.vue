@@ -39,6 +39,7 @@
         v-model:local-only="localOnly"
         class="mb-4"
         :settings="settings"
+        :already-sent="sentBeforeLocalOnlyChange"
       />
       <IngestCapture :max-pages-per-card="settings?.limits?.maxPagesPerCard" />
       <IngestUploadQueue class="mt-4" :group-slug="groupSlug" />
@@ -87,7 +88,7 @@ const {
   loadFailed: settingsLoadFailed,
   load: loadSettings,
 } = useRecipeIngestSettings();
-const { localOnly } = useRecipeIngestUploads();
+const { localOnly, sentBeforeLocalOnlyChange } = useRecipeIngestUploads();
 
 const canReadCards = computed(() => !!settings.value?.canReadCards);
 const inboxFolder = computed(() => (settings.value?.inbox?.enabled && settings.value.inbox.folder) || null);

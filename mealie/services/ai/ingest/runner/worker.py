@@ -3,7 +3,9 @@ Running one claimed task (docs/ai/PHASE2.md §3.7), in its own daemon thread and
 
 1. Read the job in a short session; stop if the fence (the lease token, `task_state='running'`) fails.
 2. Set the locale context to the job's language (the uploader's `Accept-Language`; en-US for the inbox).
-3. Apply the job's AI call policy (`local_only`, `job_id`) around the handler.
+3. Apply the job's AI call policy (`local_only`, `job_id`) around the handler: local-only when the job was stored so
+   or when its group's "Keep recipe card photos and text on this server" is on now, so switching that on also covers
+   cards still queued and later re-reads, re-extracts and retries of older ones (§10: a change never loosens a job).
 4. Call the handler (`tasks.handle_extract` or `tasks.handle_reread`): it opens its own sessions, returns a result and
    writes nothing to the job row.
 5. Apply the outcome with a write fenced on the lease (`finalize`), in a short session of its own; then, after a first
@@ -38,7 +40,7 @@ from mealie.db.db_setup import session_context
 from mealie.db.models.household.household import Household
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.lang.providers import get_locale_config, get_locale_provider, set_locale_context
-from mealie.repos.repository_recipe_ingest import IngestQueue, utcnow
+from mealie.repos.repository_recipe_ingest import IngestQueue, IngestRepos, utcnow
 from mealie.schema.recipe_ingest import IngestErrorCode, IngestTaskKind
 from mealie.services.ai.policy import AICallPolicy, ai_call_policy
 
@@ -85,6 +87,7 @@ class _ClaimedJob:
     payload: dict[str, Any] | None
     locale: str
     local_only: bool
+    """The job's own `local_only`, or its group's setting as it is now"""
     owner_exists: bool
 
 
@@ -119,6 +122,8 @@ def _load_job(job_id: UUID, token: UUID) -> _ClaimedJob | None:
         if row is None:
             return None
         owner_exists = _household_exists(session, row.household_id)
+        # the group's setting as it is now: switching it on also covers cards queued before (§10)
+        local_only = bool(row.local_only) or IngestRepos(session, row.group_id, None).settings.get().local_only
         session.commit()
 
     return _ClaimedJob(
@@ -129,7 +134,7 @@ def _load_job(job_id: UUID, token: UUID) -> _ClaimedJob | None:
         kind=IngestTaskKind(row.task_kind),
         payload=row.task_payload if isinstance(row.task_payload, dict) else None,
         locale=row.locale or DEFAULT_LOCALE,
-        local_only=bool(row.local_only),
+        local_only=local_only,
         owner_exists=owner_exists,
     )
 

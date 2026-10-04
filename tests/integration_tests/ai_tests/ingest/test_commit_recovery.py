@@ -4,6 +4,9 @@ resumed (by `resume_stale_commits`, as the dispatcher's housekeeping runs it, or
 second recipe, food, unit or asset name, and `recipe_created` goes out exactly once. Runs on SQLite and PostgreSQL.
 """
 
+import fcntl
+import os
+import threading
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -292,3 +295,127 @@ def test_nothing_is_resumed_while_a_restore_pauses_ingestion(
 
     card_commit.resume_stale_commits(after_the_lease())
     assert job_row(job_id)["status"] == IngestStatus.committed.value
+
+
+# ==================================================================================================================
+# The lease fences a stalled committer
+
+
+def test_a_stalled_committer_cant_undo_the_commit_that_took_over(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str]
+):
+    """
+    A request stalls in its files past the lease, housekeeping takes the commit over, and the request then fails
+    before the new owner has created the recipe: the job stays the new owner's, and its files stay
+    """
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    real_write_files, real_create = card_commit._write_files, card_commit._create_recipe
+    stalled, taken_over_files, first_done = threading.Event(), threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def write_files(*args: Any) -> None:
+        calls.append(threading.current_thread().name)
+        if len(calls) == 1:  # the request: stalls, then its disk fails
+            stalled.set()
+            assert taken_over_files.wait(30)
+            raise OSError("the disk went away")
+        real_write_files(*args)
+
+    def create_recipe(*args: Any) -> Any:
+        taken_over_files.set()  # housekeeping has written its files; the request fails now
+        assert first_done.wait(30)
+        return real_create(*args)
+
+    monkeypatch.setattr(card_commit, "_write_files", write_files)
+    monkeypatch.setattr(card_commit, "_create_recipe", create_recipe)
+
+    outcome: dict[str, Any] = {}
+
+    def request() -> None:
+        try:
+            run_commit(user, job_id)
+        except JobActionError as e:
+            outcome["refused"] = (e.status_code, e.code, e.params)
+        finally:
+            first_done.set()
+
+    first = threading.Thread(target=request, name="request")
+    first.start()
+    assert stalled.wait(30)
+    resumer = threading.Thread(target=card_commit.resume_stale_commits, args=(after_the_lease(),), name="housekeeping")
+    resumer.start()
+    first.join(60)
+    resumer.join(60)
+
+    assert calls == ["request", "housekeeping"]
+    assert outcome["refused"] == (409, "invalid_status", {"status": "committing"})
+    row = job_row(job_id)
+    assert (row["status"], row["error_code"]) == ("committed", None)
+    recipe_id, token = row["recipe_id"], row["commit_asset_token"]
+    asset_dir = get_app_dirs().RECIPE_DATA_DIR / str(recipe_id) / "assets"
+    assert sorted(path.name for path in asset_dir.iterdir()) == [
+        f"recipe-card-{token}-1.jpg",
+        f"recipe-card-{token}-2.jpg",
+    ]
+    assert published == ["banana-mug-cake"]
+
+
+def test_a_committer_taken_over_during_its_files_stops(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str]
+):
+    """Its lease renewal finds the commit taken over: it never creates the recipe a second time"""
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    real_write_files = card_commit._write_files
+    creates: list[Any] = []
+    real_create = card_commit._create_recipe
+    monkeypatch.setattr(card_commit, "_create_recipe", lambda *a: creates.append(a) or real_create(*a))
+
+    writes: list[Any] = []
+
+    def write_files(*args: Any) -> None:
+        writes.append(args)
+        real_write_files(*args)
+        if len(writes) == 1:
+            # the request is slow here: housekeeping takes over and finishes the commit meanwhile
+            assert card_commit.resume_stale_commits(after_the_lease()) == 1
+
+    monkeypatch.setattr(card_commit, "_write_files", write_files)
+    with pytest.raises(JobActionError) as refused:
+        run_commit(user, job_id)
+
+    assert (refused.value.status_code, refused.value.code) == (409, "invalid_status")
+    assert (len(writes), len(creates)) == (2, 1)
+    assert job_row(job_id)["status"] == "committed"
+    assert len(group_recipes(user)) == 1
+    assert published == ["banana-mug-cake"]
+
+
+def test_a_resumed_commit_publishes_after_releasing_the_write_lock(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """Notifiers and webhooks run in housekeeping's thread: never while a restore would wait for the lock"""
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    monkeypatch.setattr(card_commit, "_create_recipe", crash_once(card_commit._create_recipe, before=True))
+    with pytest.raises(Crash):
+        run_commit(user, job_id)
+
+    lock_free: list[bool] = []
+
+    def dispatch(self: EventBusService, *args: Any, **kwargs: Any) -> None:
+        fd = os.open(storage.lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # what a restore takes
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            lock_free.append(True)
+        except BlockingIOError:
+            lock_free.append(False)
+        finally:
+            os.close(fd)
+
+    monkeypatch.setattr(EventBusService, "dispatch", dispatch)
+    assert card_commit.resume_stale_commits(after_the_lease()) == 1
+    assert job_row(job_id)["status"] == "committed"
+    assert lock_free == [True]

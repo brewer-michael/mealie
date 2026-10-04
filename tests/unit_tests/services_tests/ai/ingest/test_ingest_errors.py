@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
+from mealie.lang import providers
+from mealie.lang.locale_config import LOCALE_CONFIG
 from mealie.lang.providers import get_locale_provider
 from mealie.routes.ai.ingest._deps import (
     ingest_error,
@@ -20,6 +22,7 @@ from mealie.routes.ai.ingest._deps import (
 )
 from mealie.schema.recipe_ingest import CardFlagKind, IngestErrorCode, IngestRejectReason
 from mealie.services.ai.ingest import limits, storage
+from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.settings import IngestSettings, get_ingest_settings
 
 ROOT = Path(__file__).parents[5]
@@ -76,6 +79,27 @@ def test_error_bodies_carry_a_code_and_only_sometimes_a_message():
         translator=get_locale_provider("en-US"),
     )
     assert shown.detail == {"code": "too_large", "message": "The upload is too large. The limit is 100 MB."}
+
+
+@pytest.mark.parametrize("locale", ["de-DE", "en-GB", "fr-FR"])
+def test_messages_fall_back_to_english_where_the_language_lacks_them(locale: str):
+    """Only en-US carries the fork's texts: another language gets them in English, never as their keys"""
+    key = "recipe-ingest.errors.paused-for-restore"
+    english = get_locale_provider("en-US").t(key)
+    translator = get_locale_provider(locale)
+    expected = english if translator.t(key) == key else translator.t(key)
+
+    assert ingest_error(503, "paused_for_restore", message_key=key, translator=translator).detail["message"] == expected
+    assert paused_error(translator).detail["message"] == expected
+    assert translator_for(locale).t("recipe-ingest.unreadable") != "recipe-ingest.unreadable"
+    assert with_fallback(translator_for(locale)).t(key) == expected
+
+    # no translator: the request's language, as the locale middleware set it
+    token = providers._locale_context.set((translator, LOCALE_CONFIG["en-US"]))
+    try:
+        assert paused_error().detail["message"] == expected
+    finally:
+        providers._locale_context.reset(token)
 
 
 def test_the_switch_and_the_pause_answer_503(data_dir: Path, monkeypatch: pytest.MonkeyPatch):

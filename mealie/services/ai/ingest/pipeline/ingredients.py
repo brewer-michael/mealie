@@ -5,7 +5,8 @@ thread. Nothing is written: `IngestMatcher` only reads, and commit links the nam
 1. Lines are stripped and empty ones dropped (one empty string makes the NLP parser fail the whole call); section
    titles carry over. Lines that still hold a marker aren't parsed: they stay as text, and the marker is flagged.
 2. Card shorthand ("1 T.", "1/4 t.", "1/3 C.") is written out first, case-sensitively, for English cards and cards of
-   unknown language (`shorthand.normalize_shorthand`).
+   unknown language (`shorthand.normalize_shorthand`). A size word after the quantity ("1 heaping T. flour") is
+   parsed without, then leads the note: the parser would make it part of the unit or the food.
 3. Only Mealie's NLP parser, with the matcher as its `data_matcher`. The brute parser links "pkg." to kilogram, and
    the AI parser builds its own `OpenAIService` (escaping the eval's pinning). Other languages aren't parsed.
 4. `original_text` is the card's line again (the parser stores its own input there), and `display` is rebuilt, since
@@ -31,7 +32,7 @@ from mealie.schema.recipe_ingest import CardDraftIngredient, CardDraftRef
 from mealie.services.parser_services import get_parser
 
 from ..matching import IngestMatcher
-from ..shorthand import normalize_shorthand
+from ..shorthand import normalize_shorthand, split_size
 from .cardtext import canonical_markers, markers_in
 from .flags import ingredient_hash, is_english
 from .service import end_transaction
@@ -87,10 +88,10 @@ def _as_text(line: IngredientLine, text: str) -> CardDraftIngredient:
     return ingredient
 
 
-def _from_parsed(line: IngredientLine, text: str, parsed: ParsedIngredient) -> CardDraftIngredient:
+def _from_parsed(line: IngredientLine, text: str, parsed: ParsedIngredient, size: str | None) -> CardDraftIngredient:
     result = parsed.ingredient
     quantity = result.quantity or None
-    note = (result.note or "").strip()
+    note = ", ".join(part for part in (size, (result.note or "").strip()) if part)  # sizes lead, as the parser has it
     # rebuilt rather than kept: the parser's display was made before the matcher linked the unit and food
     display = RecipeIngredient(quantity=quantity, unit=result.unit, food=result.food, note=note).display
     ingredient = CardDraftIngredient(
@@ -120,11 +121,13 @@ async def normalize_lines(
     english = is_english(language)
     texts: list[str] = []
     to_parse: dict[int, str] = {}
+    sizes: dict[int, str | None] = {}
     for index, line in enumerate(lines):
         text = canonical_markers(line.text.strip())
         texts.append(text)
         if text and english and not markers_in(text):
-            to_parse[index] = normalize_shorthand(text)[0]
+            plain, sizes[index] = split_size(text)
+            to_parse[index] = normalize_shorthand(plain)[0]
 
     parsed: dict[int, ParsedIngredient] = {}
     if to_parse:
@@ -151,7 +154,7 @@ async def normalize_lines(
         if not text:
             continue
         if result := parsed.get(index):
-            ingredients.append(_from_parsed(line, text, result))
+            ingredients.append(_from_parsed(line, text, result, sizes.get(index)))
         else:
             ingredients.append(_as_text(line, text))
     return ingredients

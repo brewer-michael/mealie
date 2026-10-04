@@ -39,7 +39,7 @@ def test_two_saves_of_the_same_version_give_one_200_and_one_409(
     lock = threading.Lock()
 
     def meeting_flags(
-        draft: CardDraft, extraction: ExtractionMeta | None, resolutions: Mapping[str, FlagResolution]
+        draft: CardDraft, extraction: ExtractionMeta | None, resolutions: Mapping[str, FlagResolution], **kwargs: Any
     ) -> list[CardFlag]:
         nonlocal calls
         with lock:
@@ -47,7 +47,7 @@ def test_two_saves_of_the_same_version_give_one_200_and_one_409(
             first_two = calls <= 2
         if first_two:
             barrier.wait()
-        return fake_compute_flags(draft, extraction, resolutions)
+        return fake_compute_flags(draft, extraction, resolutions, **kwargs)
 
     monkeypatch.setattr(card_flags, "compute_flags", meeting_flags)
 
@@ -85,7 +85,7 @@ def test_a_proposal_written_during_a_save_survives_it(
     calls = 0
 
     def flags_while_a_reread_lands(
-        draft: CardDraft, extraction: ExtractionMeta | None, resolutions: Mapping[str, FlagResolution]
+        draft: CardDraft, extraction: ExtractionMeta | None, resolutions: Mapping[str, FlagResolution], **kwargs: Any
     ) -> list[CardFlag]:
         nonlocal calls
         calls += 1
@@ -93,7 +93,7 @@ def test_a_proposal_written_during_a_save_survives_it(
             # a re-read's finalize, in its own session, between the save's read and its write
             with session_context() as session:
                 update_job_json(session, job_id, lambda row: {"proposals": [*(row["proposals"] or []), proposal]})
-        return fake_compute_flags(draft, extraction, resolutions)
+        return fake_compute_flags(draft, extraction, resolutions, **kwargs)
 
     monkeypatch.setattr(card_flags, "compute_flags", flags_while_a_reread_lands)
 

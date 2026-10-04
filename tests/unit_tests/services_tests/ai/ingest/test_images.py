@@ -115,6 +115,8 @@ def test_formats_are_recognised_by_their_magic_bytes(head: bytes, kind: str | No
         ("", None),
         (None, None),
         ("x" * 300 + ".jpeg", "x" * 115 + ".jpeg"),
+        ("\ud800card.jpg", "\ufffdcard.jpg"),  # a lone surrogate from JSON can't be stored
+        ("r\udce9cipe.jpg", "r\ufffdcipe.jpg"),  # nor a file name's undecodable byte
     ],
 )
 def test_file_names_are_sanitized_for_display(name: str | None, sanitized: str | None):
@@ -218,6 +220,66 @@ def test_transparency_is_flattened_onto_white_and_the_thumbnail_keeps_the_aspect
         assert thumb.size == (480, 240)
 
 
+def _gradient_16(width: int = 256, height: int = 64) -> list[int]:
+    """A left-to-right ramp over the whole 16-bit range, as a flatbed scanner's 16-bit grayscale writes it"""
+    return [round(x * 65535 / (width - 1)) for _ in range(height) for x in range(width)]
+
+
+def _big_endian_tiff(width: int, height: int, values: list[int]) -> bytes:
+    """A 16-bit grayscale TIFF in Motorola byte order (Pillow reads it as `I;16B`; it can't write one)"""
+    data = struct.pack(f">{len(values)}H", *values)
+    tags = [(256, width), (257, height), (258, 16), (259, 1), (262, 1), (273, 8), (277, 1), (278, height)]
+    tags.append((279, len(data)))
+    ifd = struct.pack(">H", len(tags))
+    for tag, value in tags:
+        ifd += struct.pack(">HHII", tag, 4, 1, value)  # every value as a LONG
+    return b"MM\x00*" + struct.pack(">I", 8 + len(data)) + data + ifd + struct.pack(">I", 0)
+
+
+def _high_bit_scan(kind: str) -> bytes:
+    width, height = 256, 64
+    values = _gradient_16(width, height)
+    if kind == "I;16 PNG":
+        return _encoded(Image.frombytes("I;16", (width, height), struct.pack(f"<{len(values)}H", *values)), "PNG")
+    if kind == "I;16 TIFF":
+        return _encoded(Image.frombytes("I;16", (width, height), struct.pack(f"<{len(values)}H", *values)), "TIFF")
+    if kind == "I;16B TIFF":
+        return _big_endian_tiff(width, height, values)
+    if kind == "I TIFF":
+        return _encoded(Image.frombytes("I", (width, height), struct.pack(f"<{len(values)}i", *values)), "TIFF")
+    assert kind == "F TIFF"
+    floats = struct.pack(f"<{len(values)}f", *(value / 65535 for value in values))
+    return _encoded(Image.frombytes("F", (width, height), floats), "TIFF")
+
+
+@pytest.mark.parametrize("kind", ["I;16 PNG", "I;16 TIFF", "I;16B TIFF", "I TIFF", "F TIFF"])
+def test_high_bit_depth_grayscale_scans_keep_their_tones(page_dir: Path, kind: str):
+    # converted straight to RGB, 16-bit values are clipped to white and floats to black
+    normalize_page(io.BytesIO(_high_bit_scan(kind)), page_dir, 0, original_filename="scan")
+
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert page.mode == "RGB"
+        left, middle, right = (page.getpixel((x, 32)) for x in (2, 128, 253))
+    assert all(value < 20 for value in left), left
+    assert all(100 < value < 155 for value in middle), middle
+    assert all(value > 235 for value in right), right
+
+
+def test_palette_and_bilevel_images_become_rgb_pages(page_dir: Path):
+    palette = Image.new("P", (300, 100))
+    palette.putpalette([255, 255, 255, 255, 0, 0])
+    palette.paste(1, (0, 0, 100, 100))
+    normalize_page(io.BytesIO(_encoded(palette, "PNG")), page_dir, 0, original_filename=None)
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert _close(page.getpixel((50, 50)), RED) and _close(page.getpixel((250, 50)), WHITE)
+
+    bilevel = Image.new("1", (300, 100), 1)
+    bilevel.paste(0, (0, 0, 100, 100))
+    normalize_page(io.BytesIO(_encoded(bilevel, "TIFF")), page_dir, 0, original_filename=None)
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert _close(page.getpixel((50, 50)), (0, 0, 0)) and _close(page.getpixel((250, 50)), WHITE)
+
+
 def test_large_photos_are_scaled_to_the_page_and_view_sizes(page_dir: Path):
     meta = normalize_page(
         io.BytesIO(_encoded(_left_third_red(5000, 2500), "JPEG")), page_dir, 0, original_filename=None
@@ -229,6 +291,65 @@ def test_large_photos_are_scaled_to_the_page_and_view_sizes(page_dir: Path):
         assert view.size == (2048, 1024)
     with Image.open(page_dir / images.THUMB_FILE) as thumb:
         assert thumb.size == (480, 240)
+
+
+@pytest.fixture()
+def full_size_copies(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[list[str], tuple[int, int]]]:
+    """
+    Records the mode of every image Pillow makes at the upload's own size (new, copied, converted or turned) while it's
+    normalized: with a 100-megapixel upload each is about 400 MB. The page size is lowered so small images stand in
+    for large ones.
+    """
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 1000)
+    full_size = (2400, 1600)
+    made: list[str] = []
+    real_new = Image.Image._new
+
+    def new(self: Image.Image, im) -> Image.Image:
+        result = real_new(self, im)
+        if result.size in (full_size, full_size[::-1]):
+            made.append(result.mode)
+        return result
+
+    monkeypatch.setattr(Image.Image, "_new", new)
+    yield made, full_size
+
+
+def test_a_large_upload_is_scaled_down_before_it_is_copied(page_dir: Path, full_size_copies):
+    made, size = full_size_copies
+    rgba = Image.new("RGBA", size, (0, 0, 0, 0))
+    rgba.paste((255, 0, 0, 255), (0, 0, 800, 1600))
+    rgb = _left_third_red(*size)
+    uploads = [_encoded(rgba, "PNG"), _encoded(rgb, "PNG", exif=_exif(orientation=6)), _encoded(rgb, "TIFF")]
+    made.clear()
+
+    for raw in uploads:
+        meta = normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+        assert max(meta.width, meta.height) == 1000
+    # transparency is flattened into one RGB image; nothing else is copied before it's scaled down, an EXIF turn
+    # included (before: six full-size copies for the RGBA upload)
+    assert made == ["RGB"]
+    with Image.open(page_dir / images.PAGE_FILE) as page:
+        assert page.size == (1000, 667) or page.size == (667, 1000)
+
+
+def test_a_large_jpeg_is_decoded_at_a_reduced_scale(page_dir: Path, full_size_copies, monkeypatch: pytest.MonkeyPatch):
+    made, size = full_size_copies
+    raw = _encoded(_left_third_red(*size), "JPEG", exif=_exif(orientation=6))
+    decoded: list[tuple[int, int]] = []
+    real_page_rgb = images._page_rgb
+
+    def page_rgb(image: Image.Image) -> Image.Image:
+        decoded.append(image.size)
+        return real_page_rgb(image)
+
+    monkeypatch.setattr(images, "_page_rgb", page_rgb)
+    made.clear()
+    meta = normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+
+    assert decoded == [(1200, 800)]  # half scale: still larger than the page
+    assert (meta.width, meta.height) == (667, 1000)  # then turned upright
+    assert made == []
 
 
 def test_a_truncated_jpeg_is_unreadable(page_dir: Path):

@@ -4,8 +4,8 @@ made before a route does anything, the write section that turns a restore's paus
 
 **Error bodies** are `{"detail": {"code": ..., "message"?: ..., **params}}`. Errors the review page handles itself
 (`version_conflict`, `busy`, `unresolved_flags`) carry no `message`, because the frontend's axios interceptor toasts
-any `detail.message`. Errors it doesn't handle (503, 429, 413, 415, 401) carry a translated `message`, which the
-interceptor toasts and an iOS Shortcut can show.
+any `detail.message`. Errors it doesn't handle (503, 429, 413, 415, 401) carry a translated `message` (in en-US when
+the request's language doesn't have the text yet), which the interceptor toasts and an iOS Shortcut can show.
 """
 
 from collections.abc import Iterator, Mapping
@@ -16,11 +16,12 @@ from typing import Any
 from fastapi import HTTPException, status
 from fastapi.encoders import jsonable_encoder
 
-from mealie.lang.providers import Translator, get_locale_context, get_locale_provider
+from mealie.lang.providers import Translator, get_locale_context
 from mealie.repos.repository_recipe_ingest import IngestRepos
 from mealie.routes._base.base_controllers import BaseUserController
 from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import limits, storage
+from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.settings import get_ingest_settings
 
 PAUSED_FOR_RESTORE = "paused_for_restore"
@@ -36,11 +37,13 @@ class IngestController(BaseUserController):
 
 
 def _translator(translator: Translator | None) -> Translator:
-    if translator is not None:
-        return translator
-    if context := get_locale_context():
-        return context[0]
-    return get_locale_provider("en-US")
+    """
+    The given translator, else the request's, else en-US; always falling back to en-US for a text the language
+    doesn't have, since only en-US carries the fork's texts (a bare provider would answer with the key)
+    """
+    if translator is None and (context := get_locale_context()):
+        translator = context[0]
+    return with_fallback(translator) if translator is not None else translator_for(None)
 
 
 def ingest_error(

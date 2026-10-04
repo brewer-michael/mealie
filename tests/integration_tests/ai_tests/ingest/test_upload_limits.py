@@ -5,9 +5,13 @@ counts.
 """
 
 import base64
-from collections.abc import Iterator
+import json
+import threading
+import time
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -156,3 +160,50 @@ def test_too_many_form_fields_is_400(api_client: TestClient, reader: TestUser):
     response = api_client.post(INGEST, files=files(jpeg()), data=fields, headers=reader.token)
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "invalid_body"
+
+
+class _Body:
+    """A request that only has a body, for reading one without a server"""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        for start in range(0, len(self.data), MIB):
+            yield self.data[start : start + MIB]
+
+
+def test_json_bodies_are_decoded_two_at_a_time(monkeypatch: pytest.MonkeyPatch):
+    # decoding a 45 MiB body holds about three times that in memory, so it takes one of the intake slots
+    running = 0
+    most = 0
+    lock = threading.Lock()
+    real_decode = upload_service._decode_json_images
+
+    def decode(payload: Any) -> Any:
+        nonlocal running, most
+        with lock:
+            running += 1
+            most = max(most, running)
+        time.sleep(0.2)
+        with lock:
+            running -= 1
+        return real_decode(payload)
+
+    monkeypatch.setattr(upload_service, "_decode_json_images", decode)
+    payload = json.dumps({"images": [base64.b64encode(jpeg()).decode()]}).encode()
+    bodies: list[Any] = []
+
+    async def read_one() -> None:
+        bodies.append(await upload_service._read_json(_Body(payload), limits.MAX_JSON_BODY_BYTES, {}))  # type: ignore[arg-type]
+
+    async def main() -> None:
+        async with anyio.create_task_group() as group:
+            for _ in range(limits.INTAKE_CONCURRENCY + 3):
+                group.start_soon(read_one)
+
+    anyio.run(main)
+    assert most == limits.INTAKE_CONCURRENCY
+    assert all(len(body.images) == 1 and body.images[0].file is not None for body in bodies)
+    for body in bodies:
+        body.close()

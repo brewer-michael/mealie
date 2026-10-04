@@ -193,7 +193,10 @@ const model = defineModel<CardDraftIngredient>({ required: true });
 const { flagText } = useRecipeIngestText();
 
 const severity = computed(() => fieldSeverity(props.flags));
-const infoTexts = computed(() => props.infos.map(flag => ({ id: flag.id, ...flagText(flag) })));
+// a new food is kept as text at commit when the reviewer can't add foods, and its explanation says so
+const infoTexts = computed(() =>
+  props.infos.map(flag => ({ id: flag.id, ...flagText(flag, { canCreateFoods: props.canCreateFoods }) })),
+);
 const lineText = computed(() => model.value.display || ingredientDisplay(model.value) || model.value.originalText || "");
 const foodLinked = computed(() => !!model.value.food?.id);
 const newFood = computed(() => !!model.value.food?.name && !model.value.food.id);

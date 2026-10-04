@@ -1,5 +1,6 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { defineComponent } from "vue";
 import IngestRegionDialog from "./IngestRegionDialog.vue";
 import { normalizeDraft, rereadTargets, rereadTargetValue } from "~/composables/use-recipe-ingest-review";
 import type { PageOut } from "~/lib/api/types/recipe-ingest";
@@ -10,8 +11,8 @@ const cropper = vi.hoisted(() => ({
   props: [] as Record<string, unknown>[],
 }));
 
-vi.mock("vue-advanced-cropper", () => ({
-  Cropper: {
+vi.mock("vue-advanced-cropper", async () => ({
+  Cropper: (await import("vue")).defineComponent({
     name: "Cropper",
     props: ["src", "canvas", "checkOrientation", "defaultSize"],
     created() {
@@ -22,7 +23,7 @@ vi.mock("vue-advanced-cropper", () => ({
       refresh: () => cropper.refresh(),
     },
     template: "<div class=\"cropper\" :data-src=\"src\" />",
-  },
+  }),
 }));
 
 function page(index: number): PageOut {
@@ -61,7 +62,7 @@ const stubs = {
     `,
   },
   VCardText: { template: "<div><slot /></div>" },
-  VBtnToggle: {
+  VBtnToggle: defineComponent({
     props: ["modelValue"],
     emits: ["update:modelValue"],
     template: "<div class=\"pages\" :data-selected=\"modelValue\" @click=\"pick\"><slot /></div>",
@@ -73,7 +74,7 @@ const stubs = {
         }
       },
     },
-  },
+  }),
   VBtn: { props: ["value"], template: "<button type=\"button\" :data-value=\"value\"><slot /></button>" },
   VSelect: {
     props: ["modelValue", "items", "label"],

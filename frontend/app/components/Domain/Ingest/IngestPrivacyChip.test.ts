@@ -28,7 +28,7 @@ const slot = (tag = "div", className = "") => ({ template: `<${tag} class="${cla
 
 const wrappers: VueWrapper[] = [];
 
-function mountChip(props: { settings: RecipeIngestionSettingsOut | null; localOnly?: boolean }) {
+function mountChip(props: { settings: RecipeIngestionSettingsOut | null; localOnly?: boolean; alreadySent?: number }) {
   const wrapper = mount(IngestPrivacyChip, {
     props: {
       ...props,
@@ -109,6 +109,17 @@ describe("IngestPrivacyChip", () => {
     await wrapper.get(".switch input").setValue(true);
     expect(wrapper.emitted("update:localOnly")).toEqual([[true]]);
     expect(wrapper.get(".chip").text()).toBe("Stays on this server");
+  });
+
+  test("cards that had already gone when the switch changed are said to keep their setting", async () => {
+    const wrapper = mountChip({ settings: settings({ localOnlyAvailable: true }), localOnly: true, alreadySent: 3 });
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.get(".already-sent").text()).toBe("3 cards already sent aren't affected.");
+
+    await wrapper.setProps({ alreadySent: 1 });
+    expect(wrapper.get(".already-sent").text()).toBe("1 card already sent isn't affected.");
+    await wrapper.setProps({ alreadySent: 0 });
+    expect(wrapper.find(".already-sent").exists()).toBe(false);
   });
 
   test("no batch opt-in when nothing local can read cards", async () => {

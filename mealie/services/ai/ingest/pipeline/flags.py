@@ -5,8 +5,9 @@ after extraction and on every save, so the flags always describe the current dra
 **Ids and fields.** A flag is keyed to a field plus the ingredient's `reference_id` or the step's `id` (never an
 index, F4), with the stable id `"<kind>:<field>:<ref>"` (`ref` empty for single fields and the card). Fields are the
 draft's JSON names: `name`, `description`, `recipeYield`, `recipeServings`, `prepTime`, `performTime`, `totalTime`,
-`attribution`, `ingredients`, `steps`, `notes` (notes have no id, so their `ref` is the note's position), and `card`
-for the card-level flags.
+`attribution`, `ingredients`, `steps`, `notes` and `card` for the card-level flags. Notes have no id, so their `ref`
+is the note's position, and their flag ids add a digest of the note (`"<kind>:notes:<position>#<digest>"`): a
+resolution stored by id then never moves to another note when one above it is deleted or the notes are reordered.
 
 **Three kinds of flags.**
 - *Content flags* follow the draft as it is now, edits included: markers, `missing_name`, `implausible_*`,
@@ -23,6 +24,7 @@ replace `params.value`; `read_disagreement`'s single alternative is the second r
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -47,6 +49,7 @@ from ..flag_rules import KEEPABLE_KINDS, REVIEW_CONFIDENCE
 from ..shorthand import QTY, SHORTHAND, UNITS
 from .cardtext import (
     BLANK,
+    card_numbers,
     describe_token,
     find_numbers,
     find_temperatures,
@@ -104,12 +107,28 @@ SPOON_AND_CUP_UNITS = frozenset(
 )
 FAHRENHEIT_RANGE = (200, 550)
 CELSIUS_RANGE = (90, 290)
+"""
+Oven temperatures, checked in a sentence about the oven. Elsewhere ("let rise in a warm place (80°)", "cool to 70°",
+"warm water (110°F)") only the upper ends apply.
+"""
+_OVEN_WORDS = re.compile(r"\b(?:bak(?:e|es|ed|ing)|oven|preheat\w*|roast\w*|broil\w*)\b", re.IGNORECASE)
+_OVEN_AFTER = re.compile(r"\s*\)?\s*oven\b", re.IGNORECASE)
+"""A temperature followed by "oven": "a 350° oven" """
+_SENTENCE_END = re.compile(r"[.!?;]\s+(?=[A-Z])")
+"""A sentence ends at a stop before a capital: "Bake 1 hr. Cool to 70°", but not "Bake 30 min. at 350°" """
 
 _FRACTION_TYPO = re.compile(r"(?<![\d/.,])(?P<whole>[1-9])(?P<numerator>[1-9])/(?P<denominator>[2348])(?![\d/])")
 """`11/2` for "1 1/2": a whole number run into a proper fraction"""
 _LEADING_QUANTITY = re.compile(rf"^\s*[-•*]?\s*{QTY}(?:\s*(?:-|to)\s*{QTY})?\s*(?P<token>[^\W\d_]+)(?P<dot>\.)?")
 _NOT_UNIT_WORDS = frozenset({"or", "and", "to", "of", "x", "lg", "lge", "sm", "med", "md"})
 """Short words after a quantity that aren't a lost unit: joins ("2 or 3 eggs") and sizes ("1 lg onion")"""
+_FOOD_WORDS = frozenset("bay bbq bok egg fig ham hot ice jam oat old pea pie red rye sea soy sun tea yam".split())
+"""
+Short words that begin common foods ("1 egg yolk", "1 bay leaf", "1 red pepper", "1 hot dog", "1 pie crust"), so
+aren't a lost unit when written without a dot; the first words of Mealie's own seed foods, and a few more
+"""
+_MULTIPLIER_WORDS = frozenset({"dozen", "doz"})
+"""Words after a quantity that multiply it, which the parser drops: "1 dozen eggs" is read as 1 egg"""
 
 _SEVERITY = {
     CardFlagKind.illegible: CardFlagSeverity.error,
@@ -210,6 +229,8 @@ class _Target:
     """Where its markers can be"""
     ingredient: CardDraftIngredient | None = None
     is_step: bool = False
+    id_ref: str | None = None
+    """What its flag ids are keyed to, when that isn't `ref` (a note's position and digest)"""
 
 
 def _targets(draft: CardDraft) -> list[_Target]:
@@ -244,7 +265,10 @@ def _targets(draft: CardDraft) -> list[_Target]:
         targets.append(_Target(FIELD_STEPS, str(step.id), step.text, [text for text in texts if text], is_step=True))
     for index, note in enumerate(draft.notes):
         texts = [note.title, note.text]
-        targets.append(_Target(FIELD_NOTES, str(index), note.text, [text for text in texts if text]))
+        digest = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode()).hexdigest()[:8]
+        targets.append(
+            _Target(FIELD_NOTES, str(index), note.text, [text for text in texts if text], id_ref=f"{index}#{digest}")
+        )
 
     single(FIELD_ATTRIBUTION)
     return targets
@@ -267,8 +291,9 @@ class _Flags:
         source: CardFlagSource,
         params: dict | None = None,
         alternatives: Iterable[str] = (),
+        id_ref: str | None = None,
     ) -> None:
-        id = flag_id(kind, field, ref)
+        id = flag_id(kind, field, id_ref or ref)
         if existing := self.flags.get(id):
             for alternative in alternatives:
                 if alternative not in existing.alternatives:
@@ -303,9 +328,9 @@ def _card_flags(flags: _Flags, draft: CardDraft, extraction: ExtractionMeta | No
 def _marker_flags(flags: _Flags, target: _Target) -> None:
     markers = {marker for text in target.marker_texts for marker in markers_in(text)}
     if "illegible" in markers:
-        flags.add(CardFlagKind.illegible, target.field, target.ref, source=CardFlagSource.marker)
+        flags.add(CardFlagKind.illegible, target.field, target.ref, source=CardFlagSource.marker, id_ref=target.id_ref)
     if "blank" in markers:
-        flags.add(CardFlagKind.blank, target.field, target.ref, source=CardFlagSource.marker)
+        flags.add(CardFlagKind.blank, target.field, target.ref, source=CardFlagSource.marker, id_ref=target.id_ref)
 
 
 def _unsure_targets(unsure: Sequence[ExtractionUnsure], targets: Sequence[_Target]) -> dict[int, ExtractionUnsure]:
@@ -360,6 +385,29 @@ def _fraction_typo(ingredient: CardDraftIngredient, line: str) -> tuple[str, str
     return match.group(0), f"{whole} {numerator}/{denominator}"
 
 
+def _dropped_amount(ingredient: CardDraftIngredient) -> str | None:
+    """
+    An amount on the card's line that the parsed fields lost, as written: the parser keeps one quantity, so a range's
+    end ("2-3 T. milk" is read as 2), a second number ("2 or 3 eggs", the "16 oz." of "1 (16 oz.) can") or a "dozen"
+    would be gone from the recipe commit writes from the fields
+    """
+    quantity = ingredient.quantity
+    in_note = number_set(ingredient.note)
+    for number in find_numbers(ingredient.original_text):
+        for value in (number.value, number.end):
+            if value is None or value in in_note:
+                continue
+            if quantity is None or not math.isclose(float(value), quantity, abs_tol=1e-3):
+                return number.text
+
+    lead = _LEADING_QUANTITY.match(ingredient.original_text)
+    if lead and lead.group("token").lower() in _MULTIPLIER_WORDS:
+        kept = [ingredient.note, *(ref.name for ref in (ingredient.unit, ingredient.food) if ref)]
+        if not any(lead.group("token").lower() in text.lower() for text in kept):
+            return lead.group(0).strip()
+    return None
+
+
 def _ingredient_flags(flags: _Flags, target: _Target) -> None:
     ingredient = target.ingredient
     assert ingredient is not None
@@ -377,10 +425,19 @@ def _ingredient_flags(flags: _Flags, target: _Target) -> None:
                 source=CardFlagSource.parser,
                 params={"confidence": round(ingredient.parse_confidence * 100)},
             )
+        if dropped := _dropped_amount(ingredient):
+            flags.add(CardFlagKind.check_parse, field, ref, source=CardFlagSource.parser, params={"value": dropped})
         if ingredient.quantity and not ingredient.unit and (lead := _LEADING_QUANTITY.match(ingredient.original_text)):
             token = lead.group("token")
+            word = token.lower()
             food = (ingredient.food.name if ingredient.food else "").strip().lower()
-            if len(token) <= 3 and token.lower() not in _NOT_UNIT_WORDS and food != token.lower():
+            # a word that begins a food ("1 egg yolk"): a common one, or the first word of the group's food it links to
+            # ("1 sq chocolate" never names a group food, and "doz." or "env." has the dot of an abbreviation)
+            begins_food = not lead.group("dot") and (
+                word in _FOOD_WORDS
+                or (ingredient.food is not None and ingredient.food.id is not None and food.split()[:1] == [word])
+            )
+            if len(token) <= 3 and word not in _NOT_UNIT_WORDS and food != word and not begins_food:
                 flags.add(
                     CardFlagKind.unit_unclear,
                     field,
@@ -429,6 +486,15 @@ def _ingredient_flags(flags: _Flags, target: _Target) -> None:
         )
 
 
+def _about_the_oven(text: str, span: tuple[int, int]) -> bool:
+    """
+    Whether the sentence holding a temperature (at `span`) is about the oven before it ("Bake at", "Preheat oven
+    to"), or names the oven right after it ("a 350° oven")
+    """
+    sentence_start = max((match.end() for match in _SENTENCE_END.finditer(text, 0, span[0])), default=0)
+    return bool(_OVEN_WORDS.search(text, sentence_start, span[0]) or _OVEN_AFTER.match(text, span[1]))
+
+
 def _temperature_flags(flags: _Flags, target: _Target) -> None:
     for temperature in find_temperatures(target.text):
         match temperature.unit:
@@ -438,6 +504,8 @@ def _temperature_flags(flags: _Flags, target: _Target) -> None:
                 low, high = CELSIUS_RANGE
             case _:
                 low, high = CELSIUS_RANGE[0], FAHRENHEIT_RANGE[1]
+        if not _about_the_oven(target.text, temperature.span):
+            low = 0  # rising, cooling or a candy thermometer: only too hot is implausible
         if not low <= temperature.value <= high:
             flags.add(
                 CardFlagKind.implausible_temperature,
@@ -501,7 +569,7 @@ def _reading_flags(
 ) -> None:
     """`unsure`, `not_on_card`, `marker_dropped` and the cross-read's flags, against what was read"""
     unsure = _unsure_targets(extraction.unsure, targets) if extraction else {}
-    on_card = number_set(transcription) if transcription is not None else None
+    on_card = card_numbers(transcription) if transcription is not None else None
     lines = extraction.cross_read_lines if extraction else None
 
     for index, target in enumerate(targets):
@@ -513,6 +581,7 @@ def _reading_flags(
                 source=CardFlagSource.model,
                 params={"text": entry.text, "reason": entry.reason},
                 alternatives=entry.alternatives,
+                id_ref=target.id_ref,
             )
         if on_card is not None and target.field in (
             FIELD_INGREDIENTS,

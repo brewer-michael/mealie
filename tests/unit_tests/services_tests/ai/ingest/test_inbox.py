@@ -128,6 +128,36 @@ def _scan_twice() -> int:
     return inbox.scan_once() + inbox.scan_once()
 
 
+def _tree(path: Path) -> dict[str, bytes | str]:
+    """Everything under `path`, links not followed: each entry's relative path, a file's bytes or a link's target"""
+    tree: dict[str, bytes | str] = {}
+    for entry in sorted(path.rglob("*")):
+        key = entry.relative_to(path).as_posix()
+        if entry.is_symlink():
+            tree[key] = f"-> {os.readlink(entry)}"
+        elif entry.is_file():
+            tree[key] = entry.read_bytes()
+        else:
+            tree[key] = "dir"
+    return tree
+
+
+def _data_dir(tmp_path: Path) -> Path:
+    """A directory outside the inbox, standing in for DATA_DIR: a database and a backup, both long settled"""
+    data = tmp_path / "data"
+    (data / "backups").mkdir(parents=True)
+    _drop(data, "mealie.db", b"SQLite format 3\x00 precious")
+    _drop(data / "backups", "mealie_2026.10.01.zip", b"PK\x03\x04 backup")
+    return data
+
+
+@pytest.fixture()
+def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    logged: list[str] = []
+    monkeypatch.setattr(inbox.logger, "warning", logged.append)
+    return logged
+
+
 # ==========================================
 # Folders
 
@@ -332,6 +362,195 @@ def test_at_most_twenty_files_a_scan(root: Path, reader: TestUser, monkeypatch: 
     assert inbox.scan_once() == 1
 
 
+def test_a_card_folder_skips_nested_folders_and_links(root: Path, reader: TestUser, tmp_path: Path):
+    # a NAS's media indexer adds `@eaDir/` to every folder; neither it nor a link is a page
+    folder = _folder(root, reader)
+    card = folder / "grandmas-pie"
+    (card / "@eaDir" / "x").mkdir(parents=True)
+    _drop(card, "1-front.jpg", _jpeg((80, 60)))
+    _drop(card, "2-back.jpg", _jpeg((60, 80)))
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(_jpeg())
+    (card / "3-link.jpg").symlink_to(outside)
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 1
+    [job] = _jobs(reader)[before:]
+    assert [PageMeta.model_validate(page).original_filename for page in job.pages] == ["1-front.jpg", "2-back.jpg"]
+    assert (folder / "processed" / _month() / "grandmas-pie" / "@eaDir").is_dir()
+    assert outside.exists()
+
+
+def test_a_card_folder_with_too_many_pages_is_refused_before_any_is_opened(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    folder = _folder(root, reader)
+    card = folder / "stack"
+    card.mkdir()
+    for n in range(limits.MAX_PAGES_PER_CARD + 1):
+        _drop(card, f"{n}.jpg", _jpeg((8, 8)))
+    opened: list[Any] = []
+    real_open = inbox.open_page
+    monkeypatch.setattr(inbox, "open_page", lambda *args, **kwargs: opened.append(args) or real_open(*args, **kwargs))
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 0
+    assert len(_jobs(reader)) == before
+    assert opened == []  # a folder of thousands of files would hold thousands of descriptors
+    assert sorted(os.listdir(folder / "failed" / "stack")) == [f"{n}.jpg" for n in range(limits.MAX_PAGES_PER_CARD + 1)]
+    assert "too_many_pages" in (folder / "failed" / "stack.error.txt").read_text()
+
+
+def test_a_file_name_that_isnt_utf8_is_taken_like_any_other(root: Path, reader: TestUser):
+    # NFS shares and network scanners write Latin-1 names: they must neither stop the scan nor reach the database
+    folder = _folder(root, reader)
+    latin1 = os.path.join(os.fsencode(folder), b"r\xe9cipe.jpg")
+    with open(latin1, "wb") as file:
+        file.write(_jpeg())
+    _age(Path(os.fsdecode(latin1)))
+    _drop(folder, "good.jpg")
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 2
+    jobs = _jobs(reader)[before:]
+    group_slug, household_slug = _slugs(reader)
+    assert sorted(job.source_name for job in jobs) == [
+        f"inbox/{group_slug}/{household_slug}/good.jpg",
+        f"inbox/{group_slug}/{household_slug}/r\ufffdcipe.jpg",
+    ]
+    assert os.path.exists(os.path.join(os.fsencode(folder / "processed" / _month()), b"r\xe9cipe.jpg"))
+
+
+def test_an_entry_that_cant_be_claimed_is_skipped_and_logged_once(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    folder = _folder(root, reader)
+    _drop(folder, "a-locked.jpg", age=OLD + 10)  # the oldest: tried first
+    _drop(folder, "b-fine.jpg")
+    real_claim = inbox.claim
+
+    def claim(dirs: Any, name: str) -> str | None:
+        if name == "a-locked.jpg":
+            raise PermissionError(13, "Permission denied")
+        return real_claim(dirs, name)
+
+    monkeypatch.setattr(inbox, "claim", claim)
+    assert _scan_twice() == 1
+    assert inbox.scan_once() == 0
+    assert (folder / "a-locked.jpg").exists()
+    assert len([message for message in warnings if "a-locked.jpg" in message]) == 1
+
+
+# ==========================================
+# Links and other things a share writer can plant
+
+
+def test_a_household_folder_that_is_a_link_is_never_used(
+    root: Path, reader: TestUser, tmp_path: Path, warnings: list[str]
+):
+    data = _data_dir(tmp_path)
+    folder = _folder(root, reader)
+    folder.rmdir()
+    folder.symlink_to(data, target_is_directory=True)
+    before = _tree(data)
+
+    assert _scan_twice() == 0
+    assert inbox.scan_once() == 0
+    assert _tree(data) == before  # nothing claimed, moved, failed or created
+    assert folder.is_symlink()
+    household_slug = _slugs(reader)[1]
+    assert len([message for message in warnings if household_slug in message and "link" in message]) == 1
+    assert not [message for message in warnings if household_slug in message and "isn't a household" in message]
+
+
+def test_a_group_folder_that_is_a_link_is_never_used(
+    root: Path, reader: TestUser, h2_user: TestUser, tmp_path: Path, warnings: list[str]
+):
+    data = _data_dir(tmp_path)
+    group_slug, household_slug = _slugs(reader)
+    (data / household_slug).mkdir()
+    _drop(data / household_slug, "card.jpg")
+    (root / group_slug).symlink_to(data, target_is_directory=True)
+    before = _tree(data)
+
+    assert _scan_twice() == 0
+    assert _tree(data) == before  # no household folder made in it, and its card left alone
+    assert len([message for message in warnings if f"{group_slug} " in message and "link" in message]) == 1
+
+
+@pytest.mark.parametrize("reserved", [inbox.CLAIM_DIR, inbox.FAILED_DIR, inbox.PROCESSED_DIR])
+def test_a_reserved_folder_that_is_a_link_or_a_file_stops_only_its_household(
+    root: Path, reader: TestUser, h2_user: TestUser, tmp_path: Path, warnings: list[str], reserved: str
+):
+    data = _data_dir(tmp_path)
+    folders = sorted([_folder(root, reader), _folder(root, h2_user)], key=lambda path: (path.parent.name, path.name))
+    broken, working = folders  # the broken one is scanned first
+    (broken / reserved).symlink_to(data, target_is_directory=True)
+    _drop(broken, "card.jpg")
+    _drop(broken, "menu.pdf", b"%PDF-1.7 a menu")
+    _drop(working, "card.jpg")
+    before = _tree(data)
+
+    assert _scan_twice() == 1
+    assert _tree(data) == before
+    assert sorted(os.listdir(broken)) == sorted(["card.jpg", "menu.pdf", reserved])
+    assert (working / "processed" / _month() / "card.jpg").exists()
+    assert len([message for message in warnings if reserved in message]) == 1
+
+    # a stray file in its place is refused the same way
+    (broken / reserved).unlink()
+    (broken / reserved).write_text("x")
+    inbox.reset_state()
+    assert _scan_twice() == 0
+    assert sorted(os.listdir(broken)) == sorted(["card.jpg", "menu.pdf", reserved])
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_a_planted_error_note_is_never_written_through(root: Path, reader: TestUser, tmp_path: Path, dangling: bool):
+    folder = _folder(root, reader)
+    secret = tmp_path / "data" / ".secret"
+    secret.parent.mkdir()
+    if not dangling:
+        secret.write_bytes(b"SECRETKEY-abc123")
+    (folder / "failed").mkdir()
+    (folder / "failed" / "card.jpg.error.txt").symlink_to(secret)
+    _drop(folder, "card.jpg", b"not an image at all")
+
+    assert _scan_twice() == 0
+    if dangling:
+        assert not os.path.lexists(secret)
+    else:
+        assert secret.read_bytes() == b"SECRETKEY-abc123"
+    assert (folder / "failed" / "card.jpg.error.txt").is_symlink()
+    [card] = [name for name in os.listdir(folder / "failed") if not name.endswith(".error.txt")]
+    assert card != "card.jpg" and card.startswith("card-")  # beside a note of its own
+    note = folder / "failed" / f"{card}.error.txt"
+    assert not note.is_symlink() and "unsupported_format" in note.read_text()
+
+
+def test_a_folder_swapped_for_a_link_during_the_scan_is_never_followed(
+    root: Path, reader: TestUser, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    data = _data_dir(tmp_path)
+    folder = _folder(root, reader)
+    (folder / "failed").mkdir()
+    _drop(folder, "menu.pdf", b"%PDF-1.7 a menu")
+    real_claim = inbox.claim
+
+    def claim_then_swap(*args: Any) -> str | None:
+        claimed = real_claim(*args)
+        (folder / "failed").rmdir()
+        (folder / "failed").symlink_to(data, target_is_directory=True)
+        return claimed
+
+    monkeypatch.setattr(inbox, "claim", claim_then_swap)
+    before = _tree(data)
+    assert _scan_twice() == 0
+    assert _tree(data) == before
+    assert len(_claimed(folder)) == 1  # retried once the folder is fixed
+    assert len([message for message in warnings if "failed" in message and "link" in message]) == 1
+
+
 # ==========================================
 # Races and crashes
 
@@ -371,11 +590,12 @@ def test_a_symlink_swapped_in_after_the_claim_is_refused(
     _drop(folder, "swapped.jpg")
     real_claim = inbox.claim
 
-    def claim_then_swap(*args: Any) -> Path | None:
+    def claim_then_swap(*args: Any) -> str | None:
         claimed = real_claim(*args)
         assert claimed is not None
-        claimed.unlink()
-        claimed.symlink_to(secret)
+        path = folder / inbox.CLAIM_DIR / claimed
+        path.unlink()
+        path.symlink_to(secret)
         return claimed
 
     monkeypatch.setattr(inbox, "claim", claim_then_swap)
@@ -462,9 +682,10 @@ def test_a_claim_lost_before_the_insert_creates_nothing(root: Path, reader: Test
     _drop(folder, "retried-elsewhere.jpg")
     real_open = inbox._open_card
 
-    def open_then_lose_the_claim(claimed: Path, inbox_root: Path) -> Any:
-        pages = real_open(claimed, inbox_root)
-        os.rename(claimed, claimed.with_name(f"{inbox._now_ms()}__{uuid4().hex}__retried-elsewhere.jpg"))
+    def open_then_lose_the_claim(dirs: Any, claimed: str, inbox_root: Path) -> Any:
+        pages = real_open(dirs, claimed, inbox_root)
+        claim_dir = folder / inbox.CLAIM_DIR
+        os.rename(claim_dir / claimed, claim_dir / f"{inbox._now_ms()}__{uuid4().hex}__retried-elsewhere.jpg")
         return pages
 
     monkeypatch.setattr(inbox, "_open_card", open_then_lose_the_claim)

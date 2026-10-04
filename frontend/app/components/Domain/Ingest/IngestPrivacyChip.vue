@@ -38,6 +38,9 @@
           <p v-else class="local-unavailable">
             {{ $t("recipe-ingest.privacy.local-unavailable") }}
           </p>
+          <p v-if="alreadySent > 0 && !settings?.localOnly" class="already-sent text-caption mt-2 mb-0">
+            {{ $t("recipe-ingest.privacy.already-sent", alreadySent) }}
+          </p>
         </v-card-text>
       </v-card>
     </v-expand-transition>
@@ -52,9 +55,13 @@ import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
  * Where the photos go (docs/ai/PHASE2.md §1.1, §10), from the card settings' `reader`. Tapping it offers keeping this
  * batch's cards on this server when local providers can read them. Fork-owned.
  */
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   settings: RecipeIngestionSettingsOut | null;
-}>();
+  /** Cards that had already left when the switch last changed: the server keeps the setting they were sent with */
+  alreadySent?: number;
+}>(), {
+  alreadySent: 0,
+});
 
 /** The batch asks to stay on this server (a batch can opt in when the group doesn't, never out) */
 const localOnly = defineModel<boolean>("localOnly", { default: false });

@@ -1382,6 +1382,7 @@
       "recipe-cards": "Recipe cards",
       "recipe-cards-count": "Recipe cards ({count})",
       "scan-recipe-cards": "Scan recipe cards",
+      "scan-recipe-cards-subtitle": "Photograph a stack of recipe cards",
       "scan-a-stack": "Have a stack of cards? Scan them in a batch"
     },
     "capture": {
@@ -1467,6 +1468,8 @@
       "front": "Front",
       "back": "Back",
       "full-screen": "Full screen",
+      "show-card": "Show the card",
+      "hide-card": "Hide the card",
       "read-by": "Read by {name}",
       "read-by-cross-read": "Read by {name} · checked against a second reading",
       "read-by-cross-read-failed": "Read by {name} · the second reading failed",
@@ -1495,6 +1498,7 @@
       "description": "Description",
       "yield": "Yield",
       "servings": "Servings",
+      "servings-not-a-number": "Type a number. For a range like 4 to 6, use Yield.",
       "prep-time": "Prep time",
       "cook-time": "Cook time",
       "total-time": "Total time",
@@ -1668,7 +1672,21 @@
       "unsupported_media_type": "This upload isn't an image.",
       "authorization_required": "Sign in again to upload recipe cards.",
       "not_found": "This card no longer exists.",
+      "invalid_status": "This card has changed since this page loaded. Reload it and try again.",
+      "forbidden": "Only the person who scanned this card, or a household manager, can discard it.",
+      "unknown_page": "This card doesn't have that page.",
+      "unknown_target": "That line is no longer on the card. Choose another one and read the area again.",
+      "invalid_body": "The upload couldn't be read. Try sending the card again.",
+      "nothing_accepted": "None of the photos could be used.",
+      "not_exportable": "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
+      "eval_case_exists": "An eval case with this name already exists",
+      "eval_case_error": "This card couldn't be saved as an eval case.",
       "unknown": "Something went wrong ({code})."
+    },
+    "commit-warning": {
+      "tag_dropped": "The tag \"{name}\" no longer exists, so it wasn't added.",
+      "category_dropped": "The category \"{name}\" no longer exists, so it wasn't added.",
+      "tool_dropped": "The tool \"{name}\" no longer exists, so it wasn't added."
     },
     "reject": {
       "too_large": "This photo is too large.",
@@ -1699,6 +1717,7 @@
       "group-local": "Your group keeps recipe cards on this server.",
       "keep-local": "Keep these cards on this server",
       "keep-local-hint": "Only AI providers on your network read the cards in this batch.",
+      "already-sent": "{count} card already sent isn't affected. | {count} cards already sent aren't affected.",
       "local-unavailable": "No AI provider on your network can read cards.",
       "no-reader": "AI isn't set up to read recipe cards."
     },
@@ -1731,9 +1750,15 @@
       "inbox-hint": "Put photos in the {folder} folder of the inbox share to scan them.",
       "inbox-off": "The inbox folder isn't set up on this server.",
       "notifications": "Get notified when cards are ready",
+      "notifications-advanced": "To get notified when cards are ready, turn on \"Show advanced features\" in your profile settings, then add a notifier.",
       "saved": "Recipe card settings saved",
       "save-failed": "Couldn't save the recipe card settings",
       "load-failed": "Couldn't load the recipe card settings"
+    },
+    "provider": {
+      "runs-locally": "Runs on my network (local model)",
+      "runs-locally-hint": "For a model on your own network, such as Ollama. Recipe cards kept on this server are only read by providers marked so, at a private address.",
+      "runs-locally-needs-base-url": "Enter the base URL of a model on your network first. Without one, requests go to the provider's cloud API."
     },
     "eval": {
       "title": "Save as eval case",

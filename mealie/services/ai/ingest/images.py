@@ -13,7 +13,7 @@ import unicodedata
 from pathlib import Path
 from typing import BinaryIO, NamedTuple, Protocol
 
-from PIL import Image, ImageOps
+from PIL import ExifTags, Image
 
 import mealie.pkgs.img  # noqa: F401  (registers the HEIF opener)
 from mealie.schema.recipe_ingest import IngestRejectReason, PageMeta, PageRotationSource
@@ -41,6 +41,20 @@ PIL_FORMATS: dict[str, list[str]] = {
 }
 """Pillow's openers for each sniffed format. `Image.open` is never left to guess: it would also try EPS and PSD."""
 
+_EXIF_TRANSPOSE = {
+    # what `ImageOps.exif_transpose` does for each EXIF orientation
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+
+_HIGH_BIT_MODES = ("I;16", "I", "F")
+"""Grayscale modes with more than 8 bits, which `_eight_bit` scales rather than clips"""
+
 _ROTATE_CLOCKWISE = {
     # Pillow's ROTATE_* turn counter-clockwise
     90: Image.Transpose.ROTATE_270,
@@ -49,6 +63,8 @@ _ROTATE_CLOCKWISE = {
 }
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[\x00-\x1f\x7f/\\]")
+_SURROGATES = re.compile("[\ud800-\udfff]")
+"""Lone surrogates (JSON escapes, a file name's undecodable bytes) aren't text a database or a log can take"""
 MAX_FILENAME_LENGTH = 120
 
 
@@ -110,6 +126,7 @@ def sanitize_filename(name: str | None) -> str | None:
     if not name:
         return None
     base = re.split(r"[/\\]", name)[-1]
+    base = _SURROGATES.sub("\ufffd", base)
     base = unicodedata.normalize("NFC", _UNSAFE_FILENAME_CHARS.sub("", base)).strip()
     if base in ("", ".", ".."):
         return None
@@ -141,15 +158,60 @@ def _rgb_icc_profile(image: Image.Image) -> bytes | None:
     return None
 
 
-def _upright_rgb(image: Image.Image) -> Image.Image:
-    """Frame 0, turned by its EXIF orientation, transparency flattened onto white, as RGB"""
-    upright = ImageOps.exif_transpose(image)
-    if upright.mode in ("RGBA", "LA", "PA", "P") or "transparency" in upright.info:
-        rgba = upright.convert("RGBA")
-        upright = Image.alpha_composite(Image.new("RGBA", rgba.size, "white"), rgba)
-    rgb = upright.convert("RGB")
-    rgb.info = {}  # nothing of the original's metadata may reach the files
-    return rgb
+def _draft_size(size: tuple[int, int], max_side: int) -> tuple[int, int]:
+    """The size an image fits into with its long side at `max_side`, for a JPEG's reduced-scale decoding"""
+    scale = max_side / max(size)
+    return max(1, int(size[0] * scale)), max(1, int(size[1] * scale))
+
+
+def _eight_bit(image: Image.Image) -> Image.Image:
+    """
+    High-bit-depth grayscale (`I;16`, `I` or `F`: 16-bit, 32-bit or float scans) scaled to 8 bits. Pillow's `convert`
+    would clip it instead, which makes a 16-bit scan white and a float one black.
+    """
+    _, high = image.getextrema()
+    if image.mode == "F" and high <= 1.0:
+        scale = 255.0
+    elif high <= 255:
+        scale = 1.0
+    elif high <= 65535:
+        scale = 255 / 65535
+    else:
+        scale = 255 / high
+    return image.point(lambda value: value * scale).convert("L")
+
+
+def _page_rgb(image: Image.Image) -> Image.Image:
+    """
+    The decoded frame as RGB, its long side at most `PAGE_MAX_SIDE`, transparency flattened onto white. It's scaled
+    down before anything else and flattened through a mask rather than RGBA copies, so a 100-megapixel upload needs at
+    most one full-size copy besides its decoded pixels. `image` is consumed: changed in place, or closed once replaced.
+    """
+    if image.mode.startswith("I;16") and image.mode != "I;16":
+        image = _replace(image, image.convert("I"))  # the byte-swapped variants can't be resized or scaled
+    elif image.mode == "PA" or ("transparency" in image.info and image.mode not in _HIGH_BIT_MODES):
+        image = _replace(image, image.convert("RGBA"))  # palette or colour-key transparency, as alpha
+    elif image.mode in ("1", "P"):
+        image = _replace(image, image.convert("L" if image.mode == "1" else "RGB"))  # else resized with NEAREST
+
+    if image.mode in ("RGBA", "LA"):
+        flat = Image.new("RGB", image.size, "white")
+        flat.paste(image, mask=image)  # its alpha band is the mask
+        image = _replace(image, flat)
+
+    image.thumbnail((limits.PAGE_MAX_SIDE, limits.PAGE_MAX_SIDE), Image.Resampling.LANCZOS)
+    if image.mode in _HIGH_BIT_MODES:
+        image = _replace(image, _eight_bit(image))
+    if image.mode != "RGB":
+        image = _replace(image, image.convert("RGB"))
+    return image
+
+
+def _replace(old: Image.Image, new: Image.Image) -> Image.Image:
+    """`new`, with `old`'s memory released at once rather than when the caller lets go of it"""
+    if new is not old:
+        old.close()
+    return new
 
 
 def _fit(image: Image.Image, max_side: int) -> Image.Image:
@@ -219,10 +281,17 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
                 raise PageRejected(IngestRejectReason.too_many_pixels)
             if getattr(image, "n_frames", 1) > 1:
                 image.seek(0)  # MPO and TIFF: the first frame only
+            if kind == "jpeg":
+                # decoded at 1/2, 1/4 or 1/8 scale when the page is that much smaller: never below the page's size
+                image.draft(None, _draft_size(image.size, limits.PAGE_MAX_SIDE))
             image.load()  # what finds a truncated file
             format_name = (image.format or kind).lower()
             icc = _rgb_icc_profile(image)
-            upright = _upright_rgb(image)
+            transpose = _EXIF_TRANSPOSE.get(image.getexif().get(ExifTags.Base.Orientation, 1))
+            page = _page_rgb(image)
+        if transpose is not None:
+            page = _replace(page, page.transpose(transpose))  # upright by its EXIF orientation
+        page.info = {}  # nothing of the original's metadata may reach the files
     except PageRejected:
         raise
     except Image.DecompressionBombError as e:
@@ -232,7 +301,7 @@ def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filena
         # struct.error or ValueError for broken headers and EXIF): never a server error
         raise PageRejected(IngestRejectReason.unreadable_image) from e
 
-    files = _write_page_files(page_dir, upright, icc)
+    files = _write_page_files(page_dir, page, icc)
     return PageMeta(
         index=index,
         width=files.page_size[0],

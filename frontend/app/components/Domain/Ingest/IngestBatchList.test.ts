@@ -158,9 +158,11 @@ afterEach(() => {
 
 describe("IngestBatchList", () => {
   test("batches newest first, cards in capture order, with each batch's Review and Retry failed", async () => {
+    // a batch's cards share its source, and these two arrived together (one timestamp, so the test can't flake)
+    const arrived = ago(5 * HOUR);
     serverJobs = [
-      job({ id: "a2", batchId: "older", position: 1, title: "Pancakes", createdAt: ago(5 * HOUR), source: "inbox" }),
-      job({ id: "a1", batchId: "older", position: 0, title: "Waffles", createdAt: ago(5 * HOUR) }),
+      job({ id: "a2", batchId: "older", position: 1, title: "Pancakes", createdAt: arrived, source: "inbox" }),
+      job({ id: "a1", batchId: "older", position: 0, title: "Waffles", createdAt: arrived, source: "inbox" }),
       job({ id: "b2", batchId: "newer", position: 1, status: "failed", title: null, error: { code: "no_recipe_found" } }),
       job({ id: "b1", batchId: "newer", position: 0, status: "processing", title: null, task: { kind: "extract", state: "queued" } }),
     ];
@@ -172,12 +174,13 @@ describe("IngestBatchList", () => {
       "Waiting to be read",
       "Failed: No recipe was found on this card.",
     ]);
+    expect(newer!.get(".batch-meta").text()).toBe("2 cards · Scanned in the app");
     expect(newer!.find(".batch-review").exists()).toBe(false);
     expect(newer!.find(".batch-retry-failed").exists()).toBe(true);
 
     expect(older!.findAll(".job-title").map(title => title.text())).toEqual(["Waffles", "Pancakes"]);
     expect(older!.get(".batch-review").attributes("href")).toBe("/g/home/recipes/cards/review?batch=older");
-    expect(older!.get(".batch-meta").text()).toBe("2 cards · Scanned in the app");
+    expect(older!.get(".batch-meta").text()).toBe("2 cards · From the inbox");
     expect(older!.get(".batch-title").text()).toMatch(/^Batch of .+/);
     expect(jobsCalls()).toContainEqual(expect.objectContaining({ status: ["processing", "ready", "failed", "committing"] }));
   });
@@ -339,6 +342,18 @@ describe("IngestBatchList", () => {
     expect(api.discard).toHaveBeenCalledExactlyOnceWith("j1");
     expect(rowTitles(wrapper)).toEqual(["Pancakes"]);
     expect(toast.success).toHaveBeenCalledWith("Card discarded");
+  });
+
+  test("a refused discard says why", async () => {
+    serverJobs = [job()];
+    api.discard.mockResolvedValue({ data: null, error: { response: { status: 403, data: { detail: { code: "forbidden" } } } } });
+    const wrapper = await mountList();
+
+    await wrapper.get(".job-discard").trigger("click");
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith("Only the person who scanned this card, or a household manager, can discard it.");
+    expect(rowTitles(wrapper)).toEqual(["Banana Mug Cake"]);
   });
 
   test("one batch, after its review: what was added and what's left", async () => {

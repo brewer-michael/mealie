@@ -219,7 +219,7 @@ describe("IngestCapture", () => {
     await button(wrapper, ".done").trigger("click");
     await flushPromises();
 
-    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1");
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
     expect(wrapper.find(".done").exists()).toBe(false);
     expect(button(wrapper, ".take-photo").text()).toBe("Take photo");
   });

@@ -2,6 +2,7 @@
 
 import io
 import shutil
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -39,6 +40,10 @@ FAINT = {0: 100.0, 90: 140.0, 180: 90.0, 270: 60.0}
         (FAINT, limits.ORIENT_MIN_RATIO, 0),  # handwriting that reads badly every way: leave it be
         (FAINT, 1.0, 90),  # without a margin the best probe wins, as before
         ({0: 0.0, 90: 0.0, 180: 0.0, 270: 0.0}, 1.0, 0),
+        # a blank back page: a few specks read sideways, nothing upright; any ratio of 0 would turn it
+        ({0: 0.0, 90: 12.0, 180: 0.0, 270: 0.0}, limits.ORIENT_MIN_RATIO, 0),
+        ({0: 0.0, 90: 12.0, 180: 0.0, 270: 0.0}, 1.0, 90),
+        ({0: 0.0, 90: tesseract_module.MIN_TURN_SCORE, 180: 0.0, 270: 0.0}, limits.ORIENT_MIN_RATIO, 90),
     ],
 )
 def test_a_turn_needs_a_margin(scores: dict[int, float], min_ratio: float, expected: int):
@@ -141,6 +146,41 @@ def test_an_upright_page_is_settled_without_a_rewrite(monkeypatch: pytest.Monkey
         PageOCR(text="Soup", confidence=90.0),
     )
     assert page.page_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.TimeoutExpired("tesseract", 60), subprocess.CalledProcessError(1, "tesseract"), OSError("crashed")],
+)
+def test_a_failed_reading_settles_nothing(
+    fake_tesseract: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+):
+    """
+    Tesseract timing out under load isn't an upright page with no text: the page stays unsettled, so the next
+    extraction probes it again and the OCR fallback reads it itself, rather than finding no text for good
+    """
+    (page,) = make_pages(tmp_path, data=card_image(size=(600, 800)))
+    before = page.page_path.read_bytes()
+
+    def fail(*_, **__):
+        raise error
+
+    monkeypatch.setattr(tesseract_module.subprocess, "run", fail)
+
+    meta = orient_page(page)
+
+    assert meta == page.meta
+    assert (meta.oriented, meta.ocr) == (False, None)
+    assert page.page_path.read_bytes() == before
+
+    # once Tesseract answers, the page is settled
+    monkeypatch.setattr(tesseract_module, "_probe_rotations", lambda image, read: UPRIGHT)
+    monkeypatch.setattr(
+        tesseract_module, "_read_words", lambda *_, **__: [tesseract_module._Word(1, 1, 1, 100, 30, 80.0, "Soup")]
+    )
+    settled = orient_page(page)
+
+    assert (settled.oriented, settled.rotation, settled.ocr) == (True, 0, PageOCR(text="Soup", confidence=80.0))
 
 
 @pytest.fixture()

@@ -7,8 +7,9 @@ import pytest
 from mealie.lang.providers import get_locale_provider
 from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe.recipe_ingredient import RecipeIngredient
+from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardFlagKind, CardFlagSeverity, ExtractionMeta
 from mealie.services.ai.ingest.matching import IngestMatcher
-from mealie.services.ai.ingest.pipeline.flags import ingredient_hash
+from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
 from mealie.services.ai.ingest.pipeline.ingredients import (
     IngredientLine,
     normalize_ingredients,
@@ -86,6 +87,73 @@ async def test_card_shorthand(unique_user_fn_scoped: TestUser, line: str, unit: 
 
     assert (parsed.unit and parsed.unit.name, parsed.food and parsed.food.name) == (unit, food)
     assert parsed.original_text == line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "unit", "food", "note"),
+    [
+        ("1 heaping T. flour", "tablespoon", "flour", "heaping"),
+        ("1 level t. soda", "teaspoon", "soda", "level"),
+        ("1 scant c. sugar", "cup", "sugar", "scant"),
+        ("1 heaping T. coconut oil (melted)", "tablespoon", "coconut oil", "heaping, melted"),
+        ("2 heaping cups flour", "cup", "flour", "heaping"),
+    ],
+)
+async def test_a_size_word_before_shorthand_becomes_the_note(
+    unique_user_fn_scoped: TestUser, line: str, unit: str, food: str, note: str
+):
+    """Not the food "heaping T. flour" (which commit would create) or the unit "scant cup" """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+
+    (parsed,) = await _normalize(user, [line])
+
+    assert (parsed.unit and parsed.unit.name, parsed.food and parsed.food.name, parsed.note) == (unit, food, note)
+    assert parsed.unit is not None and parsed.unit.id is not None
+    assert parsed.original_text == line
+
+
+def _highlighted(lines: list[CardDraftIngredient]) -> dict[str, list[tuple[CardFlagKind, dict]]]:
+    """Each line's highlighted flags, by its card text"""
+    flags = compute_flags(CardDraft(name="Card", ingredients=lines), ExtractionMeta(language="English"), {})
+    by_ref: dict[str, list[tuple[CardFlagKind, dict]]] = {str(line.reference_id): [] for line in lines}
+    for flag in flags:
+        if flag.severity != CardFlagSeverity.info and flag.ref in by_ref:
+            by_ref[flag.ref].append((flag.kind, flag.params))
+    return {line.original_text: by_ref[str(line.reference_id)] for line in lines}
+
+
+@pytest.mark.asyncio
+async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(unique_user_fn_scoped: TestUser):
+    """Card lines through the real parser and `compute_flags`: what it loses or misreads is flagged, the rest isn't"""
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    banana = [
+        "1 banana",
+        "1 T. coconut oil (melted)",
+        "1/4 t. salt",
+        "1/2 t vanilla",
+        "1/3 C. almond flour",
+        "1 egg",
+        "Cinnamon to taste",
+    ]
+    fine = ["1 egg yolk", "2 egg whites", "1 red pepper, chopped", "1 bay leaf", "1 pie crust", "1 hot dog"]
+    fine += ["1 heaping T. flour", "1 1/2 c. flour", "2 eggs, beaten", "1 9-inch pie shell"]
+    lost = ["2-3 T. milk", "1 to 2 c. water", "2 or 3 eggs", "1 dozen eggs", "1 (16 oz.) can tomatoes"]
+    unclear = ["1 doz. eggs", "1 env. yeast"]
+
+    flags = _highlighted(await _normalize(user, banana + fine + lost + unclear))
+
+    assert {line: flags[line] for line in banana + fine} == {line: [] for line in banana + fine}
+    assert {line: flags[line] for line in lost} == {
+        "2-3 T. milk": [(CardFlagKind.check_parse, {"value": "2-3"})],
+        "1 to 2 c. water": [(CardFlagKind.check_parse, {"value": "1 to 2"})],
+        "2 or 3 eggs": [(CardFlagKind.check_parse, {"value": "3"})],
+        "1 dozen eggs": [(CardFlagKind.check_parse, {"value": "1 dozen"})],
+        "1 (16 oz.) can tomatoes": [(CardFlagKind.check_parse, {"value": "16"})],
+    }
+    assert all(CardFlagKind.unit_unclear in [kind for kind, _ in flags[line]] for line in unclear)
 
 
 @pytest.mark.asyncio

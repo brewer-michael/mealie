@@ -205,7 +205,7 @@ describe("IngestUploadQueue", () => {
 
     pending.resolve({ data: accepted, error: null });
     await flushPromises();
-    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1");
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
     expect(wrapper.find(".sealing").exists()).toBe(false);
   });
 });

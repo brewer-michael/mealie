@@ -46,7 +46,19 @@ export const INGEST_API_ERROR_CODES = [
   "unsupported_media_type",
   "authorization_required",
   "not_found",
+  "invalid_status",
+  "forbidden",
+  "unknown_page",
+  "unknown_target",
+  "invalid_body",
+  "nothing_accepted",
+  "not_exportable",
+  "eval_case_exists",
+  "eval_case_error",
 ] as const;
+
+/** Kinds of the warnings a commit answers with (`tag_dropped:<name>`: an organizer that no longer exists) */
+export const COMMIT_WARNING_KINDS = ["tag_dropped", "category_dropped", "tool_dropped"] as const;
 
 export const CARD_FLAG_KINDS = [
   "illegible",
@@ -139,6 +151,17 @@ export function progressText(key: string | null | undefined, t: TranslateFn = gl
   return translated(t, fullKey) ?? key;
 }
 
+/**
+ * A commit warning's text (`recipe-ingest.commit-warning.<kind>`): the server sends `<kind>:<name>`. None for a kind
+ * this page doesn't know.
+ */
+export function commitWarningText(warning: string, t: TranslateFn = globalT): string | null {
+  const separator = warning.indexOf(":");
+  const kind = separator < 0 ? warning : warning.slice(0, separator);
+  const name = separator < 0 ? "" : warning.slice(separator + 1);
+  return translated(t, `recipe-ingest.commit-warning.${kind}`, { name });
+}
+
 export interface FlagText {
   title: string;
   explanation: string;
@@ -160,7 +183,13 @@ function flagValues(flag: CardFlag): Record<string, unknown> {
   return named;
 }
 
-function explanationKey(flag: CardFlag): string {
+/** What a flag's text depends on beyond the flag itself */
+export interface FlagTextContext {
+  /** Whether the reviewer may create foods: a new food is otherwise kept as text at commit */
+  canCreateFoods?: boolean;
+}
+
+function explanationKey(flag: CardFlag, context: FlagTextContext): string {
   const base = `recipe-ingest.flag.${flag.kind}`;
   const params = flag.params ?? {};
   switch (flag.kind) {
@@ -170,19 +199,22 @@ function explanationKey(flag: CardFlag): string {
       return params.section === "steps" ? `${base}.explanation-steps` : `${base}.explanation-ingredients`;
     case "implausible_amount":
       return params.suggestion ? `${base}.explanation` : `${base}.explanation-plain`;
-    case "new_food":
-      return params.kept_as_text || params.keptAsText ? `${base}.explanation-kept-as-text` : `${base}.explanation`;
+    case "new_food": {
+      // the server's flags don't depend on who reviews; commit keeps the name as text for a user who can't add foods
+      const keptAsText = params.kept_as_text || params.keptAsText || context.canCreateFoods === false;
+      return keptAsText ? `${base}.explanation-kept-as-text` : `${base}.explanation`;
+    }
     default:
       return `${base}.explanation`;
   }
 }
 
 /** A flag's title, explanation (with its params) and resolution label */
-export function flagText(flag: CardFlag, t: TranslateFn = globalT): FlagText {
+export function flagText(flag: CardFlag, t: TranslateFn = globalT, context: FlagTextContext = {}): FlagText {
   const base = `recipe-ingest.flag.${flag.kind}`;
   const values = flagValues(flag);
   const title = translated(t, `${base}.title`) ?? flag.kind;
-  const explanation = translated(t, explanationKey(flag), values) ?? "";
+  const explanation = translated(t, explanationKey(flag, context), values) ?? "";
 
   let action: string | null = null;
   if (flag.severity !== "info") {
@@ -304,6 +336,7 @@ export function useRecipeIngestText() {
     ingestErrorText: (code: string, params?: Record<string, unknown> | null) => ingestErrorText(code, params, t),
     rejectReasonText: (reason: string) => rejectReasonText(reason, t),
     progressText: (key: string | null | undefined) => progressText(key, t),
-    flagText: (flag: CardFlag) => flagText(flag, t),
+    flagText: (flag: CardFlag, context?: FlagTextContext) => flagText(flag, t, context),
+    commitWarningText: (warning: string) => commitWarningText(warning, t),
   };
 }

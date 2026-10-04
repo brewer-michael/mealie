@@ -146,6 +146,23 @@ describe("IngestIngredientRow", () => {
     expect(wrapper.get(".ingest-ingredient__info").text()).toBe("Abbreviation written out: \"T.\" on the card was read as \"tbsp\".");
   });
 
+  test("a new food's note says it's kept as text when the reviewer can't add foods", () => {
+    const salt = oil({ food: { id: null, name: "salt" } });
+    const newFood: CardFlag = {
+      id: "new_food:ingredients:i1",
+      kind: "new_food",
+      severity: "info",
+      source: "parser",
+      field: "ingredients",
+      ref: "i1",
+      params: { name: "salt" },
+    };
+    expect(mountRow(salt, { expanded: true, infos: [newFood], canCreateFoods: false }).get(".ingest-ingredient__info").text())
+      .toContain("you can't add foods, so it's kept in the note");
+    expect(mountRow(salt, { expanded: true, infos: [newFood], canCreateFoods: true }).get(".ingest-ingredient__info").text())
+      .toContain("It's added when you commit the card.");
+  });
+
   test("a line can be removed", async () => {
     const wrapper = mountRow(oil(), { expanded: true });
     await wrapper.findAll("button").find(b => b.text() === "Delete")!.trigger("click");

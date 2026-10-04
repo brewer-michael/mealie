@@ -50,6 +50,7 @@ from mealie.services.ai.ingest.intake import (
     source_sha256,
 )
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
+from mealie.services.ai.routing import AIProviderRouter
 from mealie.services.ai.runtime import AIRuntime
 from tests.utils.fixture_schemas import TestUser
 
@@ -216,6 +217,26 @@ def test_a_card_has_at_most_four_pages(db: Session, unique_user: TestUser):
     outcome = _service(db, unique_user).ingest(_card(*pages), _options(unique_user))
     assert isinstance(outcome, IntakeRejected)
     assert (outcome.index, outcome.reason) == (4, IngestRejectReason.too_many_pages)
+
+
+def test_a_group_switched_to_local_only_during_the_upload_gets_a_local_only_job(
+    db: Session, unique_user_fn_scoped: TestUser
+):
+    # the upload read the group's setting before its body arrived; the insert reads it again
+    user = unique_user_fn_scoped
+    service = _service(db, user)
+    assert not _job(_accepted(service.ingest(_card(_jpeg()), _options(user))).job_id).local_only
+
+    IngestRepos(db, UUID(user.group_id), UUID(user.household_id)).settings.upsert(
+        RecipeIngestionSettingsUpdate(local_only=True)
+    )
+    assert _job(_accepted(service.ingest(_card(_jpeg()), _options(user, local_only=False))).job_id).local_only
+
+    IngestRepos(db, UUID(user.group_id), UUID(user.household_id)).settings.upsert(
+        RecipeIngestionSettingsUpdate(local_only=False)
+    )
+    assert _job(_accepted(service.ingest(_card(_jpeg()), _options(user, local_only=True))).job_id).local_only
+    assert not _job(_accepted(service.ingest(_card(_jpeg()), _options(user))).job_id).local_only
 
 
 # ==========================================
@@ -465,6 +486,38 @@ def test_async_intake_runs_in_worker_threads_two_at_a_time(
     assert loop_thread[0] not in threads
 
 
+def test_intake_runs_two_cards_at_a_time_whoever_calls_it(
+    db: Session, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the inbox's scan calls `ingest` directly, beside uploads that went through `ingest_async`'s limiter: together
+    # they normalize at most INTAKE_CONCURRENCY photos at once (each can take hundreds of megabytes)
+    running = 0
+    most = 0
+    lock = threading.Lock()
+
+    def normalize_and_insert(self: IntakeService, *args: Any) -> Any:
+        nonlocal running, most
+        with lock:
+            running += 1
+            most = max(most, running)
+        time.sleep(0.2)
+        with lock:
+            running -= 1
+        return IntakeRejected(0, None, IngestRejectReason.unreadable_image)
+
+    monkeypatch.setattr(IntakeService, "_normalize_and_insert", normalize_and_insert)
+    service = _service(db, unique_user)
+    threads = [
+        threading.Thread(target=service.ingest, args=(_card(b""), _options(unique_user)))
+        for _ in range(limits.INTAKE_CONCURRENCY + 2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert most == limits.INTAKE_CONCURRENCY
+
+
 # ==========================================
 # Can the group read cards?
 
@@ -519,6 +572,32 @@ def test_a_monthly_limit_doesnt_count_as_unable_to_read(
 
     monkeypatch.setattr(AIRuntime, "candidates", over_the_limit)
     assert reading_readiness(db, UUID(user.group_id), UUID(user.household_id)).can_read
+
+
+def test_cloud_providers_over_their_limit_dont_make_local_only_cards_readable(
+    db: Session, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the router finds every provider over its limit before the local-only policy filters them
+    user = unique_user_fn_scoped
+    group_id, household_id = UUID(user.group_id), UUID(user.household_id)
+    _providers(user, image=True)  # cloud providers
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+    monkeypatch.setattr(AIProviderRouter, "_within_limits", lambda self, providers: [])
+
+    over = reading_readiness(db, group_id, household_id)
+    assert over.can_read and not over.local_ready
+
+    # a local provider over its limit still counts: the card fails `limit_reached` when it's read, if it still is
+    repos = user.repos
+    local = repos.group_ai_providers.create(
+        AIProviderCreate(name="Ollama", model="m", api_key="k", base_url="http://127.0.0.1:11434/v1", runs_locally=True)
+    )
+    repos.group_ai_provider_settings.update(
+        repos.group_id,
+        AIProviderSettingsUpdate(default_provider_id=local.id, image_provider_id=local.id, audio_provider_id=None),
+    )
+    local_over = reading_readiness(db, group_id, household_id)
+    assert local_over.can_read and local_over.local_ready
 
 
 def test_source_names_and_the_duplicate_key(tmp_path: Path):

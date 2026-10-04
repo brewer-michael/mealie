@@ -15,9 +15,10 @@ image, a duplicate, a lost inbox claim or a database error. A pause is found bef
 Public interface:
 - `IntakePage`, `IntakeCard`, `IntakeOptions`: what an upload or the inbox hands over.
 - `IntakeAccepted`, `IntakeRejected` (`IntakeOutcome`): what became of the card.
-- `IntakeService(session, group_id, household_id)`: `ingest(card, options, *, confirm=None)` (blocking, holds the
-  write lock; raises `IngestPaused`, `NoEntryFound` for an unknown batch, `ClaimLost`) and `ingest_async(...)`, which
-  waits for an intake slot on the event loop and runs `ingest` in a worker thread.
+- `IntakeService(session, group_id, household_id)`: `ingest(card, options, *, confirm=None)` (blocking, takes one of
+  the process's intake slots and the write lock; raises `IngestPaused`, `NoEntryFound` for an unknown batch,
+  `ClaimLost`) and `ingest_async(...)`, which waits for a slot on the event loop and runs `ingest` in a worker thread.
+- `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots.
 - `ClaimLost`: the inbox's claimed file moved away before the insert (another scanner retried it).
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
   local providers only or at all, its own local-only setting and its processing jobs (the upload's checks 3 and 4,
@@ -25,6 +26,7 @@ Public interface:
 """
 
 import hashlib
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,7 +40,7 @@ from sqlalchemy.orm import Session
 from mealie.core.root_logger import get_logger
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
-from mealie.schema.group.ai_providers import AIProviderSlot
+from mealie.schema.group.ai_providers import AIProviderOut, AIProviderSlot
 from mealie.schema.recipe_ingest import (
     IngestRejectReason,
     IngestSource,
@@ -49,7 +51,9 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.services import ocr
 from mealie.services.ai.errors import AIProviderLimitReachedError, AIProviderLocalOnlyError
-from mealie.services.ai.policy import ai_call_policy
+from mealie.services.ai.local import is_local_provider
+from mealie.services.ai.policy import ai_call_policy, current_policy
+from mealie.services.ai.routing import AIProviderRouter
 
 from . import batches, images, limits, storage
 
@@ -63,7 +67,9 @@ BATCH_ATTEMPTS = 3
 """How often an insert looks for another batch when the one it picked was sealed meanwhile"""
 
 _intake_limiter = anyio.CapacityLimiter(limits.INTAKE_CONCURRENCY)
-"""At most this many cards are normalized at once in this process; further uploads wait on the event loop"""
+"""At most this many uploads are normalized at once in this process; further uploads wait on the event loop"""
+_intake_slots = threading.BoundedSemaphore(limits.INTAKE_CONCURRENCY)
+"""The same bound for every caller of `ingest`, the inbox's scan included: one large photo takes hundreds of MB"""
 
 
 class ClaimLost(Exception):
@@ -102,7 +108,7 @@ class IntakeOptions:
     position: int | None = None
     """The app's capture index; else the card goes after the batch's last one"""
     local_only: bool = False
-    """The job's snapshot: the group's setting or the upload's own request"""
+    """The upload's own request; the job is local-only with this or the group's setting as the insert reads it"""
     allow_duplicate: bool = False
     locale: str | None = None
     integration_id: str | None = None
@@ -124,6 +130,14 @@ class IntakeRejected:
 
 
 IntakeOutcome = IntakeAccepted | IntakeRejected
+
+
+async def in_intake_slot[T](work: Callable[[], T]) -> T:
+    """
+    Runs an upload's memory-heavy blocking work (intake, or decoding a JSON body's images) in a worker thread once one
+    of the process's intake slots is free; until then the upload waits on the event loop
+    """
+    return await anyio.to_thread.run_sync(work, limiter=_intake_limiter)
 
 
 def source_name(prefix: str, name: str | None) -> str | None:
@@ -171,16 +185,17 @@ class IntakeService:
         def run() -> IntakeOutcome:
             return self.ingest(card, options, confirm=confirm)
 
-        return await anyio.to_thread.run_sync(run, limiter=_intake_limiter)
+        return await in_intake_slot(run)
 
     def ingest(
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
     ) -> IntakeOutcome:
         """
-        Turns one card into a job, holding the ingest write lock from its directory's creation through the insert.
-        Each image is normalized into `pages/<n>/`; then one transaction touches the batch (choosing another if it was
-        sealed meanwhile), checks for a duplicate (unless allowed), calls `confirm` (the inbox checks that its claimed
-        file is still there) and inserts the job, `processing` with its extraction queued. The dispatcher is woken.
+        Turns one card into a job, holding the ingest write lock from its directory's creation through the insert,
+        and one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one). Each image is normalized into
+        `pages/<n>/`; then one transaction touches the batch (choosing another if it was sealed meanwhile), checks for
+        a duplicate (unless allowed), calls `confirm` (the inbox checks that its claimed file is still there) and
+        inserts the job, `processing` with its extraction queued. The dispatcher is woken.
 
         A rejected image or a duplicate is an `IntakeRejected`, and leaves nothing on disk. Raises `IngestPaused`
         (nothing written) while a restore pauses ingestion, `NoEntryFound` for an unknown batch and `ClaimLost` when
@@ -195,7 +210,8 @@ class IntakeService:
             )
 
         job_id = uuid4()
-        with storage.ingest_write():
+        # the slot first: a restore waiting for the write lock never waits for a card that's waiting for a slot
+        with _intake_slots, storage.ingest_write():
             accepted = False
             try:
                 storage.create_job_dir(self.group_id, job_id, len(card.pages))
@@ -265,6 +281,9 @@ class IntakeService:
                     )
 
             position = batches.next_position(repos, batch_id, options.position)
+            # the group's setting as it is now: an upload read it before its body arrived, and a switch to local only
+            # since then must still cover this card (it's never loosened later, §10)
+            local_only = options.local_only or repos.settings.get().local_only
             if confirm is not None and not confirm():
                 session.rollback()
                 raise ClaimLost(f"The card for recipe card job {job_id} was taken by another scan")
@@ -279,7 +298,7 @@ class IntakeService:
                     "source_name": card.source_name,
                     "integration_id": options.integration_id,
                     "locale": options.locale,
-                    "local_only": options.local_only,
+                    "local_only": local_only,
                     "status": IngestStatus.processing.value,
                     "task_kind": IngestTaskKind.extract.value,
                     "task_state": IngestTaskState.queued.value,
@@ -339,14 +358,31 @@ class ReadingReadiness:
     """The group's `processing` jobs, every household's"""
 
 
+class _EveryProvider(AIProviderRouter):
+    """A slot's providers in the router's order, whatever their monthly token limits"""
+
+    def _within_limits(self, providers: list[AIProviderOut]) -> list[AIProviderOut]:
+        return providers
+
+
 def _slot_usable(service: OpenAIService, slot: AIProviderSlot) -> bool:
     from mealie.services.openai import OpenAINotEnabledException
 
     try:
         return bool(service.runtime.candidates(slot))
     except AIProviderLimitReachedError:
-        # set up, just over this month's limit: a card read later fails `limit_reached` if it still is
-        return True
+        # set up, just over this month's limit: a card read later fails `limit_reached` if it still is. The router
+        # checks the limits before the policy filters, so under "local only" that holds only if a provider is local.
+        if not current_policy().local_only:
+            return True
+        primaries = {
+            AIProviderSlot.default: service.default_provider,
+            AIProviderSlot.image: service.image_provider,
+            AIProviderSlot.audio: service.audio_provider,
+        }
+        return any(
+            is_local_provider(provider) for provider in _EveryProvider(service.repos, primaries).candidates(slot)
+        )
     except OpenAINotEnabledException, AIProviderLocalOnlyError:
         return False
 

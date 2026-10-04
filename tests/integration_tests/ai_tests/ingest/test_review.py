@@ -3,6 +3,7 @@ Saving a draft from the review page (docs/ai/PHASE2.md §4.6, §6.6): versions, 
 banner, and errors blocking commit until they're kept. Runs on SQLite and PostgreSQL.
 """
 
+import json
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -64,9 +65,10 @@ def test_save_bumps_the_version_and_recomputes_flags(api_client: TestClient, uni
 def test_a_stale_version_is_a_409_with_the_current_one(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
     job_id = seed_job(user)
-    assert _put(api_client, user, job_id, 1).status_code == 200
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    assert _put(api_client, user, job_id, 1, draft={**draft, "name": "Banana Cake"}).status_code == 200
 
-    detail = assert_code(_put(api_client, user, job_id, 1), 409, "version_conflict")
+    detail = assert_code(_put(api_client, user, job_id, 1, draft=draft), 409, "version_conflict")
     assert detail["current"] == 2
     assert job_row(job_id)["draft_version"] == 2
 
@@ -97,6 +99,20 @@ def test_the_draft_is_the_whitelist(api_client: TestClient, unique_user_fn_scope
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_quantity_is_refused(api_client: TestClient, unique_user_fn_scoped: TestUser, bad: float):
+    user = unique_user_fn_scoped
+    job_id = seed_job(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    draft["ingredients"][0]["quantity"] = bad
+    # the test client won't send NaN, but Python's JSON parser on the server reads it
+    body = json.dumps({"draftVersion": 1, "draft": draft})
+    headers = {**user.token, "Content-Type": "application/json"}
+
+    assert api_client.put(job_url(job_id), content=body, headers=headers).status_code == 422
+    assert job_row(job_id)["draft_version"] == 1
+
+
 def test_flag_resolutions(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
     draft = banana_draft()
@@ -118,15 +134,47 @@ def test_flag_resolutions(api_client: TestClient, unique_user_fn_scoped: TestUse
     assert by_id[check_parse] == "dismissed"
     assert by_id[new_food] is None
     assert (saved["errorCount"], saved["warningCount"]) == (0, 0)
+    assert saved["draftVersion"] == 1  # resolving flags doesn't change the draft
 
     # resolutions are kept by later saves that don't mention them, and taken back with null
-    saved = _put(api_client, user, job_id, 2).json()
+    saved = _put(api_client, user, job_id, 1).json()
     assert {flag["id"]: flag["resolution"] for flag in saved["flags"]}[blank] == "kept"
-    saved = _put(api_client, user, job_id, 3, flagResolutions={blank: None, check_parse: "kept"}).json()
+    saved = _put(api_client, user, job_id, 1, flagResolutions={blank: None, check_parse: "kept"}).json()
     by_id = {flag["id"]: flag["resolution"] for flag in saved["flags"]}
     assert by_id[blank] is None
     assert by_id[check_parse] is None  # a warning can't be kept
     assert (saved["errorCount"], saved["warningCount"]) == (1, 1)
+
+
+def test_only_a_changed_draft_bumps_the_version(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """
+    §3.3: `draftVersion` is bumped only when the draft changes. Resolving flags, settling proposals or dismissing the
+    banner keeps it, so the draft still counts as unedited (a re-extract replaces it) and another device's next save
+    doesn't conflict.
+    """
+    user = unique_user_fn_scoped
+    proposal = CardProposal(kind=CardProposalKind.region, target=ProposalTarget(field="name"), text="Banana Cake")
+    job_id = seed_job(user, proposals=[proposal], error_code=IngestErrorCode.provider_failed.value)
+    blank = api_client.get(job_url(job_id), headers=user.token).json()["flags"][-1]["id"]
+
+    for body in (
+        {"flagResolutions": {blank: "kept"}},
+        {"resolvedProposalIds": [str(proposal.id)]},
+        {"clearError": True},
+    ):
+        saved = _put(api_client, user, job_id, 1, **body)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["draftVersion"] == 1
+    row = job_row(job_id)
+    assert (row["draft_version"], row["extracted_version"]) == (1, 1)
+    assert (row["proposals"], row["error_code"], row["error_count"]) == ([], None, 0)
+
+    # the other device's edit, made against version 1, still lands
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    saved = _put(api_client, user, job_id, 1, draft={**draft, "name": "Banana Cake"})
+    assert saved.json()["draftVersion"] == 2
+    assert {flag["id"]: flag["resolution"] for flag in saved.json()["flags"]}[blank] == "kept"
+    assert job_row(job_id)["extracted_version"] == 1
 
 
 def test_a_missing_name_can_only_be_fixed(api_client: TestClient, unique_user_fn_scoped: TestUser):
@@ -154,7 +202,7 @@ def test_errors_block_commit_until_kept(api_client: TestClient, unique_user_fn_s
     assert job_row(job_id)["status"] == "ready"
 
     assert _put(api_client, user, job_id, 1, flagResolutions={blank["id"]: "kept"}).status_code == 200
-    response = api_client.post(job_url(job_id, "commit"), json={"draftVersion": 2}, headers=user.token)
+    response = api_client.post(job_url(job_id, "commit"), json={"draftVersion": 1}, headers=user.token)
     assert response.status_code == 201, response.text
 
 
@@ -178,9 +226,10 @@ def test_clear_error_dismisses_the_banner(api_client: TestClient, unique_user_fn
     assert _put(api_client, user, job_id, 1).status_code == 200
     assert job_row(job_id)["error_code"] == "provider_failed"  # only when asked
 
-    assert _put(api_client, user, job_id, 2, clearError=True).status_code == 200
+    assert _put(api_client, user, job_id, 1, clearError=True).status_code == 200
     row = job_row(job_id)
     assert (row["error_code"], row["error_params"]) == (None, None)
+    assert row["draft_version"] == 1
 
 
 def test_a_tasks_proposal_never_conflicts_with_a_save(api_client: TestClient, unique_user_fn_scoped: TestUser):
@@ -192,7 +241,8 @@ def test_a_tasks_proposal_never_conflicts_with_a_save(api_client: TestClient, un
         update_job_json(session, job_id, lambda row: {"proposals": [*(row["proposals"] or []), proposal]})
     assert job_row(job_id)["row_version"] == 1
 
-    response = _put(api_client, user, job_id, 1)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    response = _put(api_client, user, job_id, 1, draft={**draft, "name": "Banana Cake"})
     assert response.status_code == 200
     assert response.json()["draftVersion"] == 2
     assert [p["id"] for p in job_row(job_id)["proposals"]] == [str(proposal.id)]

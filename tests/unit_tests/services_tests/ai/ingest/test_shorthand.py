@@ -2,7 +2,7 @@
 
 import pytest
 
-from mealie.services.ai.ingest.shorthand import SHORTHAND, UNITS, normalize_shorthand
+from mealie.services.ai.ingest.shorthand import SHORTHAND, UNITS, normalize_shorthand, split_size
 
 
 @pytest.mark.parametrize(
@@ -69,6 +69,31 @@ def test_case_matters():
 
 def test_only_the_token_after_the_leading_quantity_changes():
     assert normalize_shorthand("1 T. butter, or 1 t. oil") == ("1 tbsp butter, or 1 t. oil", True)
+
+
+@pytest.mark.parametrize(
+    "line, plain, size",
+    [
+        ("1 heaping T. flour", "1 T. flour", "heaping"),
+        ("1 level t. soda", "1 t. soda", "level"),
+        ("1 scant c. sugar", "1 c. sugar", "scant"),
+        ("1/2 Rounded tsp. baking powder", "1/2 tsp. baking powder", "Rounded"),
+        ("- 2 heaping cups flour", "- 2 cups flour", "heaping"),  # any unit: "heaping cups" would be a new unit
+        ("1 heaping", "1 heaping", None),  # nothing after it
+        ("1 levelled t. salt", "1 levelled t. salt", None),
+        ("2 large eggs", "2 large eggs", None),  # a size of the food, which the parser reads as the note
+        ("Salt, a scant pinch", "Salt, a scant pinch", None),
+    ],
+)
+def test_a_size_word_after_the_quantity_is_taken_out(line: str, plain: str, size: str | None):
+    assert split_size(line) == (plain, size)
+
+
+def test_the_pattern_finds_shorthand_after_a_size_word():
+    """`flags.shorthand_read` reads the card's line, size word and all"""
+    match = SHORTHAND.match("1 heaping T. flour")
+    assert match is not None and (match.group("unit"), match.group("size")) == ("T", "heaping ")
+    assert normalize_shorthand(split_size("1 heaping T. flour")[0]) == ("1 tbsp flour", True)
 
 
 def test_every_unit_the_pattern_matches_has_a_name():

@@ -17,7 +17,8 @@ from mealie.schema._mealie import MealieModel
 CARD_DRAFT_SCHEMA_VERSION = 1
 """The current `CardDraft.schema_version`"""
 
-_LENIENT = ConfigDict(extra="ignore")
+# NaN and infinity would reach the flag rules and the recipe as numbers; a save with one gets a 422
+_LENIENT = ConfigDict(extra="ignore", allow_inf_nan=False)
 
 
 class CardDraftRef(MealieModel):

@@ -19,7 +19,8 @@ import {
   useRecipeIngestUploads,
 } from "../use-recipe-ingest-uploads";
 import type { DraftCard, UploadQueueAction, UploadQueueState } from "../use-recipe-ingest-uploads";
-import { resetRecipeIngestCounts } from "../use-recipe-ingest";
+import { resetRecipeIngestCounts, useRecipeIngestCounts } from "../use-recipe-ingest";
+import { clearComposableCaches } from "../use-clear-composable-caches";
 import type { IngestResponse } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
@@ -367,8 +368,31 @@ describe("the upload queue", () => {
     expect(api.upload).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(api.upload).toHaveBeenCalledTimes(2);
-    // The interceptor toasted the message already
     expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("attempts don't toast: every queue request is quiet, and the card says why it's retrying or failed", async () => {
+    vi.useFakeTimers();
+    const paused = { code: "paused_for_restore", message: "Recipe cards are paused" };
+    api.createBatch.mockImplementationOnce(() => failed(503, paused, { "retry-after": "60" }));
+    api.upload.mockImplementation(() => failed(503, paused, { "retry-after": "60" }));
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+
+    // the batch couldn't be created: the card waits for the restore like an upload would
+    expect(api.createBatch).toHaveBeenCalledWith({ suppressAlert: true });
+    expect(queue.cards.value[0]).toMatchObject({ status: "retrying", error: "paused_for_restore" });
+
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(api.upload).toHaveBeenCalledTimes(3);
+    for (const call of api.upload.mock.calls) {
+      expect(call[2]).toMatchObject({ suppressAlert: true, signal: expect.any(AbortSignal) });
+    }
+    expect(queue.cards.value[0]).toMatchObject({ status: "failed", error: "paused_for_restore", retryable: true });
+    queue.done();
+    await flushPromises();
+    expect(api.sealBatch).toHaveBeenCalledWith("b1", { suppressAlert: true });
   });
 
   test("an error that retrying won't fix fails at once, without another toast", async () => {
@@ -515,7 +539,7 @@ describe("the upload queue", () => {
 
     pending.resolve({ data: accepted(), error: null });
     await flushPromises();
-    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1");
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
     // Both cards went into the sealed batch
     expect([0, 1].map(n => uploadOptions(n).batchId)).toEqual(["b1", "b1"]);
 
@@ -539,7 +563,7 @@ describe("the upload queue", () => {
 
     await vi.advanceTimersByTimeAsync(2000 + 4000 + 8000);
     expect(queue.cards.value[0]?.status).toBe("failed");
-    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1");
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
   });
 
   test("front & back: the camera takes a front, then its back, and the card uploads", async () => {
@@ -573,7 +597,7 @@ describe("the upload queue", () => {
     queue.done();
     await flushPromises();
     expect(uploadedPhotos()).toEqual([[front], [a, b]]);
-    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1");
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
   });
 
   test("chosen photos pair up as drafts, with Swap, Split and Join, and upload when asked", async () => {
@@ -646,6 +670,53 @@ describe("the upload queue", () => {
     expect(queue.openBatch.value?.localOnly).toBe(true);
   });
 
+  test("keeping cards on this server after some have gone finishes their batch; the next card starts a new one", async () => {
+    api.createBatch
+      .mockImplementationOnce(() => ok({ id: "b1", source: "app" }))
+      .mockImplementation(() => ok({ id: "b2", source: "app" }));
+    api.upload.mockImplementation((_files, options: { batchId: string }) => ok(accepted(options.batchId)));
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    queue.takePhoto(photo());
+    queue.takePhoto(photo());
+    await flushPromises();
+    const first = queue.openBatch.value?.key;
+
+    queue.localOnly.value = true;
+    await flushPromises();
+    // the server stored those three as cloud cards: their batch is done, and says nothing about the next ones
+    expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
+    expect(queue.openBatch.value).toBeNull();
+    expect(queue.sentBeforeLocalOnlyChange.value).toBe(3);
+
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect([0, 1, 2, 3].map(n => uploadOptions(n).localOnly)).toEqual([false, false, false, true]);
+    expect(uploadOptions(3)).toMatchObject({ batchId: "b2", position: 0 });
+    expect(queue.openBatch.value).toMatchObject({ localOnly: true });
+    expect(queue.openBatch.value?.key).not.toBe(first);
+
+    queue.done();
+    expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+  });
+
+  test("keeping cards on this server while no card has gone keeps the batch, and its cards go with the new setting", async () => {
+    vi.useFakeTimers();
+    api.upload.mockImplementationOnce(() => failed(null)).mockImplementation(() => ok(accepted()));
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    expect(queue.cards.value[0]?.status).toBe("retrying");
+
+    queue.localOnly.value = true;
+    expect(queue.sentBeforeLocalOnlyChange.value).toBe(0);
+    expect(queue.openBatch.value).toMatchObject({ localOnly: true });
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect([0, 1].map(n => uploadOptions(n).localOnly)).toEqual([false, true]);
+    expect(api.sealBatch).not.toHaveBeenCalled();
+  });
+
   test("leaving the page warns while photos are pending", async () => {
     const pending = deferred<unknown>();
     api.upload.mockImplementation(() => pending.promise);
@@ -664,6 +735,40 @@ describe("the upload queue", () => {
     pending.resolve({ data: accepted(), error: null });
     await flushPromises();
     expect(leave()).toBe(false);
+  });
+
+  test("signing out forgets the queue and stops its uploads, so the next user neither sees nor sends the photos", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const pending = deferred<unknown>();
+    api.upload
+      .mockImplementationOnce((_files, _options, config: { signal: AbortSignal }) => {
+        signals.push(config.signal);
+        return pending.promise;
+      })
+      .mockImplementationOnce(() => failed(503, { code: "paused_for_restore" }, { "retry-after": "60" }))
+      .mockImplementation(() => ok(accepted()));
+    const queue = useRecipeIngestUploads();
+    const counts = useRecipeIngestCounts();
+    counts.set({ processing: 2, ready: 3, needsAttention: 0, failed: 0 });
+    queue.takePhoto(photo());
+    queue.takePhoto(photo());
+    queue.addPhotos([photo()]);
+    await flushPromises();
+    expect(queue.cards.value.map(card => card.status)).toEqual(["uploading", "retrying"]);
+
+    clearComposableCaches();
+    expect(signals[0]?.aborted).toBe(true);
+    expect(queue.cards.value).toEqual([]);
+    expect(queue.drafts.value).toEqual([]);
+    expect(queue.hasPending.value).toBe(false);
+    expect(counts.counts.value).toBeNull();
+
+    // the retry that was due, and the upload that was in flight, change nothing
+    pending.resolve({ data: accepted(), error: null });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.upload).toHaveBeenCalledTimes(2);
+    expect(useRecipeIngestUploads().cards.value).toEqual([]);
   });
 
   test("a lost batch (404) is created again on the next attempt", async () => {

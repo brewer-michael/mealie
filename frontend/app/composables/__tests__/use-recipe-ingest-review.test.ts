@@ -6,6 +6,7 @@ import {
   applyProposal,
   buildNeedsALook,
   draftsEqual,
+  editFlaggedText,
   fieldText,
   fillBlank,
   firstCardToReview,
@@ -297,6 +298,41 @@ describe("flags", () => {
     expect(fieldText(draft, "ingredients", "i3")).toBe("[illegible] banana");
     expect(fieldText(draft, "steps", "s2")).toBe("Microwave on high for [blank] minutes.");
     expect(fieldText({ ...draft, prepTime: "5 minutes" }, "prep_time")).toBe("5 minutes");
+  });
+
+  test("a flag on a note is about the note its ref names, not the first one holding the marker", () => {
+    // the server keys notes by index: two notes with a blank raise blank:notes:0 and blank:notes:1
+    const draft = normalizeDraft(bananaDraft({
+      notes: [{ title: "", text: "Bake [blank] min if doubled" }, { title: "", text: "Cool [blank] min" }],
+    }));
+    const second = flag({ id: "blank:notes:1", field: "notes", ref: "1" });
+    const first = flag({ id: "blank:notes:0", field: "notes", ref: "0" });
+
+    expect(fieldText(draft, "notes", "1")).toBe("Cool [blank] min");
+    const { items } = buildNeedsALook([second, first], [second, first], new Set(), draft, []);
+    expect(items.map(item => [item.flag.id, item.line, item.text])).toEqual([
+      ["blank:notes:0", 0, "Bake [blank] min if doubled"],
+      ["blank:notes:1", 1, "Cool [blank] min"],
+    ]);
+
+    expect(editFlaggedText(draft, second, "5", "fill")).toBe(true);
+    expect(draft.notes.map(note => note.text)).toEqual(["Bake [blank] min if doubled", "Cool 5 min"]);
+    expect(editFlaggedText(draft, first, "20", "fill")).toBe(true);
+    expect(draft.notes.map(note => note.text)).toEqual(["Bake 20 min if doubled", "Cool 5 min"]);
+  });
+
+  test("a marker in a note's title is filled there", () => {
+    const draft = normalizeDraft(bananaDraft({
+      notes: [{ title: "", text: "Grandma Jo's, 1962" }, { title: "From [blank]", text: "Can double for a 9x13 pan" }],
+    }));
+    const titleFlag = flag({ id: "blank:notes:1", field: "notes", ref: "1" });
+
+    expect(fieldText(draft, "notes", "1")).toBe("From [blank]\nCan double for a 9x13 pan");
+    expect(editFlaggedText(draft, titleFlag, "Aunt May", "fill")).toBe(true);
+    expect(draft.notes[1]).toMatchObject({ title: "From Aunt May", text: "Can double for a 9x13 pan" });
+    expect(draft.notes[0]!.text).toBe("Grandma Jo's, 1962");
+    // a note that's gone points at nothing
+    expect(editFlaggedText(draft, flag({ id: "blank:notes:5", field: "notes", ref: "5" }), "x", "fill")).toBe(false);
   });
 });
 
@@ -780,6 +816,124 @@ describe("useRecipeIngestReview", () => {
 
     await review.reextract();
     expect(toast.info).toHaveBeenCalledWith("This card is being read. Try again when it's done.");
+  });
+
+  test("a refresh that already sees this page's save in flight raises no conflict (§6.6)", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [], task: { kind: "reread", state: "running" } })));
+    const { review } = await loaded();
+    review.draft.value.steps[0]!.text = "Mix well.";
+    await nextTick();
+
+    // the autosave goes out and is slow to answer
+    let answerSave: (value: unknown) => void = () => {};
+    api.updateJob.mockImplementation(() => new Promise((resolve) => {
+      answerSave = resolve;
+    }));
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(api.updateJob).toHaveBeenCalledOnce();
+
+    // the re-read lands: the poll sees its proposal, and the GET already sees the saved version
+    const proposal: CardProposal = { id: "p1", kind: "region", target: { field: "name", ref: null }, text: "Banana Cake", readable: true };
+    api.getJobState.mockResolvedValue(ok(state({ draftVersion: 4, proposalIds: ["p1"] })));
+    api.getJob.mockResolvedValue(ok(job({
+      draftVersion: 4,
+      flags: [],
+      draft: bananaDraft({ steps: [{ id: "s1", text: "Mix well." }, { id: "s2", text: "Microwave on high for [blank] minutes." }] }),
+      proposals: [proposal],
+    })));
+    const polled = review.pollState();
+    await flushPromises();
+    answerSave(ok({ draftVersion: 4, flags: [], errorCount: 0, warningCount: 0 }));
+    await polled;
+    await flushPromises();
+
+    expect(review.conflict.value).toBe(false);
+    expect(review.readOnly.value).toBe(false);
+    expect(review.draftVersion.value).toBe(4);
+    expect(review.draft.value.steps[0]!.text).toBe("Mix well.");
+    expect(review.proposals.value.map(item => item.id)).toEqual(["p1"]);
+  });
+
+  test("a read from before this page's save, answered after it, rolls nothing back", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [], task: { kind: "reread", state: "running" } })));
+    api.updateJob.mockImplementation((_id: string, payload: { draftVersion: number }) =>
+      Promise.resolve(ok({ draftVersion: payload.draftVersion + 1, flags: [], errorCount: 0, warningCount: 0 })),
+    );
+    const { review } = await loaded();
+    review.draft.value.steps[0]!.text = "Mix well.";
+    await nextTick();
+
+    // the poll's GET goes out and reads the row before the save
+    let answerGet: (value: unknown) => void = () => {};
+    const proposal: CardProposal = { id: "p1", kind: "region", target: { field: "name", ref: null }, text: "Banana Cake", readable: true };
+    api.getJobState.mockResolvedValue(ok(state({ proposalIds: ["p1"] })));
+    api.getJob.mockImplementation(() => new Promise((resolve) => {
+      answerGet = resolve;
+    }));
+    const polled = review.pollState();
+    await flushPromises();
+
+    // meanwhile the autosave fires and is answered first; the reviewer keeps typing
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(review.draftVersion.value).toBe(4);
+    review.draft.value.steps[0]!.text = "Mix well, then rest.";
+    await nextTick();
+
+    answerGet(ok(job({ draftVersion: 3, flags: [], proposals: [proposal] })));
+    await polled;
+    await flushPromises();
+
+    expect(review.conflict.value).toBe(false);
+    expect(review.draftVersion.value).toBe(4);
+    expect(review.job.value?.draftVersion).toBe(4);
+    expect(review.draft.value.steps[0]!.text).toBe("Mix well, then rest.");
+    // the read's news still shows
+    expect(review.proposals.value.map(item => item.id)).toEqual(["p1"]);
+    expect(review.task.value).toBeNull();
+
+    // and the next save and the commit carry the version the save returned
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: "j2", warnings: [] }));
+    expect(await review.commit()).toBe("committed");
+    expect(api.updateJob.mock.calls.at(-1)![1].draftVersion).toBe(4);
+    expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 5 });
+  });
+
+  test("Save as eval case says a name is taken only when it is; other refusals say why", async () => {
+    const { review } = await loaded();
+
+    api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "eval_case_exists" }));
+    expect(await review.saveEvalCase("banana-mug-cake", true)).toBe("exists");
+    expect(toast.error).not.toHaveBeenCalled();
+
+    api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "not_exportable" }));
+    expect(await review.saveEvalCase("banana-mug-cake-2", true)).toBe("failed");
+    expect(toast.error).toHaveBeenCalledWith(
+      "Only a card that is ready to review or added, with its photos, can be saved as an eval case.",
+    );
+
+    api.saveEvalCase.mockResolvedValueOnce(apiError(409, { code: "files_missing" }));
+    expect(await review.saveEvalCase("banana-mug-cake-3", true)).toBe("failed");
+    expect(toast.error).toHaveBeenLastCalledWith("The card's photos are missing. Scan it again.");
+  });
+
+  test("what commit left out (an organizer deleted since) is said with the Added toast", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [], draft: bananaDraft({ tags: [{ id: "t1", name: "Desserts" }] }) })));
+    api.commit.mockResolvedValueOnce(ok({
+      recipeId: "r1",
+      slug: "banana-mug-cake",
+      nextJobId: "j2",
+      warnings: ["tag_dropped:Desserts", "something_new:x"],
+    }));
+    const { review, navigate } = await loaded();
+
+    expect(await review.commit()).toBe("committed");
+    expect(toast.warning).toHaveBeenCalledExactlyOnceWith(
+      "The tag \"Desserts\" no longer exists, so it wasn't added.",
+      "Added Banana Mug Cake",
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards/j2");
   });
 
   test("a missing card says so", async () => {

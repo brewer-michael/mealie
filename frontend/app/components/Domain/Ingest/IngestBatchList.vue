@@ -124,10 +124,9 @@
 import { useDocumentVisibility } from "@vueuse/core";
 import IngestJobListItem from "./IngestJobListItem.vue";
 import { useUserApi } from "~/composables/api";
-import { errorStatusOf, useRecipeIngestCounts } from "~/composables/use-recipe-ingest";
+import { errorCodeOf, errorStatusOf, useRecipeIngestCounts, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import { alert } from "~/composables/use-toast";
-import type { PaginationData } from "~/lib/api/types/non-generated";
 import type { IngestSource, IngestStatus, RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestJobsQuery } from "~/lib/api/user/recipe-ingest";
 
@@ -165,6 +164,7 @@ const OPEN_STATUSES: IngestStatus[] = ["processing", "ready", "failed", "committ
 
 const i18n = useI18n();
 const api = useUserApi();
+const { ingestErrorText } = useRecipeIngestText();
 const counts = useRecipeIngestCounts();
 const uploads = useRecipeIngestUploads();
 const visibility = useDocumentVisibility();
@@ -247,8 +247,7 @@ function sourceText(source: IngestSource): string {
 async function fetchAll(query: RecipeIngestJobsQuery): Promise<Job[] | null> {
   const items: Job[] = [];
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const { data } = await api.recipeIngest.getJobs({ ...query, page, perPage: PER_PAGE });
-    const result = data as PaginationData<Job> | null;
+    const { data: result } = await api.recipeIngest.getJobs({ ...query, page, perPage: PER_PAGE });
     if (!result) {
       return null;
     }
@@ -394,7 +393,7 @@ async function load() {
       if (open) {
         jobs.value = open;
       }
-      const added = (committed.data as PaginationData<Job> | null)?.items;
+      const added = committed.data?.items;
       if (added) {
         recent.value = sortRecent(added.filter(job => isRecent(job)));
       }
@@ -513,8 +512,10 @@ async function confirmDiscard() {
     void counts.refresh();
   }
   else if (!(error as { response?: { data?: { detail?: { message?: unknown } } } }).response?.data?.detail?.message) {
-    // Errors with a message were already shown by the API client
-    alert.error(i18n.t("recipe-ingest.error.unknown", { code: errorStatusOf(error) ?? "network" }));
+    // Errors with a message were already shown by the API client; the others say why by their code (`forbidden`:
+    // only the uploader, or a household manager, discards someone else's card)
+    const code = errorCodeOf(error);
+    alert.error(code ? ingestErrorText(code) : i18n.t("recipe-ingest.error.unknown", { code: errorStatusOf(error) ?? "network" }));
   }
 }
 </script>

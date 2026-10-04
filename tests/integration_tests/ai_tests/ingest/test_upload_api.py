@@ -6,6 +6,7 @@ The helpers at the top are shared by the other upload and batch API tests.
 """
 
 import asyncio
+import base64
 import fcntl
 import io
 import json
@@ -184,6 +185,35 @@ def test_a_session_cookie_alone_is_401(api_client: TestClient, reader: TestUser)
     assert detail["code"] == "authorization_required"
     assert detail["message"] == "Send your API token in the Authorization header to upload recipe cards."
     assert consumed == []
+
+
+@pytest.mark.parametrize("authorization", ["Basic dXNlcjpwYXNz", "Bearer", "Bearer  ", "Token abc", "bearer"])
+def test_a_session_cookie_with_any_other_authorization_is_401(
+    api_client: TestClient, reader: TestUser, authorization: str
+):
+    # a browser behind a proxy using HTTP Basic auth sends its cached credentials with a cross-site form post: the
+    # cookie would still authenticate it (F18)
+    consumed: list[int] = []
+
+    def body() -> Iterator[bytes]:
+        consumed.append(1)
+        yield jpeg()
+
+    token = reader.token["Authorization"].removeprefix("Bearer ")
+    api_client.cookies.set("mealie.access_token", token)
+    response = api_client.post(
+        INGEST, content=body(), headers={"Content-Type": "image/jpeg", "Authorization": authorization}
+    )
+    assert response.status_code == 401
+    assert consumed == []
+
+
+def test_the_bearer_scheme_is_matched_in_any_case(api_client: TestClient, reader: TestUser):
+    token = reader.token["Authorization"].removeprefix("Bearer ")
+    response = api_client.post(
+        INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg", "Authorization": f"bearer {token}"}
+    )
+    assert response.status_code == 202
 
 
 def test_503_while_paused_with_no_body_read(api_client: TestClient, reader: TestUser, paused: Path):
@@ -375,6 +405,17 @@ def test_json_with_base64_as_shortcuts_send_it(api_client: TestClient, reader: T
     assert job_row(item["id"]).source_name == "upload/front.jpg"
 
 
+def test_a_file_name_that_isnt_valid_text_is_stored_with_a_replacement(api_client: TestClient, reader: TestUser):
+    # JSON can carry a lone surrogate, which no database column accepts
+    image = base64.b64encode(jpeg()).decode()
+    body = '{"images": [{"data": "' + image + '", "filename": "\\ud800card.jpg"}]}'
+    response = api_client.post(INGEST, content=body, headers={**reader.token, "Content-Type": "application/json"})
+    assert response.status_code == 202
+    job = job_row(response.json()["jobs"][0]["id"])
+    assert job.source_name == "upload/\ufffdcard.jpg"
+    assert PageMeta.model_validate(job.pages[0]).original_filename == "\ufffdcard.jpg"
+
+
 def test_split_makes_each_image_a_card_and_partial_success_is_202(api_client: TestClient, reader: TestUser):
     response = api_client.post(
         INGEST,
@@ -516,6 +557,25 @@ def test_a_language_without_the_text_falls_back_to_english(api_client: TestClien
         ("*", "en-US"),
         ("xx-YY", "en-US"),
         ("pt_BR", "pt-BR"),
+        # Chinese by script, then by the regions that write Traditional Chinese
+        ("zh-Hant-TW", "zh-TW"),
+        ("zh-Hant-HK", "zh-TW"),
+        ("zh-HK", "zh-TW"),
+        ("zh-MO", "zh-TW"),
+        ("zh-Hant", "zh-TW"),
+        ("zh-Hans-HK", "zh-CN"),
+        ("zh-Hans", "zh-CN"),
+        ("zh-SG", "zh-CN"),
+        ("zh", "zh-CN"),
+        # Mealie keys Norwegian as no-NO; iOS sends Bokmål or Nynorsk
+        ("nb-NO", "no-NO"),
+        ("nb", "no-NO"),
+        ("nn-NO", "no-NO"),
+        ("no", "no-NO"),
+        # a script subtag between language and region
+        ("pt-Latn-BR", "pt-BR"),
+        ("fr-CA", "fr-CA"),
+        ("fr-CH", "fr-FR"),
     ],
 )
 def test_accept_language_resolves_to_a_supported_locale(header: str | None, locale: str):

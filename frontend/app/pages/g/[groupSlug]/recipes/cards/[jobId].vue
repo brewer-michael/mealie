@@ -315,23 +315,20 @@
                 <v-expansion-panel value="organizers">
                   <v-expansion-panel-title>{{ $t("general.organizers") }}</v-expansion-panel-title>
                   <v-expansion-panel-text :id="fieldAnchorId('tags')">
-                    <RecipeOrganizerSelector
+                    <IngestOrganizerSelector
                       v-model="review.draft.value.tags"
                       selector-type="tags"
-                      :show-add="false"
-                      :input-attrs="{ disabled: review.readOnly.value }"
+                      :readonly="review.readOnly.value"
                     />
-                    <RecipeOrganizerSelector
+                    <IngestOrganizerSelector
                       v-model="review.draft.value.categories"
                       selector-type="categories"
-                      :show-add="false"
-                      :input-attrs="{ disabled: review.readOnly.value }"
+                      :readonly="review.readOnly.value"
                     />
-                    <RecipeOrganizerSelector
+                    <IngestOrganizerSelector
                       v-model="review.draft.value.tools"
                       selector-type="tools"
-                      :show-add="false"
-                      :input-attrs="{ disabled: review.readOnly.value }"
+                      :readonly="review.readOnly.value"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -445,6 +442,7 @@ import IngestCardViewer from "~/components/Domain/Ingest/IngestCardViewer.vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestIngredientList from "~/components/Domain/Ingest/IngestIngredientList.vue";
 import IngestNeedsALook from "~/components/Domain/Ingest/IngestNeedsALook.vue";
+import IngestOrganizerSelector from "~/components/Domain/Ingest/IngestOrganizerSelector.vue";
 import IngestProposalBanner from "~/components/Domain/Ingest/IngestProposalBanner.vue";
 import IngestRecipeFields from "~/components/Domain/Ingest/IngestRecipeFields.vue";
 import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vue";
@@ -452,7 +450,6 @@ import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
 import RecipeNotes from "~/components/Domain/Recipe/RecipeNotes.vue";
-import RecipeOrganizerSelector from "~/components/Domain/Recipe/RecipeOrganizerSelector.vue";
 import { useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
 import {
   fieldAnchorId,

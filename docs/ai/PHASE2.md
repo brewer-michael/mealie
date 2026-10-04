@@ -1608,7 +1608,7 @@ sealing only after the batch's uploads drain); the review page (flags panel and 
 
 ```bash
 PGBIN=/usr/lib/postgresql/16/bin; PGD=$(runuser -u postgres -- mktemp -d); PORT=55471
-runuser -u postgres -- $PGBIN/initdb -D $PGD/data -U mealie --auth=trust
+runuser -u postgres -- $PGBIN/initdb -D $PGD/data -U mealie --auth=trust -E UTF8 --locale=C.UTF-8
 runuser -u postgres -- $PGBIN/pg_ctl -D $PGD/data -o "-p $PORT -k $PGD -c listen_addresses=127.0.0.1" -l $PGD/log -w start
 runuser -u postgres -- $PGBIN/createdb -h 127.0.0.1 -p $PORT -U mealie mealie
 DB_ENGINE=postgres POSTGRES_SERVER=127.0.0.1 POSTGRES_PORT=$PORT PYTEST_XDIST_WORKER=pg1 \

@@ -3,8 +3,9 @@ The inbox folder (docs/ai/PHASE2.md §1.3): `AI_INGEST_INBOX_DIR/<group-slug>/<h
 dispatcher. Files are taken once they've settled, claimed by an atomic rename, opened once with `O_NOFOLLOW` and passed
 to intake, then moved to `processed/` (or `failed/` with the reason).
 
-- **Off** unless `AI_INGEST_INBOX_DIR` is set and outside `DATA_DIR` and `/app` (`settings.inbox_root`). Each scan
-  creates every household's folder; unknown folders are logged once and ignored. Inbox jobs have no uploader.
+- **Off** unless `AI_INGEST_INBOX_DIR` is set and outside `DATA_DIR` and `/app` (`settings.inbox_root`), and on
+  Windows (no directory-descriptor calls). Each scan creates every household's folder; unknown folders are logged once
+  and ignored. Inbox jobs have no uploader.
 - **A file is one card; a first-level subfolder is one multi-page card** (pages in name order). Skipped: anything that
   isn't a regular file or directory by `lstat` (symlinks included), names starting with `.` or `~`, partial-download
   suffixes, `Thumbs.db`, `desktop.ini`, and the reserved `processed/`, `failed/` and `.mealie-claimed/`.
@@ -13,11 +14,19 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
 - **Claim:** `os.rename` into `.mealie-claimed/<claim_ms>__<uuid>__<name>` beside it, on the share's own filesystem.
   A scanner that loses the race gets `FileNotFoundError`. The claim time is in the name because a rename (and
   Syncthing, rsync, `cp -p`) keeps the file's old mtime.
+- **Never through a link:** anyone who can write to the share can plant symbolic links, so every file operation is
+  relative to a directory descriptor opened with `O_DIRECTORY | O_NOFOLLOW` from the root down (group, household,
+  reserved folder, card folder). A group, household or reserved folder that is a link or not a directory is skipped
+  and logged once; nothing in or behind it is created, claimed, moved or written.
 - **Open once:** every page is opened with `O_NOFOLLOW`, checked with `fstat` to be a regular file whose real path is
   inside the inbox root, and that file object goes to intake; nothing reopens it by path. Intake confirms the claimed
-  path still exists just before its insert commits.
+  entry still exists just before its insert commits. A card folder's pages are its regular files (subfolders and links
+  are skipped); one with more than `MAX_PAGES_PER_CARD` is refused before any is opened.
 - **Then** a rename to a unique name in `processed/YYYY-MM/` (or an unlink with `AI_INGEST_INBOX_KEEP_PROCESSED=false`);
-  a rejected card goes to `failed/` with `<name>.error.txt`.
+  a rejected card goes to `failed/` with `<name>.error.txt`, created with `O_EXCL | O_NOFOLLOW` under a name nothing
+  in `failed/` has yet.
+- **One bad entry or folder stops nothing else:** a file that can't be claimed and a folder that can't be scanned are
+  logged once and skipped; names that aren't UTF-8 are taken like any other (shown with U+FFFD).
 - **Crash safety:** a claim older than `INBOX_CLAIM_RETRY` (by the time in its name) is claimed again by a second
   rename to a fresh claim time, so only one process retries it. A card already inserted is then found by its content
   hash, and the file is just moved to `processed/`.
@@ -32,6 +41,8 @@ import shutil
 import stat
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +89,20 @@ INBOX_LOCALE = "en-US"
 NAME_MAX_BYTES = 255
 _CLAIM_NAME = re.compile(r"^(?P<ms>\d+)__(?P<token>[0-9a-f]{32})__(?P<name>.+)$", re.DOTALL)
 
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_ROOT_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+"""The root is the administrator's setting: it may be reached through a link"""
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+_NOTE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_SUPPORTED = (
+    hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and {os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd
+    and os.scandir in os.supports_fd
+    and shutil.rmtree.avoids_symlink_attacks
+)
+"""Whether every inbox operation can be made relative to a directory descriptor (Linux and macOS; not Windows)"""
+
 REJECTION_TEXT = {
     IngestRejectReason.too_large: "The photo is larger than 30 MB.",
     IngestRejectReason.unsupported_format: "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF or TIFF.",
@@ -90,7 +115,19 @@ REJECTION_TEXT = {
 
 
 class _Refused(Exception):
-    """A claimed entry that can't be read safely (a symlink, a device, a path outside the inbox)"""
+    """A claimed entry that can't be read safely (a symlink, a device, a path outside the inbox), or too many pages"""
+
+    def __init__(self, message: str, reason: IngestRejectReason | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class _UnsafeFolder(OSError):
+    """A folder of the inbox that is a symbolic link or not a directory: never used, nor anything behind it"""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(f"{label} is a symbolic link or not a folder")
+        self.label = label
 
 
 @dataclass(frozen=True)
@@ -99,7 +136,6 @@ class HouseholdFolder:
     household_id: UUID
     group_slug: str
     household_slug: str
-    path: Path
 
     @property
     def key(self) -> str:
@@ -115,12 +151,21 @@ class _ScanState:
     seen: dict[str, dict[str, tuple]] = field(default_factory=dict)
     logged: set[str] = field(default_factory=set)
 
-    def log_once(self, key: str, message: str) -> None:
+    def first(self, key: str) -> bool:
+        """Whether `key` is new since it was last forgotten (and marks it seen)"""
         with self.lock:
             if key in self.logged:
-                return
+                return False
             self.logged.add(key)
-        logger.warning(message)
+            return True
+
+    def forget(self, key: str) -> None:
+        with self.lock:
+            self.logged.discard(key)
+
+    def log_once(self, key: str, message: str) -> None:
+        if self.first(key):
+            logger.warning(message)
 
     def reset(self) -> None:
         with self.lock:
@@ -144,11 +189,104 @@ def _safe_slug(slug: str | None) -> bool:
     """A slug usable as one path component"""
     if not slug:
         return False
-    return "/" not in slug and "\\" not in slug and not slug.startswith(".")
+    return "/" not in slug and "\\" not in slug and "\0" not in slug and not slug.startswith(".")
 
 
-def household_folders(session: Session, root: Path) -> list[HouseholdFolder]:
-    """Every household's inbox folder, created if missing (idempotent)"""
+def _display_name(name: str) -> str:
+    """A file name as text that can be stored and logged: bytes that aren't UTF-8 (NFS, scanners) become U+FFFD"""
+    return os.fsencode(name).decode("utf-8", errors="replace")
+
+
+def _open_dir(name: str, dir_fd: int, label: str, *, create: bool = False) -> int:
+    """
+    The directory `name` inside `dir_fd`, opened without following a link (and created first when asked). Raises
+    `_UnsafeFolder` when it's a link or not a directory, `FileNotFoundError` when it's missing.
+    """
+    if create:
+        try:
+            os.mkdir(name, dir_fd=dir_fd)
+        except FileExistsError:
+            pass  # a link or a file in its place fails below
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _UnsafeFolder(label) from e
+        raise
+
+
+def _lexists(name: str, dir_fd: int) -> bool:
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+class _FolderDirs:
+    """
+    A household folder opened for one scan. Every file operation on it goes through these descriptors, opened from
+    the root down without following links, so a link swapped in for a folder later can't redirect anything.
+    """
+
+    def __init__(self, folder: HouseholdFolder, fd: int) -> None:
+        self.folder = folder
+        self.fd = fd
+        self._claims: int | None = None
+
+    def claim_dir(self) -> int:
+        """`.mealie-claimed/`, created if missing"""
+        if self._claims is None:
+            self._claims = _open_dir(CLAIM_DIR, self.fd, f"{self.folder.key}/{CLAIM_DIR}", create=True)
+        return self._claims
+
+    def existing_claim_dir(self) -> int | None:
+        if self._claims is None:
+            try:
+                self._claims = _open_dir(CLAIM_DIR, self.fd, f"{self.folder.key}/{CLAIM_DIR}")
+            except FileNotFoundError:
+                return None
+        return self._claims
+
+    def subfolder(self, name: str) -> int:
+        """`processed/` or `failed/`, created if missing; the caller closes it"""
+        return _open_dir(name, self.fd, f"{self.folder.key}/{name}", create=True)
+
+    def close(self) -> None:
+        for fd in (self._claims, self.fd):
+            if fd is not None:
+                os.close(fd)
+        self._claims = None
+
+
+@contextmanager
+def _open_folder(root_fd: int, folder: HouseholdFolder) -> Iterator[_FolderDirs]:
+    """
+    A household folder for one scan; raises `_UnsafeFolder` when it, its group's folder or one of its reserved
+    folders is a link or not a directory
+    """
+    group_fd = _open_dir(folder.group_slug, root_fd, folder.group_slug)
+    try:
+        fd = _open_dir(folder.household_slug, group_fd, folder.key)
+    finally:
+        os.close(group_fd)
+
+    dirs = _FolderDirs(folder, fd)
+    try:
+        for reserved in sorted(RESERVED_NAMES):
+            try:
+                st = os.stat(reserved, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                raise _UnsafeFolder(f"{folder.key}/{reserved}")
+        yield dirs
+    finally:
+        dirs.close()
+
+
+def household_folders(session: Session, root_fd: int) -> list[HouseholdFolder]:
+    """Every household's inbox folder, created if missing (idempotent); one that's a link is logged, never followed"""
     rows = session.execute(
         sa.select(Group.id, Group.slug, Household.id, Household.slug)
         .join(Household, Household.group_id == Group.id)
@@ -161,9 +299,15 @@ def household_folders(session: Session, root: Path) -> list[HouseholdFolder]:
     for group_id, group_slug, household_id, household_slug in rows:
         if not (_safe_slug(group_slug) and _safe_slug(household_slug)):
             continue
-        folder = HouseholdFolder(group_id, household_id, group_slug, household_slug, root / group_slug / household_slug)
+        folder = HouseholdFolder(group_id, household_id, group_slug, household_slug)
         try:
-            folder.path.mkdir(parents=True, exist_ok=True)
+            group_fd = _open_dir(group_slug, root_fd, group_slug, create=True)
+            try:
+                os.close(_open_dir(household_slug, group_fd, folder.key, create=True))
+            finally:
+                os.close(group_fd)
+        except _UnsafeFolder as e:
+            _log_unsafe(e)  # still the household's: the scan skips it
         except OSError as e:
             _state.log_once(f"mkdir:{folder.key}", f"Couldn't create the recipe card inbox folder {folder.key}: {e}")
             continue
@@ -171,35 +315,49 @@ def household_folders(session: Session, root: Path) -> list[HouseholdFolder]:
     return folders
 
 
-def _log_unknown_folders(root: Path, folders: list[HouseholdFolder]) -> None:
+def _log_unsafe(error: _UnsafeFolder) -> None:
+    _state.log_once(
+        f"unsafe:{error.label}",
+        f"The recipe card inbox folder {_display_name(error.label)} is a symbolic link or not a folder: it's skipped",
+    )
+
+
+def _log_unknown_folders(root_fd: int, folders: list[HouseholdFolder]) -> None:
     known: dict[str, set[str]] = {}
     for folder in folders:
         known.setdefault(folder.group_slug, set()).add(folder.household_slug)
 
     try:
-        groups = list(os.scandir(root))
+        groups = os.listdir(root_fd)
     except OSError:
         return
-    for group_entry in groups:
-        if _ignored_name(group_entry.name):
+    for group_name in groups:
+        if _ignored_name(group_name):
             continue
-        if group_entry.name not in known:
+        if group_name not in known:
             _state.log_once(
-                f"unknown:{group_entry.name}",
-                f"The recipe card inbox has an entry that isn't a group's folder: {group_entry.name} (ignored)",
+                f"unknown:{group_name}",
+                "The recipe card inbox has an entry that isn't a group's folder: "
+                f"{_display_name(group_name)} (ignored)",
             )
             continue
         try:
-            households = list(os.scandir(group_entry.path))
+            group_fd = _open_dir(group_name, root_fd, group_name)
         except OSError:
             continue
-        for household_entry in households:
-            if _ignored_name(household_entry.name) or household_entry.name in known[group_entry.name]:
+        try:
+            households = os.listdir(group_fd)
+        except OSError:
+            continue
+        finally:
+            os.close(group_fd)
+        for household_name in households:
+            if _ignored_name(household_name) or household_name in known[group_name]:
                 continue
             _state.log_once(
-                f"unknown:{group_entry.name}/{household_entry.name}",
+                f"unknown:{group_name}/{household_name}",
                 "The recipe card inbox has an entry that isn't a household's folder: "
-                f"{group_entry.name}/{household_entry.name} (ignored)",
+                f"{group_name}/{_display_name(household_name)} (ignored)",
             )
 
 
@@ -213,16 +371,26 @@ def _ignored_name(name: str) -> bool:
     )
 
 
-def _page_entries(directory: str) -> list[os.DirEntry]:
-    """A card folder's files that aren't ignored by name, sorted by name"""
-    with os.scandir(directory) as entries:
-        return sorted((entry for entry in entries if not _ignored_name(entry.name)), key=lambda entry: entry.name)
+def _page_entries(dir_fd: int) -> list[tuple[str, os.stat_result]]:
+    """A card folder's pages: its regular files by `lstat` (not subfolders or links) not ignored by name, by name"""
+    pages = []
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            if _ignored_name(entry.name):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                pages.append((entry.name, st))
+    return sorted(pages, key=lambda page: page[0])
 
 
-def _signature(entry: os.DirEntry) -> tuple | None:
+def _signature(entry: os.DirEntry, dir_fd: int) -> tuple | None:
     """
     What has to stay the same between two scans for an entry to count as settled, with its newest mtime; None when the
-    entry isn't a card (not a regular file or directory by `lstat`, or an empty folder)
+    entry isn't a card (not a regular file or directory by `lstat`, or a folder without pages)
     """
     st = entry.stat(follow_symlinks=False)
     if stat.S_ISREG(st.st_mode):
@@ -230,27 +398,28 @@ def _signature(entry: os.DirEntry) -> tuple | None:
     if not stat.S_ISDIR(st.st_mode):
         return None
 
-    files = []
-    for page in _page_entries(entry.path):
-        page_st = page.stat(follow_symlinks=False)
-        if stat.S_ISREG(page_st.st_mode):
-            files.append((page.name, page_st.st_size, page_st.st_mtime_ns))
+    card_fd = _open_dir(entry.name, dir_fd, entry.name)
+    try:
+        files = [(name, page.st_size, page.st_mtime_ns) for name, page in _page_entries(card_fd)]
+    finally:
+        os.close(card_fd)
     return tuple(files) or None
 
 
-def _settled_entries(folder: HouseholdFolder, now: float) -> list[str]:
+def _settled_entries(dirs: _FolderDirs, now: float) -> list[str]:
     """The folder's new cards that have settled since this process's previous scan, oldest first"""
+    folder = dirs.folder
     current: dict[str, tuple] = {}
     newest: dict[str, int] = {}
     try:
-        with os.scandir(folder.path) as entries:
+        with os.scandir(dirs.fd) as entries:
             for entry in entries:
                 if _ignored_name(entry.name):
                     continue
                 try:
-                    signature = _signature(entry)
+                    signature = _signature(entry, dirs.fd)
                 except OSError:
-                    continue  # gone, or unreadable
+                    continue  # gone, unreadable, or swapped for a link
                 if signature is None:
                     continue
                 current[entry.name] = signature
@@ -259,10 +428,9 @@ def _settled_entries(folder: HouseholdFolder, now: float) -> list[str]:
         _state.log_once(f"scan:{folder.key}", f"Couldn't read the recipe card inbox folder {folder.key}: {e}")
         return []
 
-    key = str(folder.path)
     with _state.lock:
-        previous = _state.seen.get(key, {})
-        _state.seen[key] = current
+        previous = _state.seen.get(folder.key, {})
+        _state.seen[folder.key] = current
 
     settle_ns = limits.INBOX_SETTLE * 1_000_000_000
     now_ns = int(now * 1_000_000_000)
@@ -280,10 +448,10 @@ def _settled_entries(folder: HouseholdFolder, now: float) -> list[str]:
 
 def _claim_name(claim_ms: int, name: str) -> str:
     prefix = f"{claim_ms}__{uuid4().hex}__"
-    room = NAME_MAX_BYTES - len(prefix.encode())
-    encoded = name.encode()
+    room = NAME_MAX_BYTES - len(prefix)
+    encoded = os.fsencode(name)  # a name that isn't UTF-8 keeps its bytes
     if len(encoded) > room:
-        name = encoded[:room].decode(errors="ignore")
+        name = os.fsdecode(encoded[:room])
     return prefix + name
 
 
@@ -291,16 +459,14 @@ def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
-def claim(folder: HouseholdFolder, name: str) -> Path | None:
+def claim(dirs: _FolderDirs, name: str) -> str | None:
     """
-    Takes `<folder>/<name>` by renaming it into `.mealie-claimed/`; None when another scanner got there first (or it's
-    gone). The rename stays on the share's filesystem.
+    Takes the folder's entry `name` by renaming it into `.mealie-claimed/`: its name there, or None when another
+    scanner got there first (or it's gone). The rename stays on the share's filesystem.
     """
-    claim_dir = folder.path / CLAIM_DIR
-    claim_dir.mkdir(exist_ok=True)
-    claimed = claim_dir / _claim_name(_now_ms(), name)
+    claimed = _claim_name(_now_ms(), name)
     try:
-        os.rename(folder.path / name, claimed)
+        os.rename(name, claimed, src_dir_fd=dirs.fd, dst_dir_fd=dirs.claim_dir())
     except FileNotFoundError:
         return None
     return claimed
@@ -313,20 +479,18 @@ def _parse_claim(claimed_name: str) -> tuple[int, str] | None:
     return int(match.group("ms")), match.group("name")
 
 
-def stale_claims(folder: HouseholdFolder, now_ms: int) -> list[str]:
+def stale_claims(dirs: _FolderDirs, now_ms: int) -> list[str]:
     """Claims older than `INBOX_CLAIM_RETRY` by the time in their names (never by mtime), oldest first"""
-    claim_dir = folder.path / CLAIM_DIR
-    try:
-        names = os.listdir(claim_dir)
-    except FileNotFoundError:
+    claim_dir = dirs.existing_claim_dir()
+    if claim_dir is None:
         return []
     stale = []
-    for claimed_name in names:
+    for claimed_name in os.listdir(claim_dir):
         parsed = _parse_claim(claimed_name)
         if parsed is None:
             _state.log_once(
-                f"claim:{folder.key}/{claimed_name}",
-                f"An entry in the recipe card inbox's claim folder of {folder.key} isn't a claim (ignored)",
+                f"claim:{dirs.folder.key}/{claimed_name}",
+                f"An entry in the recipe card inbox's claim folder of {dirs.folder.key} isn't a claim (ignored)",
             )
             continue
         if now_ms - parsed[0] > limits.INBOX_CLAIM_RETRY * 1000:
@@ -334,15 +498,15 @@ def stale_claims(folder: HouseholdFolder, now_ms: int) -> list[str]:
     return [claimed_name for _, claimed_name in sorted(stale)]
 
 
-def reclaim(folder: HouseholdFolder, claimed_name: str) -> Path | None:
+def reclaim(dirs: _FolderDirs, claimed_name: str) -> str | None:
     """Claims a stale claim again under a fresh claim time, so only one process retries it; None if one already did"""
     parsed = _parse_claim(claimed_name)
     if parsed is None:
         return None
-    claim_dir = folder.path / CLAIM_DIR
-    fresh = claim_dir / _claim_name(_now_ms(), parsed[1])
+    claim_dir = dirs.claim_dir()
+    fresh = _claim_name(_now_ms(), parsed[1])
     try:
-        os.rename(claim_dir / claimed_name, fresh)
+        os.rename(claimed_name, fresh, src_dir_fd=claim_dir, dst_dir_fd=claim_dir)
     except FileNotFoundError:
         return None
     return fresh
@@ -364,17 +528,14 @@ def _fd_path(fd: int) -> str | None:
         return None
 
 
-_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-
-
-def open_page(path: Path, root: Path) -> BinaryIO:
+def open_page(path: str | Path, root: Path, *, dir_fd: int | None = None) -> BinaryIO:
     """
-    Opens a claimed page once: with `O_NOFOLLOW` (a symlink fails), `O_NONBLOCK` (a FIFO can't hang the scan), then
-    `fstat` must show a regular file whose real path is inside the inbox root. Raises `_Refused` otherwise, and
-    `FileNotFoundError` when it's gone.
+    Opens a claimed page once (`path` relative to `dir_fd` when given): with `O_NOFOLLOW` (a symlink fails),
+    `O_NONBLOCK` (a FIFO can't hang the scan), then `fstat` must show a regular file whose real path is inside the
+    inbox root. Raises `_Refused` otherwise, and `FileNotFoundError` when it's gone.
     """
     try:
-        fd = os.open(path, _OPEN_FLAGS)
+        fd = os.open(path, _OPEN_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
         raise
     except OSError as e:
@@ -385,8 +546,9 @@ def open_page(path: Path, root: Path) -> BinaryIO:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _Refused("not a regular file")
-        real = _fd_path(fd) or os.path.realpath(path)
-        if not _within(real, os.path.realpath(root)):
+        # without /proc, a page opened through the descriptors is inside the root by how they were opened
+        real = _fd_path(fd) or (os.path.realpath(path) if dir_fd is None else None)
+        if real is not None and not _within(real, os.path.realpath(root)):
             raise _Refused("outside the inbox folder")
         os.set_blocking(fd, True)
         return os.fdopen(fd, "rb")
@@ -395,26 +557,38 @@ def open_page(path: Path, root: Path) -> BinaryIO:
         raise
 
 
-def _open_card(claimed: Path, root: Path) -> list[tuple[BinaryIO, str]]:
-    """The claimed entry's pages, opened: the file itself, or a folder's files in name order"""
-    st = claimed.lstat()
+def _open_card(dirs: _FolderDirs, claimed: str, root: Path) -> list[tuple[BinaryIO, str]]:
+    """
+    The claimed entry's pages, opened: the file itself, or a folder's regular files in name order, refused with
+    `too_many_pages` before any is opened when there are more than a card can have
+    """
+    claim_dir = dirs.claim_dir()
+    st = os.stat(claimed, dir_fd=claim_dir, follow_symlinks=False)
     if stat.S_ISREG(st.st_mode):
-        return [(open_page(claimed, root), "")]
+        return [(open_page(claimed, root, dir_fd=claim_dir), "")]
     if not stat.S_ISDIR(st.st_mode):
         raise _Refused("not a regular file or folder")
 
+    try:
+        card_fd = _open_dir(claimed, claim_dir, claimed)
+    except _UnsafeFolder as e:
+        raise _Refused("not a regular file or folder") from e  # swapped for a link since
+
     opened: list[tuple[BinaryIO, str]] = []
     try:
-        if not _within(os.path.realpath(claimed), os.path.realpath(root)):
-            raise _Refused("outside the inbox folder")
-        for entry in _page_entries(str(claimed)):
-            opened.append((open_page(Path(entry.path), root), entry.name))
-        if not opened:
+        pages = _page_entries(card_fd)
+        if not pages:
             raise _Refused("the folder is empty")
+        if len(pages) > limits.MAX_PAGES_PER_CARD:
+            raise _Refused("too many pages", IngestRejectReason.too_many_pages)
+        for name, _ in pages:
+            opened.append((open_page(name, root, dir_fd=card_fd), name))
     except BaseException:
         for file, _ in opened:
             file.close()
         raise
+    finally:
+        os.close(card_fd)
     return opened
 
 
@@ -422,43 +596,73 @@ def _open_card(claimed: Path, root: Path) -> list[tuple[BinaryIO, str]]:
 # Moving claimed entries on
 
 
-def _unique_target(directory: Path, name: str) -> Path:
-    target = directory / name
-    if not os.path.lexists(target):
-        return target
+def _unique_name(dir_fd: int, name: str, *, with_note: bool = False) -> str:
+    """`name`, or a unique variant of it when the directory has that name already (or, `with_note`, its note's)"""
+
+    def taken(candidate: str) -> bool:
+        return _lexists(candidate, dir_fd) or (with_note and _lexists(candidate + ERROR_SUFFIX, dir_fd))
+
+    if not taken(name):
+        return name
     stem, dot, suffix = name.rpartition(".")
     if not dot or not stem:
         stem, suffix = name, ""
     else:
         suffix = "." + suffix
-    return directory / f"{stem}-{_now_ms()}-{uuid4().hex[:8]}{suffix}"
+    return f"{stem}-{_now_ms()}-{uuid4().hex[:8]}{suffix}"
 
 
-def _remove(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
+def _remove(dir_fd: int, name: str) -> None:
+    if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+        shutil.rmtree(name, dir_fd=dir_fd)
     else:
-        path.unlink()
+        os.unlink(name, dir_fd=dir_fd)
 
 
-def finish(folder: HouseholdFolder, claimed: Path, name: str) -> None:
+def finish(dirs: _FolderDirs, claimed: str, name: str) -> None:
     """A card that's in Mealie: to `processed/YYYY-MM/` under a unique name, or deleted when nothing is kept"""
     if not get_ingest_settings().INBOX_KEEP_PROCESSED:
-        _remove(claimed)
+        _remove(dirs.claim_dir(), claimed)
         return
-    month = folder.path / PROCESSED_DIR / datetime.now(UTC).strftime("%Y-%m")
-    month.mkdir(parents=True, exist_ok=True)
-    os.rename(claimed, _unique_target(month, name))
+    processed = dirs.subfolder(PROCESSED_DIR)
+    month_name = datetime.now(UTC).strftime("%Y-%m")
+    try:
+        month = _open_dir(month_name, processed, f"{dirs.folder.key}/{PROCESSED_DIR}/{month_name}", create=True)
+    finally:
+        os.close(processed)
+    try:
+        os.rename(claimed, _unique_name(month, name), src_dir_fd=dirs.claim_dir(), dst_dir_fd=month)
+    finally:
+        os.close(month)
 
 
-def fail(folder: HouseholdFolder, claimed: Path, name: str, reason: str) -> None:
-    """A card that can't be added: to `failed/` with `<name>.error.txt` saying why"""
-    failed = folder.path / FAILED_DIR
-    failed.mkdir(exist_ok=True)
-    target = _unique_target(failed, name)
-    os.rename(claimed, target)
-    note = target.with_name(target.name + ERROR_SUFFIX)
-    note.write_text(f"{reason}\n", encoding="utf-8")
+def fail(dirs: _FolderDirs, claimed: str, name: str, reason: str) -> None:
+    """
+    A card that can't be added: to `failed/` with `<name>.error.txt` saying why. The note is a new file under a name
+    nothing in `failed/` has yet, never written through a link or over anything there.
+    """
+    failed = dirs.subfolder(FAILED_DIR)
+    try:
+        target = _unique_name(failed, name, with_note=True)
+        os.rename(claimed, target, src_dir_fd=dirs.claim_dir(), dst_dir_fd=failed)
+        try:
+            fd = os.open(target + ERROR_SUFFIX, _NOTE_FLAGS, 0o666, dir_fd=failed)
+        except OSError as e:
+            # planted since the name was chosen: the card is in failed/ all the same
+            _state.log_once(
+                f"note:{dirs.folder.key}/{target}",
+                f"Couldn't write the note of {_display_name(target)} in the recipe card inbox of {dirs.folder.key}: "
+                f"{e}",
+            )
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as note:
+            note.write(f"{reason}\n")
+    finally:
+        os.close(failed)
+
+
+def _rejection(reason: IngestRejectReason) -> str:
+    return f"Not added ({reason.value}): {REJECTION_TEXT[reason]}"
 
 
 # ==================================================================================================================
@@ -498,24 +702,28 @@ def _gate(session: Session, folder: HouseholdFolder, gates: dict[UUID, _GroupGat
 
 
 def _ingest_claimed(
-    session: Session, root: Path, folder: HouseholdFolder, claimed: Path, *, local_only: bool, recovered: bool
+    session: Session, root: Path, dirs: _FolderDirs, claimed: str, *, local_only: bool, recovered: bool
 ) -> bool:
     """Intake for one claimed entry, then where it goes; whether a job was created"""
-    parsed = _parse_claim(claimed.name)
-    name = parsed[1] if parsed else claimed.name
+    folder = dirs.folder
+    parsed = _parse_claim(claimed)
+    name = parsed[1] if parsed else claimed
 
     try:
-        pages = _open_card(claimed, root)
+        pages = _open_card(dirs, claimed, root)
     except FileNotFoundError:
         return False  # another scanner retried it
     except _Refused as e:
-        fail(folder, claimed, name, f"Not added: {e}.")
+        fail(dirs, claimed, name, _rejection(e.reason) if e.reason else f"Not added: {e}.")
         return False
 
     try:
         card = IntakeCard(
-            pages=[IntakePage(file, page_name or name, index) for index, (file, page_name) in enumerate(pages)],
-            source_name=source_name(f"inbox/{folder.key}", name),
+            pages=[
+                IntakePage(file, _display_name(page_name or name), index)
+                for index, (file, page_name) in enumerate(pages)
+            ],
+            source_name=source_name(f"inbox/{folder.key}", _display_name(name)),
         )
         options = IntakeOptions(
             source=IngestSource.inbox,
@@ -526,7 +734,7 @@ def _ingest_claimed(
 
         def still_claimed() -> bool:
             # a retry by another scanner would have renamed it
-            return os.path.lexists(claimed)
+            return _lexists(claimed, dirs.claim_dir())
 
         outcome = IntakeService(session, folder.group_id, folder.household_id).ingest(
             card, options, confirm=still_claimed
@@ -540,7 +748,7 @@ def _ingest_claimed(
     if isinstance(outcome, IntakeAccepted):
         logger.info(f"Recipe card job {outcome.job_id} from the inbox of {folder.key}")
         try:
-            finish(folder, claimed, name)
+            finish(dirs, claimed, name)
         except OSError:
             # the job exists: when the claim is retried, the content hash finds it and the file is just moved
             logger.exception(f"Couldn't move an ingested file out of the inbox claim folder of {folder.key}")
@@ -549,13 +757,13 @@ def _ingest_claimed(
     assert isinstance(outcome, IntakeRejected)
     if outcome.reason == IngestRejectReason.duplicate and recovered:
         # a retried claim whose card was inserted before a crash: the job exists, so the file is just moved
-        finish(folder, claimed, name)
+        finish(dirs, claimed, name)
         return False
 
-    reason = f"Not added ({outcome.reason.value}): {REJECTION_TEXT[outcome.reason]}"
+    reason = _rejection(outcome.reason)
     if outcome.duplicate_of:
         reason += f" Recipe card job {outcome.duplicate_of}."
-    fail(folder, claimed, name, reason)
+    fail(dirs, claimed, name, reason)
     return False
 
 
@@ -570,12 +778,16 @@ class _FolderScan:
 
 
 def _scan_folder(
-    session: Session, root: Path, folder: HouseholdFolder, gates: dict[UUID, _GroupGate], budget: int
+    session: Session, root: Path, dirs: _FolderDirs, gates: dict[UUID, _GroupGate], budget: int
 ) -> _FolderScan:
-    """Retries the folder's stale claims, then takes its settled cards"""
+    """
+    Retries the folder's stale claims, then takes its settled cards. An entry that can't be claimed or ingested is
+    skipped (its claim, if any, is retried later); a reserved folder found to be a link stops the folder.
+    """
+    folder = dirs.folder
     result = _FolderScan()
-    work: list[tuple[str, str]] = [("stale", claimed_name) for claimed_name in stale_claims(folder, _now_ms())]
-    work += [("new", name) for name in _settled_entries(folder, time.time())]
+    work: list[tuple[str, str]] = [("stale", claimed_name) for claimed_name in stale_claims(dirs, _now_ms())]
+    work += [("new", name) for name in _settled_entries(dirs, time.time())]
 
     for kind, name in work:
         if result.claims >= budget:
@@ -587,7 +799,17 @@ def _scan_folder(
         if not gate.open:
             break
 
-        claimed = reclaim(folder, name) if kind == "stale" else claim(folder, name)
+        try:
+            claimed = reclaim(dirs, name) if kind == "stale" else claim(dirs, name)
+        except _UnsafeFolder:
+            raise
+        except OSError as e:
+            # permissions, a name too long for a claim: the next entry is still taken
+            _state.log_once(
+                f"claim:{folder.key}/{name}",
+                f"Couldn't take {_display_name(name)} from the recipe card inbox of {folder.key}: {e}",
+            )
+            continue
         if claimed is None:
             continue
         result.claims += 1
@@ -595,7 +817,7 @@ def _scan_folder(
             if _ingest_claimed(
                 session,
                 root,
-                folder,
+                dirs,
                 claimed,
                 local_only=gate.readiness.group_local_only,
                 recovered=kind == "stale",
@@ -605,6 +827,8 @@ def _scan_folder(
         except IngestPaused:
             result.paused = True  # the claim stays; it's retried after INBOX_CLAIM_RETRY
             break
+        except _UnsafeFolder:
+            raise  # failed/ or processed/ was swapped for a link: the claim stays
         except Exception:
             # the claim stays and is retried later; the scan goes on with the next card
             logger.exception(f"Couldn't take a recipe card from the inbox of {folder.key}")
@@ -616,22 +840,43 @@ def scan_once() -> int:
     root = inbox_root()
     if root is None or not get_ingest_settings().ENABLED or storage.is_paused():
         return 0
-    if not root.is_dir():
+    if not _SUPPORTED:
+        _state.log_once("unsupported", "The recipe card inbox needs Linux or macOS; it's off on this system")
+        return 0
+    try:
+        root_fd = os.open(root, _ROOT_FLAGS)
+    except OSError:
         _state.log_once("root", f"The recipe card inbox {root} doesn't exist or isn't a folder")
         return 0
 
     created = 0
     budget = limits.INBOX_FILES_PER_TICK
-    with session_context() as session:
-        folders = household_folders(session, root)
-        _log_unknown_folders(root, folders)
-        gates: dict[UUID, _GroupGate] = {}
-        for folder in folders:
-            if budget <= 0:
-                break
-            scanned = _scan_folder(session, root, folder, gates, budget)
-            budget -= scanned.claims
-            created += scanned.created
-            if scanned.paused:
-                break
+    try:
+        with session_context() as session:
+            folders = household_folders(session, root_fd)
+            _log_unknown_folders(root_fd, folders)
+            gates: dict[UUID, _GroupGate] = {}
+            for folder in folders:
+                if budget <= 0:
+                    break
+                try:
+                    with _open_folder(root_fd, folder) as dirs:
+                        scanned = _scan_folder(session, root, dirs, gates, budget)
+                except _UnsafeFolder as e:
+                    _log_unsafe(e)
+                    continue
+                except Exception:
+                    # one folder's trouble never stops the others; logged when it starts
+                    if session.in_transaction():
+                        session.rollback()
+                    if _state.first(f"failing:{folder.key}"):
+                        logger.exception(f"Couldn't scan the recipe card inbox folder {folder.key}; it's retried")
+                    continue
+                _state.forget(f"failing:{folder.key}")
+                budget -= scanned.claims
+                created += scanned.created
+                if scanned.paused:
+                    break
+    finally:
+        os.close(root_fd)
     return created

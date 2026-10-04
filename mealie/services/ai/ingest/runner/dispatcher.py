@@ -25,7 +25,8 @@ call. A task past `TASK_DEADLINE` is cancelled (`timeout`); one stuck in synchro
 returns, and is logged.
 
 **Shutdown** (the lifespan's exit): stop claiming, cancel the running tasks, wait up to `SHUTDOWN_GRACE`, then release
-every lease still held (`queued`, `attempts - 1`, so deploys don't use up retries).
+every lease still held (`queued`, `attempts - 1`, so deploys don't use up retries). A claim still in flight when the
+loop is cancelled is waited for within that grace, so the tasks it took are released too.
 
 Every time stored or compared is `utcnow()` from Python: never the database's own clock (§3.2).
 """
@@ -187,10 +188,10 @@ class _RunningTask:
                     self._reason = reason
             if self._sent == self._reason:
                 return False
-            self._sent = self._reason
             loop, task = self._loop, self._task
-        if loop is None or task is None:
-            return True  # delivered by `attach`
+            if loop is None or task is None:
+                return True  # its loop isn't running yet: `attach` delivers it, so it isn't marked sent
+            self._sent = self._reason
         try:
             loop.call_soon_threadsafe(task.cancel)
         except RuntimeError:
@@ -210,6 +211,7 @@ class IngestDispatcher:
         self._wake_event: asyncio.Event | None = None
         self._limiter: anyio.CapacityLimiter | None = None
         self._runner: asyncio.Task[None] | None = None
+        self._claiming: asyncio.Task[None] | None = None
         self._stopping = False
         self._paused = False
         self._last_paused_at: float | None = None
@@ -304,7 +306,10 @@ class IngestDispatcher:
         )
 
     async def stop(self) -> None:
-        """Stops claiming, cancels this process's tasks, waits `SHUTDOWN_GRACE`, then releases their leases"""
+        """
+        Stops claiming (waiting for a claim in flight), cancels this process's tasks, waits up to `SHUTDOWN_GRACE` in
+        all, then releases their leases
+        """
         self._bind_loop()
         self._stopping = True
         self.wake()
@@ -317,12 +322,14 @@ class IngestDispatcher:
                 await asyncio.gather(runner, return_exceptions=True)
             except Exception as e:
                 logger.error(f"The recipe card dispatcher's loop failed:\n{safe_trace(e)}")
+        grace_ends = time.monotonic() + limits.SHUTDOWN_GRACE
+        await self._finish_claiming(limits.SHUTDOWN_GRACE)
 
         handles = list(self._tasks.values())
         for handle in handles:
             if not handle.done.is_set():
                 handle.cancel(CancelReason.shutdown)
-        if not await self.drain(limits.SHUTDOWN_GRACE):
+        if not await self.drain(max(grace_ends - time.monotonic(), 0.0)):
             stuck = [str(handle.job_id) for handle in handles if not handle.done.is_set()]
             logger.warning(f"Recipe card tasks still running at shutdown, their leases are released: {stuck}")
 
@@ -354,6 +361,7 @@ class IngestDispatcher:
         self._loop = loop
         self._wake_event = asyncio.Event()
         self._limiter = anyio.CapacityLimiter(limits.DISPATCHER_DB_THREADS)
+        self._claiming = None
         for state in self._phases.values():
             state.task = None
 
@@ -492,6 +500,19 @@ class IngestDispatcher:
         if general <= 0 and reread <= 0:
             return
 
+        # A task of its own that shutdown waits for (`_finish_claiming`): cancelling the loop mid-claim would leave
+        # the claims already committed without their threads, so neither run nor released
+        claiming = asyncio.get_running_loop().create_task(
+            self._claim_and_start(general, reread), name="ai-ingest-claim"
+        )
+        self._claiming = claiming
+        try:
+            await asyncio.shield(claiming)
+        finally:
+            if claiming.done():
+                self._claiming = None
+
+    async def _claim_and_start(self, general: int, reread: int) -> None:
         owner = self.owner
         batch: ClaimBatch = await self._call(
             _with_session,
@@ -502,6 +523,22 @@ class IngestDispatcher:
             self._start(claim)
         if batch.error is not None:
             raise batch.error
+
+    async def _finish_claiming(self, timeout: float) -> None:
+        """
+        Shutdown: waits up to `timeout` for a claim that was in flight when the loop was cancelled, so its tasks are
+        started, then stopped and released with the others
+        """
+        claiming, self._claiming = self._claiming, None
+        if claiming is None:
+            return
+        await asyncio.wait({claiming}, timeout=timeout)
+        if not claiming.done():
+            logger.warning(
+                "A recipe card claim was still running at shutdown; its tasks wait for their leases to expire"
+            )
+        elif not claiming.cancelled() and (error := claiming.exception()) is not None:
+            logger.error(f"Recipe card dispatcher: the {Phase.claim.value} failed at shutdown:\n{safe_trace(error)}")
 
     async def _housekeeping(self) -> None:
         from .. import events  # imported here: stage B modules import the dispatcher (`wake`)

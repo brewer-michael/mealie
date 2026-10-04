@@ -36,8 +36,8 @@ repository factory stays untouched.
   - `.settings` (group-scoped): `get` (defaults when there's no row), `upsert`;
   - `.notifier_options`: `get`, `set` (for the household's notifiers), `enabled_notifier_ids`;
   - `processing_jobs_in_group()`, for the per-group quota.
-- `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids`, `claim`, `heartbeat`,
-  `set_progress`, `expired`, `requeue_expired`, `release`, `update_job_json`.
+- `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids`, `claim`, `holds`, `heartbeat`,
+  `set_progress`, `expired`, `requeue_expired`, `release`, `cancel_requeued`, `update_job_json`.
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -275,34 +275,43 @@ def enqueue_task(
     return queued
 
 
+def _cancel_queued(session: Session, conditions: Sequence[sa.ColumnElement[bool]]) -> bool:
+    """
+    Clears the queued task of the job matching `conditions`: a `processing` job becomes `failed` with `cancelled`, a
+    `ready` job stays ready. Whether it did; the caller ends the transaction.
+    """
+    queued = [*conditions, Job.task_state == IngestTaskState.queued.value]
+    failed = sa.update(Job).where(*queued, Job.status == IngestStatus.processing.value)
+    failed = failed.values(
+        **_versioned(
+            {
+                **TASK_CLEARED,
+                "status": IngestStatus.failed.value,
+                "error_code": IngestErrorCode.cancelled.value,
+                "error_params": None,
+            }
+        )
+    )
+    if _execute_update(session, failed) == 1:
+        return True
+
+    cleared = sa.update(Job).where(*queued, Job.status != IngestStatus.processing.value)
+    return _execute_update(session, cleared.values(**TASK_CLEARED)) == 1
+
+
 def cancel_task(session: Session, job_id: UUID, *, household_id: UUID | None = None) -> CancelOutcome:
     """
     Cancels a job's task (§3.5). A queued task is cleared at once: a `processing` job becomes `failed` with
     `cancelled`, a `ready` job stays ready. A running task gets `cancel_requested`, and the dispatcher stops it within
-    a heartbeat. Commits.
+    a heartbeat; if it's given back to the queue first, it's never claimed again (`IngestQueue.cancel_requeued`).
+    Commits.
     """
     scope = [Job.id == job_id]
     if household_id is not None:
         scope.append(Job.household_id == household_id)
-    queued = Job.task_state == IngestTaskState.queued.value
 
     try:
-        failed = sa.update(Job).where(*scope, queued, Job.status == IngestStatus.processing.value)
-        failed = failed.values(
-            **_versioned(
-                {
-                    **TASK_CLEARED,
-                    "status": IngestStatus.failed.value,
-                    "error_code": IngestErrorCode.cancelled.value,
-                    "error_params": None,
-                }
-            )
-        )
-        if _execute_update(session, failed) == 1:
-            return CancelOutcome.cancelled
-
-        cleared = sa.update(Job).where(*scope, queued, Job.status != IngestStatus.processing.value)
-        if _execute_update(session, cleared.values(**TASK_CLEARED)) == 1:
+        if _cancel_queued(session, scope):
             return CancelOutcome.cancelled
 
         running = sa.update(Job).where(*scope, Job.task_state == IngestTaskState.running.value)
@@ -741,6 +750,19 @@ class IngestQueue:
         stmt = sa.select(Job).where(Job.id == job_id).execution_options(**_FRESH)
         return self.session.execute(stmt).scalars().one_or_none()
 
+    @staticmethod
+    def _claimable(now: datetime) -> list[sa.ColumnElement[bool]]:
+        """
+        A queued task that can run now. Not one the reviewer asked to cancel while it ran: a rate limit, a pause,
+        shutdown or the sweep can give it back to the queue before a heartbeat stopped it, and it's then ended
+        (`cancel_requeued`) instead of being run again.
+        """
+        return [
+            Job.task_state == IngestTaskState.queued.value,
+            sa.or_(Job.not_before.is_(None), Job.not_before <= now),
+            Job.cancel_requested.is_(False),
+        ]
+
     def queued_ids(self, now: datetime, limit: int, *, max_priority: int | None = None) -> list[UUID]:
         """
         Jobs whose task can run now, by priority then age. `max_priority` limits it to the more urgent tasks (e.g.
@@ -748,10 +770,7 @@ class IngestQueue:
         """
         if limit <= 0:
             return []
-        conditions = [
-            Job.task_state == IngestTaskState.queued.value,
-            sa.or_(Job.not_before.is_(None), Job.not_before <= now),
-        ]
+        conditions = self._claimable(now)
         if max_priority is not None:
             conditions.append(Job.task_priority <= max_priority)
         stmt = sa.select(Job.id).where(*conditions).order_by(Job.task_priority, Job.created_at, Job.id).limit(limit)
@@ -763,11 +782,7 @@ class IngestQueue:
         """Takes a queued task with a new lease token; whether this caller won it"""
         stmt = (
             sa.update(Job)
-            .where(
-                Job.id == job_id,
-                Job.task_state == IngestTaskState.queued.value,
-                sa.or_(Job.not_before.is_(None), Job.not_before <= now),
-            )
+            .where(Job.id == job_id, *self._claimable(now))
             .values(
                 task_state=IngestTaskState.running.value,
                 lease_token=token,
@@ -780,6 +795,13 @@ class IngestQueue:
         claimed = _execute_update(self.session, stmt) == 1
         _end_transaction(self.session)
         return claimed
+
+    def holds(self, job_id: UUID, token: UUID) -> bool:
+        """Whether the task claimed with `token` still holds the job's lease (a check before costly work)"""
+        stmt = sa.select(Job.id).where(Job.id == job_id, *self.fence(token))
+        held = self.session.execute(stmt).scalar_one_or_none() is not None
+        _end_transaction(self.session)
+        return held
 
     def heartbeat(self, tokens: Iterable[UUID], now: datetime) -> dict[UUID, bool]:
         """
@@ -867,6 +889,27 @@ class IngestQueue:
         released = _execute_update(self.session, stmt) == 1
         _end_transaction(self.session)
         return released
+
+    def cancel_requeued(self) -> list[UUID]:
+        """
+        Ends the queued tasks the reviewer asked to cancel while they ran (§3.5), as cancelling a queued task does: a
+        `processing` job fails with `cancelled`, a `ready` one stays ready. `cancel_requested` survives a requeue (a
+        rate limit, a pause, shutdown, the sweep) that came before the heartbeat that would have stopped the task, and
+        such a task is never claimed again. Each is its own transaction, conditional on the request still standing.
+        Returns the jobs whose task it ended.
+        """
+        stmt = sa.select(Job.id).where(Job.task_state == IngestTaskState.queued.value, Job.cancel_requested.is_(True))
+        candidates = list(self.session.execute(stmt).scalars())
+        _end_transaction(self.session)
+
+        ended: list[UUID] = []
+        for job_id in candidates:
+            try:
+                if _cancel_queued(self.session, [Job.id == job_id, Job.cancel_requested.is_(True)]):
+                    ended.append(job_id)
+            finally:
+                _end_transaction(self.session)
+        return ended
 
     def update_job_json(
         self, job_id: UUID, mutate: JobMutation, *, where: Sequence[sa.ColumnElement[bool]] = ()

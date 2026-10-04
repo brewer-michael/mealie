@@ -27,6 +27,8 @@ _TEMPERATURE_RE = re.compile(
 )
 """`350°`, `350 °F`, `180°C`, `350 degrees F`, `350F`. A bare `C` after a number is cups ("12 C. flour")."""
 _LETTERS_RE = re.compile(r"[^\W\d_]+")
+LIST_MARKER_RE = re.compile(r"^[ \t]*\d{1,2}[.)][ \t]+", re.MULTILINE)
+"""A numbered list's marker at the start of a line ("2. Microwave…"): a step's number, not an amount"""
 
 
 def canonical_markers(text: str) -> str:
@@ -111,6 +113,14 @@ def number_set(text: str | None) -> set[Fraction]:
     return {part for number in find_numbers(text) for part in number.parts}
 
 
+def card_numbers(transcription: str | None) -> set[Fraction]:
+    """
+    The numbers on the card, as `number_set` of its transcription, but without the step numbers of a numbered list
+    ("2. Microwave…"): they aren't amounts, and counting them would let an invented "2" pass as on the card.
+    """
+    return number_set(LIST_MARKER_RE.sub("", transcription or ""))
+
+
 def format_number(value: Fraction) -> str:
     """A rational as a card writes it: `2`, `1/4`, `1 1/2`"""
     if value.denominator == 1:
@@ -126,6 +136,8 @@ class Temperature:
     unit: str | None
     """`F`, `C`, or None when the text only says degrees"""
     text: str
+    span: tuple[int, int] = (0, 0)
+    """Where it is in the text"""
 
 
 def find_temperatures(text: str | None) -> list[Temperature]:
@@ -133,12 +145,16 @@ def find_temperatures(text: str | None) -> list[Temperature]:
     found: list[Temperature] = []
     for match in _TEMPERATURE_RE.finditer(text or ""):
         unit = match.group("unit") or match.group("unit2") or match.group("unit3")
-        found.append(Temperature(int(match.group("value")), unit.upper() if unit else None, match.group(0).strip()))
+        found.append(
+            Temperature(int(match.group("value")), unit.upper() if unit else None, match.group(0).strip(), match.span())
+        )
     return found
 
 
 SalientToken = tuple[str, ...]
-"""A token the cross-read compares: `("number", "1/4")`, `("range", "2", "3")`, `("unit", "T")` or `("marker", "blank")`
+"""
+A token the cross-read compares: `("number", "1/4")`, `("range", "2", "3")`, `("unit", "tbsp")` or
+`("marker", "blank")`
 """
 
 
@@ -146,6 +162,8 @@ def salient_tokens(text: str | None) -> list[SalientToken]:
     """
     The tokens of a line that a second reading has to agree on (§4.5): numbers (as rationals; ranges kept whole;
     temperatures are their numbers), the case-sensitive shorthand units right after a number, and the markers.
+    A unit is compared by what it means (`shorthand.UNITS`): "C." and "c." are both cups and "t" and "tsp" both
+    teaspoons, while "T" and "t" stay apart.
     """
     text = text or ""
     tokens: list[SalientToken] = []
@@ -155,7 +173,7 @@ def salient_tokens(text: str | None) -> list[SalientToken]:
         else:
             tokens.append(("number", str(number.value)))
         if unit := _UNIT_AFTER_NUMBER_RE.match(text, number.span[1]):
-            tokens.append(("unit", unit.group("unit")))
+            tokens.append(("unit", UNITS[unit.group("unit")]))
     tokens.extend(("marker", marker) for marker in markers_in(text))
     return tokens
 

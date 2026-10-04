@@ -1,9 +1,14 @@
+import axios, { AxiosError, type AxiosRequestConfig } from "axios";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
   CARD_FLAG_KINDS,
+  COMMIT_WARNING_KINDS,
   INGEST_API_ERROR_CODES,
   INGEST_ERROR_CODES,
   INGEST_REJECT_REASONS,
+  commitWarningText,
   errorCodeOf,
   errorStatusOf,
   flagText,
@@ -113,7 +118,41 @@ describe("the recipe card API client", () => {
     expect(url).toBe("/api/ai/ingest");
     expect(body).toBeInstanceOf(FormData);
     expect(body.get("batchId")).toBe("new");
-    expect(config).toEqual({ onUploadProgress, signal: controller.signal, suppressAlert: true });
+    expect(config).toMatchObject({ onUploadProgress, signal: controller.signal, suppressAlert: true });
+    expect(config.transformResponse).toBeInstanceOf(Array);
+  });
+
+  test("a quiet request's error reaches the interceptor without its message, so nothing toasts it", async () => {
+    // an axios instance with the error branch of plugins/axios.ts, which toasts any detail.message
+    const instance = axios.create();
+    const toasted: string[] = [];
+    instance.interceptors.response.use(response => response, (error) => {
+      if (error?.response?.data?.detail?.message) {
+        toasted.push(error.response.data.detail.message);
+      }
+      return Promise.reject(error);
+    });
+    instance.defaults.adapter = (config) => {
+      const data = JSON.stringify({ detail: { code: "paused_for_restore", message: "Recipe cards are paused" } });
+      const response = { data, status: 503, statusText: "Service Unavailable", headers: {}, config, request: {} };
+      return Promise.reject(new AxiosError("Request failed", AxiosError.ERR_BAD_RESPONSE, config, {}, response));
+    };
+    const requests = {
+      post: (url: string, data: unknown, config?: AxiosRequestConfig) =>
+        instance.post(url, data, config).then(r => ({ data: r.data, error: null }), (e: unknown) => ({ data: null, error: e })),
+    };
+    const client = new RecipeIngestAPI(requests as unknown as ApiRequestInstance);
+
+    const quiet = await client.upload([new Blob(["x"])], {}, { suppressAlert: true });
+    const quietBatch = await client.createBatch({ suppressAlert: true });
+    expect(toasted).toEqual([]);
+    // the caller still reads the code
+    expect(errorCodeOf(quiet.error)).toBe("paused_for_restore");
+    expect(errorStatusOf(quiet.error)).toBe(503);
+    expect(errorCodeOf(quietBatch.error)).toBe("paused_for_restore");
+
+    await client.upload([new Blob(["x"])]);
+    expect(toasted).toEqual(["Recipe cards are paused"]);
   });
 
   test("routes match the API", async () => {
@@ -248,6 +287,36 @@ describe("text", () => {
       explanation: "\"ghee\" isn't one of your foods yet. It's added when you commit the card.",
       action: null,
     });
+  });
+
+  test("a new food is kept as text for a reviewer who can't add foods, whatever the flag says", () => {
+    const newFood = flag({ kind: "new_food", severity: "info", field: "ingredients", params: { name: "ghee" } });
+    expect(flagText(newFood, t, { canCreateFoods: false }).explanation).toBe(
+      "\"ghee\" isn't one of your foods, and you can't add foods, so it's kept in the note.",
+    );
+    expect(flagText(newFood, t, { canCreateFoods: true }).explanation).toContain("It's added when you commit the card.");
+  });
+
+  test("commit warnings name what was left out; an unknown kind has no text", () => {
+    for (const kind of COMMIT_WARNING_KINDS) {
+      expect(commitWarningText(`${kind}:Desserts`, t), kind).toContain("\"Desserts\"");
+    }
+    expect(commitWarningText("tag_dropped:Desserts", t)).toBe("The tag \"Desserts\" no longer exists, so it wasn't added.");
+    expect(commitWarningText("something_new:x", t)).toBeNull();
+  });
+
+  test("every recipe-ingest key the app's code names has an en-US text", () => {
+    const app = resolve(__dirname, "../..");
+    const sources = (readdirSync(app, { recursive: true }) as string[])
+      .filter(file => /\.(vue|ts)$/.test(file) && !/\.test\.ts$|lib[\\/]api[\\/]types/.test(file));
+    const keys = new Set<string>();
+    for (const file of sources) {
+      for (const match of readFileSync(join(app, file), "utf8").matchAll(/["'`](recipe-ingest\.[\w.-]+[\w-])["'`]/g)) {
+        keys.add(match[1]!);
+      }
+    }
+    expect(keys.size).toBeGreaterThan(100);
+    expect([...keys].filter(key => !i18n.global.te(key, "en-US"))).toEqual([]);
   });
 
   test("progress keys are translated whether full or bare", () => {
