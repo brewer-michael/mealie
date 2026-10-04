@@ -17,6 +17,7 @@ callers hold.
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -64,6 +65,7 @@ from mealie.schema.recipe_ingest import (
 )
 from mealie.schema.user.user import PrivateUser
 from mealie.services.ai.ingest import flag_rules, images, limits, storage
+from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
 
@@ -92,7 +94,7 @@ FORBIDDEN = "forbidden"
 UNKNOWN_PAGE = "unknown_page"
 """422: a re-read names a page the card doesn't have"""
 UNKNOWN_TARGET = "unknown_target"
-"""422: a re-read targets an ingredient or step the draft doesn't have"""
+"""422: a re-read targets an ingredient or step `ref` the draft doesn't have"""
 
 
 class JobActionError(Exception):
@@ -190,6 +192,10 @@ def _error(job: RecipeIngestionJob) -> RecipeIngestionJobError | None:
 def is_slimmed(job: RecipeIngestionJob) -> bool:
     """A committed job whose files and card text the retention purge has removed (§16)"""
     return job.status == IngestStatus.committed.value and job.draft is None and job.flags is None
+
+
+READABLE_STATUSES = frozenset({IngestStatus.processing.value, IngestStatus.ready.value, IngestStatus.failed.value})
+"""A job in these may still run a task (a first read, a retry, a re-read or re-extract), under the group's policy"""
 
 
 # ==========================================
@@ -332,6 +338,10 @@ class ReviewService:
         self.group_id: UUID = repos.group_id
         self.household_id: UUID = repos.household_id
 
+    @cached_property
+    def _group_local_only(self) -> bool:
+        return self.repos.settings.get().local_only
+
     # ==========================================
     # Reading
 
@@ -381,9 +391,17 @@ class ReviewService:
             "task": _task(job),
             "error": _error(job),
             "recipe": recipe,
-            "local_only": job.local_only,
+            "local_only": self._local_only(job),
+            "can_discard": self.can_discard(job),
             "created_at": job.created_at,
         }
+
+    def _local_only(self, job: RecipeIngestionJob) -> bool:
+        """
+        The policy the job's reads run under: its own `local_only`, or its group's setting as it is now, which the
+        worker applies to every task it runs (§10). A committed card isn't read again, so only its own counts.
+        """
+        return bool(job.local_only) or (job.status in READABLE_STATUSES and self._group_local_only)
 
     def list_jobs(
         self,
@@ -415,8 +433,16 @@ class ReviewService:
         return RecipeIngestionJobPermissions(
             can_create_foods=bool(self.user.can_organize),
             can_discard=self.can_discard(job),
-            can_export_eval=bool(self.user.can_manage),
+            can_export_eval=bool(self.user.can_manage) and self.exportable(job),
         )
+
+    @staticmethod
+    def exportable(job: RecipeIngestionJob) -> bool:
+        """
+        Whether the card can be saved as an eval case (§11.6): `ready` or `committed` with its draft and pages, which
+        a committed card loses to the retention purge. A page file gone missing is only found when exporting.
+        """
+        return job.status in EXPORTABLE_STATUSES and bool(job.draft) and bool(job.pages) and not is_slimmed(job)
 
     def can_discard(self, job: RecipeIngestionJob) -> bool:
         """§9: the uploader; anyone for inbox cards; otherwise the household's managers"""
@@ -600,6 +626,10 @@ class ReviewService:
 
     @staticmethod
     def _check_target(draft: CardDraft | None, request: RereadRequest) -> None:
+        """
+        An ingredient or step target names a line the draft has by its `ref`, or none for a new line (a line the
+        reading missed, or the first of an empty section): the review page adds the reading as one.
+        """
         target = request.target
         field = target.field.strip()
         if not field or len(field) > 64:
@@ -610,7 +640,7 @@ class ReviewService:
             refs = {str(i.reference_id) for i in draft.ingredients} if draft else set()
         elif field == "steps":
             refs = {str(s.id) for s in draft.steps} if draft else set()
-        if refs is not None and (target.ref is None or target.ref not in refs):
+        if refs is not None and target.ref is not None and target.ref not in refs:
             raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, UNKNOWN_TARGET)
 
     def reextract(self, job_id: UUID) -> RecipeIngestionJobState:

@@ -17,7 +17,16 @@
     <v-progress-linear v-if="!settingsLoaded && settingsLoading" class="mb-4" indeterminate />
 
     <v-alert
-      v-if="settingsLoaded && !canReadCards"
+      v-if="settingsLoaded && settings?.enabled === false"
+      class="ingest-disabled mb-6"
+      type="info"
+      variant="tonal"
+    >
+      {{ $t("recipe-ingest.error.ingest_disabled") }}
+    </v-alert>
+
+    <v-alert
+      v-else-if="settingsLoaded && !canReadCards"
       class="cannot-read mb-6"
       type="info"
       variant="tonal"
@@ -35,6 +44,16 @@
     </v-alert>
 
     <section v-else-if="canReadCards" class="capture mb-6">
+      <!-- uploads are still taken (the limit may reset first); a card read while it applies fails and can be retried -->
+      <v-alert
+        v-if="settings?.limitReached"
+        class="limit-reached mb-4"
+        type="warning"
+        variant="tonal"
+        density="compact"
+      >
+        {{ $t("recipe-ingest.capture.limit-reached") }}
+      </v-alert>
       <IngestPrivacyChip
         v-model:local-only="localOnly"
         class="mb-4"

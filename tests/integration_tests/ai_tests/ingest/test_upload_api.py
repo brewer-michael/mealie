@@ -469,6 +469,7 @@ def test_malformed_bodies_are_400(api_client: TestClient, reader: TestUser):
     )
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "invalid_body"
+    assert response.json()["detail"]["message"].startswith("The upload couldn't be read.")
 
     response = api_client.post(INGEST, json={"pictures": []}, headers=reader.token)
     assert response.json()["detail"]["code"] == "invalid_body"

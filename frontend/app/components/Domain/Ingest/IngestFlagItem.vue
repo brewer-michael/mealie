@@ -89,7 +89,7 @@
 
           <div class="d-flex flex-wrap ga-1 mt-2 ingest-flag-item__actions">
             <v-btn
-              v-if="canReread"
+              v-if="onField"
               size="small"
               variant="tonal"
               :prepend-icon="mdiCropFree"
@@ -167,11 +167,8 @@ const label = computed(() => fieldLabel((key, named) => i18n.t(key, named ?? {})
 const segments = computed(() => highlightSegments(props.item.text, props.item.fragment));
 const alternatives = computed(() => flagAlternatives(props.item.flag));
 const fillable = computed(() => canFillFlag(props.item.flag));
-/** Edit needs a place in the editor; Re-read also needs a line, since an ingredient or step re-read is for one */
+/** Edit and Re-read need a place in the editor; a re-read for an ingredient or step flag without a line adds one */
 const onField = computed(() => props.item.field !== "card");
-const canReread = computed(() =>
-  onField.value && !(["ingredients", "steps"].includes(props.item.field) && !props.item.flag.ref),
-);
 
 /** What the one-tap resolution stores: errors are kept as written, warnings dismissed as right */
 const resolution = computed<FlagResolution | null>(() => {

@@ -33,6 +33,20 @@ admin_users_password_reset_token = "/api/admin/users/password-reset-token"
 """`/api/admin/users/password-reset-token`"""
 admin_users_unlock = "/api/admin/users/unlock"
 """`/api/admin/users/unlock`"""
+ai_about = "/api/ai/about"
+"""`/api/ai/about`"""
+ai_ingest = "/api/ai/ingest"
+"""`/api/ai/ingest`"""
+ai_ingest_batches = "/api/ai/ingest/batches"
+"""`/api/ai/ingest/batches`"""
+ai_ingest_eval_cases = "/api/ai/ingest/eval-cases"
+"""`/api/ai/ingest/eval-cases`"""
+ai_ingest_jobs = "/api/ai/ingest/jobs"
+"""`/api/ai/ingest/jobs`"""
+ai_ingest_jobs_counts = "/api/ai/ingest/jobs/counts"
+"""`/api/ai/ingest/jobs/counts`"""
+ai_ingest_settings = "/api/ai/ingest/settings"
+"""`/api/ai/ingest/settings`"""
 ai_tools = "/api/ai/tools"
 """`/api/ai/tools`"""
 app_about = "/api/app/about"
@@ -267,6 +281,81 @@ def admin_households_item_id(item_id):
 def admin_users_item_id(item_id):
     """`/api/admin/users/{item_id}`"""
     return f"{prefix}/admin/users/{item_id}"
+
+
+def ai_ingest_batches_batch_id(batch_id):
+    """`/api/ai/ingest/batches/{batch_id}`"""
+    return f"{prefix}/ai/ingest/batches/{batch_id}"
+
+
+def ai_ingest_batches_batch_id_seal(batch_id):
+    """`/api/ai/ingest/batches/{batch_id}/seal`"""
+    return f"{prefix}/ai/ingest/batches/{batch_id}/seal"
+
+
+def ai_ingest_eval_cases_slug(slug):
+    """`/api/ai/ingest/eval-cases/{slug}`"""
+    return f"{prefix}/ai/ingest/eval-cases/{slug}"
+
+
+def ai_ingest_jobs_job_id(job_id):
+    """`/api/ai/ingest/jobs/{job_id}`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}"
+
+
+def ai_ingest_jobs_job_id_cancel(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/cancel`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/cancel"
+
+
+def ai_ingest_jobs_job_id_commit(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/commit`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/commit"
+
+
+def ai_ingest_jobs_job_id_eval_case(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/eval-case`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/eval-case"
+
+
+def ai_ingest_jobs_job_id_pages_index_kind(job_id, index, kind):
+    """`/api/ai/ingest/jobs/{job_id}/pages/{index}/{kind}`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/pages/{index}/{kind}"
+
+
+def ai_ingest_jobs_job_id_pages_index_rotate(job_id, index):
+    """`/api/ai/ingest/jobs/{job_id}/pages/{index}/rotate`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/pages/{index}/rotate"
+
+
+def ai_ingest_jobs_job_id_reextract(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/reextract`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/reextract"
+
+
+def ai_ingest_jobs_job_id_reread(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/reread`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/reread"
+
+
+def ai_ingest_jobs_job_id_retry(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/retry`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/retry"
+
+
+def ai_ingest_jobs_job_id_state(job_id):
+    """`/api/ai/ingest/jobs/{job_id}/state`"""
+    return f"{prefix}/ai/ingest/jobs/{job_id}/state"
+
+
+def ai_notifiers_notifier_id_events(notifier_id):
+    """`/api/ai/notifiers/{notifier_id}/events`"""
+    return f"{prefix}/ai/notifiers/{notifier_id}/events"
+
+
+def ai_notifiers_notifier_id_events_test(notifier_id):
+    """`/api/ai/notifiers/{notifier_id}/events/test`"""
+    return f"{prefix}/ai/notifiers/{notifier_id}/events/test"
 
 
 def ai_tools_name(name):

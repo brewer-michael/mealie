@@ -39,6 +39,7 @@ function job(overrides: Partial<RecipeIngestionJobSummary> = {}): RecipeIngestio
     error: null,
     recipe: null,
     localOnly: false,
+    canDiscard: true,
     createdAt: "2026-10-03T12:00:00+00:00",
     ...overrides,
   };
@@ -128,6 +129,12 @@ describe("IngestJobListItem", () => {
     expect(wrapper.get(".job-title a").attributes("href")).toBe("/g/home/r/banana-mug-cake");
     expect(wrapper.get(".job-view-recipe").attributes("href")).toBe("/g/home/r/banana-mug-cake");
     expect(wrapper.find(".job-discard").exists()).toBe(false);
+  });
+
+  test("Discard shows only to who may discard the card", () => {
+    expect(mountItem(job({ canDiscard: false })).find(".job-discard").exists()).toBe(false);
+    expect(mountItem(job({ status: "failed", canDiscard: false })).find(".job-discard").exists()).toBe(false);
+    expect(mountItem(job({ canDiscard: true })).find(".job-discard").exists()).toBe(true);
   });
 
   test("a card being added, and the local-only badge", () => {

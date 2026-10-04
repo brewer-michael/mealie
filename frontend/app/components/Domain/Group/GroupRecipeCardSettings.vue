@@ -25,14 +25,33 @@
         <AppLoader v-if="!settings && loading" />
 
         <template v-if="settings">
+          <!-- AI_INGEST_ENABLED is off: no provider would help, and the switches can't be saved -->
           <v-alert
-            v-if="!settings.canReadCards"
+            v-if="disabled"
+            type="info"
+            density="compact"
+            variant="tonal"
+            class="mb-4 disabled"
+          >
+            {{ $t("recipe-ingest.settings.disabled") }}
+          </v-alert>
+          <v-alert
+            v-else-if="!settings.canReadCards"
             type="info"
             density="compact"
             variant="tonal"
             class="mb-4 cannot-read"
           >
             {{ $t("recipe-ingest.settings.cannot-read") }}
+          </v-alert>
+          <v-alert
+            v-else-if="settings.limitReached"
+            type="warning"
+            density="compact"
+            variant="tonal"
+            class="mb-4 limit-reached"
+          >
+            {{ $t("recipe-ingest.settings.limit-reached") }}
           </v-alert>
           <p v-if="settings.ocrAvailable" class="text-caption text-medium-emphasis mb-2 ocr-available">
             {{ $t("recipe-ingest.settings.ocr-available") }}
@@ -42,7 +61,7 @@
             :model-value="localOnly"
             :label="$t('recipe-ingest.settings.local-only')"
             :hint="$t('recipe-ingest.settings.local-only-hint')"
-            :disabled="!canManage || saving"
+            :disabled="!canManage || saving || disabled"
             persistent-hint
             color="primary"
             class="mb-2 local-only"
@@ -81,7 +100,7 @@
             :model-value="crossRead"
             :label="$t('recipe-ingest.settings.cross-read')"
             :hint="$t('recipe-ingest.settings.cross-read-hint')"
-            :disabled="!canManage || saving"
+            :disabled="!canManage || saving || disabled"
             persistent-hint
             color="primary"
             class="mb-4 cross-read"
@@ -195,6 +214,8 @@ const { group } = useGroupSelf();
 const { settings, loading, loadFailed, saving, load, save: saveSettings } = useRecipeIngestSettings();
 
 const canManage = computed(() => !!auth.user.value?.canManage);
+/** Recipe card scanning is turned off on this server (`AI_INGEST_ENABLED`) */
+const disabled = computed(() => settings.value?.enabled === false);
 const advanced = computed(() => !!auth.user.value?.advanced);
 
 // What the switches show: the requested value while it's saved, the saved one after

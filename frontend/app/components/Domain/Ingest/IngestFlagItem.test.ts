@@ -159,12 +159,14 @@ describe("IngestFlagItem", () => {
     expect(buttonTexts(wrapper)).toEqual(["Looks right"]);
   });
 
-  test("a flag on a whole list can be edited but not re-read: there's no line to read", () => {
+  test("a flag on a whole list is re-read into a new line, or edited", async () => {
     const empty = flag({ id: "empty_section:steps:", kind: "empty_section", severity: "warning", source: "validator", ref: null, params: { section: "steps" } });
     const wrapper = mountItem(item(empty));
 
     expect(wrapper.text()).toContain("No steps were found on the card.");
-    expect(buttonTexts(wrapper)).toEqual(["Looks right", "Edit"]);
+    expect(buttonTexts(wrapper)).toEqual(["Re-read", "Looks right", "Edit"]);
+    await button(wrapper, "Re-read").trigger("click");
+    expect(wrapper.emitted("reread")).toEqual([[empty]]);
   });
 
   test("a resolved item collapses with a check mark and can be undone", async () => {

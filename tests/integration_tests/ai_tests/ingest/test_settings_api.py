@@ -89,9 +89,11 @@ def test_a_group_without_ai_cant_read_cards(api_client: TestClient, unique_user_
     settings = get_settings(api_client, unique_user_fn_scoped)
 
     assert settings == {
+        "enabled": True,
         "localOnly": False,
         "crossRead": False,
         "canReadCards": False,
+        "limitReached": False,
         "ocrAvailable": False,
         "reader": None,
         "localOnlyAvailable": False,
@@ -183,7 +185,39 @@ def test_a_provider_over_its_monthly_limit_still_counts_as_able_to_read(
     monkeypatch.setattr(AIRuntime, "candidates", over_the_limit)
     settings = get_settings(api_client, unique_user_fn_scoped)
     assert settings["canReadCards"] is True
+    assert settings["limitReached"] is True  # the capture page warns before anything is uploaded
     assert settings["reader"] is None
+
+
+@pytest.mark.parametrize(
+    ("over", "ocr_available", "limit_reached"),
+    [
+        (set(), False, False),
+        ({"image"}, False, True),
+        ({"image"}, True, False),  # OCR reads the photo, and the default slot builds the recipe
+        ({"default"}, True, True),  # every card needs the default slot
+    ],
+)
+def test_limit_reached_says_whether_a_card_read_now_would_fail(
+    api_client: TestClient,
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    over: set[str],
+    ocr_available: bool,
+    limit_reached: bool,
+):
+    providers(unique_user_fn_scoped, default={"name": "Claude Sonnet"}, image={"name": "Gemini Flash"})
+    monkeypatch.setattr(ocr, "is_available", lambda: ocr_available)
+    real = AIRuntime.candidates
+
+    def some_over_the_limit(self: AIRuntime, slot: Any) -> list:
+        if slot.value in over:
+            raise AIProviderLimitReachedError("over the limit")
+        return real(self, slot)
+
+    monkeypatch.setattr(AIRuntime, "candidates", some_over_the_limit)
+    settings = get_settings(api_client, unique_user_fn_scoped)
+    assert (settings["canReadCards"], settings["limitReached"]) == (True, limit_reached)
 
 
 def test_a_member_gets_the_reader_but_not_the_readiness(
@@ -227,6 +261,7 @@ def test_with_ingestion_turned_off(
     monkeypatch.setattr(settings_routes, "inbox_root", lambda: tmp_path)
 
     settings = get_settings(api_client, unique_user_fn_scoped)
+    assert settings["enabled"] is False  # the settings card says so, rather than asking for a provider
     assert settings["canReadCards"] is False
     assert settings["reader"] is None
     assert settings["inbox"] == {"enabled": False, "folder": None}

@@ -179,7 +179,6 @@
             "unsupported-media-type": "Send recipe cards as images, a multipart form or JSON.",
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",
             "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
-            "nothing-accepted": "None of the photos could be used.",
             "busy-restore": "Recipe card ingestion is busy writing files. Try the restore again in a minute.",
             "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again."
         }

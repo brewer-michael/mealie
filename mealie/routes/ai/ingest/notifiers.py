@@ -11,12 +11,11 @@ through the household-scoped repositories, so another household's notifier is a 
 from fastapi import APIRouter, status
 from pydantic import UUID4
 
-from mealie.lang.providers import get_locale_provider
 from mealie.routes._base import controller
 from mealie.schema.household.group_events import GroupEventNotifierPrivate
 from mealie.schema.recipe_ingest import AINotifierEventsOut, AINotifierEventsUpdate
 from mealie.services.ai.ingest import events
-from mealie.services.ai.ingest.upload import DEFAULT_LOCALE, FallbackTranslator
+from mealie.services.ai.ingest.i18n import with_fallback
 
 from ._deps import IngestController, ingest_error
 
@@ -60,5 +59,5 @@ class AINotifierEventsController(IngestController):
         it: the same event and data shape, with the household's current counts
         """
         notifier = self._notifier(notifier_id)
-        translator = FallbackTranslator(self.translator, get_locale_provider(DEFAULT_LOCALE))
+        translator = with_fallback(self.translator)
         events.send_test_notification(self.session, self.group_id, self.household_id, notifier.apprise_url, translator)

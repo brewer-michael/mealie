@@ -6,7 +6,7 @@ upstream's `AppSettings` is untouched. `mealie.core.config` has already loaded `
 from functools import cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mealie.core.config import get_app_dirs, get_app_settings
@@ -44,6 +44,14 @@ class IngestSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AI_INGEST_", extra="ignore")
 
+    @field_validator("INBOX_DIR", mode="before")
+    @classmethod
+    def _blank_inbox_is_unset(cls, value: object) -> object:
+        # Unraid and compose files pass an unused variable as `AI_INGEST_INBOX_DIR=''`, which `Path` reads as `.`
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @property
     def max_upload_bytes(self) -> int:
         return self.MAX_UPLOAD_MB * MIB
@@ -65,7 +73,7 @@ def inbox_root() -> Path | None:
     or `/app` (backups would zip it, restores would wipe it and `entry.sh` would re-own it). A refusal is logged once.
     """
     configured = get_ingest_settings().INBOX_DIR
-    if configured is None or not str(configured).strip():
+    if configured is None:
         return None
 
     root = configured.expanduser().resolve()

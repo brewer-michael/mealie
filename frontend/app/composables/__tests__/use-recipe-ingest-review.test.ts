@@ -414,15 +414,22 @@ describe("drafts and proposals", () => {
     expect(draft.steps.map(step => step.text)).toEqual(["Mix everything in a mug.", "Microwave on high for [blank] minutes.", "Serve warm."]);
   });
 
-  test("re-read targets name each field by its JSON name, and lines that exist", () => {
+  test("re-read targets name each field by its JSON name, the lines that exist, and a new line", () => {
     const options = rereadTargets(normalizeDraft(bananaDraft()));
     expect(options.find(option => option.kind === "prepTime")!.target).toEqual({ field: "prepTime", ref: null });
-    // the server refuses an ingredient or step without its line
-    expect(options.filter(option => ["ingredients", "steps"].includes(option.target.field)).every(option => option.target.ref)).toBe(true);
+    // an ingredient or step target names its line, except the new one (the server takes a target without a ref)
+    const lines = options.filter(option => ["ingredient", "step"].includes(option.kind));
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.every(option => option.target.ref)).toBe(true);
+    expect(options.find(option => option.kind === "new-ingredient")!.target).toEqual({ field: "ingredients", ref: null });
+    expect(options.find(option => option.kind === "new-step")!.target).toEqual({ field: "steps", ref: null });
     expect(options.find(option => option.kind === "note")!.target).toEqual({ field: "notes", ref: null });
     expect(rereadTargetValue(options, "steps", "s2")).toBe("steps:s2");
     expect(rereadTargetValue(options, "prep_time", null)).toBe("prepTime");
     expect(rereadTargetValue(options, "ingredients", "gone")).toBe("ingredients:i1");
+    // an empty section's flag has no line: its re-read adds one
+    expect(rereadTargetValue(options, "steps", null)).toBe("steps:new");
+    expect(rereadTargetValue(rereadTargets(normalizeDraft({ name: "Banana Mug Cake" })), "ingredients", "gone")).toBe("ingredients:new");
   });
 
   test("eval case names are made from the recipe's name", () => {
@@ -732,7 +739,7 @@ describe("useRecipeIngestReview", () => {
     expect(api.getCounts).toHaveBeenCalled();
   });
 
-  test("after the batch's last card, the queue opens with the batch's summary", async () => {
+  test("after the batch's last card, the queue opens on the batch, which sums it up: no summary toast", async () => {
     api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
     api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: null, warnings: [] }));
     api.getBatch.mockResolvedValue(ok({
@@ -745,7 +752,7 @@ describe("useRecipeIngestReview", () => {
     expect(await review.commit()).toBe("committed");
 
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/g/home/recipes/cards?batch=b1");
-    expect(toast.success).toHaveBeenCalledWith("Batch done: 2 added, 0 left to review", "Added Banana Mug Cake");
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Added Banana Mug Cake");
   });
 
   test("errors block commit: nothing is sent, and the page is told to show them", async () => {

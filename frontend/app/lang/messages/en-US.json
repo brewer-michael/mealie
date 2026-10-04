@@ -1418,9 +1418,9 @@
       "already-scanned": "Already scanned",
       "open-earlier": "Open the earlier card",
       "rejected": "Not used: {reason}",
-      "pending-warning": "Some photos haven't uploaded yet. Leave anyway?",
       "cards-queued": "No cards queued | {count} card queued | {count} cards queued",
-      "cannot-read": "AI isn't set up to read recipe cards. A group manager can set it up in the group settings."
+      "cannot-read": "AI isn't set up to read recipe cards. A group manager can set it up in the group settings.",
+      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. They're kept: retry them once the limit resets or a group manager raises it."
     },
     "queue": {
       "title": "Cards",
@@ -1449,7 +1449,6 @@
       "source-inbox": "From the inbox",
       "local-only": "Local only",
       "batch-summary": "Batch done: {added} added, {left} left to review",
-      "counts": "{ready} ready, {processing} reading, {failed} failed",
       "load-failed": "Couldn't load the cards"
     },
     "review": {
@@ -1476,8 +1475,6 @@
       "read-with-ocr": "Read with OCR (confidence {confidence}%). Check every line.",
       "needs-a-look": "Needs a look ({count})",
       "nothing-to-check": "Nothing left to check",
-      "keep-as-written": "Keep as written",
-      "looks-right": "Looks right",
       "re-read": "Re-read",
       "edit": "Edit",
       "use": "Use",
@@ -1524,7 +1521,6 @@
       "commit-next": "Commit & next",
       "commit": "Commit",
       "to-fix": "{count} to fix",
-      "committing": "Adding",
       "added": "Added {name}",
       "last-card": "That was the last card to review in this batch.",
       "saving": "Saving",
@@ -1549,11 +1545,7 @@
     },
     "flag": {
       "actions": {
-        "keep-as-written": "Keep as written",
-        "keep-blank": "Keep blank",
         "looks-right": "Looks right",
-        "re-read": "Re-read",
-        "edit": "Edit",
         "fill-in": "Fill in",
         "use-alternative": "Use \"{text}\""
       },
@@ -1734,6 +1726,8 @@
       "title": "Recipe cards",
       "description": "Scan stacks of handwritten or printed recipe cards, and review each one before it becomes a recipe.",
       "cannot-read": "Cards can't be read yet: add a text provider, plus an image provider or OCR.",
+      "disabled": "Recipe card scanning is turned off on this server. A server administrator can turn it on with AI_INGEST_ENABLED.",
+      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so new cards fail until the limit resets. Raise a provider's limit in the AI provider settings to read them now.",
       "ocr-available": "OCR is available on this server",
       "local-only": "Keep recipe card photos and text on this server",
       "local-only-hint": "Only AI providers marked \"Runs on my network\" at a private address read cards.",

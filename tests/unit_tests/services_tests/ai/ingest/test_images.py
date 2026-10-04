@@ -6,6 +6,7 @@ import tempfile
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 from typing import BinaryIO
 
@@ -51,7 +52,9 @@ def _encoded(image: Image.Image, format: str, **params) -> bytes:
     return buffer.getvalue()
 
 
+@cache
 def _srgb_profile() -> bytes:
+    # built once: the profile's header records when it was made, to the second, so two builds can differ
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 

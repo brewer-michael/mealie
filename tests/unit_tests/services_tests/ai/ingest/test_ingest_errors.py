@@ -4,6 +4,7 @@ translation for every code, kind and reason the pages show.
 """
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from mealie.services.ai.ingest.settings import IngestSettings, get_ingest_settin
 ROOT = Path(__file__).parents[5]
 FRONTEND_MESSAGES = ROOT / "frontend" / "app" / "lang" / "messages" / "en-US.json"
 BACKEND_MESSAGES = ROOT / "mealie" / "lang" / "messages" / "en-US.json"
+FRONTEND_COMPOSABLE = ROOT / "frontend" / "app" / "composables" / "use-recipe-ingest.ts"
 
 
 @pytest.fixture()
@@ -53,6 +55,41 @@ def test_every_error_code_flag_kind_and_rejection_has_frontend_text():
         assert messages["progress"].get(step), step
     for step in ("linking-ingredients", "suggesting-organizers"):
         assert messages["progress"].get(step), step
+
+
+def _frontend_codes() -> set[str]:
+    """The codes the frontend knows (`INGEST_ERROR_CODES` and `INGEST_API_ERROR_CODES` in `use-recipe-ingest.ts`)"""
+    source = FRONTEND_COMPOSABLE.read_text()
+    codes: set[str] = set()
+    for name in ("INGEST_ERROR_CODES", "INGEST_API_ERROR_CODES"):
+        found = re.search(rf"export const {name} = \[(.*?)\] as const", source, re.DOTALL)
+        assert found, name
+        codes |= set(re.findall(r'"([a-z_]+)"', found.group(1)))
+    return codes
+
+
+def test_every_code_the_routes_send_is_known_to_the_frontend():
+    """Each refusal code has a `recipe-ingest.error.<code>` text and is one the pages expect, not shown as unknown"""
+    from mealie.routes.ai.ingest import _deps, eval_cases, notifiers
+    from mealie.services.ai.ingest import eval_export, review, upload
+
+    sent = {code.value for code in IngestErrorCode}
+    for module in (_deps, eval_cases, notifiers, review, upload):
+        sent |= {
+            value
+            for name, value in vars(module).items()
+            if name.isupper() and isinstance(value, str) and re.fullmatch(r"[a-z][a-z_]*", value)
+        }
+    pending = [eval_export.EvalCaseError]
+    while pending:
+        error = pending.pop()
+        sent.add(error.code)
+        pending.extend(error.__subclasses__())
+
+    assert {"busy", "invalid_body", "not_exportable", "unknown_target", "paused_for_restore"} <= sent
+    texts = _frontend()["error"]
+    assert sorted(code for code in sent if not texts.get(code)) == []
+    assert sorted(sent - _frontend_codes()) == []
 
 
 def test_backend_texts_are_translated():
@@ -144,6 +181,25 @@ def test_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch):
     # the dispatcher doesn't start under TESTING
     assert get_ingest_settings().WORKER is False
     assert get_ingest_settings().INBOX_DIR is None
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_a_blank_inbox_variable_is_unset(blank: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    """Unraid passes an unused variable as `-e AI_INGEST_INBOX_DIR=''`, which isn't the current directory"""
+    from mealie.services.ai.ingest import settings as ingest_settings
+
+    monkeypatch.setenv("AI_INGEST_INBOX_DIR", blank)
+    settings = IngestSettings()
+    assert settings.INBOX_DIR is None
+
+    monkeypatch.setattr(ingest_settings, "get_ingest_settings", lambda: settings)
+    ingest_settings.inbox_root.cache_clear()
+    try:
+        with caplog.at_level("WARNING"):
+            assert ingest_settings.inbox_root() is None
+    finally:
+        ingest_settings.inbox_root.cache_clear()
+    assert "overlaps" not in caplog.text
 
 
 def test_the_inbox_may_not_be_inside_the_data_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

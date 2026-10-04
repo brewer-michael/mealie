@@ -21,8 +21,8 @@ Public interface:
 - `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots.
 - `ClaimLost`: the inbox's claimed file moved away before the insert (another scanner retried it).
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
-  local providers only or at all, its own local-only setting and its processing jobs (the upload's checks 3 and 4,
-  and the inbox's).
+  local providers only or at all, its own local-only setting, its processing jobs (the upload's checks 3 and 4,
+  and the inbox's) and whether the monthly token limits stop a card being read now (the capture page's warning).
 """
 
 import hashlib
@@ -356,6 +356,12 @@ class ReadingReadiness:
     """The group keeps every card on this server"""
     processing: int
     """The group's `processing` jobs, every household's"""
+    limit_reached: bool = False
+    """
+    Cards can be read, but under the group's policy every provider the read needs is over its monthly token limit: a
+    card read now fails `limit_reached`. Uploads are still accepted (the limit may reset before the card is read);
+    the capture page warns.
+    """
 
 
 class _EveryProvider(AIProviderRouter):
@@ -365,12 +371,18 @@ class _EveryProvider(AIProviderRouter):
         return providers
 
 
-def _slot_usable(service: OpenAIService, slot: AIProviderSlot) -> bool:
+def _slot_usable(service: OpenAIService, slot: AIProviderSlot, over_limit: set[AIProviderSlot] | None = None) -> bool:
+    """
+    Whether `slot` has a provider a card may use under the current policy. A slot whose providers are all over their
+    monthly limit is added to `over_limit`.
+    """
     from mealie.services.openai import OpenAINotEnabledException
 
     try:
         return bool(service.runtime.candidates(slot))
     except AIProviderLimitReachedError:
+        if over_limit is not None:
+            over_limit.add(slot)
         # set up, just over this month's limit: a card read later fails `limit_reached` if it still is. The router
         # checks the limits before the policy filters, so under "local only" that holds only if a provider is local.
         if not current_policy().local_only:
@@ -387,18 +399,29 @@ def _slot_usable(service: OpenAIService, slot: AIProviderSlot) -> bool:
         return False
 
 
-def _can_read(service: OpenAIService, *, local_only: bool) -> bool:
+def _can_read(service: OpenAIService, *, local_only: bool, over_limit: set[AIProviderSlot] | None = None) -> bool:
     with ai_call_policy(local_only=local_only):
-        if not _slot_usable(service, AIProviderSlot.default):
+        if not _slot_usable(service, AIProviderSlot.default, over_limit):
             return False
-        return _slot_usable(service, AIProviderSlot.image) or ocr.is_available()
+        return _slot_usable(service, AIProviderSlot.image, over_limit) or ocr.is_available()
+
+
+def _limit_reached(over_limit: set[AIProviderSlot]) -> bool:
+    """
+    Whether a card read now fails `limit_reached`: the default slot builds every recipe, and the image slot reads the
+    photo unless OCR can (the pipeline falls back to it)
+    """
+    if AIProviderSlot.default in over_limit:
+        return True
+    return AIProviderSlot.image in over_limit and not ocr.is_available()
 
 
 def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> ReadingReadiness:
     """
     Whether the group can read cards at all and with local providers only, its local-only setting and its processing
     jobs. Blocking (provider settings, address lookups for "local", a count): call it from a worker thread. A monthly
-    token limit doesn't count as "can't read": the card fails `limit_reached` when it's read, if it still applies.
+    token limit doesn't count as "can't read": the card fails `limit_reached` when it's read, if it still applies, and
+    `limit_reached` says so beforehand.
     """
     from mealie.services.openai import OpenAIService
 
@@ -407,11 +430,18 @@ def reading_readiness(session: Session, group_id: UUID, household_id: UUID) -> R
     processing = ingest_repos.processing_jobs_in_group()
 
     service = OpenAIService(get_repositories(session, group_id=group_id, household_id=household_id))
-    can_read = _can_read(service, local_only=False)
-    local_ready = can_read and _can_read(service, local_only=True)
+    # the limits are tallied under the group's own policy, from the same lookups
+    over_limit: set[AIProviderSlot] = set()
+    can_read = _can_read(service, local_only=False, over_limit=None if group_local_only else over_limit)
+    local_ready = can_read and _can_read(service, local_only=True, over_limit=over_limit if group_local_only else None)
     if session.in_transaction():
         session.commit()  # no transaction stays open while the body streams in
 
+    readable = local_ready if group_local_only else can_read
     return ReadingReadiness(
-        can_read=can_read, local_ready=local_ready, group_local_only=group_local_only, processing=processing
+        can_read=can_read,
+        local_ready=local_ready,
+        group_local_only=group_local_only,
+        processing=processing,
+        limit_reached=readable and _limit_reached(over_limit),
     )

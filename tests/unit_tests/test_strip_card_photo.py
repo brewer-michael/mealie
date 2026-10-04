@@ -1,6 +1,7 @@
 """Cleaning a recipe card photo for the repository without jpegtran (docs/ai/PHASE2.md §11.6)"""
 
 import io
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,9 @@ XMP = b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta><rdf:Description exif:GPSLati
 PHOTOSHOP = b"Photoshop 3.0\x008BIM\x04\x04\x00\x00\x00\x00\x00\x08\x1c\x02\x00\x00\x02\x00\x04"
 
 
+@cache
 def _icc() -> bytes:
+    # built once: the profile's header records when it was made, to the second, so two builds can differ
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 

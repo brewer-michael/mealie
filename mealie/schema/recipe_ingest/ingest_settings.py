@@ -55,10 +55,17 @@ class IngestInboxInfo(MealieModel):
 
 
 class RecipeIngestionSettingsOut(MealieModel):
+    enabled: bool = True
+    """Recipe card scanning is on (`AI_INGEST_ENABLED`); when it's off, the server reads no cards"""
     local_only: bool = False
     cross_read: bool = False
     can_read_cards: bool = False
     """A default provider, plus an image provider or OCR"""
+    limit_reached: bool = False
+    """
+    Cards can be uploaded, but every provider their reading would use under the group's policy is over its monthly
+    token limit: a card read now fails `limit_reached`
+    """
     ocr_available: bool = False
     reader: ReaderInfo | None = None
     """Under the group's policy"""

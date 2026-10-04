@@ -5,6 +5,7 @@ import json
 import shutil
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from functools import cache
 from uuid import UUID, uuid4
 
 import pytest
@@ -63,7 +64,9 @@ def db() -> Iterator[Session]:
         yield session
 
 
+@cache
 def _srgb_profile() -> bytes:
+    # built once: the profile's header records when it was made, to the second, so two builds can differ
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 

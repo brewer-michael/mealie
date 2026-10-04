@@ -126,7 +126,10 @@ const recipeLink = computed(() => {
 });
 /** The card's review page, or its recipe once added */
 const link = computed(() => (props.job.status === "committed" ? recipeLink.value : jobLink.value));
-const canDiscard = computed(() => props.job.status !== "committing" && props.job.status !== "committed");
+/** The server says who may (the uploader, anyone for an inbox card, household managers); never once it's added */
+const canDiscard = computed(() =>
+  props.job.canDiscard !== false && props.job.status !== "committing" && props.job.status !== "committed",
+);
 
 const chip = computed<{ text: string; color?: string; busy?: boolean }>(() => {
   const job = props.job;

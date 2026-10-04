@@ -171,6 +171,8 @@ class _Progress:
 
     def _store(self, key: str) -> None:
         self._last_write = time.monotonic()
+        if storage.is_paused():
+            return  # a restore is replacing the row (§3.9): the write would fail, or be replaced with it
         try:
             with session_context() as session:
                 IngestQueue(session).set_progress(self.job_id, self.token, key)

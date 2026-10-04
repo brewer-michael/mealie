@@ -355,6 +355,7 @@ export interface RecipeIngestionJobOut {
   error?: RecipeIngestionJobError | null;
   recipe?: RecipeIngestionRecipeRef | null;
   localOnly?: boolean;
+  canDiscard?: boolean;
   createdAt?: string | null;
   draftVersion: number;
   pages?: PageOut[];
@@ -406,12 +407,15 @@ export interface RecipeIngestionJobSummary {
   error?: RecipeIngestionJobError | null;
   recipe?: RecipeIngestionRecipeRef | null;
   localOnly?: boolean;
+  canDiscard?: boolean;
   createdAt?: string | null;
 }
 export interface RecipeIngestionSettingsOut {
+  enabled?: boolean;
   localOnly?: boolean;
   crossRead?: boolean;
   canReadCards?: boolean;
+  limitReached?: boolean;
   ocrAvailable?: boolean;
   reader?: ReaderInfo | null;
   localOnlyAvailable?: boolean;

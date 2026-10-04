@@ -148,6 +148,10 @@ function targetTitle(option: RereadTargetOption): string {
       return option.text || i18n.t("recipe-ingest.review.ingredients");
     case "step":
       return i18n.t("recipe.step-index", { step: option.text });
+    case "new-ingredient":
+      return i18n.t("recipe-ingest.review.add-ingredient");
+    case "new-step":
+      return i18n.t("recipe-ingest.review.add-step");
     case "note":
       return i18n.t("recipe-ingest.review.add-note");
     default:

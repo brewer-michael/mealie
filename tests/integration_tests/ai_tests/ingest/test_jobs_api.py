@@ -40,6 +40,7 @@ from mealie.schema.recipe_ingest import (
     IngestTaskKind,
     IngestTaskState,
     ProposalTarget,
+    RecipeIngestionSettingsUpdate,
 )
 from mealie.services.ai.ingest import flag_rules, images, limits, storage
 from mealie.services.ai.ingest.pipeline import flags as card_flags
@@ -409,6 +410,51 @@ def test_get_job_permissions_of_a_plain_member(
     inbox = api_client.get(job_url(inbox_job), headers=member.token).json()["permissions"]
     assert inbox["canDiscard"] is True
 
+    # the queue shows Discard only where it's allowed
+    listed = api_client.get(JOBS, headers=member.token).json()["items"]
+    assert {item["id"]: item["canDiscard"] for item in listed} == {str(job_id): False, str(inbox_job): True}
+    listed = api_client.get(JOBS, headers=user.token).json()["items"]
+    assert all(item["canDiscard"] for item in listed)
+
+
+def test_only_a_card_with_a_draft_and_pages_can_be_exported(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    purged = seed_job(user, status=IngestStatus.committed)
+    set_columns(purged, draft=None, flags=None, transcription=None)  # what the retention purge leaves
+    exportable = {
+        seed_job(user): True,
+        seed_job(user, status=IngestStatus.committed): True,
+        seed_job(user, status=IngestStatus.processing): False,
+        seed_job(user, status=IngestStatus.failed): False,
+        purged: False,
+    }
+    for job_id, expected in exportable.items():
+        job = api_client.get(job_url(job_id), headers=user.token).json()
+        assert job["permissions"]["canExportEval"] is expected, job["status"]
+
+
+def test_local_only_shows_the_policy_the_card_is_read_under(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """The worker applies the group's current setting to every task, so a card from before the switch shows it"""
+    user = unique_user_fn_scoped
+    sent_local = seed_job(user, local_only=True)
+    ready = seed_job(user)
+    committed = seed_job(user, status=IngestStatus.committed)
+
+    def local_only() -> dict[str, bool]:
+        items = api_client.get(JOBS, headers=user.token).json()["items"]
+        listed = {item["id"]: item["localOnly"] for item in items}
+        for job_id in (sent_local, ready, committed):
+            assert api_client.get(job_url(job_id), headers=user.token).json()["localOnly"] is listed[str(job_id)]
+        return listed
+
+    assert local_only() == {str(sent_local): True, str(ready): False, str(committed): False}
+
+    with session_context() as session:
+        repos = IngestRepos(session, UUID(user.group_id), UUID(user.household_id))
+        repos.settings.upsert(RecipeIngestionSettingsUpdate(local_only=True))
+    # a committed card was read before, under the policy it had then
+    assert local_only() == {str(sent_local): True, str(ready): True, str(committed): False}
+
 
 def test_state(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
@@ -507,6 +553,17 @@ def test_reread_validates_the_region_and_target(api_client: TestClient, unique_u
     unknown_step = _region(target={"field": "steps", "ref": str(uuid4())})
     assert_code(api_client.post(url, json=unknown_step, headers=user.token), 422, "unknown_target")
     assert job_row(job_id)["task_state"] is None
+
+
+@pytest.mark.parametrize("field", ["ingredients", "steps"])
+def test_a_reread_without_a_ref_is_for_a_new_line(api_client: TestClient, unique_user_fn_scoped: TestUser, field: str):
+    """A line the reading missed, or the first of an empty section: the review page adds the reading as a new one"""
+    user = unique_user_fn_scoped
+    job_id = seed_job(user, draft=banana_draft(**{field: []}))
+
+    response = api_client.post(job_url(job_id, "reread"), json=_region(target={"field": field}), headers=user.token)
+    assert response.status_code == 202, response.text
+    assert job_row(job_id)["task_payload"]["target"] == {"field": field, "ref": None}
 
 
 def test_reextract_and_retry(api_client: TestClient, unique_user_fn_scoped: TestUser):

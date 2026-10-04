@@ -10,12 +10,14 @@ every member's capture page needs to know.
 
 `canReadCards` and `localOnlyAvailable` follow exactly the rule the upload applies (`intake.reading_readiness`), so
 the app never offers what an upload would refuse: a provider over its monthly token limit still counts as able to
-read, and the card fails `limit_reached` when it's read if the limit still applies. The privacy chip's `reader` is
-the first provider the card's read would try under the group's policy.
+read, and the card fails `limit_reached` when it's read if the limit still applies. `limitReached` says so up front,
+from the same lookups, so the capture page can warn before anything is uploaded. The privacy chip's `reader` is the
+first provider the card's read would try under the group's policy.
 
 The handlers are synchronous, so FastAPI runs them in its threadpool: the provider settings, the address lookups that
 decide what's local (`getaddrinfo`) and every query stay off the event loop. With `AI_INGEST_ENABLED` off the `GET`
-still answers, with `canReadCards: false`, because the app asks on every load; the `PUT` answers 503.
+still answers, with `enabled: false` and `canReadCards: false`, because the app asks on every load; the `PUT`
+answers 503.
 """
 
 from uuid import UUID
@@ -84,6 +86,7 @@ def settings_out(session: Session, group_id: UUID, household_id: UUID, *, manage
 
     stored = IngestRepos(session, group_id, household_id).settings.get()
     settings = RecipeIngestionSettingsOut(
+        enabled=get_ingest_settings().ENABLED,
         local_only=stored.local_only,
         cross_read=stored.cross_read,
         ocr_available=ocr.is_available(),
@@ -95,6 +98,7 @@ def settings_out(session: Session, group_id: UUID, household_id: UUID, *, manage
         readiness = reading_readiness(session, group_id, household_id)
         settings.can_read_cards = readiness.can_read
         settings.local_only_available = readiness.local_ready
+        settings.limit_reached = readiness.limit_reached
 
         service = OpenAIService(get_repositories(session, group_id=group_id, household_id=household_id))
         settings.reader = card_reader(service, local_only=stored.local_only)

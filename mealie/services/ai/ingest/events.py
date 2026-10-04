@@ -16,7 +16,7 @@ route's threadpool), never on the event loop, and no database transaction stays 
 
 from datetime import datetime, timedelta
 from enum import Enum
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -30,7 +30,7 @@ from mealie.db.db_setup import session_context
 from mealie.db.models.group import Group
 from mealie.db.models.household.events import GroupEventNotifierModel
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
-from mealie.lang.providers import Translator, get_locale_provider
+from mealie.lang.providers import Translator
 from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
 from mealie.schema.recipe_ingest import IngestStatus, RecipeIngestionJobCounts
 from mealie.services.event_bus_service.event_bus_listeners import AppriseEventListener
@@ -45,7 +45,7 @@ from mealie.services.event_bus_service.event_types import (
 
 from . import limits
 from .batches import seal_idle_batches
-from .upload import DEFAULT_LOCALE, FallbackTranslator
+from .i18n import translator_for
 
 logger = get_logger(__name__)
 
@@ -105,6 +105,25 @@ class AIEventAppriseListener(AppriseEventListener):
 
         return self.update_urls_with_event_data(urls, event)
 
+    @staticmethod
+    def update_urls_with_event_data(urls: list[str], event: Event) -> list[str]:
+        """
+        Upstream's, with the query percent-encoded: upstream's `urlencode` writes a space as `+`, which Apprise doesn't
+        read back (it decodes `:key` values with `unquote`), so Home Assistant got a `document_data` with `+` between
+        its JSON tokens, which `from_json` can't parse (§8)
+        """
+        return [
+            urlunsplit(
+                parts._replace(
+                    query=urlencode(parse_qs(parts.query, keep_blank_values=True), doseq=True, quote_via=quote)
+                )
+            )
+            if AppriseEventListener.is_custom_url(url)
+            else url
+            for url in AppriseEventListener.update_urls_with_event_data(urls, event)
+            for parts in [urlsplit(url)]
+        ]
+
 
 def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier_ids: list[UUID]) -> list[str]:
     """The Apprise URLs of the household's notifiers among `notifier_ids`"""
@@ -125,12 +144,6 @@ def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier
 
 # ==================================================================================================================
 # The message
-
-
-def translator_for(locale: str | None) -> Translator:
-    """The batch's language, falling back to en-US for a text that language doesn't have yet"""
-    fallback = get_locale_provider(DEFAULT_LOCALE)
-    return FallbackTranslator(get_locale_provider(locale or DEFAULT_LOCALE), fallback)
 
 
 def ready_message(counts: RecipeIngestionJobCounts, translator: Translator) -> EventBusMessage:

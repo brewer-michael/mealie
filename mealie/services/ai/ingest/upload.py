@@ -251,13 +251,13 @@ def _parse_position(value: Any) -> int | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     if isinstance(value, bool):
-        raise UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.unsupported-media-type")
+        raise _invalid_body()
     try:
         position = int(str(value).strip()) if not isinstance(value, int) else value
     except ValueError:
-        raise UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.unsupported-media-type") from None
+        raise _invalid_body() from None
     if position < 0:
-        raise UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.unsupported-media-type")
+        raise _invalid_body()
     return position
 
 
@@ -320,7 +320,8 @@ async def _capped(request: Request, limit: int) -> AsyncIterator[bytes]:
 
 
 def _invalid_body() -> UploadRefused:
-    return UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.unsupported-media-type")
+    """400 `invalid_body`: a body of a supported type that can't be read (a broken form, bad JSON, a bad option)"""
+    return UploadRefused(400, INVALID_BODY, message_key="recipe-ingest.errors.invalid-body")
 
 
 async def _read_multipart(request: Request, limit: int, query: Mapping[str, str]) -> UploadBody:

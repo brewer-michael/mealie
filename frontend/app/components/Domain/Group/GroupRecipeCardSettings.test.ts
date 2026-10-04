@@ -31,9 +31,11 @@ vi.mock("~/composables/use-groups", () => ({
 
 function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIngestionSettingsOut {
   return {
+    enabled: true,
     localOnly: false,
     crossRead: false,
     canReadCards: true,
+    limitReached: false,
     ocrAvailable: false,
     reader: { name: "Qwen VL", local: true, viaOcr: false },
     localOnlyAvailable: true,
@@ -189,6 +191,27 @@ describe("GroupRecipeCardSettings", () => {
 
     expect(wrapper.find(".readiness-warning").exists()).toBe(false);
     expect(wrapper.find(".not-private").exists()).toBe(false);
+  });
+
+  test("with scanning turned off on the server, says so instead of asking for a provider", async () => {
+    api.getSettings.mockResolvedValue({
+      data: settings({ enabled: false, canReadCards: false, reader: null, localReadiness: null }),
+      error: null,
+    });
+    const wrapper = await mountSettings();
+
+    expect(wrapper.get(".disabled").text()).toContain("Recipe card scanning is turned off on this server.");
+    expect(wrapper.find(".cannot-read").exists()).toBe(false);
+    expect(toggle(wrapper, "local-only").attributes("disabled")).toBeDefined();
+    expect(toggle(wrapper, "cross-read").attributes("disabled")).toBeDefined();
+  });
+
+  test("warns a manager when this month's token limit stops cards being read", async () => {
+    api.getSettings.mockResolvedValue({ data: settings({ limitReached: true }), error: null });
+    const wrapper = await mountSettings();
+
+    expect(wrapper.get(".limit-reached").text()).toContain("monthly token limit");
+    expect(wrapper.find(".disabled").exists()).toBe(false);
   });
 
   test("says when the group can't read cards, and when OCR is available", async () => {

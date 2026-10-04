@@ -70,6 +70,12 @@ class RecipeIngestionJobSummary(MealieModel):
     recipe: RecipeIngestionRecipeRef | None = None
     """The committed recipe"""
     local_only: bool = False
+    """
+    Only local providers read the card: it was sent so, or its group keeps cards local now and the card can still be
+    read again (it isn't committed)
+    """
+    can_discard: bool = False
+    """The user may discard the card (§9): its uploader, anyone for an inbox card, otherwise household managers"""
     created_at: datetime | None = None
 
 

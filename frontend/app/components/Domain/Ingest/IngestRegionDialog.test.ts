@@ -149,6 +149,19 @@ describe("IngestRegionDialog", () => {
     expect(wrapper.emitted("submit")![0]![0]).toMatchObject({ page: 1, target: { field: "ingredients", ref: "i1" } });
   });
 
+  test("a line the reading missed is read as a new ingredient or step", async () => {
+    const wrapper = mountDialog({ initialTarget: rereadTargetValue(targets, "steps", null) });
+    await flushPromises();
+    const titles = wrapper.findAll("option").map(option => option.text());
+    expect(titles).toContain("Add ingredient");
+    expect(titles).toContain("Add step");
+    expect((wrapper.get("select").element as HTMLSelectElement).value).toBe("steps:new");
+
+    await wrapper.get(".submit").trigger("click");
+
+    expect(wrapper.emitted("submit")![0]![0]).toMatchObject({ target: { field: "steps", ref: null } });
+  });
+
   test("a sliver isn't sent: the dialog stays open and says to select more", async () => {
     cropper.result = { coordinates: { left: 0, top: 0, width: 1536, height: 10 }, image: { width: 1536, height: 2048 } };
     const wrapper = mountDialog({ initialTarget: "name" });

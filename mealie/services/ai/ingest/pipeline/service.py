@@ -22,6 +22,8 @@ from mealie.services.ai.runtime import AIRuntime
 from mealie.services.ai.usage import AITokenUsage
 from mealie.services.openai import OpenAIService
 
+from .. import storage
+
 
 def end_transaction(session: Session) -> None:
     """Commits the session's transaction if one is open (it only ever holds reads and usage rows); else does nothing"""
@@ -54,18 +56,21 @@ class JobAIRuntime(AIRuntime):
         error: BaseException | None = None,
         error_type: str | None = None,
     ) -> None:
-        try:
-            super().record_attempt(
-                provider,
-                slot=slot,
-                feature=feature,
-                usage=usage,
-                latency_ms=latency_ms,
-                error=error,
-                error_type=error_type,
-            )
-        finally:
-            end_transaction(self.service.repos.session)
+        # While a backup restore pauses ingestion (§3.9) its tables may be dropped or half imported: the row would fail
+        # with a logged traceback, or be replaced by the restore anyway. The job's own tally below keeps the tokens.
+        if not storage.is_paused():
+            try:
+                super().record_attempt(
+                    provider,
+                    slot=slot,
+                    feature=feature,
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    error=error,
+                    error_type=error_type,
+                )
+            finally:
+                end_transaction(self.service.repos.session)
 
         self._tally(provider, slot, feature, usage, latency_ms, failed=error is not None or error_type is not None)
 

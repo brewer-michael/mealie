@@ -710,15 +710,15 @@ export interface RereadTargetOption {
   /** A key unique among the options */
   value: string;
   target: ProposalTarget;
-  /** "name", "ingredient", "step", ...: which label the dialog shows */
-  kind: TextField | "ingredient" | "step" | "note";
+  /** "name", "ingredient", "step", "new-ingredient", ...: which label the dialog shows */
+  kind: TextField | "ingredient" | "step" | "new-ingredient" | "new-step" | "note";
   /** The line's text, or the step's number (from 1) */
   text: string;
 }
 
 /**
- * Every line a re-read can be for. An ingredient or step is always an existing line (the server refuses one without
- * its `ref`); a reading for the notes is added as a new note.
+ * Every line a re-read can be for: each field, each ingredient and step by its `ref`, and a new ingredient, step or
+ * note (a target without a `ref`, for a line the reading missed), which `applyProposal` adds.
  */
 export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
   const options: RereadTargetOption[] = TEXT_FIELDS.filter(field => field !== "recipeServings").map(field => ({
@@ -735,6 +735,7 @@ export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
       text: ingredient.display || ingredient.originalText || ingredientDisplay(ingredient),
     });
   });
+  options.push({ value: "ingredients:new", target: { field: "ingredients", ref: null }, kind: "new-ingredient", text: "" });
   draft.steps.forEach((step, index) => {
     options.push({
       value: `steps:${step.id}`,
@@ -743,6 +744,7 @@ export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
       text: String(index + 1),
     });
   });
+  options.push({ value: "steps:new", target: { field: "steps", ref: null }, kind: "new-step", text: "" });
   options.push({ value: "notes:new", target: { field: "notes", ref: null }, kind: "note", text: "" });
   return options;
 }
@@ -818,14 +820,6 @@ export function nextCardInBatch(jobs: readonly RecipeIngestionBatchJob[], curren
   const index = ordered.findIndex(job => job.id === currentId);
   const rotated = index < 0 ? ordered : [...ordered.slice(index + 1), ...ordered.slice(0, index)];
   return rotated.find(job => job.status === "ready" && job.id !== currentId)?.id ?? null;
-}
-
-/** How many of a batch's cards are added and how many are still to review */
-export function batchProgress(jobs: readonly RecipeIngestionBatchJob[]): { added: number; left: number } {
-  return {
-    added: jobs.filter(job => job.status === "committed" || job.status === "committing").length,
-    left: jobs.filter(job => job.status === "ready").length,
-  };
 }
 
 // ==========================================
@@ -1463,8 +1457,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
 
   /**
    * "Commit & next": waits for the pending save, commits with the version it returned, then goes to the batch's next
-   * ready card, or to the queue with the batch's summary after the last one. Unresolved errors don't commit: the
-   * result is `"fix"` and the page scrolls to the first.
+   * ready card, or after the last one to the queue filtered to the batch, which sums it up. Unresolved errors don't
+   * commit: the result is `"fix"` and the page scrolls to the first.
    */
   async function commit(): Promise<"committed" | "fix" | "conflict" | "failed"> {
     if (committing.value || !job.value || job.value.status !== "ready") {
@@ -1515,13 +1509,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       const warnings = (data.warnings ?? [])
         .map(warning => text.commitWarningText(warning))
         .filter((warning): warning is string => !!warning);
-      const { path, last } = await nextPath(data.nextJobId);
+      // after the batch's last card the queue opens on the batch, whose own line sums it up
+      const { path } = await nextPath(data.nextJobId);
       if (warnings.length) {
         alert.warning(warnings.join(" "), added);
-      }
-      else if (last) {
-        const progress = batchProgress(batch.value?.jobs ?? []);
-        alert.success(i18n.t("recipe-ingest.queue.batch-summary", progress), added);
       }
       else {
         alert.success(added);
