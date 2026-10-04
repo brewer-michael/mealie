@@ -8,8 +8,8 @@ Ask Home Assistant (HA) Assist about your Mealie recipes, meal plan and shopping
   server, which gives the LLM richer tools: search by time and ingredients, scaled ingredients, one cooking step at a
   time, and optionally adding to the shopping list and planning meals.
 
-[Section 9](#9-recipe-cards) covers recipe cards: camera snapshots into Mealie, a "cards ready" notification and a
-"cards waiting" sensor.
+[Section 9](#9-recipe-cards) covers recipe cards: camera snapshots into Mealie, "cards ready" and "cards not added"
+notifications, and a "cards waiting" sensor.
 
 **Layer A:**
 
@@ -286,12 +286,13 @@ Your LLM conversation agent then gets Mealie's own tools instead of the three La
 | `suggest_from_ingredients` | "What can I make with chicken and rice?" |
 | `whats_planned` | The plan for a day or a range, optionally one meal |
 | `get_shopping_list` | The open items on a list |
-| `recipe_card_queue` | How many scanned recipe cards are waiting to be reviewed (counts only, never card text) |
+| `recipe_card_queue` | How many scanned recipe cards are waiting to be reviewed: `ready`, `needs_attention`, `processing` and `failed` (counts only, never card text) |
 | `add_to_shopping_list` | Add items, or a recipe's ingredients for N servings (only if you allow changes) |
 | `plan_meal` | Put a recipe or a note on the plan (only if you allow changes) |
 
-Each tool answers with a short `speech` sentence the assistant can read out, plus the data for follow-up questions.
-The full reference, including Claude Code and other clients, is [`docs/ai/MCP.md`](../ai/MCP.md).
+Each tool answers with a short `speech` sentence the assistant can read out, plus the data for follow-up questions,
+under snake_case keys. The speech is in English, whatever your assistant's language. The full reference, including
+Claude Code and other clients, is [`docs/ai/MCP.md`](../ai/MCP.md#1-the-tools).
 
 Keep Layer A installed: its local sentences still answer "What's for dinner?" instantly and without an LLM. Once
 Layer B works, you can un-expose the three Layer A scripts (**Settings > Voice assistants > Expose**) so the LLM
@@ -394,16 +395,22 @@ If you skip this step, HA asks for the credentials when you add the integration 
 ## 9. Recipe cards
 
 This Mealie build scans stacks of recipe cards and lets you check each one before it becomes a recipe. HA can take
-part in four ways. The steps and the YAML are in the recipe card guide, [`docs/ai/CARDS.md`](../ai/CARDS.md#9-home-assistant):
+part in several ways. The steps and the YAML are in the recipe card guide, [`docs/ai/CARDS.md`](../ai/CARDS.md#9-home-assistant):
 
 | You want | How | Needs |
 |---|---|---|
 | A kitchen camera to scan a card | [`camera.snapshot` into Mealie's inbox folder](../ai/CARDS.md#camera-snapshots-into-the-inbox), shared with HA OS as network storage (usage **Media**) | The inbox on the Mealie server ([`DEPLOY.md`](../ai/DEPLOY.md#the-inbox-folder)); no token |
-| The same, without a shared folder | [A `shell_command` that uploads the snapshot with `curl`](../ai/CARDS.md#without-shared-storage-shell_command) | An API token in `secrets.yaml` |
+| The same, without a shared folder | [A `shell_command` that uploads the snapshot with `curl`](../ai/CARDS.md#without-shared-storage-shell_command) | An API token in a file next to `configuration.yaml` |
+| The same, with `rest_command` | [The snapshot's `/local/` URL sent to Mealie](../ai/CARDS.md#with-an-image-url-rest_command) | An API token in `secrets.yaml`; image URLs allowed on the Mealie server (off by default) |
 | A phone notification when a batch is read, opening the first card to review | [An Apprise `json://` notifier in Mealie and a webhook automation](../ai/CARDS.md#the-ready-notification-on-your-phone) | **Show advanced features** in Mealie, for the notifiers page |
+| A phone notification when inbox photos weren't added | [A second automation on the same webhook](../ai/CARDS.md#photos-the-inbox-didnt-add), for the `recipe_ingestion_rejected` event | The notifier above |
 | A "cards waiting" dashboard tile | [A `rest` sensor on `/api/ai/ingest/jobs/counts`](../ai/CARDS.md#a-cards-waiting-sensor) | An API token in `secrets.yaml` |
 
 By voice, Layer B's `recipe_card_queue` tool answers "Any recipe cards to review?" with counts only.
+
+The notifier sends two events to the same webhook: `recipe_ingestion_ready` ("Recipe cards ready") and
+`recipe_ingestion_rejected` ("Recipe cards not added", for inbox photos that couldn't be used). Match on
+`trigger.json.event_type` in each automation.
 
 Use the `Kitchen Voice` user's token ([section 1](#use-a-dedicated-kitchen-voice-user-for-the-token)): cards it uploads
 belong to its household, and the sensor counts that household's cards.

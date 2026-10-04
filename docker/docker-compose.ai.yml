@@ -25,6 +25,7 @@ services:
       - mealie-ai-data:/app/data/
       # Optional recipe card inbox (docs/ai/CARDS.md): photos put in <inbox>/<group-slug>/<household-slug>/ are
       # read and queued for review. Use a host folder outside the data volume; mounting it at /inbox turns it on.
+      # Whatever writes the photos must be in PGID's group, with umask 002 (docs/ai/DEPLOY.md).
       # - /path/to/mealie-inbox:/inbox
     ports:
       - 9925:9000
@@ -39,9 +40,14 @@ services:
       OCR_LANGUAGES: "eng" # joined by '+', e.g. "eng+deu"; each needs its pack in OCR_LANGUAGE_PACKS
       # OCR_TIMEOUT: "60" # seconds
 
-      # Recipe cards (docs/ai/CARDS.md). Tesseract above also turns sideways card photos upright.
+      # Recipe cards (docs/ai/CARDS.md; every setting is in docs/ai/DEPLOY.md). Tesseract above also turns
+      # sideways card photos upright, even with OCR_ENABLED off (AI_INGEST_ORIENT).
       # AI_INGEST_INBOX_DIR: "/inbox" # optional: a folder mounted at /inbox is used without it
+      # AI_INGEST_INBOX_PROCESSED_DAYS: "90" # delete read photos from processed/ after this many days
       # AI_INGEST_CONCURRENCY: "2" # cards read at once per worker process, plus one re-read
+      # AI_INGEST_MAX_PROCESSING_PER_USER: "50" # a user's cards waiting to be read before their uploads get 429
+      # AI_INGEST_URL_FETCH: "true" # accept image URLs in the upload API (Home Assistant's rest_command)
+      # AI_INGEST_URL_ALLOW_HOSTS: "192.168.1.20" # private addresses image URLs may reach, e.g. Home Assistant
 
       # PUID: 99 # Unraid's nobody:users
       # PGID: 100

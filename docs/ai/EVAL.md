@@ -49,10 +49,9 @@ tests/data/cards/
   grandmas-pancakes.json
 ```
 
-> [!IMPORTANT]
-> Use lowercase kebab-case names (`grandmas-pancakes.jpg`, not `IMG_2503.JPG`), and keep nothing but card photos and
-> their JSON in the folder. The code generator (`dev/code-generation`) renames every file under `tests/data/` to
-> kebab-case, which would leave the JSON's `source` pointing at a file that no longer exists.
+Use lowercase kebab-case names (`grandmas-pancakes.jpg`, not `IMG_2503.JPG`), as **Save as eval case** does. The
+code generator (`dev/code-generation`) renames files under `tests/data/` to kebab-case, but leaves `tests/data/cards/`
+alone, so a JSON's `source` keeps pointing at its photos.
 
 Add the photo as it would really be uploaded: sideways, uncropped, with glare. For a card with writing on both sides,
 add both photos and list them in `source`, front first; they are read together as one card. The easiest way to collect
@@ -96,7 +95,7 @@ The JSON file (version 2):
 | `verified_by_owner` | `true` once the card's owner has checked the JSON against the physical card. Unverified cards are marked `(unverified)` in the results, so treat their scores as provisional. |
 | `tags` | Any of `handwritten`, `printed`, `sideways`, `two-sided`, `faded`, `blank`, for the per-tag rows. `sideways` also tells the orientation check which cards should be turned. |
 | `local_only` | `true` keeps the card away from any provider that doesn't run on your network, whatever the command line says. |
-| `origin` | Written by **Save as eval case**: the job, the provider and model that drafted it, when and from which Mealie commit. The report marks runs scored against a provider's own drafts. |
+| `origin` | Written by **Save as eval case**: the job and its household, the provider and model that drafted it, when and from which Mealie commit. The report marks runs scored against a provider's own drafts. |
 | `expected.name` | The recipe title as written. |
 | `expected.attribution` | Who the recipe is from, as written. Optional. |
 | `expected.description_contains` | Words the description should mention (whole words, case-insensitive). Optional. |
@@ -110,10 +109,10 @@ Write the expected values from the card, not from a model's output. A blank on t
 minutes") is `[blank]` in the JSON and listed in `blanks`; if it's a whole field, it goes in `must_not_invent` too.
 Unknown keys are errors, so a typo can't silently drop a value.
 
-Check the fixtures without running anything (no group or providers needed):
+Check the fixtures without running anything (no group, providers, settings or database needed):
 
 ```bash
-PRODUCTION=false uv run python -m mealie.scripts.eval_recipe_cards --check --cards tests/data/cards
+uv run python -m mealie.scripts.eval_recipe_cards --check --cards tests/data/cards
 ```
 
 A unit test also loads every committed fixture.
@@ -127,8 +126,9 @@ set stays private, in the group's data folder. Running the eval sends every phot
 
 ## Saving eval cases from the phone
 
-On a card's review page, group managers have **⋯ → Save as eval case**: a name (lowercase letters, numbers and dashes)
-and a **verified** tick for when you've checked the draft against the physical card. It writes
+On a card's review page, group managers have **⋯ → Save as eval case**: a name (lowercase letters, numbers and
+dashes), a **verified** tick for when you've checked the draft against the physical card, what the card is
+(**Handwritten**, **Printed**, **Faded**) and **Notes** (at most 2,000 characters). It writes
 `DATA_DIR/groups/<group id>/eval-cards/<name>.json` and `<name>-1.jpg`, `<name>-2.jpg` …:
 
 - the photos are the card's normalized pages **turned back by the rotation orientation applied**, so the eval
@@ -136,12 +136,15 @@ and a **verified** tick for when you've checked the draft against the physical c
 - the expected values are the **reviewed** draft. A line the reviewer corrected is written from the corrected
   quantity, unit and food; otherwise the card's own wording is kept. A field that held `[blank]` when the card was
   read keeps it, even if the reviewer filled the gap in, and is listed in `blanks`;
-- `tags` get `sideways`, `two-sided` and `blank` where they apply (add `handwritten`, `printed` or `faded` by hand),
-  `local_only` follows the card's, and `origin` records who drafted it.
+- `tags` get the ones you ticked, plus `sideways`, `two-sided` and `blank` where they apply; `notes` gets your notes,
+  `local_only` follows the card's, and `origin` records who drafted it and the card's household.
 
 It works for cards that are ready or committed, until a committed card's files are purged. A name that exists is
-refused, never overwritten. The group's Recipe cards settings card lists the cases and deletes them
-(`GET`/`DELETE /api/ai/ingest/eval-cases`). The folder is backed up with the group and never purged.
+refused, never overwritten. **Group Settings > Recipe cards** lists the cases: change **Verified**, the tags and the
+notes in place, **Download** one as `<name>.zip` (its JSON and photos, to move into `tests/data/cards/` or run the
+eval elsewhere), or **Delete** it (`/api/ai/ingest/eval-cases`). A manager sees the cases saved from their own
+household's cards, plus any added by hand; an admin sees all. The folder is backed up with the group and never
+purged.
 
 ## Running the eval
 
@@ -166,7 +169,8 @@ name shown there.
 | `--baseline LABEL` | Compare every config (and chain) with this one, paired by card. |
 | `--chain 'A>B'` | Also report "A, falling back to B when A can't read a card itself", from the same results; repeatable. |
 | `--reference FILE` | An earlier run's JSON, for the cross-read rule (with `--cross-read`) and orientation (with `--no-intake-ocr`). |
-| `--check` | Only validate the fixtures. |
+| `--check` | Only validate the fixtures. Needs no settings or database. |
+| `--dry-run` | Check everything the run needs (fixtures, group, providers and their slots, chains, prices) without calling a provider or writing anything. Lists every problem and exits 1, or exits 0. |
 | `--out FILE` | Where to write the full JSON results. Defaults to `recipe-card-eval.json`. |
 
 Configs are labelled by provider name: `Claude Sonnet`, `qwen3-vl:Claude Sonnet`, `OCR+qwen3-vl`. A chain or baseline
@@ -183,6 +187,9 @@ PRODUCTION=false uv run python -m mealie.scripts.eval_recipe_cards \
   --price Gemini=0.30,2.50 --price Ollama=0,0 --repeat 3
 ```
 
+Add `--dry-run` to the same command first: it finds a mistyped provider, a chain or baseline naming a config that
+isn't there, or a provider without a `--price`, before anything is spent.
+
 ### In the Docker container
 
 The image doesn't include `tests/`. Cards saved from the phone are already in the data volume; the repository's cards
@@ -198,14 +205,17 @@ docker cp mealie:/app/data/recipe-card-eval.json .
 
 - `--ocr` needs Tesseract in the image (`--build-arg INSTALL_OCR=true`, the fork image's default, see
   [`DEPLOY.md`](DEPLOY.md)) and `OCR_ENABLED` left on. Without them the script stops before reading any card; leave
-  out `--ocr` instead. Orientation needs Tesseract too; without it cards are read as intake leaves them.
-- `docker exec` doesn't run the container's entry script, so settings passed as `*_FILE` variables (for example
-  `POSTGRES_PASSWORD_FILE`) aren't loaded. Pass them with `docker exec -e` if the script can't reach the database.
+  out `--ocr` instead. Orientation needs Tesseract and `AI_INGEST_ORIENT` left on, as in production; without them
+  cards are read as intake leaves them.
+- `docker exec` doesn't run the container's entry script, so the script reads the settings passed as `*_FILE`
+  variables itself (for example `POSTGRES_PASSWORD_FILE`), the same list the entry script reads. A variable already
+  set wins, so `docker exec -e` overrides a secret.
 
 ## Reading the results
 
-The script prints one row per config and chain, a second table of the card pipeline's own measures, each card's mean
-score per config, the per-tag rows, the paired comparisons, and the rules of §11.4 as pass or fail.
+The script prints one row per config and chain, a second table of the card pipeline's own measures, a third ranking
+the flags and their cost, each card's mean score per config, the per-tag rows, the paired comparisons, and the rules
+of §11.4 as pass or fail.
 
 ```
 Config         Model           Local  Runs  Errors  Score  Recall  Precision  Misread  Instr  Invented  Latency    p50  Tokens  Cost/card   Std
@@ -235,7 +245,7 @@ The card pipeline's own measures:
 | **FlagRecall** | P(flagged \| wrong): the share of wrong items the review page highlights. |
 | **FlagPrec** | P(wrong \| flagged): the share of highlighted items that really are wrong. |
 | **FlagRate** | The share of items highlighted. |
-| **CleanPrec** | P(card fully correct \| clean): of the cards with nothing highlighted (one tap to commit), the share that were right. What a future "commit clean cards" button would need. |
+| **CleanPrec** | P(card fully correct \| clean): of the cards with nothing highlighted (one tap to commit), the share that were right. What **Add N clean cards** relies on. |
 | **BlanksKept** | Expected blanks that came out as `[blank]`. |
 | **BlanksSafe** | Expected blanks kept, or flagged with an **error** (which blocks commit), so the reviewer can't miss them. |
 | **StepInv** | Numbers per run in the steps, times or yield that aren't on the card. An invented "2 minutes" in a blank still covers a step almost fully, so it's counted here. |
@@ -243,6 +253,18 @@ The card pipeline's own measures:
 | **Food**, **Unit** | On correctly read lines with a structured expectation: the share linked right. Right means linked to the group's food (by name, plural or alias) when the group has it, and left unlinked under the right name when it doesn't (commit creates it). |
 | **WrongLink** | The share of those links made to an existing but wrong food or unit: worse than no link. |
 | **NewFood** | The share of those lines whose food isn't linked: commit creates it, or keeps the line as text. |
+
+A third table ranks the flags and their cost:
+
+| Column | Meaning |
+|---|---|
+| **Cards**, **Items**, **Wrong** | Cards read, the items ranked, and how many of them are wrong |
+| **AUROC** | How well the flags rank wrong items above right ones: the chance that a wrong item's highest flag (none, info, warning or error) is above a right item's, ties counting half. 0.5 is no better than chance, 1.0 perfect. |
+| **Caught** | Wrong items that were highlighted |
+| **Cost/caught** | The config's total cost divided by Caught: what each error the review page points at costs. Needs a `--price` for every provider. |
+
+With fewer than 50 cards both AUROC and Cost/caught move a lot from one card to the next; the report says so. Read
+them as rough until the set is larger.
 
 **Items** for the flag columns are the name, each ingredient line, each step, and the times and yield the draft or
 card has. Each is right or wrong per the scores above (a step with an invented number, or a lost blank, is wrong; an
@@ -319,9 +341,10 @@ below.
 ## Runbook: 20 cards scored per provider
 
 1. Review cards from the box on the phone and tap ⋯ → **Save as eval case** on each: at least 5 printed, 5 faded or
-   pencil, some two-sided, some sideways. Tick **verified** after checking the draft against the card, and add the
-   `handwritten`, `printed` or `faded` tags to the JSON.
-2. Score every candidate, the mixed setup, the OCR configs and the D3 chain, three times each:
+   pencil, some two-sided, some sideways. Tick **verified** after checking the draft against the card, and pick
+   **Handwritten**, **Printed** or **Faded**.
+2. Score every candidate, the mixed setup, the OCR configs and the D3 chain, three times each. Run the command once
+   with `--dry-run` first:
 
    ```bash
    docker exec -it mealie python -m mealie.scripts.eval_recipe_cards --group home \
