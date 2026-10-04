@@ -8,6 +8,9 @@ Ask Home Assistant (HA) Assist about your Mealie recipes, meal plan and shopping
   server, which gives the LLM richer tools: search by time and ingredients, scaled ingredients, one cooking step at a
   time, and optionally adding to the shopping list and planning meals.
 
+[Section 9](#9-recipe-cards) covers recipe cards: camera snapshots into Mealie, a "cards ready" notification and a
+"cards waiting" sensor.
+
 **Layer A:**
 
 - Simple questions ("What's for dinner?") are answered **locally**, with no LLM, in well under a second.
@@ -27,6 +30,7 @@ Ask Home Assistant (HA) Assist about your Mealie recipes, meal plan and shopping
 - [6. How it works](#6-how-it-works)
 - [7. Troubleshooting](#7-troubleshooting)
 - [8. Layer B: Mealie's MCP server](#8-layer-b-mealies-mcp-server)
+- [9. Recipe cards](#9-recipe-cards)
 
 ---
 
@@ -282,6 +286,7 @@ Your LLM conversation agent then gets Mealie's own tools instead of the three La
 | `suggest_from_ingredients` | "What can I make with chicken and rice?" |
 | `whats_planned` | The plan for a day or a range, optionally one meal |
 | `get_shopping_list` | The open items on a list |
+| `recipe_card_queue` | How many scanned recipe cards are waiting to be reviewed (counts only, never card text) |
 | `add_to_shopping_list` | Add items, or a recipe's ingredients for N servings (only if you allow changes) |
 | `plan_meal` | Put a recipe or a note on the plan (only if you allow changes) |
 
@@ -363,6 +368,7 @@ If you skip this step, HA asks for the credentials when you add the integration 
 | "What's planned this week?" | `whats_planned(start, end)` |
 | "Add the lasagna ingredients to the shopping list" | `add_to_shopping_list(recipe_slug, servings)` (changes) |
 | "Put the lasagna on Friday's dinner" | `plan_meal(date, meal="dinner", recipe_slug)` (changes) |
+| "Any recipe cards to review?" | `recipe_card_queue()` |
 
 ### Allowing changes later
 
@@ -383,7 +389,28 @@ If you skip this step, HA asks for the credentials when you add the integration 
 | The agent reads the wrong household's plan | You approved as the wrong user. Disconnect it in Mealie and re-authenticate as Kitchen Voice. |
 | "Mealie took too long to answer. Try again." | HA gives up after 5 seconds, so Mealie stops each tool after 4. Check Mealie's load. |
 
-### References
+---
+
+## 9. Recipe cards
+
+This Mealie build scans stacks of recipe cards and lets you check each one before it becomes a recipe. HA can take
+part in four ways. The steps and the YAML are in the recipe card guide, [`docs/ai/CARDS.md`](../ai/CARDS.md#9-home-assistant):
+
+| You want | How | Needs |
+|---|---|---|
+| A kitchen camera to scan a card | [`camera.snapshot` into Mealie's inbox folder](../ai/CARDS.md#camera-snapshots-into-the-inbox), shared with HA OS as network storage (usage **Media**) | The inbox on the Mealie server ([`DEPLOY.md`](../ai/DEPLOY.md#the-inbox-folder)); no token |
+| The same, without a shared folder | [A `shell_command` that uploads the snapshot with `curl`](../ai/CARDS.md#without-shared-storage-shell_command) | An API token in `secrets.yaml` |
+| A phone notification when a batch is read, opening the first card to review | [An Apprise `json://` notifier in Mealie and a webhook automation](../ai/CARDS.md#the-ready-notification-on-your-phone) | **Show advanced features** in Mealie, for the notifiers page |
+| A "cards waiting" dashboard tile | [A `rest` sensor on `/api/ai/ingest/jobs/counts`](../ai/CARDS.md#a-cards-waiting-sensor) | An API token in `secrets.yaml` |
+
+By voice, Layer B's `recipe_card_queue` tool answers "Any recipe cards to review?" with counts only.
+
+Use the `Kitchen Voice` user's token ([section 1](#use-a-dedicated-kitchen-voice-user-for-the-token)): cards it uploads
+belong to its household, and the sensor counts that household's cards.
+
+---
+
+## References
 
 - [Model Context Protocol integration](https://www.home-assistant.io/integrations/mcp/),
   [Application credentials](https://www.home-assistant.io/integrations/application_credentials/)

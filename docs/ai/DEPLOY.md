@@ -9,6 +9,7 @@ built from the stock `docker/Dockerfile` with Tesseract added for the OCR fallba
 - [3. Upgrade from the old `mealie-dev` image](#3-upgrade-from-the-old-mealie-dev-image)
 - [4. Configure AI providers](#4-configure-ai-providers)
 - [5. OCR fallback](#5-ocr-fallback)
+- [6. Recipe cards](#6-recipe-cards)
 
 For upstream's own reference, see [Backend configuration](../docs/documentation/getting-started/installation/backend-config.md)
 and [AI integration](../docs/documentation/getting-started/installation/ai-providers.md).
@@ -65,7 +66,8 @@ docker compose -f docker/docker-compose.ai.yml up -d
 ```
 
 Set `BASE_URL` and `TZ` in the file first. The file also has a commented-out `ollama` service, with notes for
-NVIDIA and AMD GPUs, if you want local models next to Mealie.
+NVIDIA and AMD GPUs, if you want local models next to Mealie, and commented-out lines for the recipe card inbox
+([section 6](#the-inbox-folder)).
 
 ### Unraid
 
@@ -85,7 +87,8 @@ Then go to **Docker > Add Container** and pick **mealie-ai** from the template l
   template variable replaces it, so the template makes this field required rather than leaving it blank.
 
 **App Data** defaults to `/mnt/user/appdata/mealie-ai`. AI providers are not template variables; you set them up in
-the web UI ([section 4](#4-configure-ai-providers)).
+the web UI ([section 4](#4-configure-ai-providers)). **Recipe card inbox** and `AI_INGEST_INBOX_DIR` are optional and
+empty by default ([section 6](#the-inbox-folder)).
 
 ## 3. Upgrade from the old `mealie-dev` image
 
@@ -269,6 +272,10 @@ Tesseract reads the text from each photo on the server, and the **default provid
 OCR still needs a default provider. Without one, AI imports are off entirely. OCR loses the page layout and struggles
 with handwriting, so a vision model gives better results and OCR is never preferred over one that works.
 
+Recipe cards ([section 6](#6-recipe-cards)) use Tesseract twice: as the same fallback reader, and to turn a card shot
+flat on the table, which phones often save sideways, the right way up before it's read. `OCR_ENABLED=false` turns off
+both.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OCR_ENABLED` | `true` | Turns the fallback off when `false`. It's also skipped when the `tesseract` command isn't installed, as in images built without `INSTALL_OCR`. |
@@ -277,7 +284,86 @@ with handwriting, so a vision model gives better results and OCR is never prefer
 
 Whether to keep Tesseract long term is open decision D3 in the [plan](../AI_INTEGRATION_PLAN.md#11-open-decisions).
 
+## 6. Recipe cards
+
+The **Recipe cards** page scans stacks of recipe cards from a phone, an iOS Shortcut, Home Assistant or a watched
+folder; the user guide is [`CARDS.md`](CARDS.md). It runs inside the Mealie container and needs only the AI providers
+of [section 4](#4-configure-ai-providers): a default provider, plus an image provider or OCR. The settings below are
+all optional.
+
+### The inbox folder
+
+Photos put in a watched folder are read like uploads. It's off until you set `AI_INGEST_INBOX_DIR`.
+
+1. Mount a folder at `/inbox`, **outside App Data**. A folder inside `/app/data` or `/app` is refused at startup (the
+   log says so): backups would zip it, and a restore would wipe it.
+   - **Compose:** uncomment the `/inbox` volume and `AI_INGEST_INBOX_DIR` in `docker-compose.ai.yml`, with your host
+     folder.
+   - **Unraid:** set **Recipe card inbox** to a share such as `/mnt/user/mealie-inbox`, and `AI_INGEST_INBOX_DIR` to
+     `/inbox`. To let Home Assistant drop camera snapshots there, export the share over SMB or NFS.
+2. Set `AI_INGEST_INBOX_DIR=/inbox` and restart. Leave it empty or unset to keep the inbox off.
+3. On its next scan Mealie creates a folder per household, `/inbox/<group-slug>/<household-slug>/`. **Group Settings
+   > Recipe cards** shows yours. `GET /api/ai/about` reports `"inbox": true` once it's on.
+
+- **Permissions.** Mealie, running as `PUID`/`PGID`, must be able to create folders and move files in the share
+  (it moves read photos to `processed/` and unusable ones to `failed/`). Whatever writes the photos, such as a
+  scanner or HA, must be able to write to the household folders Mealie created.
+- **Trust.** Anyone who can write to the share can queue cards for any household. Cards are still reviewed before
+  they become recipes.
+- **Backups.** The inbox isn't backed up, and Mealie never empties `processed/`.
+
+How files are picked up is in [`CARDS.md` section 6](CARDS.md#6-the-inbox-folder).
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AI_INGEST_ENABLED` | `true` | `false` turns recipe card scanning off: its routes answer `503` and nothing runs in the background |
+| `AI_INGEST_WORKER` | `true` | Read cards in this process. Leave it on. |
+| `AI_INGEST_CONCURRENCY` | `2` | Cards read at once per worker process, plus one slot kept for re-reads (1 to 32) |
+| `AI_INGEST_MAX_UPLOAD_MB` | `100` | Largest upload request. JSON bodies are capped at 45 MiB whatever this says. |
+| `AI_INGEST_RETENTION_DAYS` | `14` | Days before the photos of committed cards, and failed cards entirely, are deleted. Cards waiting for review are never deleted. |
+| `AI_INGEST_INBOX_DIR` | unset | The inbox folder inside the container, such as `/inbox` |
+| `AI_INGEST_INBOX_POLL_SECONDS` | `30` | How often the inbox is scanned |
+| `AI_INGEST_INBOX_KEEP_PROCESSED` | `true` | `false` deletes read photos instead of moving them to `processed/` |
+
+### Reverse proxy
+
+Phone photos are several megabytes. nginx accepts 1 MB request bodies by default, so raise it to match
+`AI_INGEST_MAX_UPLOAD_MB`:
+
+```nginx
+client_max_body_size 100m;
+```
+
+Cloudflare's proxy caps uploads at 100 MB. After a `413` the app makes that card's photos smaller once in the browser
+and sends them again, but the iOS Shortcuts and Home Assistant don't.
+
+### How many cards are read at once
+
+Each worker process reads `AI_INGEST_CONCURRENCY` cards at once, plus one re-read, so at most `UVICORN_WORKERS ×
+(AI_INGEST_CONCURRENCY + 1)` cards are with your AI providers at a time (times `WORKER_PER_CORE`, if you set it).
+Keep it low for a single local GPU or a provider with tight rate limits. A group can have at most 200 cards waiting
+to be read; more uploads get `429`.
+
+### Ollama
+
+Set `OLLAMA_CONTEXT_LENGTH` to at least `16384` on the Ollama server (the commented-out service in
+`docker-compose.ai.yml` has it). A two-sided card sends two 2048-pixel images, which overflow Ollama's default
+context on small GPUs. Some local vision models take only one image per request, and fail two-sided cards.
+
+### Backups and restores
+
+- Card photos, drafts and eval cases are stored under App Data (`groups/<group id>/ai-ingest/` and
+  `groups/<group id>/eval-cards/`), so backups include them. The inbox isn't included.
+- **A restore pauses card scanning.** Uploads get `503` with `Retry-After: 60` (the app retries on its own), and the
+  inbox and the background reader stop. Before it starts, the restore waits up to 2 minutes for card files being
+  written; if they're still busy, it stops without changing anything, and you try again.
+- Cards being read during a restore are read again afterwards. If Mealie crashes in the middle of a restore, card
+  scanning stays paused for up to 5 minutes.
+
 ## Related
 
 - [`AI_INTEGRATION_PLAN.md`](../AI_INTEGRATION_PLAN.md): what this fork adds and why
+- [`CARDS.md`](CARDS.md): scanning recipe cards
 - [`home-assistant/README.md`](../home-assistant/README.md): connecting Home Assistant and voice

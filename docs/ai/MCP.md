@@ -2,8 +2,8 @@
 
 Mealie serves its voice-friendly tools over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP) at
 **`/api/mcp`**. An MCP client (Home Assistant's voice assistants, Claude Code, Claude Desktop and others) can then
-search your recipes, read a recipe out step by step, check the meal plan and shopping list, and, if you allow it, add
-to the shopping list and plan meals.
+search your recipes, read a recipe out step by step, check the meal plan, the shopping list and how many scanned recipe
+cards are waiting, and, if you allow it, add to the shopping list and plan meals.
 
 - [1. The tools](#1-the-tools)
 - [2. The MCP server URL](#2-the-mcp-server-url)
@@ -29,6 +29,7 @@ The design and the research behind it are in [`PHASE3.md`](PHASE3.md).
 | `suggest_from_ingredients` | Recipes that use the foods you have, best matches first | No |
 | `whats_planned` | The meal plan for a day or a range, optionally one meal | No |
 | `get_shopping_list` | The open items on a shopping list | No |
+| `recipe_card_queue` | How many scanned recipe cards are ready to review, need a closer look, are still being read or failed ([`CARDS.md`](CARDS.md)). Counts only: never card names or text. | No |
 | `add_to_shopping_list` | Add items, or a recipe's ingredients (scaled), to a shopping list | **Yes** |
 | `plan_meal` | Put a recipe or a note on the meal plan | **Yes** |
 

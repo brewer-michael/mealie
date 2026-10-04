@@ -23,6 +23,9 @@ services:
     restart: always
     volumes:
       - mealie-ai-data:/app/data/
+      # Optional recipe card inbox (docs/ai/CARDS.md): photos put in <inbox>/<group-slug>/<household-slug>/ are
+      # read and queued for review. Use a host folder outside the data volume, and set AI_INGEST_INBOX_DIR below.
+      # - /path/to/mealie-inbox:/inbox
     ports:
       - 9925:9000
     environment:
@@ -35,6 +38,10 @@ services:
       OCR_ENABLED: "true"
       OCR_LANGUAGES: "eng" # joined by '+', e.g. "eng+deu"; each needs its pack in OCR_LANGUAGE_PACKS
       # OCR_TIMEOUT: "60" # seconds
+
+      # Recipe cards (docs/ai/CARDS.md). Tesseract above also turns sideways card photos upright.
+      # AI_INGEST_INBOX_DIR: "/inbox" # turns on the inbox mounted above
+      # AI_INGEST_CONCURRENCY: "2" # cards read at once per worker process, plus one re-read
 
       # PUID: 99 # Unraid's nobody:users
       # PGID: 100
@@ -49,6 +56,9 @@ services:
   #     - ollama-data:/root/.ollama
   #   ports:
   #     - 11434:11434
+  #   environment:
+  #     # Room for a two-sided recipe card (two 2048 px images)
+  #     OLLAMA_CONTEXT_LENGTH: "16384"
   #   # NVIDIA GPU: needs the NVIDIA Container Toolkit on the host
   #   # (on Unraid, the Nvidia-Driver plugin).
   #   # deploy:

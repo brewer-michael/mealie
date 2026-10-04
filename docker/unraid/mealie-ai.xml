@@ -14,6 +14,7 @@
 - AI providers are set up in the web UI, per group, under User Settings > Group Settings > AI Provider Settings (not with variables). Any OpenAI-compatible API works: OpenAI, Google Gemini, OpenRouter, or a local Ollama. A default provider is required for AI features; separate image and audio providers are optional.
 - Create > Import with AI turns photos, pasted text, links or videos into recipes.
 - Tesseract OCR is built in as a fallback for recipe photos: when no image provider is set, or it fails, the text is read with OCR and the default provider turns it into a recipe.
+- Recipe cards (in the sidebar) scans stacks of handwritten or printed recipe cards from your phone, an iOS Shortcut, Home Assistant or an optional inbox folder, and lets you check each one before it becomes a recipe.
 
 Upgrading from the older mealie-dev image: back up your appdata folder FIRST. The database is migrated on first start and the old image-scanning variables and admin page no longer exist. Read the deploy guide (Support link) before switching.
 
@@ -41,6 +42,10 @@ On a fresh install, sign in with Mealie's documented default admin account and c
   <Config Name="OCR_ENABLED" Target="OCR_ENABLED" Default="true" Mode="" Description="Read recipe photos with Tesseract when no image provider is set or it fails. Needs a default AI provider to turn the text into a recipe." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="OCR_LANGUAGES" Target="OCR_LANGUAGES" Default="eng" Mode="" Description="Tesseract language codes joined by +, e.g. eng+deu. This image ships English (eng) only; other languages need a rebuild with OCR_LANGUAGE_PACKS." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="OCR_TIMEOUT" Target="OCR_TIMEOUT" Default="60" Mode="" Description="Seconds before an OCR run is abandoned" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <!-- Recipe cards: an optional inbox folder (docs/ai/CARDS.md) -->
+  <Config Name="Recipe card inbox" Target="/inbox" Default="" Mode="rw" Description="Optional. A share outside App Data, e.g. /mnt/user/mealie-inbox. Photos put in its group/household folders are read and queued for review. Also set AI_INGEST_INBOX_DIR to /inbox." Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="AI_INGEST_INBOX_DIR" Target="AI_INGEST_INBOX_DIR" Default="" Mode="" Description="Set to /inbox to turn on the recipe card inbox mounted above. Leave empty to keep it off." Type="Variable" Display="always" Required="false" Mask="false"/>
 
   <!-- Email -->
   <Config Name="SMTP_HOST" Target="SMTP_HOST" Default="" Mode="" Description="SMTP server hostname (leave empty to disable email)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
