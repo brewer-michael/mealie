@@ -65,6 +65,16 @@ def capture_openai_usage(completion: ChatCompletion) -> None:
         usage.completion_tokens = completion.usage.completion_tokens
 
 
+async def close_client(client: object) -> None:
+    """
+    Closes an OpenAI client on the event loop that used it. Recipe card tasks run in threads with their own loops
+    (docs/ai/PHASE2.md §3.2); an unclosed client is freed by the cyclic garbage collector, whose `__del__` schedules
+    `aclose()` on whatever loop is running then, and logs "Event loop is closed". Test doubles may have no `close`.
+    """
+    if (close := getattr(client, "close", None)) is not None:
+        await close()
+
+
 async def get_claude_response[T: OpenAIBase](
     prompt: str,
     message: str,
@@ -222,10 +232,12 @@ class AIRuntime:
             usage = AITokenUsage()
             started = time.perf_counter()
             try:
-                with open(audio_file_path, "rb") as audio_file:
-                    transcript = await self.service.get_client(provider).audio.transcriptions.create(
-                        model=provider.model, file=audio_file
-                    )
+                client = self.service.get_client(provider)
+                try:
+                    with open(audio_file_path, "rb") as audio_file:
+                        transcript = await client.audio.transcriptions.create(model=provider.model, file=audio_file)
+                finally:
+                    await close_client(client)
             except Exception as e:
                 error = e
                 latency_ms = int((time.perf_counter() - started) * 1000)
@@ -265,9 +277,12 @@ class AIRuntime:
             return await anthropic_adapter.list_models(provider)
 
         client = self.service.get_client(provider)
-        # OpenAI-compatible model lists don't say which models read images
-        models = [
-            AIProviderModelInfo(id=model.id, display_name=None, supports_images=None)
-            async for model in take(client.models.list(), MAX_LISTED_MODELS)
-        ]
+        try:
+            # OpenAI-compatible model lists don't say which models read images
+            models = [
+                AIProviderModelInfo(id=model.id, display_name=None, supports_images=None)
+                async for model in take(client.models.list(), MAX_LISTED_MODELS)
+            ]
+        finally:
+            await close_client(client)
         return sorted(models, key=lambda model: model.id)

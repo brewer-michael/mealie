@@ -334,7 +334,12 @@ Phone photos are several megabytes. nginx accepts 1 MB request bodies by default
 
 ```nginx
 client_max_body_size 100m;
+proxy_read_timeout 180s;
 ```
+
+The longer read timeout is for backup restores, which can wait up to 2 minutes for card scanning to finish writing
+(see [Backups and restores](#backups-and-restores)). With nginx's default of 60 seconds the browser shows a `504`
+while the restore carries on.
 
 Cloudflare's proxy caps uploads at 100 MB. After a `413` the app makes that card's photos smaller once in the browser
 and sends them again, but the iOS Shortcuts and Home Assistant don't.
@@ -345,6 +350,10 @@ Each worker process reads `AI_INGEST_CONCURRENCY` cards at once, plus one re-rea
 (AI_INGEST_CONCURRENCY + 1)` cards are with your AI providers at a time (times `WORKER_PER_CORE`, if you set it).
 Keep it low for a single local GPU or a provider with tight rate limits. A group can have at most 200 cards waiting
 to be read; more uploads get `429`.
+
+Start a new install once with one worker before raising `UVICORN_WORKERS`: on a fresh database, two workers run
+the database migrations at the same time and the first start fails (upstream Mealie behaves the same). Restarting
+fixes it.
 
 ### Ollama
 

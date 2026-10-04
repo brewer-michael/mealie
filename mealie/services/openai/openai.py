@@ -24,7 +24,7 @@ from mealie.schema.group.ai_providers import AIProviderOut, AIProviderProtocol, 
 from mealie.schema.group.ai_routing import AIProviderModelInfo
 from mealie.schema.openai._base import OpenAIBase
 from mealie.schema.openai.general import OpenAIText
-from mealie.services.ai.runtime import AIRuntime, capture_openai_usage, get_claude_response
+from mealie.services.ai.runtime import AIRuntime, capture_openai_usage, close_client, get_claude_response
 
 from .._base_service import BaseService
 
@@ -360,25 +360,28 @@ class OpenAIService(BaseService):
         from openai.types.chat import ChatCompletion
 
         client = self.get_client(provider)
-        # parse() builds the same response_format payload create() would send, but its
-        # client-side validation runs as a post_parser that the raw-response path never
-        # triggers, so we read the body ourselves and let parse_openai_response() below
-        # do the parsing (e.g. of markdown-fenced JSON the SDK would otherwise discard).
-        async with client.chat.completions.with_streaming_response.parse(
-            messages=[
-                {
-                    "role": "system",
-                    "content": prompt,
-                },
-                {
-                    "role": "user",
-                    "content": content,
-                },
-            ],
-            model=provider.model,
-            response_format=response_schema,
-        ) as response:
-            completion = ChatCompletion.model_validate(json.loads(await response.text()))
+        try:
+            # parse() builds the same response_format payload create() would send, but its
+            # client-side validation runs as a post_parser that the raw-response path never
+            # triggers, so we read the body ourselves and let parse_openai_response() below
+            # do the parsing (e.g. of markdown-fenced JSON the SDK would otherwise discard).
+            async with client.chat.completions.with_streaming_response.parse(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": content,
+                    },
+                ],
+                model=provider.model,
+                response_format=response_schema,
+            ) as response:
+                completion = ChatCompletion.model_validate(json.loads(await response.text()))
+        finally:
+            await close_client(client)  # Fork: on this loop, not the garbage collector's (recipe card task threads)
 
         capture_openai_usage(completion)  # Fork: for the usage log
         for choice in completion.choices:

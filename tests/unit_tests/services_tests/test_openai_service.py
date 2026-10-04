@@ -412,3 +412,39 @@ async def test_get_response_reports_token_usage_for_the_usage_log(settings_stub)
     # Outside an attempt the fork logs, there's nothing to report to
     completions._parse_result = _make_body('{"answer": "hi"}', usage=(120, 30))
     assert await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
+
+
+def _real_client(body: str) -> openai.AsyncOpenAI:
+    import httpx2
+
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, content=body.encode()))
+    return openai.AsyncOpenAI(
+        base_url="http://provider.invalid/v1",
+        api_key="test",
+        http_client=openai.DefaultAsyncHttpxClient(transport=transport),
+        max_retries=0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ['{"answer": "hi"}', "not json"])
+async def test_get_response_closes_its_client(settings_stub, content: str):
+    """
+    Fork: the client is closed on the loop that used it, also when the answer is rejected. Recipe card tasks run in
+    threads with their own loops, and the garbage collector would otherwise close it on another (docs/ai/PHASE2.md)
+    """
+    svc = OpenAIService(_make_mock_repos())
+    clients: list[openai.AsyncOpenAI] = []
+
+    def get_client(provider: AIProviderOut) -> openai.AsyncOpenAI:
+        clients.append(_real_client(_make_body(content)))
+        return clients[-1]
+
+    svc.get_client = get_client  # type: ignore[method-assign]
+    try:
+        await svc.get_response("system prompt", "hello", response_schema=_SampleSchema, provider=_make_provider())
+    except Exception:
+        assert content == "not json"
+
+    assert len(clients) == 1
+    assert clients[0].is_closed()
