@@ -1,5 +1,6 @@
 from .fetch import (
     BROWSER_IMPERSONATIONS,
+    DEFAULT_MAX_BYTES,  # fork
     SCRAPER_TIMEOUT,
     FetchResult,
     ForceTimeoutException,
@@ -24,6 +25,7 @@ __all__ = [
     "is_blocked_ip",
     "post",
     "BROWSER_IMPERSONATIONS",
+    "DEFAULT_MAX_BYTES",
     "SCRAPER_TIMEOUT",
     "FetchResult",
     "ForceTimeoutException",

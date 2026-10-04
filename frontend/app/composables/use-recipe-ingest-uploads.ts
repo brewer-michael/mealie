@@ -6,9 +6,10 @@
  * the batch (the server ends an app batch after 10 idle minutes).
  *
  * Everything lives at module level, so the queue keeps going while the user reviews a card and comes back, and it is
- * kept in IndexedDB per user (`use-recipe-ingest-upload-storage.ts`), so a reload or a closed tab resumes it. The
- * transitions are a pure reducer (`reduceUploadQueue`); the requests, timers, storage and previews live around it.
- * Fork-owned.
+ * kept in IndexedDB per user (`use-recipe-ingest-upload-storage.ts`), so a reload or a closed tab resumes it. One tab
+ * of the browser keeps the user's queue at a time: another of their tabs neither reads it back nor sends it, and its
+ * cards page offers "Use this tab". The transitions are a pure reducer (`reduceUploadQueue`); the requests, timers,
+ * storage and previews live around it. Fork-owned.
  */
 import type { AxiosProgressEvent } from "axios";
 import { computed, effectScope, markRaw, readonly, ref, shallowRef, watch } from "vue";
@@ -17,16 +18,24 @@ import { useUserApi } from "~/composables/api";
 import {
   errorCodeOf,
   errorStatusOf,
+  recipeIngestSignedIn,
   resetRecipeIngestCounts,
   resetRecipeIngestReviewState,
   resetRecipeIngestSettings,
+  runRecipeIngestLogoutTasks,
   useRecipeIngestCounts,
 } from "~/composables/use-recipe-ingest";
 import { inspectScanFile, mayBeDocument } from "~/composables/use-recipe-ingest-files";
 import type { ScanFile } from "~/composables/use-recipe-ingest-files";
 import { resetCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
-import { openUploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
-import type { UploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
+import {
+  QueueTakenError,
+  openQueueChannel,
+  openQueueLock,
+  openUploadStorage,
+  uploadStorageName,
+} from "~/composables/use-recipe-ingest-upload-storage";
+import type { QueueLock, UploadStorage } from "~/composables/use-recipe-ingest-upload-storage";
 import type { IngestedJob, IngestRejected, IngestResponse } from "~/lib/api/types/recipe-ingest";
 import type { RecipeIngestAPI } from "~/lib/api/user/recipe-ingest";
 
@@ -57,6 +66,10 @@ export const PREVIEW_CONCURRENCY = 2;
 export const DEFAULT_MAX_PAGES_PER_CARD = 4;
 /** How often the capture page touches its open batch: well inside the server's 10 idle minutes for an app batch */
 export const BATCH_HEARTBEAT_MS = 3 * 60_000;
+/** How often a cards page in a tab that doesn't keep the queue asks for it (the tab keeping it lets go when it's idle) */
+export const QUEUE_WANT_MS = 10_000;
+/** "Use this tab" waits this long for the tab keeping the queue to hand it over, then takes it */
+export const QUEUE_HAND_OVER_MS = 2000;
 export const CAPTURE_MODE_STORAGE_KEY = "mealie.recipe-ingest.capture-mode";
 export const DATA_SAVER_STORAGE_KEY = "mealie.recipe-ingest.data-saver";
 /** "Keep these cards on this server", per user: `<key>.<user id>` */
@@ -759,17 +772,27 @@ const hasPending = computed(
   () => state.value.cards.some(card => !isSettled(card)) || drafts.value.length > 0 || pendingFront.value !== null,
 );
 
-/**
- * Photos a logout would drop: of cards not uploaded (on their way, or failed with Retry), in the tray, and a front
- * waiting for its back. Cards the server refused for good don't count.
- */
-export const recipeIngestPhotosNotUploaded = computed(() =>
+/** Whether this tab keeps the user's queue, another of their tabs does, or neither is settled (no user, or not yet) */
+const keeper = ref<"here" | "elsewhere" | null>(null);
+/** Photos not uploaded yet in the tab that keeps the queue, when that's another tab (it says so on every change) */
+const photosElsewhere = ref(0);
+
+/** The photos of this tab's queue a logout would drop */
+const photosHere = computed(() =>
   state.value.cards
     .filter(card => card.status !== "done" && !isRefused(card))
     .reduce((count, card) => count + card.photos.length, 0)
     + drafts.value.reduce((count, card) => count + card.photos.length, 0)
     + (pendingFront.value ? 1 : 0),
 );
+
+/**
+ * Photos a logout would drop: of cards not uploaded (on their way, or failed with Retry), in the tray, and a front
+ * waiting for its back, in this tab or in the user's tab that keeps the queue. Cards the server refused for good don't
+ * count.
+ */
+export const recipeIngestPhotosNotUploaded = computed(() =>
+  photosHere.value + (keeper.value === "elsewhere" ? photosElsewhere.value : 0));
 
 function dispatch(action: UploadQueueAction) {
   const before = state.value;
@@ -1007,10 +1030,25 @@ function canReencode(photo: Blob): boolean {
 
 /** The signed-in user whose queue this is; null until `connect` */
 let owner: string | null = null;
-/** Where the queue is kept; null when it lives in memory only */
+/** Where the user's queue is kept, whichever tab keeps it; null when it lives in memory only */
+let storageHandle: UploadStorage | null = null;
+/** Where this tab writes the queue: the storage while this tab keeps it; null otherwise, or in memory only */
 let storage: UploadStorage | null = null;
+/**
+ * A storage whose write failed (full, or broken): the queue isn't written to it any more, but deletes still go to it,
+ * so a card that uploads later isn't sent again from it on the next visit (deletes free space, too)
+ */
+let deletesOnly: UploadStorage | null = null;
 /** The stored queue being read back: writes wait for it */
 let restoring: Promise<void> | null = null;
+/** `connect`: settled once this tab knows who keeps the queue, and read it back if it's this one */
+let connecting: Promise<void> | null = null;
+/** This tab, as it names itself to the user's other tabs and in the stored queue */
+const tabId = `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+/** Which of the user's tabs keeps the queue */
+let queueLock: QueueLock | null = null;
+/** How the user's tabs tell each other about the queue: its photos, "Use this tab", a logout */
+let channel: BroadcastChannel | null = null;
 let persistQueued = false;
 let persistChain: Promise<void> = Promise.resolve();
 /** What the storage holds: each record as JSON, and the photo ids */
@@ -1074,48 +1112,90 @@ function snapshot(): { records: Map<string, string>; photos: Map<string, Blob> }
   return { records, photos };
 }
 
-/** The storage failed: the queue lives in memory only from now on, and the capture page says so once */
-function storageFailed(error: unknown) {
+/**
+ * The storage failed (full, or broken): the queue lives in memory from now on, and the capture page says so once. With
+ * the storage whose write failed, what it holds is still known, so deletes keep going to it: a card stored before
+ * the failure that uploads later isn't sent again on the next visit. Once a delete fails too, nothing more goes to it.
+ */
+function storageFailed(error: unknown, failed: UploadStorage | null = null) {
   console.error(error);
   storage = null;
-  writtenRecords.clear();
-  writtenPhotos.clear();
+  deletesOnly = failed;
+  if (!failed) {
+    writtenRecords.clear();
+    writtenPhotos.clear();
+  }
   storageFailedNotice.value = true;
 }
 
-/** Writes what changed since the last write: new and changed records, new photos, and what's gone */
+/** Where the next write goes: the storage, or the failed one that still takes deletes */
+function writeTarget(): UploadStorage | null {
+  return storage ?? deletesOnly;
+}
+
+/** The photos the stored records name, other than those of the records about to go */
+function photosNamed(leaving: readonly string[]): Set<string> {
+  const gone = new Set(leaving);
+  const named = new Set<string>();
+  writtenRecords.forEach((json, key) => {
+    if (gone.has(key)) {
+      return;
+    }
+    const record = JSON.parse(json) as { photoIds?: string[]; photoId?: string };
+    record.photoIds?.forEach(id => named.add(id));
+    if (record.photoId) {
+      named.add(record.photoId);
+    }
+  });
+  return named;
+}
+
+/**
+ * Writes what changed since the last write: new and changed records, new photos, and what's gone. To a failed storage,
+ * only what's gone: a photo goes once no record left names it, as a card's record there may still name its old photos.
+ */
 async function persistOnce() {
   persistQueued = false;
-  const target = storage;
+  const target = writeTarget();
+  const onlyDeletes = target !== null && target === deletesOnly;
   if (restoring) {
     await restoring;
   }
-  if (!target || target !== storage) {
+  if (!target || target !== writeTarget()) {
     return;
   }
   const { records, photos } = snapshot();
   const putRecords = new Map<string, unknown>();
-  records.forEach((json, key) => {
-    if (writtenRecords.get(key) !== json) {
-      putRecords.set(key, JSON.parse(json));
-    }
-  });
+  if (!onlyDeletes) {
+    records.forEach((json, key) => {
+      if (writtenRecords.get(key) !== json) {
+        putRecords.set(key, JSON.parse(json));
+      }
+    });
+  }
   const deleteRecords = [...writtenRecords.keys()].filter(key => !records.has(key));
-  const putPhotos = new Map([...photos].filter(([id]) => !writtenPhotos.has(id)));
-  const deletePhotos = [...writtenPhotos].filter(id => !photos.has(id));
+  const putPhotos = onlyDeletes ? new Map<string, Blob>() : new Map([...photos].filter(([id]) => !writtenPhotos.has(id)));
+  const kept = onlyDeletes ? photosNamed(deleteRecords) : new Set<string>();
+  const deletePhotos = [...writtenPhotos].filter(id => !photos.has(id) && !kept.has(id));
   if (!putRecords.size && !deleteRecords.length && !putPhotos.size && !deletePhotos.length) {
     return;
   }
   try {
-    await target.save({ putRecords, deleteRecords, putPhotos, deletePhotos });
+    // named by this tab: once another tab has taken the queue over, nothing is written
+    await target.save({ putRecords, deleteRecords, putPhotos, deletePhotos }, tabId);
   }
   catch (error) {
-    if (target === storage) {
-      storageFailed(error);
+    if (target === writeTarget()) {
+      if (error instanceof QueueTakenError) {
+        queueTaken(error);
+      }
+      else {
+        storageFailed(error, onlyDeletes ? null : target);
+      }
     }
     return;
   }
-  if (target !== storage) {
+  if (target !== writeTarget()) {
     return;
   }
   putRecords.forEach((_record, key) => writtenRecords.set(key, records.get(key) as string));
@@ -1126,7 +1206,7 @@ async function persistOnce() {
 
 /** Writes the queue soon: changes made together (and progress, which isn't stored) cost one write */
 function schedulePersist() {
-  if (!storage || persistQueued) {
+  if (!writeTarget() || persistQueued) {
     return;
   }
   persistQueued = true;
@@ -1152,11 +1232,18 @@ function restoredCard(stored: Omit<StoredCard, "photoIds">, photos: Blob[]): Upl
 async function restoreFrom(target: UploadStorage, gen: number) {
   let loaded: Awaited<ReturnType<UploadStorage["load"]>>;
   try {
+    // this tab's from now on: a tab that kept it before writes nothing more
+    await target.claim(tabId);
     loaded = await target.load();
   }
   catch (error) {
-    if (target === storage) {
-      storageFailed(error);
+    if (target === storage && gen === generation) {
+      if (error instanceof QueueTakenError) {
+        queueTaken(error);
+      }
+      else {
+        storageFailed(error);
+      }
     }
     return;
   }
@@ -1283,13 +1370,14 @@ function forgetLocalOnly(userId: string) {
 }
 
 /**
- * Whose queue this is: the default layout calls it with the signed-in user. Their stored queue is read back and
- * resumes, and their "Keep these cards on this server" comes back. Another user's queue in memory is forgotten here;
- * it stays stored for that user, and a logout deletes it.
+ * Whose queue this is: the default layout calls it with the signed-in user. The tab that keeps their queue (the first,
+ * or the next once it closes or hands it over) reads it back and resumes it; their "Keep these cards on this server"
+ * comes back. Another user's queue in memory is forgotten here; it stays stored for that user, and a logout deletes it.
+ * Settles once the tab knows whether it keeps the queue (and has read it back if so).
  */
 function connectUser(userId: string | null, open: (userId: string) => UploadStorage | null): Promise<void> {
   if (userId === owner) {
-    return restoring ?? Promise.resolve();
+    return connecting ?? Promise.resolve();
   }
   if (owner !== null) {
     resetRecipeIngestUploads();
@@ -1300,26 +1388,332 @@ function connectUser(userId: string | null, open: (userId: string) => UploadStor
   }
   localOnlyRef.value = readLocalOnly(userId);
   try {
-    storage = open(userId);
+    storageHandle = open(userId);
   }
   catch (error) {
     storageFailed(error);
+    storageHandle = null;
   }
-  if (!storage) {
+  if (!storageHandle) {
+    // nothing is kept between visits, so nothing is shared with other tabs: this tab's queue is its own
+    keeper.value = "here";
     return Promise.resolve();
   }
-  const reading = restoreFrom(storage, generation).catch(storageFailed).finally(() => {
+
+  const name = uploadStorageName(userId);
+  channel = openQueueChannel(name);
+  if (channel) {
+    channel.onmessage = onQueueMessage;
+  }
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  connecting = settled;
+  const current = () => owner === userId && connecting === settled;
+  queueLock = openQueueLock(name, {
+    granted: () => {
+      if (current()) {
+        void startKeeping().finally(settle);
+      }
+    },
+    waiting: () => {
+      if (current()) {
+        keptElsewhere();
+        settle();
+      }
+    },
+    lost: () => {
+      if (current()) {
+        stopKeeping();
+      }
+    },
+  }, tabId);
+  return settled;
+}
+
+// ---- which of the user's tabs keeps the queue
+
+type QueueMessage
+  = | { type: "photos"; count: number }
+    | { type: "photos?" }
+    | { type: "want" }
+    | { type: "hand-over" }
+    | { type: "logout"; id: string }
+    | { type: "logout-done"; id: string };
+
+/** Answers to a logout's "logout", by its id */
+const logoutAnswers = new Map<string, () => void>();
+/** While a cards page is open in a tab that doesn't keep the queue, it asks for it now and then */
+let wantTimer: ReturnType<typeof setInterval> | null = null;
+let handingOver = false;
+
+function post(message: QueueMessage) {
+  try {
+    channel?.postMessage(message);
+  }
+  catch {
+    // closed
+  }
+}
+
+/** The tab keeping the queue tells the user's other tabs how many of its photos aren't uploaded (their logout asks) */
+function announcePhotos() {
+  if (keeper.value === "here") {
+    post({ type: "photos", count: photosHere.value });
+  }
+}
+
+/** Nothing on its way: no card to send, nothing in the tray, no front waiting, no batch open or waiting to be sealed */
+function isIdle(): boolean {
+  const current = state.value;
+  return !hasPending.value
+    && !current.openBatchKey
+    && !current.batches.some(batch => batch.sealing && !isBatchFinished(current, batch));
+}
+
+function onQueueMessage(event: MessageEvent<QueueMessage>) {
+  const message = event.data;
+  switch (message?.type) {
+    case "photos":
+      if (keeper.value === "elsewhere") {
+        photosElsewhere.value = message.count;
+      }
+      break;
+    case "photos?":
+      announcePhotos();
+      break;
+    case "want":
+      // a cards page is open in another tab: an idle queue goes there, unless this tab shows a cards page too
+      if (keeper.value === "here" && cardsPageViews === 0 && isIdle()) {
+        void handOver();
+      }
+      break;
+    case "hand-over":
+      if (keeper.value === "here") {
+        void handOver();
+      }
+      break;
+    case "logout":
+      void stopForLogout(message.id);
+      break;
+    case "logout-done":
+      logoutAnswers.get(message.id)?.();
+      break;
+  }
+}
+
+/** This tab keeps the queue now: it claims the stored queue, reads it back and resumes it */
+function startKeeping(): Promise<void> {
+  keeper.value = "here";
+  photosElsewhere.value = 0;
+  updateWanting();
+  const target = storageHandle;
+  if (!target) {
+    return Promise.resolve();
+  }
+  storage = target;
+  deletesOnly = null;
+  const reading = restoreFrom(target, generation).catch(error => storageFailed(error)).finally(() => {
     if (restoring === reading) {
       restoring = null;
     }
+    announcePhotos();
   });
   restoring = reading;
   return reading;
 }
 
+/** Another tab keeps the queue: this one only says so (and counts that tab's photos for a logout) */
+function keptElsewhere() {
+  keeper.value = "elsewhere";
+  post({ type: "photos?" });
+  updateWanting();
+}
+
+/**
+ * This tab doesn't keep the queue any more (another tab took it, or asked for it): nothing more is sent or written,
+ * and the queue in memory goes; the tab keeping it now reads it back from the storage
+ */
+function stopKeeping() {
+  forgetQueueInMemory();
+  storage = null;
+  deletesOnly = null;
+  restoring = null;
+  persistQueued = false;
+  persistChain = Promise.resolve();
+  writtenRecords.clear();
+  writtenPhotos.clear();
+  keptElsewhere();
+}
+
+/**
+ * Whether this tab still keeps the stored queue, as the storage says: false once another tab has claimed it, or a
+ * logout in another tab deleted it. A storage that fails otherwise doesn't stop the uploads.
+ */
+async function stillKeeping(): Promise<boolean> {
+  const target = storage;
+  if (!target) {
+    return keeper.value !== "elsewhere";
+  }
+  let taken: QueueTakenError | null;
+  try {
+    const by = await target.claimedBy();
+    taken = by === null || by === tabId ? null : new QueueTakenError();
+  }
+  catch (error) {
+    taken = error instanceof QueueTakenError ? error : null;
+  }
+  if (taken && target === storage) {
+    queueTaken(taken);
+  }
+  return !taken;
+}
+
+/** The stored queue isn't this tab's any more: another tab claimed it, or a logout in another tab deleted it */
+function queueTaken(error: QueueTakenError) {
+  stopKeeping();
+  if (error.closed) {
+    // nothing more is stored from this tab (it signs out too in a moment); other tabs aren't held up by it
+    storageHandle = null;
+    queueLock?.release();
+    queueLock = null;
+  }
+  else {
+    queueLock?.yield();
+  }
+}
+
+/** Another tab asked for the queue: what changed last is written first, then this tab lets it go and waits again */
+async function handOver() {
+  if (handingOver) {
+    return;
+  }
+  handingOver = true;
+  try {
+    schedulePersist();
+    await persistChain;
+  }
+  finally {
+    handingOver = false;
+  }
+  if (keeper.value !== "here") {
+    return;
+  }
+  stopKeeping();
+  queueLock?.yield();
+}
+
+/** A cards page open in a tab that doesn't keep the queue asks for it now, and every `QUEUE_WANT_MS` while it's open */
+function updateWanting() {
+  const wanting = keeper.value === "elsewhere" && cardsPageViews > 0 && !!channel;
+  if (wanting && wantTimer === null) {
+    post({ type: "want" });
+    wantTimer = setInterval(() => post({ type: "want" }), QUEUE_WANT_MS);
+  }
+  else if (!wanting && wantTimer !== null) {
+    clearInterval(wantTimer);
+    wantTimer = null;
+  }
+}
+
+/**
+ * "Use this tab": the tab keeping the queue hands it over (it writes what changed last first). One that doesn't
+ * answer within `QUEUE_HAND_OVER_MS` (frozen in the background) has it taken; it writes nothing more once it wakes.
+ * Settles once this tab keeps the queue, or has asked for it.
+ */
+function takeOverQueue(): Promise<void> {
+  const lock = queueLock;
+  if (keeper.value !== "elsewhere" || !lock) {
+    return Promise.resolve();
+  }
+  post({ type: "hand-over" });
+  return new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const stop = watch(keeper, (now) => {
+      if (now !== "elsewhere") {
+        finish();
+      }
+    });
+    function finish() {
+      stop();
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      resolve();
+    }
+    timer = setTimeout(() => {
+      timer = null;
+      if (keeper.value === "elsewhere" && queueLock === lock) {
+        lock.steal();
+      }
+      finish();
+    }, QUEUE_HAND_OVER_MS);
+  });
+}
+
+/** Server batches the queue started that aren't sealed yet */
+function unsealedServerBatches(): string[] {
+  return [...new Set(state.value.batches.flatMap(batch =>
+    batch.serverIds.filter(serverId => !batch.sealedIds.includes(serverId))))];
+}
+
+/** Stops sending and writing at once: nothing in flight changes the queue any more, and nothing more is stored */
+function stopSending() {
+  generation += 1;
+  uploadsInFlight.forEach(controller => controller.abort());
+  uploadsInFlight.clear();
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  storage = null;
+  deletesOnly = null;
+}
+
+/** Waits for all of `work` to settle, at most `timeoutMs` */
+async function settleWithin(work: Promise<unknown>[], timeoutMs: number): Promise<void> {
+  if (!work.length) {
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled(work),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  clearTimeout(timer);
+}
+
+/** Sealing a batch at logout is best effort: it waits at most this long */
+const LOGOUT_SEAL_MS = 2500;
+
+/**
+ * The user logs out in another tab: this tab stops sending and writing at once (the stored queue is deleted next).
+ * The tab that keeps the queue seals its batches first, while the session is still there, and says when it's done.
+ */
+async function stopForLogout(id: string) {
+  const keeping = keeper.value === "here";
+  const sender = api;
+  const unsealed = keeping ? unsealedServerBatches() : [];
+  stopSending();
+  if (keeping) {
+    if (sender) {
+      await settleWithin(unsealed.map(serverId => sender.sealBatch(serverId, { suppressAlert: true })), LOGOUT_SEAL_MS);
+    }
+    post({ type: "logout-done", id });
+  }
+  resetRecipeIngestUploads();
+}
+
 // ---- leaving the page with photos pending
 
 function warnBeforeUnload(event: BeforeUnloadEvent) {
+  // an expired session's redirect to the login page: nothing could be uploaded from here, and the queue is kept
+  if (!recipeIngestSignedIn()) {
+    return;
+  }
   event.preventDefault();
   // Browsers show their own text; some still want a value set
   event.returnValue = "";
@@ -1344,6 +1738,8 @@ function ensureScope() {
     }, { immediate: true });
     // the tray and the waiting front are kept too
     watch([drafts, pendingFront], () => schedulePersist());
+    // the user's other tabs count this tab's photos when they log out
+    watch(photosHere, () => announcePhotos());
   });
 }
 
@@ -1530,6 +1926,11 @@ async function runCard(key: string) {
       return;
     }
 
+    // a tab that lost the queue without noticing (frozen in the background while another took it) sends nothing
+    if (!(await stillKeeping()) || gen !== generation) {
+      return;
+    }
+
     // the switch as it is now: a card that hasn't gone yet takes its setting, whatever batch it's in
     const localOnly = localOnlyRef.value;
     dispatch({ type: "sending", key, localOnly });
@@ -1630,8 +2031,8 @@ function scheduleRetries() {
 
 /** Starts what can start: seals that are due, then cards up to the free upload slots */
 function pump() {
-  if (!api) {
-    return; // nothing can be sent before `useRecipeIngestUploads()`; it pumps then
+  if (!api || keeper.value === "elsewhere") {
+    return; // nothing can be sent before `useRecipeIngestUploads()`, nor by a tab that doesn't keep the queue
   }
   for (const { batchKey, serverId } of batchesToSeal(state.value)) {
     void sealBatch(batchKey, serverId);
@@ -2004,11 +2405,14 @@ function remove(key: string) {
 function openCardsPage(): () => void {
   cardsPageViews += 1;
   failedAway.value = 0;
+  // the queue is kept in another tab: it comes here if it's idle there
+  updateWanting();
   let closed = false;
   return () => {
     if (!closed) {
       closed = true;
       cardsPageViews = Math.max(0, cardsPageViews - 1);
+      updateWanting();
     }
   };
 }
@@ -2064,6 +2468,11 @@ export function useRecipeIngestUploads() {
     lastUploadBatchId: readonly(lastUploadBatchId),
     /** Cards that failed for good while no cards page was open (the sidebar badge), until one opens */
     failedWhileAway: readonly(failedAway),
+    /** Another of the user's tabs keeps the queue: this one doesn't capture or send ("Use this tab" takes it over) */
+    queueElsewhere: computed(() => keeper.value === "elsewhere"),
+    /** Photos not uploaded yet in the tab that keeps the queue, when that's another tab */
+    photosElsewhere: readonly(photosElsewhere),
+    takeOverQueue,
     /** The queue couldn't be kept on this device, so it's lost if the page closes; until dismissed */
     storageFailed: computed<boolean>({
       get: () => storageFailedNotice.value,
@@ -2115,43 +2524,39 @@ export function useRecipeIngestUploads() {
 }
 
 /**
- * A logout the user chose (the header asks first when photos haven't been uploaded): stops the uploads, seals every
- * server batch the queue started that isn't sealed yet, so none stays open and empty on the server, and deletes what
- * this device keeps for the user (the stored queue, the remembered privacy switch). Sealing is best effort: it waits
- * at most `timeoutMs`. The logout then forgets the queue in memory (`resetRecipeIngestState`).
+ * A logout the user chose (the header asks first when photos haven't been uploaded): a review page's edit not saved
+ * yet is saved, the uploads stop, every server batch the queue started that isn't sealed yet is sealed, so none stays
+ * open and empty on the server, and what this device keeps for the user is deleted (the stored queue, the remembered
+ * privacy switch). The user's other tabs stop too; the one keeping the queue seals its batches and stops writing before
+ * the stored queue is deleted. All of it is best effort: it waits at most `timeoutMs`. The logout then forgets the
+ * queue in memory (`resetRecipeIngestState`).
  */
 export async function prepareRecipeIngestLogout(timeoutMs = 3000): Promise<void> {
+  // while the session is still there
+  const finishing = runRecipeIngestLogoutTasks();
   const sender = api;
-  // nothing in flight changes the queue any more, and nothing more is stored
-  generation += 1;
-  uploadsInFlight.forEach(controller => controller.abort());
-  uploadsInFlight.clear();
-  if (retryTimer !== null) {
-    clearTimeout(retryTimer);
-    retryTimer = null;
-  }
-  const forgotten = forgetStoredQueue();
-
-  const unsealed = [...new Set(state.value.batches.flatMap(batch =>
-    batch.serverIds.filter(serverId => !batch.sealedIds.includes(serverId))))];
-  if (sender && unsealed.length) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.allSettled(unsealed.map(serverId => sender.sealBatch(serverId, { suppressAlert: true }))),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, timeoutMs);
-      }),
-    ]);
-    clearTimeout(timer);
-  }
-  await forgotten;
+  const id = newKey("logout");
+  const answered = keeper.value === "elsewhere" && channel
+    ? new Promise<void>(resolve => logoutAnswers.set(id, resolve))
+    : null;
+  post({ type: "logout", id });
+  const unsealed = unsealedServerBatches();
+  stopSending();
+  await settleWithin([
+    ...finishing,
+    ...(sender ? unsealed.map(serverId => sender.sealBatch(serverId, { suppressAlert: true })) : []),
+    ...(answered ? [answered] : []),
+  ], timeoutMs);
+  logoutAnswers.delete(id);
+  await forgetStoredQueue();
 }
 
 /** Deletes what this device keeps for the signed-in user: the stored queue and the remembered privacy switch */
 async function forgetStoredQueue(): Promise<void> {
   const user = owner;
-  let stored = storage;
+  let stored = storageHandle;
   storage = null;
+  deletesOnly = null;
   writtenRecords.clear();
   writtenPhotos.clear();
   if (!user) {
@@ -2174,8 +2579,8 @@ async function forgetStoredQueue(): Promise<void> {
   }
 }
 
-/** Forgets the queue in memory (between tests, on logout and when the user changes); the stored queue stays */
-export function resetRecipeIngestUploads() {
+/** Forgets the queue in memory (photos, retries, seals, thumbnails); what's stored, and the user's choices, stay */
+function forgetQueueInMemory() {
   generation += 1;
   uploadsInFlight.forEach(controller => controller.abort());
   uploadsInFlight.clear();
@@ -2183,32 +2588,10 @@ export function resetRecipeIngestUploads() {
     clearTimeout(retryTimer);
     retryTimer = null;
   }
-  heartbeatHolders = 0;
   heartbeatInFlight = false;
-  stopHeartbeat();
-  scope?.stop();
-  scope = null;
-  if (typeof window !== "undefined") {
-    window.removeEventListener("beforeunload", warnBeforeUnload);
-  }
-  // nothing more is written for the user who was here
-  owner = null;
-  storage = null;
-  restoring = null;
-  persistQueued = false;
-  persistChain = Promise.resolve();
-  writtenRecords.clear();
-  writtenPhotos.clear();
-  storageFailedNotice.value = false;
-
   state.value = emptyUploadQueue();
   drafts.value = [];
   pendingFront.value = null;
-  modeRef.value = null;
-  localOnlyRef.value = false;
-  dataSaverRef.value = null;
-  uploadedCount.value = 0;
-  lastUploadBatchId.value = null;
   sentBeforeChange.value = new Set();
   finishedBySwitch.value = false;
   failedAway.value = 0;
@@ -2218,6 +2601,51 @@ export function resetRecipeIngestUploads() {
   releaseUnusedPreviews();
   previewQueue.length = 0;
   addChain = Promise.resolve();
+}
+
+/** Forgets the queue in memory (between tests, on logout and when the user changes); the stored queue stays */
+export function resetRecipeIngestUploads() {
+  forgetQueueInMemory();
+  heartbeatHolders = 0;
+  stopHeartbeat();
+  scope?.stop();
+  scope = null;
+  if (typeof window !== "undefined") {
+    window.removeEventListener("beforeunload", warnBeforeUnload);
+  }
+  // nothing more is written for the user who was here, and the user's other tabs are left to themselves
+  queueLock?.release();
+  queueLock = null;
+  if (channel) {
+    channel.onmessage = null;
+    channel.close();
+    channel = null;
+  }
+  if (wantTimer !== null) {
+    clearInterval(wantTimer);
+    wantTimer = null;
+  }
+  logoutAnswers.clear();
+  handingOver = false;
+  keeper.value = null;
+  photosElsewhere.value = 0;
+  owner = null;
+  storageHandle = null;
+  storage = null;
+  deletesOnly = null;
+  restoring = null;
+  connecting = null;
+  persistQueued = false;
+  persistChain = Promise.resolve();
+  writtenRecords.clear();
+  writtenPhotos.clear();
+  storageFailedNotice.value = false;
+
+  modeRef.value = null;
+  localOnlyRef.value = false;
+  dataSaverRef.value = null;
+  uploadedCount.value = 0;
+  lastUploadBatchId.value = null;
   api = null;
   refreshCounts = null;
 }

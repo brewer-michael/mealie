@@ -41,11 +41,14 @@ any descriptor of the file drops them all.
 
 **Where the locks live** (`lock_path`): `AI_INGEST_LOCK_DIR/.ai-ingest-lock` when that's set; else
 `DATA_DIR/.ai-ingest-lock`, unless `DATA_DIR`'s filesystem doesn't support locks (`ENOLCK`, `EOPNOTSUPP`: some network
-filesystems). Then `/tmp/mealie-ai-ingest-<sha1 of DATA_DIR, 12 hex digits>.lock` is used, which every worker process
-of the container shares, and a warning says so. A lock outside `DATA_DIR` only works within one host, so a stale-marker
-check trusts the restore lock beside it only for a marker this host wrote. Only where no lock works at all is one
-warning logged and the marker and the gate apply alone: a restore then can't wait for other worker processes' writes,
-and a stale marker is told only by its process.
+filesystems). Then `/tmp/mealie-ai-ingest-<uid>/mealie-ai-ingest-<sha1 of DATA_DIR, 12 hex digits>.lock` is used,
+which every worker process of the container shares, and a warning says so. That folder is this user's own (created
+owner only; one that isn't, or is open to others, is left alone, with a warning): in a shared `/tmp` another local
+user could otherwise create the lock file first and hold it, stalling every write and refusing every restore. A lock
+outside `DATA_DIR` only works within one host, so a stale-marker check trusts the restore lock beside it only for a
+marker this host wrote. Only where no lock works at all (or that folder can't be used) is one warning logged and the
+marker and the gate apply alone: a restore then can't wait for other worker processes' writes, and a stale marker is
+told only by its process.
 
 **The dispatcher's presence file** `DATA_DIR/.ai-ingest-dispatcher`: every running dispatcher sets its modification time
 at most once every `DISPATCHER_SEEN_INTERVAL` (one atomic `utime`, no content), paused or not, so
@@ -66,6 +69,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -99,7 +103,10 @@ RESTORE_LOCK_SUFFIX = ".restore"
 RESTORE_LOCK_HOLD_WAIT = 5.0
 """How long a restore waits for a stale-marker check to let go of the restore lock (it holds it for moments)"""
 FALLBACK_LOCK_DIR = Path("/tmp")
-"""Where the locks go when `DATA_DIR` doesn't support them: a local folder every process of the container shares"""
+"""
+Where the locks go when `DATA_DIR` doesn't support them, in a folder of this user's own (`_private_lock_dir`): a local
+folder every process of the container shares
+"""
 
 _UNSUPPORTED_LOCK_ERRORS = {errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS}
 
@@ -314,6 +321,35 @@ def _locks_work(path: Path) -> bool:
         os.close(fd)
 
 
+def _private_lock_dir() -> Path | None:
+    """
+    `FALLBACK_LOCK_DIR/mealie-ai-ingest-<uid>`, created owner only if it doesn't exist, when it's a folder of this
+    user's own that nobody else can write to; else None. In a shared temporary folder anyone can create a file first
+    and hold its lock, but not one in a folder of someone else's that only its owner can enter.
+    """
+    uid = os.geteuid()
+    folder = FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{uid}"
+    try:
+        folder.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+    except OSError as e:
+        why = type(e).__name__
+    else:
+        if not stat.S_ISDIR(info.st_mode):
+            why = "not a folder"
+        elif info.st_uid != uid:
+            why = "another user's"
+        elif info.st_mode & 0o077:
+            why = "open to other users"
+        else:
+            return folder
+    logger.warning(
+        f"{folder} can't hold recipe card ingestion's locks ({why}): a backup restore pauses ingestion with its "
+        "marker alone. Set AI_INGEST_LOCK_DIR to a local folder only Mealie's user can write to."
+    )
+    return None
+
+
 def _choose_lock_path(data_dir: Path, lock_dir: Path | None) -> Path:
     if lock_dir is not None:
         try:
@@ -325,8 +361,11 @@ def _choose_lock_path(data_dir: Path, lock_dir: Path | None) -> Path:
     path = data_dir / LOCK_FILE_NAME
     if _locks_work(path):
         return path
+    folder = _private_lock_dir()
+    if folder is None:
+        return path  # where locks don't work: the marker alone applies
     digest = hashlib.sha1(str(data_dir.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
-    fallback = FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{digest}.lock"
+    fallback = folder / f"mealie-ai-ingest-{digest}.lock"
     logger.warning(
         f"DATA_DIR ({data_dir}) doesn't support file locks: recipe card ingestion locks {fallback} instead, which "
         "every worker process of this container shares. Set AI_INGEST_LOCK_DIR to choose another local folder."
@@ -336,8 +375,9 @@ def _choose_lock_path(data_dir: Path, lock_dir: Path | None) -> Path:
 
 def lock_path() -> Path:
     """
-    The ingest write lock: `AI_INGEST_LOCK_DIR/.ai-ingest-lock`, else `DATA_DIR/.ai-ingest-lock`, or a file under
-    `/tmp` named after `DATA_DIR` where `DATA_DIR` doesn't support locks. Decided once per process (logged then).
+    The ingest write lock: `AI_INGEST_LOCK_DIR/.ai-ingest-lock`, else `DATA_DIR/.ai-ingest-lock`, or a file named
+    after `DATA_DIR` in this user's own folder under `/tmp` where `DATA_DIR` doesn't support locks. Decided once per
+    process (logged then).
     """
     from .settings import get_ingest_settings  # here: the backup service imports this module
 

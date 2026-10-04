@@ -9,7 +9,16 @@ from typing import Any
 import pytest
 from rapidfuzz import fuzz
 
-from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardDraftStep, CardFlagSource, ExtractionMeta
+from mealie.schema.recipe_ingest import (
+    CardDraft,
+    CardDraftIngredient,
+    CardDraftStep,
+    CardFlagKind,
+    CardFlagSeverity,
+    CardFlagSource,
+    ExtractionMeta,
+    IngestReadPath,
+)
 from mealie.services.ai.ingest.pipeline import crossread
 from mealie.services.ai.ingest.pipeline.cardtext import (
     canonical_markers,
@@ -288,6 +297,82 @@ def test_a_step_longer_than_four_lines_aligns_whole():
 
     assert align_step(step, lines) == (1, 7)
     assert compare(step, " ".join(lines[1:7])) is None
+
+
+# A card whose ingredient lines and terse steps make one run of short lines (`crossread.SHORT_LINE`)
+COOKIE_INGREDIENTS = ["1 c. butter", "1 c. sugar", "2 eggs", "2 c. flour", "1 tsp. soda"]
+COOKIE_STEPS = ["Cream butter and sugar together until fluffy.", "Add eggs.", "Stir in flour.", "Pour into pan."]
+COOKIE_STEPS += ["Bake 30 min.", "Cool."]
+COOKIE = ["Sugar Cookies", *COOKIE_INGREDIENTS, *COOKIE_STEPS]
+
+
+def _steps_flags(
+    ingredients: list[str], steps: list[str], second: list[str], *, ocr: bool = False
+) -> dict[str, list[tuple[str, str, Any, list[str]]]]:
+    """Each step's cross-read (or OCR check) flags, by its text: `(kind, severity, value, alternatives)`"""
+    draft = CardDraft(
+        name=second[0],
+        ingredients=[CardDraftIngredient(original_text=text, note=text, display=text) for text in ingredients],
+        steps=[CardDraftStep(text=text) for text in steps],
+    )
+    read = ExtractionMeta(language="English", read_path=IngestReadPath.image, cross_read_lines=None if ocr else second)
+    flags = compute_flags(draft, read, {}, ocr_lines=second if ocr else None)
+    by_step: dict[str, list[tuple[str, str, Any, list[str]]]] = {step.text: [] for step in draft.steps}
+    texts = {str(step.id): step.text for step in draft.steps}
+    for flag in flags:
+        if flag.ref in texts and flag.source in (CardFlagSource.cross_read, CardFlagSource.ocr):
+            by_step[texts[flag.ref]].append((flag.kind, flag.severity, flag.params.get("value"), flag.alternatives))
+    return by_step
+
+
+def test_a_short_step_among_short_lines_aligns_with_its_own_line():
+    """
+    Each terse step aligns with its own line, not a window of its neighbours: one tap on the second reading would
+    write them into the step ("Add eggs. Stir in flour. Pour into pan. Bake 30 min."), and an ingredient line of
+    more letters ("7 oz. marshmallow creme" for "Add creme.") would beat its own line
+    """
+    first = len(COOKIE_INGREDIENTS) + 1
+    steps = ["Cream butter and sugar together until fluffy.", "Add 3 eggs.", "Stir in flour.", "Pour into pan."]
+    steps += ["Bake 35 min.", "Cool."]
+    assert [align_step(step, COOKIE) for step in steps] == [(first + index, first + index + 1) for index in range(6)]
+
+    fudge = ["Fudge", "3 c. sugar", "3/4 c. butter", "2/3 c. milk", "12 oz. chocolate chips", "7 oz. marshmallow creme"]
+    fudge += ["Boil sugar, butter, milk 6 min.", "Stir in chips.", "Add creme.", "Beat well.", "Pour in 9x13 pan."]
+    assert align_step("Add creme.", fudge) == (8, 9)
+    assert align_step("Pour in 9x13 pan.", fudge) == (10, 11)
+
+    # each step's own reading is offered, alone
+    flags = _steps_flags(COOKIE_INGREDIENTS, steps, COOKIE)
+    assert flags["Add 3 eggs."] == [(CardFlagKind.read_disagreement, CardFlagSeverity.warning, "3", ["Add eggs."])]
+    assert flags["Bake 35 min."] == [(CardFlagKind.read_disagreement, CardFlagSeverity.warning, "35", ["Bake 30 min."])]
+
+
+def test_a_gap_in_a_neighbouring_step_is_not_this_ones():
+    """A gap the second reading has in "Bake [blank] min." is that step's, never a gap in "Add 2 eggs." beside it"""
+    second = [*COOKIE[:-2], "Bake [blank] min.", "Cool."]
+    second[second.index("Add eggs.")] = "Add 3 eggs."
+    steps = [*COOKIE_STEPS]
+    steps[1] = "Add 2 eggs."
+
+    flags = _steps_flags(COOKIE_INGREDIENTS, steps, second)
+
+    assert flags["Add 2 eggs."] == [(CardFlagKind.read_disagreement, CardFlagSeverity.warning, "2", ["Add 3 eggs."])]
+    assert flags["Bake 30 min."] == [(CardFlagKind.blank, CardFlagSeverity.error, "30", [])]
+
+
+@pytest.mark.parametrize("ocr", [False, True], ids=["second reading", "OCR check"])
+def test_a_short_first_step_after_the_ingredients_is_checked(ocr: bool):
+    """The oven's 375° against a reading of 350°, with the ingredient lines as a run of short lines just before it"""
+    ingredients = ["1 can (10 3/4 oz.) soup", "6 oz. chocolate chips", "350 g flour", "1 #2 can pineapple"]
+    ingredients += ["2-3 T. milk"]
+    steps = ["Preheat oven to 350°.", "Cream butter and sugar; add eggs one at a time."]
+    second = ["Pineapple Cake", *ingredients, *steps]
+
+    assert align_step("Preheat oven to 375°.", second) == (6, 7)
+    flags = _steps_flags(ingredients, ["Preheat oven to 375°.", steps[1]], second, ocr=ocr)
+    assert flags["Preheat oven to 375°."] == [
+        (CardFlagKind.read_disagreement, CardFlagSeverity.warning, "375", ["Preheat oven to 350°."])
+    ]
 
 
 # A printed page: long steps, each wrapped over many lines of the second reading

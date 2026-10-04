@@ -11,7 +11,7 @@
       hide-details
       @update:model-value="handleChange"
     />
-    <p v-if="loadFailed" class="text-caption text-error mb-0">
+    <p v-if="loadFailed" class="text-body-small text-error mb-0">
       {{ $t("mcp.token-grant-load-failed") }}
     </p>
   </div>

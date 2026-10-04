@@ -9,7 +9,11 @@ byte-capped body stream, and the three body shapes (multipart, a raw image, JSON
 3. `400 ai_not_enabled` / `local_only_unavailable`, and 4. `429 too_many_jobs` at 200 processing jobs in the group,
    then `429 user_quota` at `AI_INGEST_MAX_PROCESSING_PER_USER` of the uploader's own (when that's set; inbox cards
    have no uploader): one worker-thread call (`intake.reading_readiness`), so provider settings, address lookups and
-   the counts never block the event loop. Both gate new uploads: a request that passes them queues all its cards;
+   the counts never block the event loop. Their counts were read before the body, so intake counts again for every
+   card, under the household's intake lock in the insert's transaction (`IntakeOptions.group_cap`, `user_cap`): a
+   request whose first card finds a cap reached (another upload got in first, the same user's at once, say) gets the
+   same `429`, with nothing in; a later card that would pass a cap is refused on its own, `quota` in `rejected`, so
+   requests running at once can't each add more past it;
 5. `413` by `Content-Length` (45 MiB for JSON), and `415` for any other content type;
 6. the body, through a byte counter that also stops chunked bodies at the same caps.
 
@@ -69,6 +73,7 @@ from .intake import (
     IntakeOptions,
     IntakePage,
     IntakeService,
+    QuotaReached,
     ReadingReadiness,
     in_intake_slot,
     reading_readiness,
@@ -571,20 +576,28 @@ class UploadHandler:
         if readiness.group_local_only and not readiness.local_ready:
             raise UploadRefused(400, LOCAL_ONLY_UNAVAILABLE, message_key="recipe-ingest.errors.local-only-unavailable")
         if readiness.processing >= limits.MAX_PROCESSING_JOBS_PER_GROUP:
-            raise UploadRefused(
-                429,
-                TOO_MANY_JOBS,
-                message_key="recipe-ingest.errors.too-many-jobs",
-                headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
-            )
+            raise UploadHandler._too_many_jobs()
         if user_cap and readiness.user_processing is not None and readiness.user_processing >= user_cap:
-            raise UploadRefused(
-                429,
-                USER_QUOTA,
-                message_key="recipe-ingest.errors.user-quota",
-                message_params={"count": user_cap},
-                headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
-            )
+            raise UploadHandler._user_quota(user_cap)
+
+    @staticmethod
+    def _too_many_jobs() -> UploadRefused:
+        return UploadRefused(
+            429,
+            TOO_MANY_JOBS,
+            message_key="recipe-ingest.errors.too-many-jobs",
+            headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
+        )
+
+    @staticmethod
+    def _user_quota(user_cap: int) -> UploadRefused:
+        return UploadRefused(
+            429,
+            USER_QUOTA,
+            message_key="recipe-ingest.errors.user-quota",
+            message_params={"count": user_cap},
+            headers={"Retry-After": str(limits.QUOTA_RETRY_AFTER)},
+        )
 
     def _cap(self, kind: BodyKind | None) -> int:
         if kind == "json":
@@ -669,11 +682,13 @@ class UploadHandler:
                 )
             await anyio.to_thread.run_sync(self._check_batch, options.batch_id)
             await _fetch_urls(body)
-            return await self._ingest(body, local_only=readiness.group_local_only or options.local_only)
+            return await self._ingest(
+                body, local_only=readiness.group_local_only or options.local_only, user_cap=user_cap
+            )
         finally:
             body.close()
 
-    async def _ingest(self, body: UploadBody, *, local_only: bool) -> IngestResponse:
+    async def _ingest(self, body: UploadBody, *, local_only: bool, user_cap: int = 0) -> IngestResponse:
         options = body.options
         cards = [[image] for image in body.images] if options.split else ([body.images] if body.images else [])
 
@@ -708,6 +723,9 @@ class UploadHandler:
                 allow_duplicate=options.allow_duplicate,
                 locale=self.locale,
                 integration_id=self.integration_id,
+                # check 4 again for every card, counted in the insert's transaction
+                group_cap=limits.MAX_PROCESSING_JOBS_PER_GROUP,
+                user_cap=user_cap or None,
             )
             try:
                 outcome = await service.ingest_async(intake_card, intake_options)
@@ -715,6 +733,15 @@ class UploadHandler:
                 raise self._paused() from e
             except NoEntryFound as e:
                 raise _unknown_batch() from e
+            except QuotaReached as e:
+                if not jobs:  # nothing of the request is in: it's refused whole, as by the counts before the body
+                    raise (self._too_many_jobs() if e.which == "group" else self._user_quota(user_cap)) from e
+                rejected.append(
+                    IngestRejected(
+                        index=front.index, filename=sanitize_filename(front.filename), reason=IngestRejectReason.quota
+                    )
+                )
+                continue
 
             if isinstance(outcome, IntakeAccepted):
                 # the request's further cards join the same batch, in order

@@ -60,7 +60,7 @@ from mealie.schema.recipe_ingest import (
 )
 
 from ..flag_rules import KEEPABLE_KINDS, REVIEW_CONFIDENCE
-from ..shorthand import ABBREVIATIONS, ITEM_SIZE_WORDS, QTY, SIZE_WORDS, UNITS, prepare_line
+from ..shorthand import ABBREVIATIONS, ITEM_SIZE_WORDS, QTY, SIZE_WORDS, UNITS, prepare_line, unit_spellings
 from .cardtext import (
     BLANK,
     MARKER_RE,
@@ -155,7 +155,9 @@ _WORD_BEFORE = re.compile(r"[^\W\d_]+$")
 
 _FRACTION_TYPO = re.compile(r"(?<![\d/.,])(?P<whole>[1-9])(?P<numerator>[1-9])/(?P<denominator>[2348])(?![\d/])")
 """`11/2` for "1 1/2": a whole number run into a proper fraction"""
-_LEADING_QUANTITY = re.compile(rf"^\s*[-•*]?\s*{QTY}(?:\s*(?:-|to)\s*{QTY})?\s*(?P<token>[^\W\d_]+)(?P<dot>\.)?")
+_LEADING_QUANTITY = re.compile(
+    rf"^\s*+[-•*]?+\s*+{QTY}(?:\s*+(?:-|to)\s*+{QTY})?\s*+(?P<token>[^\W\d_]+)(?P<dot>\.)?"
+)  # possessive: each run of spaces is read once (`QTY` itself may start with spaces before a "½")
 _NOT_UNIT_WORDS = frozenset({"or", "and", "to", "of", "x", *ITEM_SIZE_WORDS, *SIZE_WORDS})
 """Short words after a quantity that aren't a lost unit: joins ("2 or 3 eggs") and sizes ("1 lg onion")"""
 _FOOD_WORDS = frozenset("bay bbq bok egg fig ham hot ice jam oat old pea pie red rye sea soy sun tea yam".split())
@@ -190,12 +192,19 @@ _MULTIPLIER_WORDS = frozenset({"dozen", "doz"})
 """Words after a quantity that multiply it, which the parser drops: "1 dozen eggs" is read as 1 egg"""
 _JOINER = r"(?:[+&,;]|\b(?:and|or|plus)\b)"
 """What joins a second amount to a line: "butter + 1 T. oil", "flour (or 1 1/2 c. bread flour)", "sugar, 1 c. flour" """
-_AFTER_JOINER = re.compile(rf"{_JOINER}\s*\(?\s*$", re.IGNORECASE)
-_JOINED_AMOUNT = re.compile(rf"{_JOINER}\s*\(?\s*(?P<amount>{QTY})", re.IGNORECASE)
-_UNIT_AFTER_AMOUNT = re.compile(r"\s*(?P<word>[^\W\d_]+)(?P<dot>\.)?")
-_REST_OF_AMOUNT = re.compile(rf"(?:(?!{_JOINER})[^\d()])*?(?=\s*(?:{_JOINER}|[()]|\d|$))", re.IGNORECASE)
-"""The words after an amount and its unit, up to the next joiner, parenthesis or number"""
+_AFTER_JOINER = re.compile(rf"{_JOINER}\s*+\(?+\s*+$", re.IGNORECASE)
+_KEPT_JOINER = re.compile(rf"(?P<joiner>{_JOINER})\s*+\(?\s*+\d", re.IGNORECASE)
+_JOINED_AMOUNT = re.compile(rf"{_JOINER}\s*+\(?+\s*+(?P<amount>{QTY})", re.IGNORECASE)
+_UNIT_AFTER_AMOUNT = re.compile(r"\s*+-?\s*+(?P<word>[^\W\d_]+)(?P<dot>\.)?")
+_REST_OF_AMOUNT = re.compile(rf"(?:(?!{_JOINER})[^\d()\s]|\s++(?!{_JOINER}|[()]|\d|$))*+", re.IGNORECASE)
+"""
+The words after an amount and its unit, up to the next joiner, parenthesis or number (or the spaces before it). Each
+run of spaces is read once (possessive), so a line with long ones takes linear time; the spaces between amounts used
+to be tried every way (seconds for a few thousand).
+"""
 _WORD = re.compile(r"[^\W\d_]+\.?")
+_UNIT_NAMES = sorted(word for word in _UNIT_WORDS if len(word) >= 5)
+"""Unit words written in full, which a card abbreviates in its own way ("tblsp." for "tablespoon")"""
 
 _SEVERITY = {
     CardFlagKind.illegible: CardFlagSeverity.error,
@@ -587,11 +596,16 @@ def _merged_amount(line: str, food: str | None) -> re.Match[str] | None:
 
 
 def _unit_end(line: str, end: int) -> int:
-    """Where an amount that ends at `end` ends with its unit ("2 T.", "10 3/4 oz."); `end` when no unit follows it"""
+    """
+    Where an amount that ends at `end` ends with its unit ("2 T.", "10 3/4 oz.", "8-oz."); `end` when no unit follows
+    it, or only a size ("or 2 lg.": a size word the note keeps on its own)
+    """
     match = _UNIT_AFTER_AMOUNT.match(line, end)
     if match is None:
         return end
     word = match.group("word").lower()
+    if word in _SIZE_WORD_TOKENS:
+        return end
     if word in _UNIT_WORDS or (match.group("dot") and len(word) <= 4):
         return match.end()
     return end
@@ -619,6 +633,14 @@ def _kept_text(line: str, span: tuple[int, int], field_words: set[str]) -> str:
     return line[start:end].strip().lstrip(",;").strip()
 
 
+def _close_to(value: Fraction, quantity: float) -> bool:
+    """Whether a number on the line is the parsed quantity; a number too large for a float (300 digits) never is"""
+    try:
+        return math.isclose(float(value), quantity, abs_tol=1e-3)
+    except OverflowError:
+        return False
+
+
 def lost_amounts(line: str, quantity: float | None, unit: str | None, food: str | None, note: str) -> list[LostAmount]:
     """
     The amounts on an ingredient's line (as read from the card) that its parsed fields lost, in order: the parser keeps
@@ -640,7 +662,7 @@ def lost_amounts(line: str, quantity: float | None, unit: str | None, food: str 
         for value in (number.value, number.end):
             if value is None:
                 continue
-            if left is not None and math.isclose(float(value), left, abs_tol=1e-3):
+            if left is not None and _close_to(value, left):
                 left = None  # the parsed quantity accounts for this one
                 missing.append(False)
             elif in_fields[value]:
@@ -681,6 +703,11 @@ def keep_lost_amounts(
     """
     lost = lost_amounts(line, quantity, unit, food, note)
     kept = list(dict.fromkeys(amount.kept for amount in lost if amount.kept))
+    if kept and (joiner := _KEPT_JOINER.match(kept[0])):
+        # the parser kept the word that joins the amount on its own ("plus" of "1 c. sugar plus 2 T."): said once
+        before, _, last = note.rpartition(", ")
+        if last.strip().lower() == joiner.group("joiner").lower():
+            note = before
     return ", ".join(part for part in (note, *kept) if part), lost
 
 
@@ -714,6 +741,23 @@ def _size_word_in_names(ingredient: CardDraftIngredient) -> str | None:
             if word.lower().rstrip(".") in _SIZE_WORD_TOKENS:
                 return word
     return None
+
+
+def _abbreviates_a_unit(word: str) -> bool:
+    """
+    Whether a longer word after a quantity (4-6 letters, lowercase) is a unit's plural ("pkgs", "ozs") or the card's
+    own abbreviation of a unit word: its first letter, then letters of it in order ("tblsp", "teasp", "envs"). Foods
+    aren't ("eggs", "pears", "lemon").
+    """
+    if word in _UNIT_WORDS or (word.endswith("s") and word[:-1] in UNIT_VOCABULARY | _UNIT_WORDS):
+        return True
+    for name in _UNIT_NAMES:
+        if name[0] != word[0] or len(name) <= len(word):
+            continue
+        letters = iter(name[1:])
+        if all(letter in letters for letter in word[1:]):
+            return True
+    return False
 
 
 def _looks_like_unit(token: str, dot: bool, units: Collection[str]) -> bool:
@@ -789,9 +833,10 @@ def _fuzzy_links(
 ) -> list[tuple[str, str]]:
     """
     The food and unit the line links that none of their names is on: `("food" | "unit", the linked name)`. A linked
-    item goes by its name, plural and aliases (a unit by its abbreviations too, `linked`); the line is read as written
-    and, on an English card, with its shorthand written out ("1 T. sugar" says "tbsp"). An id `linked` doesn't hold
-    (no longer the group's) isn't judged.
+    item goes by its name, plural and aliases (a unit by its abbreviations too, `linked`, and by the common unit's
+    every spelling, `shorthand.UNIT_SPELLINGS`: "lb." is a pound's); the line is read as written and, on an English
+    card, with its shorthand written out ("1 T. sugar" says "tbsp"). An id `linked` doesn't hold (no longer the
+    group's) isn't judged.
     """
     line = ingredient.original_text
     lines = [_link_words(line)]
@@ -803,7 +848,13 @@ def _fuzzy_links(
         if ref is None or ref.id is None or not ref.name.strip():
             continue
         names = linked.get(ref.id)
-        if names is not None and not _named_on_line([ref.name, *names], lines):
+        if names is None:
+            continue
+        known = [ref.name, *names]
+        if kind == "unit":
+            # a group's unit may have no abbreviation ("teaspoon": commit creates them so), and the line says "tsp."
+            known += [spelling for name in known for spelling in unit_spellings(name)]
+        if not _named_on_line(known, lines):
             fuzzy.append((kind, ref.name))
     return fuzzy
 
@@ -865,8 +916,9 @@ def _ingredient_flags(
                 word in _FOOD_WORDS
                 or (ingredient.food is not None and ingredient.food.id is not None and food.split()[:1] == [word])
             )
+            # a 1-3 letter word, or a longer abbreviation of a unit with its dot ("2 tblsp. sugar", "2 pkgs. yeast")
             if (
-                len(token) <= 3
+                (len(token) <= 3 or (dot and len(token) <= 6 and _abbreviates_a_unit(word)))
                 and word not in _NOT_UNIT_WORDS
                 and food != word
                 and not begins_food

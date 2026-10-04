@@ -87,6 +87,49 @@ def test_a_suffix_another_name_already_holds_is_skipped(api_client: TestClient, 
     assert _job(api_client, user, job_id)["duplicateName"] == "Lemon Bars (2)"
 
 
+@pytest.mark.parametrize("taken", [10, 11, 12])
+def test_a_name_taken_with_every_number_upstream_tries_gets_the_next_free_one(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, taken: int
+):
+    """
+    A family recipe box with many versions of one recipe: upstream's create only tries "(1)" to "(9)" itself, so commit
+    picks the name before it, as the banner says, and the card never gets stuck being added
+    """
+    user = unique_user_fn_scoped
+    name = "Chocolate Chip Cookies"
+    for title in [name, *(f"{name} ({number})" for number in range(1, taken))]:
+        _recipe(api_client, user, title)
+    job_id = _card(user, name)
+    expected = f"{name} ({taken})"
+    assert _job(api_client, user, job_id)["duplicateName"] == expected
+
+    response = api_client.post(job_url(job_id, "commit"), json={"draftVersion": 1}, headers=user.token)
+    assert response.status_code == 201, response.text
+    assert response.json()["slug"] == f"chocolate-chip-cookies-{taken}"
+    recipe = api_client.get(api_routes.recipes_slug(response.json()["slug"]), headers=user.token).json()
+    assert recipe["name"] == expected
+    assert job_row(job_id)["status"] == "committed"
+
+
+def test_a_name_with_every_number_taken_goes_back_for_review(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    from mealie.services.ai.ingest import review
+
+    user = unique_user_fn_scoped
+    monkeypatch.setattr(review, "MAX_NAME_SUFFIX", 3)
+    for title in ["Plum Cake", "Plum Cake (1)", "Plum Cake (2)", "Plum Cake (3)"]:
+        _recipe(api_client, user, title)
+    job_id = _card(user, "Plum Cake")
+    assert _job(api_client, user, job_id)["duplicateName"] is None  # no free one is left
+
+    response = api_client.post(job_url(job_id, "commit"), json={"draftVersion": 1}, headers=user.token)
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {"code": "commit_invalid", "fields": ["name"]}
+    row = job_row(job_id)
+    assert (row["status"], row["error_code"]) == ("ready", "commit_invalid")
+
+
 @pytest.mark.parametrize("existing", ["Bananna Bread", "Banana Bred", "banana-bread!"])
 def test_a_recipe_with_a_near_name_is_a_possible_duplicate(
     api_client: TestClient, unique_user_fn_scoped: TestUser, existing: str

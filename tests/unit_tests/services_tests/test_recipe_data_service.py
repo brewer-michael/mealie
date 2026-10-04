@@ -201,3 +201,15 @@ async def test_scrape_image_returns_none_without_writing_when_download_fails(dat
 
     assert await data_service.scrape_image("https://example.test/photo") is None
     assert written == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("downgrade", [True, False])
+async def test_fetch_image_reports_a_refused_redirect_on_its_own(data_service, monkeypatch, downgrade: bool):
+    """Fork (safehttp/redirects.py): still an `InvalidDomainError`, but routes can tell the reason apart"""
+    _patch_fetch(monkeypatch, raises=safehttp.UnsafeRedirectError("refused", downgrade=downgrade))
+
+    with pytest.raises(recipe_data_service.UnsafeRedirectError) as raised:
+        await data_service.fetch_image("https://example.test/photo")
+    assert isinstance(raised.value, InvalidDomainError)
+    assert raised.value.downgrade is downgrade

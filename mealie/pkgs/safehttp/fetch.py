@@ -1,9 +1,13 @@
 import asyncio
 import random
 import time
+import zlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
+from curl_cffi import CurlECode, CurlOpt
 from httpx import AsyncClient
 
 from mealie.core.config import get_app_settings
@@ -46,6 +50,15 @@ _CHALLENGE_BODY_MARKERS: tuple[bytes, ...] = (
 )
 _CHALLENGE_BODY_SAMPLE = 4096
 
+# fork hook (docs/ai/PHASE2.md, "Changes from the design"): a body is read as the server sent it, never past a cap.
+# curl decoded gzip into an unbounded queue faster than `_read_capped` counted it (1 MiB of gzip held 1 GiB in memory),
+# and closing a response it stopped reading waited for (and held) the rest of the body. So curl decodes nothing and
+# stops receiving at the cap, requests ask for no compression, a body compressed anyway is inflated here within the cap
+# (gzip and deflate only), and a refused body stops the transfer. A caller without `max_bytes` gets this cap.
+DEFAULT_MAX_BYTES = 50 * 1024 * 1024
+IDENTITY = "identity"
+_INFLATABLE = frozenset({"gzip", "x-gzip", "deflate"})
+
 _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 5.0
 _BACKOFF_JITTER = 0.5
@@ -59,6 +72,10 @@ class ForceTimeoutException(Exception):
 
 class ResponseTooLargeError(Exception):
     """Raised when a response body exceeds the caller's byte budget."""
+
+
+class UnreadableEncodingError(Exception):
+    """Fork: a body compressed with a coding that wasn't asked for and isn't inflated here (`_read_capped`)"""
 
 
 @dataclass
@@ -100,7 +117,9 @@ def body_indicates_challenge(content: bytes) -> bool:
     return any(marker in sample for marker in _CHALLENGE_BODY_MARKERS)
 
 
-def _build_transport(impersonate: str, proxy: str | None = None) -> AsyncSafeTransport:
+def _build_transport(
+    impersonate: str, proxy: str | None = None, max_bytes: int | None = DEFAULT_MAX_BYTES
+) -> AsyncSafeTransport:
     settings = get_app_settings()
     kwargs: dict = {
         "impersonate": impersonate,
@@ -116,7 +135,87 @@ def _build_transport(impersonate: str, proxy: str | None = None) -> AsyncSafeTra
         # hands the hostname to the proxy, which does its own resolution. Routing egress through a
         # proxy is an explicit operator choice, so that trade-off is theirs to make.
         kwargs["proxy"] = proxy
+    # fork hook (DEFAULT_MAX_BYTES): no decoding by curl, and no body past `max_bytes` (None for a HEAD, whose declared
+    # length curl would refuse too). NOPROXY is set again by the transport (to "" with a proxy); options of our own
+    # replace safehttp's default, which is this
+    kwargs["curl_options"] = {CurlOpt.NOPROXY: "*", CurlOpt.HTTP_CONTENT_DECODING: 0}
+    if max_bytes is not None:
+        kwargs["curl_options"][CurlOpt.MAXFILESIZE_LARGE] = max_bytes
     return AsyncSafeTransport(**kwargs)
+
+
+def _stop_transfer(resp: httpx.Response) -> None:
+    """
+    Fork hook (DEFAULT_MAX_BYTES): tells curl to drop the rest of a body that won't be read. Closing the response
+    otherwise waits for the whole transfer, queueing every byte still to come. Other transports have nothing to stop.
+    """
+    curl_response = getattr(resp, "extensions", {}).get("curl", {}).get("response")
+    quit_now = getattr(curl_response, "quit_now", None)
+    if quit_now is not None:
+        quit_now.set()
+
+
+def _over_the_cap(error: BaseException) -> bool:
+    """Fork hook: whether curl stopped a body at `MAXFILESIZE_LARGE`, as raised or as the transport's error for it"""
+    return any(
+        getattr(candidate, "code", None) == CurlECode.FILESIZE_EXCEEDED for candidate in (error, error.__cause__)
+    )
+
+
+class _Inflater:
+    """
+    Fork hook (DEFAULT_MAX_BYTES): inflates a body a server compressed although it was asked not to, never past
+    `max_bytes` of output. None of these for an encoding other than gzip or deflate (`encoding_of`).
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._inflate = zlib.decompressobj(zlib.MAX_WBITS | 32)  # a gzip or zlib header, whichever it has
+        self._max_bytes = max_bytes
+        self.size = 0
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        while data:
+            # never 0 here, which would mean "no limit": past the cap it has already raised
+            try:
+                piece = self._inflate.decompress(data, self._max_bytes + 1 - self.size)
+            except zlib.error as e:
+                raise UnreadableEncodingError(f"response body isn't valid gzip or deflate: {e}") from e
+            self.size += len(piece)
+            if self.size > self._max_bytes:
+                raise ResponseTooLargeError(f"response body inflates past {self._max_bytes} bytes")
+            out += piece
+            data = self._inflate.unconsumed_tail
+        return bytes(out)
+
+
+def _cap(max_bytes: int | None) -> int:
+    """Fork hook: the most of a body that is read, `max_bytes` or DEFAULT_MAX_BYTES, whichever is less"""
+    return min(max_bytes, DEFAULT_MAX_BYTES) if max_bytes is not None else DEFAULT_MAX_BYTES
+
+
+def encoding_of(headers: httpx.Headers) -> str:
+    """Fork hook: the body's content coding, lower-case, "identity" when it has none"""
+    return headers.get("content-encoding", IDENTITY).strip().lower() or IDENTITY
+
+
+@asynccontextmanager
+async def _stream(client: AsyncClient, method: str, url: str, timeout: int) -> AsyncIterator[httpx.Response]:
+    """
+    Fork hook (DEFAULT_MAX_BYTES): `client.stream`, asking for no compression. Whatever of the body isn't read when
+    the block ends is never received, and curl stopping at the cap is a `ResponseTooLargeError`.
+    """
+    headers = {"Accept-Encoding": IDENTITY}
+    try:
+        async with client.stream(method, url, timeout=timeout, follow_redirects=True, headers=headers) as resp:
+            try:
+                yield resp
+            finally:
+                _stop_transfer(resp)
+    except Exception as e:
+        if _over_the_cap(e):
+            raise ResponseTooLargeError("response body exceeds its cap") from e
+        raise
 
 
 async def _read_capped(resp: httpx.Response, timeout: int, max_bytes: int | None = None) -> bytes:
@@ -126,21 +225,28 @@ async def _read_capped(resp: httpx.Response, timeout: int, max_bytes: int | None
 
     Mitigates abuse from URLs that serve arbitrarily large or slow content.
     """
+    # fork hook (DEFAULT_MAX_BYTES): every body has a cap, and a compressed one is counted as inflated
+    max_bytes = _cap(max_bytes)
+    encoding = encoding_of(resp.headers)
+    inflater = _Inflater(max_bytes) if encoding in _INFLATABLE else None
+    if inflater is None and encoding != IDENTITY:
+        raise UnreadableEncodingError(f"response body is encoded with {encoding!r}, which wasn't asked for")
+
     if max_bytes is not None:
         declared_length = resp.headers.get("content-length")
         if declared_length and declared_length.isdigit() and int(declared_length) > max_bytes:
             raise ResponseTooLargeError(f"declared content-length {declared_length} exceeds {max_bytes} bytes")
 
-    content = b""
+    content = bytearray()  # fork: `bytes +=` copied the whole body for every 1 KiB chunk
     start_time = time.monotonic()
     async for chunk in resp.aiter_bytes(chunk_size=1024):
-        content += chunk
+        content += inflater.feed(chunk) if inflater else chunk
         if time.monotonic() - start_time > timeout:
             raise ForceTimeoutException()
         # Servers that omit or understate Content-Length are caught by the running total.
         if max_bytes is not None and len(content) > max_bytes:
             raise ResponseTooLargeError(f"response body exceeds {max_bytes} bytes")
-    return content
+    return bytes(content)
 
 
 async def _sleep_backoff(retry_after: str | None, deadline: float) -> None:
@@ -180,10 +286,10 @@ async def _attempt(
     - When both ``result`` is None and ``blocked`` is False, the response was a hard error that
       rotating won't fix, and the caller should stop.
     """
-    transport = _build_transport(impersonation, proxy)
+    transport = _build_transport(impersonation, proxy, _cap(max_bytes) if read_body else None)  # fork: curl's cap
     # fork hook: no redirect off http(s), or from https to http (redirects.py)
     async with AsyncClient(transport=transport, event_hooks={"response": [acheck_redirect]}) as client:
-        async with client.stream(method, url, timeout=timeout, follow_redirects=True) as resp:
+        async with _stream(client, method, url, timeout) as resp:  # fork hook (DEFAULT_MAX_BYTES)
             status_code = resp.status_code
             retry_after = resp.headers.get("Retry-After")
 
@@ -242,9 +348,13 @@ async def _rotate(
             break
 
         logger.debug(f'Trying browser impersonation: "{impersonation}"')
-        result, blocked, status_code, retry_after = await _attempt(
-            url, method, timeout, impersonation, read_body, proxy, max_bytes
-        )
+        try:
+            result, blocked, status_code, retry_after = await _attempt(
+                url, method, timeout, impersonation, read_body, proxy, max_bytes
+            )
+        except UnreadableEncodingError as e:  # fork hook (DEFAULT_MAX_BYTES): a hard error, as an error status is
+            logger.debug(f'{e} with impersonation "{impersonation}"')
+            return None, False
 
         if result is not None:
             return result, False

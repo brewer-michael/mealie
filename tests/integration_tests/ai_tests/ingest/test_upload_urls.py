@@ -61,12 +61,15 @@ class CardServer:
                 if path == "/slow":
                     time.sleep(server.delay)
                 status, body, headers = server.files.get(path, (404, b"not found", {}))
-                self.send_response(status)
-                for name, value in headers.items():
-                    self.send_header(name, value)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # Mealie hung up: a body over the limit isn't read
 
             def log_message(self, *args: Any) -> None:
                 pass

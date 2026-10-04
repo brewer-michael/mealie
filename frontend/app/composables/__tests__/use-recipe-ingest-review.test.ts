@@ -40,7 +40,13 @@ import {
   NOTICE_MS,
   type RecipeIngestReview,
 } from "../use-recipe-ingest-review";
-import { resetRecipeIngestCounts, resetRecipeIngestReviewState, takeRecipeIngestCommitNotice } from "../use-recipe-ingest";
+import {
+  resetRecipeIngestCounts,
+  resetRecipeIngestReviewState,
+  runRecipeIngestLogoutTasks,
+  setRecipeIngestSessionCheck,
+  takeRecipeIngestCommitNotice,
+} from "../use-recipe-ingest";
 import { clearComposableCaches } from "../use-clear-composable-caches";
 import type {
   CardDraft,
@@ -986,6 +992,50 @@ describe("useRecipeIngestReview", () => {
 
     expect(review.attachCardPhoto.value).toBe(true);
     expect(review.cardPhotoPublic.value).toBe(false);
+  });
+
+  test("the cover follows the household's default until the reviewer sets it, and an edit doesn't store the default", async () => {
+    api.getJob.mockResolvedValue(ok(job({
+      householdRecipesPublic: true,
+      cardPhotoDefault: false,
+      cardCoverDefault: false,
+      draft: bananaDraft({ useCardAsCover: null }),
+    })));
+    const { review } = await loaded();
+
+    // a public household: no cover unless the reviewer turns it on, so nothing is public
+    expect(review.draft.value.useCardAsCover ?? null).toBeNull();
+    expect(review.useCardAsCover.value).toBe(false);
+    expect(review.cardPhotoPublic.value).toBe(false);
+    expect(review.isDirty.value).toBe(false);
+
+    // an unrelated edit keeps "the household's default" (null) rather than turning the cover on
+    review.draft.value.name = "Banana Mug Cake for Two";
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft.useCardAsCover ?? null).toBeNull();
+
+    review.useCardAsCover.value = true;
+    expect(review.draft.value.useCardAsCover).toBe(true);
+    expect(review.cardPhotoPublic.value).toBe(true);
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[1]![1].draft).toMatchObject({ useCardAsCover: true });
+  });
+
+  test("a private household (or a server that doesn't say) uses the card as the cover by default; a read-only card keeps it", async () => {
+    api.getJob.mockResolvedValue(ok(job({ householdRecipesPublic: false, cardCoverDefault: true, draft: bananaDraft({ useCardAsCover: null }) })));
+    const first = await loaded();
+    expect(first.review.useCardAsCover.value).toBe(true);
+    expect(first.review.cardPhotoPublic.value).toBe(false);
+
+    const { useCardAsCover: _cover, ...withoutCover } = bananaDraft();
+    api.getJob.mockResolvedValue(ok(job({ status: "committed", draft: withoutCover })));
+    const second = await loaded();
+    expect(second.review.useCardAsCover.value).toBe(true);
+    second.review.useCardAsCover.value = false;
+    expect(second.review.draft.value.useCardAsCover ?? null).toBeNull();
+    expect(second.review.useCardAsCover.value).toBe(true);
   });
 
   test("Keep as text on Check this ingredient keeps the card's line, and the line's parser flags are done", async () => {
@@ -2052,6 +2102,52 @@ describe("useRecipeIngestReview", () => {
     await nextTick();
     expect(await review.saveBeforeLeaving()).toBe(false);
     expect(review.isDirty.value).toBe(true);
+  });
+
+  test("a logout the user chose saves the edit still waiting for its autosave, while the session is there", async () => {
+    const { review } = await loaded();
+    review.draft.value.name = "Typed just before logging out";
+    await nextTick();
+    expect(api.updateJob).not.toHaveBeenCalled();
+
+    await Promise.all(runRecipeIngestLogoutTasks());
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(api.updateJob.mock.calls[0]![1].draft).toMatchObject({ name: "Typed just before logging out" });
+    expect(review.isDirty.value).toBe(false);
+
+    // the page closed: a later logout has nothing of it to wait for
+    wrappers.forEach(wrapper => wrapper.unmount());
+    wrappers.length = 0;
+    expect(runRecipeIngestLogoutTasks()).toHaveLength(0);
+  });
+
+  test("once signed out, the page sends nothing and lets the browser leave without asking", async () => {
+    let signedIn = true;
+    setRecipeIngestSessionCheck(() => signedIn);
+    try {
+      const { review } = await loaded();
+      review.draft.value.name = "Typed as the session ran out";
+      await nextTick();
+      const unload = () => {
+        const event = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      // signed in, an unsaved edit asks before the page is closed
+      expect(unload()).toBe(true);
+
+      // an expired session's redirect clears the token first
+      signedIn = false;
+      expect(unload()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1500);
+      await flushPromises();
+      await review.save();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(api.updateJob).not.toHaveBeenCalled();
+    }
+    finally {
+      setRecipeIngestSessionCheck(null);
+    }
   });
 
   // ==========================================

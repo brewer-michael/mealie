@@ -75,6 +75,7 @@ from mealie.services.recipe.recipe_data_service import (
     InvalidDomainError,
     NotAnImageError,
     RecipeDataService,
+    UnsafeRedirectError,
 )
 from mealie.services.scraper.recipe_bulk_scraper import RecipeBulkScraperService
 from mealie.services.scraper.scraped_extras import ScraperContext
@@ -92,6 +93,13 @@ ASSET_ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png", "gif", "webp", "bmp", "
 # A downloaded asset is stored as-is rather than re-encoded, so the download needs its own
 # ceiling. Matches the budget `openid_provider` uses for remotely-fetched profile images.
 ASSET_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+
+
+def unsafe_redirect_message(error: UnsafeRedirectError) -> str:
+    """Fork (safehttp/redirects.py): why an image URL that redirected wasn't downloaded"""
+    if error.downgrade:
+        return "Url redirected to an insecure http:// address"
+    return "Url redirected to an address that isn't http or https"
 
 
 def asset_name_from_url(url: str) -> str:
@@ -246,6 +254,11 @@ class RecipeController(BaseRecipeController):
 
         if isinstance(ex, exceptions.RateLimitError):
             return self.t("exceptions.rate-limit-error")
+
+        if isinstance(ex, safehttp.UnsafeRedirectError | UnsafeRedirectError):  # fork hook (safehttp/redirects.py)
+            if ex.downgrade:
+                return self.t("recipe.import-errors.insecure-redirect")
+            return self.t("recipe.import-errors.unsafe-redirect")
 
         if isinstance(ex, NoRecipeDataError | AIProviderNotEnabledError):
             # these are raised with an already-translated message
@@ -796,10 +809,17 @@ class RecipeController(BaseRecipeController):
                 status_code=400,
                 detail=ErrorResponse.respond("Url is not an image"),
             ) from e
+        except UnsafeRedirectError as e:  # fork hook (safehttp/redirects.py): the domain was allowed
+            raise HTTPException(status_code=400, detail=ErrorResponse.respond(unsafe_redirect_message(e))) from e
         except InvalidDomainError as e:
             raise HTTPException(
                 status_code=400,
                 detail=ErrorResponse.respond("Url is not from an allowed domain"),
+            ) from e
+        except safehttp.ResponseTooLargeError as e:  # fork hook: safehttp caps every body (DEFAULT_MAX_BYTES)
+            raise HTTPException(
+                status_code=400,
+                detail=ErrorResponse.respond(f"Image is larger than {safehttp.DEFAULT_MAX_BYTES // (1024 * 1024)}MB"),
             ) from e
 
         # A failed download must not leave the recipe claiming an image, or every render
@@ -911,6 +931,8 @@ class RecipeController(BaseRecipeController):
                 status_code=400,
                 detail=ErrorResponse.respond("Url is not an image"),
             ) from e
+        except UnsafeRedirectError as e:  # fork hook (safehttp/redirects.py): the domain was allowed
+            raise HTTPException(status_code=400, detail=ErrorResponse.respond(unsafe_redirect_message(e))) from e
         except InvalidDomainError as e:
             raise HTTPException(
                 status_code=400,

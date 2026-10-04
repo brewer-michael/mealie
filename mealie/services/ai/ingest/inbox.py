@@ -36,7 +36,8 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
 - **No write access** (`EACCES`/`EPERM` on the claim): moving a card folder needs write access to the folder itself,
   so one another user made under umask 022 (mode 2755) stays where it is. The log names the fix (Mealie's group needs
   write access: umask 002), and the app's inbox status lists it as `no_permission` until it's taken or gone
-  (`household_status`; remembered by each process that scans).
+  (`household_status`). Every scanning process records it in `DATA_DIR/.ai-ingest-inbox/blocked.json` (with when it
+  was first found), so a process that doesn't scan (a web process beside a worker), or has just started, lists it too.
 - **Crash safety:** a claim older than `INBOX_CLAIM_RETRY` (by the time in its name) is claimed again by a second
   rename to a fresh claim time, so only one process retries it. A card already inserted is then found by its content
   hash, and the file is just moved to `processed/`.
@@ -61,13 +62,15 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
 
 import calendar
 import errno
+import fcntl
+import json
 import os
 import re
 import shutil
 import stat
 import threading
 import time
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,6 +81,7 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from mealie.core.config import get_app_dirs
 from mealie.core.root_logger import get_logger
 from mealie.db.db_setup import session_context
 from mealie.db.models.group import Group
@@ -537,6 +541,7 @@ def _settled_entries(dirs: _FolderDirs, now: float) -> list[str]:
         blocked = _state.blocked.get(folder.key, {})
         for name in blocked.keys() - current.keys():
             del blocked[name]  # gone, or no longer a card: no longer listed
+    _forget_shared_blocked(folder, _shared_blocked().get(folder.key, {}).keys() - current.keys())
 
     settle_ns = limits.INBOX_SETTLE * 1_000_000_000
     now_ns = int(now * 1_000_000_000)
@@ -972,9 +977,10 @@ def household_status(
     group_slug: str | None, household_slug: str | None, readiness: ReadingReadiness | None = None
 ) -> InboxStatus:
     """
-    What waits in a household's inbox folder, what the scan may not move (`no_permission`: what this process's scans
-    found) and what it refused lately, read without writing anything or following a link (through the scan's
-    descriptors, from the root down); an empty status when the inbox is off or the folder doesn't exist (yet).
+    What waits in a household's inbox folder, what the scan may not move (`no_permission`: what any process's scans
+    found, from the shared record) and what it refused lately, read without writing anything or following a link
+    (through the scan's descriptors, from the root down); an empty status when the inbox is off or the folder doesn't
+    exist (yet).
     `readiness` is the group's (`intake.reading_readiness`), which says why photos wait; without it no reason is given.
     Blocking (file system): call it from a worker thread.
     """
@@ -993,7 +999,7 @@ def household_status(
         if fd is None:
             return InboxStatus()
         try:
-            blocked = _still_there(fd, _blocked(f"{group_slug}/{household_slug}"))
+            blocked = _still_there(fd, _blocked(f"{group_slug}/{household_slug}"))  # every scanning process's
             waiting = _count_waiting(fd, time.time(), skip=blocked.keys())
             rejections = _recent_rejections(fd, time.time())
         finally:
@@ -1398,18 +1404,124 @@ def _scan_folder(
 
 def _block(folder: HouseholdFolder, name: str) -> None:
     with _state.lock:
-        _state.blocked.setdefault(folder.key, {}).setdefault(name, time.time())
+        first_found = _state.blocked.setdefault(folder.key, {}).setdefault(name, time.time())
+
+    def record(folders: dict[str, dict[str, float]]) -> None:
+        folders.setdefault(folder.key, {}).setdefault(name, first_found)  # another process may have found it first
+
+    _update_shared_blocked(record)
 
 
 def _unblock(folder: HouseholdFolder, name: str) -> None:
     with _state.lock:
         _state.blocked.get(folder.key, {}).pop(name, None)
+    _forget_shared_blocked(folder, {name})
 
 
 def _blocked(key: str) -> dict[str, float]:
-    """The folder's entries the scan may not move (`no_permission`), with when it first found each"""
+    """
+    The folder's entries the scan may not move (`no_permission`), with when a scan first found each: this process's,
+    and what every scanning process recorded
+    """
     with _state.lock:
-        return dict(_state.blocked.get(key, {}))
+        found = dict(_state.blocked.get(key, {}))
+    for name, at in _shared_blocked().get(key, {}).items():
+        found[name] = min(at, found.get(name, at))
+    return found
+
+
+# ==========================================
+# The shared record of what the scans may not move
+
+
+STATE_DIR_NAME = ".ai-ingest-inbox"
+"""
+`DATA_DIR/.ai-ingest-inbox/`: what the inbox's scans found that every process shows, a runtime folder backups leave
+out. `blocked.json` holds each household folder's entries the scan may not move, with when one was first found; it's
+rewritten atomically under `blocked.lock`, so scans in several processes don't lose each other's entries.
+"""
+BLOCKED_FILE = "blocked.json"
+BLOCKED_LOCK_FILE = "blocked.lock"
+BLOCKED_MAX_BYTES = 1024 * 1024
+"""A larger record isn't read: the scanning process still lists what it found itself"""
+
+
+def _blocked_path() -> Path:
+    return get_app_dirs().DATA_DIR / STATE_DIR_NAME / BLOCKED_FILE
+
+
+def _shared_blocked() -> dict[str, dict[str, float]]:
+    """
+    Every folder's entries the scans may not move, as the scanning processes recorded them for this inbox; empty
+    when nothing was recorded, the record is another inbox folder's (it moved), or it can't be read
+    """
+    root = inbox_root()
+    if root is None:
+        return {}
+    try:
+        with _blocked_path().open("rb") as file:
+            data = file.read(BLOCKED_MAX_BYTES + 1)
+        record = json.loads(data) if len(data) <= BLOCKED_MAX_BYTES else None
+    except OSError, ValueError:
+        return {}
+    if not isinstance(record, dict) or record.get("root") != str(root) or not isinstance(record.get("folders"), dict):
+        return {}
+    folders: dict[str, dict[str, float]] = {}
+    for key, entries in record["folders"].items():
+        if isinstance(entries, dict):
+            folders[key] = {
+                name: float(at)
+                for name, at in entries.items()
+                if isinstance(at, int | float) and not isinstance(at, bool)
+            }
+    return folders
+
+
+def _update_shared_blocked(change: Callable[[dict[str, dict[str, float]]], None]) -> None:
+    """
+    `change` applied to the shared record, which is read and, when that changed it, written back atomically, all
+    under its lock file. A record that can't be kept is logged once: this process still lists what it found.
+    """
+    root = inbox_root()
+    if root is None:
+        return
+    path = _blocked_path()
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        lock = os.open(path.parent / BLOCKED_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except OSError:
+                pass  # a filesystem without locks: what another scan's write loses, its next scan records again
+            folders = _shared_blocked()
+            before = json.dumps(folders, sort_keys=True)
+            change(folders)
+            folders = {key: entries for key, entries in folders.items() if entries}
+            if json.dumps(folders, sort_keys=True) != before:
+                # ASCII, a name that isn't UTF-8 included (its stand-in characters are escaped)
+                record = json.dumps({"root": str(root), "folders": folders}, sort_keys=True)
+                storage.atomic_write_bytes(path, record.encode("ascii"))
+        finally:
+            os.close(lock)  # and the lock with it
+    except OSError as e:
+        _state.log_once(
+            "blocked-record", f"Couldn't record what the recipe card inbox may not move in {path.parent}: {e}"
+        )
+
+
+def _forget_shared_blocked(folder: HouseholdFolder, names: Collection[str]) -> None:
+    """Takes `names` out of the folder's shared record: taken, gone or no longer a card. Locks only when it has them."""
+    recorded = _shared_blocked().get(folder.key, {})
+    if not any(name in recorded for name in names):
+        return
+
+    def forget(folders: dict[str, dict[str, float]]) -> None:
+        entries = folders.get(folder.key, {})
+        for name in names:
+            entries.pop(name, None)
+
+    _update_shared_blocked(forget)
 
 
 REFUSALS_BURST = limits.AUTO_BATCH_IDLE

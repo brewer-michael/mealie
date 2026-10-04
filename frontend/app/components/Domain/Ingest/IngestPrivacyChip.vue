@@ -18,7 +18,7 @@
         variant="outlined"
         max-width="560"
       >
-        <v-card-title class="text-subtitle-1">
+        <v-card-title class="text-title-medium">
           {{ $t("recipe-ingest.privacy.title") }}
         </v-card-title>
         <v-card-text>
@@ -39,7 +39,7 @@
             {{ $t("recipe-ingest.privacy.local-unavailable") }}
           </p>
           <!-- remembered on, but nothing on the network can read cards now -->
-          <p v-if="kind === 'blocked' && !settings?.localOnly" class="keep-local-unavailable text-caption text-warning mt-4 mb-0">
+          <p v-if="kind === 'blocked' && !settings?.localOnly" class="keep-local-unavailable text-body-small text-warning mt-4 mb-0">
             {{ $t("recipe-ingest.privacy.keep-local-unavailable") }}
           </p>
           <!-- spaced from the switch's hint: the cards that had already left keep the setting they went with -->

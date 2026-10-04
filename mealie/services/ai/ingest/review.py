@@ -24,9 +24,11 @@ two turns of one page both land.
 import asyncio
 import errno
 import fcntl
+import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
@@ -44,6 +46,7 @@ from pydantic import ValidationError
 from pydantic_core import to_jsonable_python
 from rapidfuzz import fuzz
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.orm import Session
 
 from mealie.core.exceptions import SlugError
 from mealie.core.root_logger import get_logger
@@ -72,6 +75,7 @@ from mealie.schema.recipe_ingest import (
     IngestSource,
     IngestStatus,
     IngestTaskKind,
+    IngestTaskMode,
     IngestTaskState,
     PageMeta,
     PageOut,
@@ -95,7 +99,7 @@ from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import flag_rules, images, limits, retention, storage, tasks
 from mealie.services.ai.ingest.eval_export import EXPORTABLE_STATUSES
 from mealie.services.ai.ingest.i18n import translator_for
-from mealie.services.ai.ingest.intake import source_sha256
+from mealie.services.ai.ingest.intake import lock_household_intake, source_sha256
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.pipeline.cardtext import MARKER_RE, canonical_markers, markers_in
@@ -157,7 +161,12 @@ A household recipe whose name is at least this like the draft's (rapidfuzz `rati
 names) is a possible duplicate: "Bananna Bread" for "Banana Bread", not "Banana Bread Muffins"
 """
 NAME_SUFFIXES = 10
-"""Upstream's recipe create tries "Name (1)" to "Name (10)" in turn while the name's slug is taken"""
+"""How many "Name (n)" one look for a free recipe name checks at a time (`suffixed_name`)"""
+MAX_NAME_SUFFIX = 1000
+"""
+The highest "Name (n)" commit gives a recipe: with every one taken, the card's name must change first. Upstream's
+create only tries "(1)" to "(9)" itself, so commit picks the name before it.
+"""
 
 
 class JobActionError(Exception):
@@ -233,12 +242,33 @@ def _parse_extraction(raw: Any) -> ExtractionMeta | None:
 def _task(job: RecipeIngestionJob) -> RecipeIngestionJobTask | None:
     if job.task_state is None or job.task_kind is None:
         return None
+    kind = IngestTaskKind(job.task_kind)
+    mode, refs = _task_mode(job.task_payload) if kind == IngestTaskKind.extract else (None, [])
     return RecipeIngestionJobTask(
-        kind=IngestTaskKind(job.task_kind),
+        kind=kind,
         state=IngestTaskState(job.task_state),
+        mode=mode,
+        refs=refs,
         progress_key=job.progress_key,
         cancel_requested=job.cancel_requested,
     )
+
+
+def _task_mode(payload: Any) -> tuple[IngestTaskMode | None, list[str]]:
+    """
+    What an extract task does, by its `task_payload` as the runner reads it (no mode: the whole card is read), and the
+    lines a `parse_lines` task parses, so a page loaded while it runs (a reload, another device) can say so; never the
+    payload's text. An unknown mode is None.
+    """
+    raw = payload.get("mode") if isinstance(payload, dict) else None
+    try:
+        mode = IngestTaskMode(raw) if raw is not None else IngestTaskMode.reextract
+    except ValueError:
+        return None, []
+    refs: list[str] = []
+    if mode == IngestTaskMode.parse_lines and isinstance(lines := payload.get("lines"), list):
+        refs = [line["ref"] for line in lines if isinstance(line, dict) and isinstance(line.get("ref"), str)]
+    return mode, refs
 
 
 def _error(job: RecipeIngestionJob) -> RecipeIngestionJobError | None:
@@ -656,9 +686,41 @@ def _recipe_name(name: str, locale: str | None) -> str:
     return convert_markers(name, translator_for(locale).t("recipe-ingest.unreadable")).strip()
 
 
-def suffixed_names(name: str) -> list[str]:
-    """The names upstream's create tries, in turn, while the slug of `name` is taken: "Name (1)" to "Name (10)" """
-    return [f"{name} ({number})" for number in range(1, NAME_SUFFIXES + 1)]
+def _slugs_taken(session: Session, group_id: UUID, slugs: Collection[str]) -> set[str]:
+    """Which of `slugs` a recipe of the group has (slugs are unique in a group)"""
+    if not slugs:
+        return set()
+    stmt = sa.select(RecipeModel.slug).where(RecipeModel.group_id == group_id, RecipeModel.slug.in_(set(slugs)))
+    return set(session.execute(stmt).scalars())
+
+
+def suffixed_name(session: Session, group_id: UUID, name: str) -> str | None:
+    """
+    The first "Name (n)" whose slug no recipe of the group has, as upstream's create numbers a taken name: what
+    commit names the recipe while `name`'s slug is taken. None when every one up to `MAX_NAME_SUFFIX` is.
+    """
+    for start in range(1, MAX_NAME_SUFFIX + 1, NAME_SUFFIXES):
+        numbers = range(start, min(start + NAME_SUFFIXES, MAX_NAME_SUFFIX + 1))
+        candidates = {candidate: _slug(candidate) for candidate in (f"{name} ({number})" for number in numbers)}
+        taken = _slugs_taken(session, group_id, {slug for slug in candidates.values() if slug})
+        free = next((candidate for candidate, slug in candidates.items() if slug and slug not in taken), None)
+        if free is not None:
+            return free
+    return None
+
+
+def free_recipe_name(session: Session, group_id: UUID, name: str) -> str | None:
+    """
+    The name commit gives a recipe called `name` (§7): `name` while its slug is free in the group, else the first
+    free "Name (n)" (`suffixed_name`), which the review page announces (`duplicate_name`). None for a name without a
+    slug, or with every "Name (n)" taken.
+    """
+    slug = _slug(name)
+    if slug is None:
+        return None
+    if not _slugs_taken(session, group_id, {slug}):
+        return name
+    return suffixed_name(session, group_id, name)
 
 
 def _near_name_lengths(key: str) -> tuple[int, int]:
@@ -692,6 +754,17 @@ def attaches_card_photo(draft: CardDraft, household: HouseholdInDB | None) -> bo
     """
     if draft.attach_card_photo is not None:
         return draft.attach_card_photo
+    return not recipes_public(household)
+
+
+def uses_card_as_cover(draft: CardDraft, household: HouseholdInDB | None) -> bool:
+    """
+    Whether commit makes the front of the card the recipe's image: the draft's switch, else the household's default,
+    which keeps the card off recipes that are public when created (the image is served without a login, as the assets
+    are), whether the card was reviewed or added with its batch's clean cards
+    """
+    if draft.use_card_as_cover is not None:
+        return draft.use_card_as_cover
     return not recipes_public(household)
 
 
@@ -801,10 +874,13 @@ def settle_turns(
     against its metadata read again there, and not while a task runs: the runner owns a running task's pages (it
     settles them when the task starts, and may be turning one now).
 
+    A merge a stop left half done (`settle_merges`) is settled first, so a page another card was holding is home.
+
     Returns the job as last read (`job` itself when nothing was staged) and whether none of the pages asked about is
     left staged. Raises `JobActionError` `not_found` when the job is gone, `FileNotFoundError` when a page's directory
     is, and `TimeoutError` when a turn holds a page past `TURN_LOCK_WAIT`. Callers hold `storage.ingest_write()`.
     """
+    job = settle_merges(repos, job)
     staged = [
         page.index
         for page in parse_pages(job.pages)
@@ -827,6 +903,153 @@ def settle_turns(
             if outcome != "none":
                 logger.info(f"Recipe card job {job.id}: the staged turn of page {index} a stop left was {outcome}")
     return job, settled
+
+
+# ==========================================
+# Merging cards: the household's lock, and settling a merge a stop left
+
+
+_merge_gates: dict[UUID, threading.Lock] = {}
+"""This process's merge lock per household, taken before the database's (`household_merge_lock`)"""
+_merge_gates_guard = threading.Lock()
+
+MERGE_MARKER_PREFIX = ".merge-"
+"""
+A merge's note in the target's folder, `.merge-<source id>.json`, written before the source's pages move there and
+removed once the merge is over: what a stop in between leaves for `settle_merges`
+"""
+
+
+def _merge_gate(household_id: UUID) -> threading.Lock:
+    with _merge_gates_guard:
+        return _merge_gates.setdefault(household_id, threading.Lock())
+
+
+@contextmanager
+def household_merge_lock(session: Session, household_id: UUID) -> Iterator[None]:
+    """
+    Holds the household's lock for merging cards (and discarding one, or settling a merge a stop left): this process's
+    lock, then the household's intake lock (`intake.lock_household_intake`) in a fresh transaction of `session`, so
+    every row read inside is as the last merge left it. The transaction is the lock's: whatever the body hasn't
+    committed is committed at the end, or rolled back when it raises. Nothing may be pending in `session` before.
+    """
+    with _merge_gate(household_id):
+        if session.in_transaction():
+            session.commit()
+        try:
+            lock_household_intake(session, household_id)
+            yield
+        except BaseException:
+            session.rollback()
+            raise
+        session.commit()
+
+
+def _merge_marker(group_id: UUID, target_id: UUID, source_id: UUID) -> Path:
+    return storage.job_dir(group_id, target_id) / f"{MERGE_MARKER_PREFIX}{source_id}.json"
+
+
+@dataclass(frozen=True)
+class _MergeMarker:
+    path: Path
+    source_id: UUID
+    target_id: UUID
+    moves: list[tuple[int, int]]
+    """Each moved page's index on the source, then on the target"""
+
+    @classmethod
+    def write(cls, group_id: UUID, source_id: UUID, target_id: UUID, moves: list[tuple[int, int]]) -> _MergeMarker:
+        path = _merge_marker(group_id, target_id, source_id)
+        body = {"source": str(source_id), "target": str(target_id), "moves": [list(move) for move in moves]}
+        storage.atomic_write_bytes(path, json.dumps(body).encode())
+        return cls(path, source_id, target_id, moves)
+
+    @classmethod
+    def read(cls, path: Path) -> _MergeMarker | None:
+        try:
+            body = json.loads(path.read_bytes())
+            moves = [(int(origin), int(dest)) for origin, dest in body["moves"]]
+            return cls(path, UUID(body["source"]), UUID(body["target"]), moves)
+        except FileNotFoundError:
+            return None  # settled meanwhile
+        except OSError, ValueError, KeyError, TypeError:
+            logger.warning(f"Removed a recipe card merge note that can't be read ({path.name})")
+            path.unlink(missing_ok=True)
+            return None
+
+
+def _merge_markers(job: RecipeIngestionJob) -> list[Path]:
+    """
+    The merge notes `job` is in: as the target, the notes in its folder; as the source, while one of its pages is
+    missing (a card that can be merged: ready or failed, or being committed since), a note naming it in another card's
+    folder
+    """
+    paths = sorted(storage.job_dir(job.group_id, job.id).glob(f"{MERGE_MARKER_PREFIX}*.json"))
+    statuses = (IngestStatus.ready.value, IngestStatus.failed.value, IngestStatus.committing.value)
+    if job.status in statuses and any(
+        not storage.page_dir(job.group_id, job.id, page.index).is_dir() for page in parse_pages(job.pages)
+    ):
+        paths += sorted(storage.ingest_root(job.group_id).glob(f"*/{MERGE_MARKER_PREFIX}{job.id}.json"))
+    return paths
+
+
+def _remove_merged_source(group_id: UUID, source_id: UUID) -> None:
+    """What is left of a merged card's folder once its pages moved: only empty folders go, never files"""
+    folder = storage.job_dir(group_id, source_id)
+    for path in (folder / "pages", folder):
+        try:
+            path.rmdir()
+        except OSError:
+            pass  # gone already, or not empty: the orphan purge removes a folder without a row later
+
+
+def _settle_marker(repos: IngestRepos, marker: _MergeMarker) -> None:
+    """
+    Settles one merge a stop left, by what the database says, holding the household's merge lock (so no merge is
+    under way): the merge deletes the source and gives the target its pages in one transaction, after moving them.
+    - The source is still there: the merge never happened, so its pages go back.
+    - The source is gone and the target lists the pages: the merge happened; the pages are where they belong.
+    - The source is gone and the target doesn't list them (it was discarded or purged after a merge that never
+      happened): the pages are nobody's and go.
+    """
+    group_id = repos.group_id
+    source, target = repos.jobs.get(marker.source_id), repos.jobs.get(marker.target_id)
+    listed = {page.index for page in parse_pages(target.pages)} if target is not None else set()
+    for origin_index, dest_index in marker.moves:
+        origin = storage.page_dir(group_id, marker.source_id, origin_index)
+        dest = storage.page_dir(group_id, marker.target_id, dest_index)
+        if dest_index in listed or not dest.is_dir():
+            continue  # the target's page now, or never moved
+        if source is None:
+            shutil.rmtree(dest, ignore_errors=True)
+        elif origin.exists() or not origin.parent.is_dir():
+            logger.error(f"Recipe card job {marker.source_id}: couldn't put back page {origin_index} of a merge")
+        else:
+            os.rename(dest, origin)
+    marker.path.unlink(missing_ok=True)
+    if source is None:
+        _remove_merged_source(group_id, marker.source_id)
+    outcome = "undone" if source is not None else "finished"
+    logger.info(f"Recipe card job {marker.target_id}: a merge a stop left half done was {outcome}")
+
+
+def settle_merges(repos: IngestRepos, job: RecipeIngestionJob) -> RecipeIngestionJob:
+    """
+    Settles what a stop left of a merge `job` was in, as the target or the source (`_merge_markers`, `_settle_marker`),
+    under the household's merge lock; returns the job read again then, or `job` itself when there was nothing to
+    settle. Raises `JobActionError` `not_found` when the job is gone (a source whose merge happened). Ends the session's
+    transaction, which must have nothing pending. Callers hold `storage.ingest_write()`.
+    """
+    if not _merge_markers(job):
+        return job
+    with household_merge_lock(repos.session, repos.household_id or job.household_id):
+        for path in _merge_markers(job):
+            if (marker := _MergeMarker.read(path)) is not None:
+                _settle_marker(repos, marker)
+        current = repos.jobs.get(job.id)
+    if current is None:
+        raise not_found()
+    return current
 
 
 # ==========================================
@@ -932,6 +1155,7 @@ class ReviewService:
             "auto_retry_at": job.auto_retry_at if job.status == IngestStatus.failed.value else None,
             # when the retention purge removes a failed card (§16), by the purge's own rule
             "expires_at": retention.failed_card_expires_at(job),
+            "household_recipes_public": self._household_recipes_public,
         }
 
     def _local_only(self, job: RecipeIngestionJob) -> bool:
@@ -1084,9 +1308,9 @@ class ReviewService:
 
     def _same_name(self, name: str, own_recipe: UUID | None) -> tuple[RecipeIngestionRecipeRef | None, str | None]:
         """
-        The group recipe holding the slug `name` gets (slugs are unique in a group), and the first of
-        `suffixed_names` whose slug is free, which commit names the recipe; (None, None) when the slug is free or held
-        by the card's own recipe
+        The group recipe holding the slug `name` gets (slugs are unique in a group), and the first free "Name (n)",
+        which commit names the recipe (`suffixed_name`); (None, None) when the slug is free or held by the card's own
+        recipe
         """
         slug = _slug(name)
         if slug is None:
@@ -1097,15 +1321,8 @@ class ReviewService:
         row = self.session.execute(stmt.limit(1)).one_or_none()
         if row is None or row.id == own_recipe:
             return None, None
-
-        candidates = {candidate: _slug(candidate) for candidate in suffixed_names(name)}
-        taken_stmt = sa.select(RecipeModel.slug).where(
-            RecipeModel.group_id == self.group_id,
-            RecipeModel.slug.in_({slug for slug in candidates.values() if slug}),
-        )
-        taken = set(self.session.execute(taken_stmt).scalars())
-        free = next((candidate for candidate, slug in candidates.items() if slug and slug not in taken), None)
-        return RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name), free
+        ref = RecipeIngestionRecipeRef(id=row.id, slug=row.slug, name=row.name)
+        return ref, suffixed_name(self.session, self.group_id, name)
 
     def _near_name(self, name: str, own_recipe: UUID | None) -> RecipeIngestionRecipeRef | None:
         """The household's recipe whose name is most like `name`, at least `NEAR_NAME_RATIO`; the oldest of a tie"""
@@ -1159,8 +1376,8 @@ class ReviewService:
             duplicate_of=duplicates.recipe,
             duplicate_job=duplicates.job,
             duplicate_name=duplicates.name,
-            household_recipes_public=self._household_recipes_public,
             card_photo_default=not self._household_recipes_public,
+            card_cover_default=not self._household_recipes_public,
         )
         return out
 
@@ -1627,32 +1844,84 @@ class ReviewService:
         """
         Deletes the job's row and its files (§3.1, §9): the uploader, anyone for an inbox card, otherwise the
         household's managers. Deleting the row clears any task with it, so a running one stops within a heartbeat.
-        The caller holds the ingest write lock.
+        Holds the household's merge lock, so a merge never moves pages into a folder being deleted. The caller holds the
+        ingest write lock.
         """
-        job = self.job(job_id)
-        if not self.can_discard(job):
-            raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
-        discardable = [IngestStatus.processing.value, IngestStatus.ready.value, IngestStatus.failed.value]
-        if job.status not in discardable:
-            raise invalid_status(job.status)
+        with household_merge_lock(self.session, self.household_id):
+            job = self.job(job_id)
+            if not self.can_discard(job):
+                raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+            discardable = [IngestStatus.processing.value, IngestStatus.ready.value, IngestStatus.failed.value]
+            if job.status not in discardable:
+                raise invalid_status(job.status)
 
-        if not self.repos.jobs.delete(job_id, where=[Job.status.in_(discardable)]):
-            current = self.job(job_id)
-            raise invalid_status(current.status)
-        storage.remove_job_dir(self.group_id, job_id)
+            if not self.repos.jobs.delete(job_id, where=[Job.status.in_(discardable)]):
+                current = self.job(job_id)
+                raise invalid_status(current.status)
+            storage.remove_job_dir(self.group_id, job_id)
 
     def merge(self, job_id: UUID, into_job_id: UUID) -> RecipeIngestionJobState:
         """
         Adds a card's photos to another card of the household as its next pages (a back sent as a card of its own),
         deletes the card, and reads the other one again: an unedited draft is replaced, an edited one gets a proposal.
         Both must be ready or failed with no task, the user must have uploaded both or manage the household, and the
-        pages must fit in one card. The files move first, then one transaction writes the target and deletes the
-        source, fenced on both rows' `row_version`; when that matches nothing the files move back. The caller holds
-        the ingest write lock.
+        pages must fit in one card. The other card keeps to this server if either was sent so (`local_only`, §10).
+
+        Merges of the household run one at a time (`household_merge_lock`), each reading both cards under the lock, so
+        one never moves pages into a card another is deleting. The files move first, under a note in the target's
+        folder (`_MergeMarker`), then one transaction writes the target and deletes the source, fenced on both rows'
+        `row_version`; when that matches nothing the files move back. Only the moved pages leave the source's folder,
+        whose empty remains are removed after. A stop in between is settled from the note (`settle_merges`). The
+        caller holds the ingest write lock.
         """
         if job_id == into_job_id:
             raise JobActionError(status.HTTP_422_UNPROCESSABLE_CONTENT, SAME_CARD)
-        source, target = self.job(job_id), self.job(into_job_id)
+        with household_merge_lock(self.session, self.household_id):
+            source, target = self.job(job_id), self.job(into_job_id)
+            for job in (source, target):
+                for path in _merge_markers(job):  # a merge a stop left, settled before this one counts the pages
+                    if (marker := _MergeMarker.read(path)) is not None:
+                        _settle_marker(self.repos, marker)
+            source, target = self.job(job_id), self.job(into_job_id)
+            moves = self._check_merge(source, target)
+
+            marker = _MergeMarker.write(
+                self.group_id, job_id, into_job_id, [(page.index, moved.index) for page, _, _, moved in moves]
+            )
+            done: list[tuple[Path, Path]] = []
+            try:
+                for _, origin, dest, _ in moves:
+                    os.rename(origin, dest)
+                    done.append((origin, dest))
+                merged = [*parse_pages(target.pages), *(moved for _, _, _, moved in moves)]
+                written = self._write_merge(source, target, merged)
+            except BaseException:
+                self._move_back(done)
+                marker.path.unlink(missing_ok=True)
+                raise
+            if not written:
+                self._move_back(done)
+                marker.path.unlink(missing_ok=True)
+                self.session.rollback()
+                current = self.repos.jobs.get(into_job_id), self.repos.jobs.get(job_id)
+                if any(job is not None and job.task_state is not None for job in current):
+                    raise busy()
+                state = next((job.status for job in current if job is not None), IngestStatus.ready.value)
+                raise invalid_status(state)
+
+            # a commit that fails leaves the note: the next look settles the pages by what the database holds
+            self.session.commit()
+            marker.path.unlink(missing_ok=True)
+            _remove_merged_source(self.group_id, job_id)
+        return self._queued(into_job_id)
+
+    def _check_merge(
+        self, source: RecipeIngestionJob, target: RecipeIngestionJob
+    ) -> list[tuple[PageMeta, Path, Path, PageMeta]]:
+        """
+        Why the source can't be added to the target, or its pages' moves: each page, its folder, the folder it moves
+        to, and the page as the target's
+        """
         movable = (IngestStatus.ready.value, IngestStatus.failed.value)
         for job in (source, target):
             if not (self._uploaded(job) or self.user.can_manage_household):
@@ -1669,39 +1938,30 @@ class ReviewService:
         first = max((page.index for page in target_pages), default=-1) + 1
         moves = [
             (
-                storage.page_dir(self.group_id, job_id, page.index),
-                storage.page_dir(self.group_id, into_job_id, first + offset),
+                page,
+                storage.page_dir(self.group_id, source.id, page.index),
+                storage.page_dir(self.group_id, target.id, first + offset),
                 page.model_copy(update={"index": first + offset}),
             )
             for offset, page in enumerate(source_pages)
         ]
-        if not all(origin.is_dir() for origin, _, _ in moves) or any(dest.exists() for _, dest, _ in moves):
+        if (
+            not moves
+            or not storage.page_dir(self.group_id, target.id, 0).parent.is_dir()
+            or not all(origin.is_dir() for _, origin, _, _ in moves)
+            or any(dest.exists() for _, _, dest, _ in moves)
+        ):
             raise JobActionError(status.HTTP_409_CONFLICT, FILES_MISSING)
-
-        done: list[tuple[Path, Path]] = []
-        try:
-            for origin, dest, _ in moves:
-                os.rename(origin, dest)
-                done.append((origin, dest))
-            merged = [*target_pages, *(page for _, _, page in moves)]
-            written = self._write_merge(source, target, merged)
-        except BaseException:
-            self._move_back(done)
-            raise
-        if not written:
-            self._move_back(done)
-            current = self.repos.jobs.get(into_job_id), self.repos.jobs.get(job_id)
-            if any(job is not None and job.task_state is not None for job in current):
-                raise busy()
-            raise invalid_status(next((job.status for job in current if job is not None), IngestStatus.ready.value))
-
-        storage.remove_job_dir(self.group_id, job_id)
-        return self._queued(into_job_id)
+        return moves
 
     def _write_merge(self, source: RecipeIngestionJob, target: RecipeIngestionJob, pages: list[PageMeta]) -> bool:
         """
-        One transaction: the target gets the pages and an extract task (a failed one goes back to `processing`), and
-        the source is deleted, each only if its `row_version`, status and idle task are as read. Whether both happened.
+        In the merge's transaction, left to the caller to end: the target gets the pages and an extract task (a failed
+        one goes back to `processing`), and the source is deleted, each only if its `row_version`, status and idle
+        task are as read. Whether both happened.
+
+        The target keeps to this server when either card was sent so: photos uploaded to stay here never reach a cloud
+        provider through the card they join (§10); only "Read with cloud" lifts that, with the user's consent.
         """
         movable = [IngestStatus.ready.value, IngestStatus.failed.value]
         failed = target.status == IngestStatus.failed.value
@@ -1709,39 +1969,35 @@ class ReviewService:
             "pages": [page.model_dump(mode="json") for page in pages],
             "source_sha256": source_sha256(pages),
         }
+        if source.local_only and not target.local_only:
+            values["local_only"] = True
         if failed:
             values |= {"status": IngestStatus.processing.value, "error_code": None, "error_params": None}
         where = [Job.row_version == target.row_version, Job.status == target.status]
-        try:
-            queued = enqueue_task(
-                self.session,
-                target.id,
-                self.household_id,
-                IngestTaskKind.extract,
-                None,
-                limits.PRIORITY_EXTRACT,
-                where=where,
-                values=values,
-                commit=False,
-            )
-            deleted = queued and self.session.execute(
-                sa.delete(Job).where(
-                    Job.id == source.id,
-                    *self.repos.jobs.scope,
-                    Job.row_version == source.row_version,
-                    Job.status.in_(movable),
-                    Job.task_state.is_(None),
-                ),
-                execution_options={"synchronize_session": False},
-            )
-            if not queued or getattr(deleted, "rowcount", 0) != 1:
-                self.session.rollback()
-                return False
-        except BaseException:
-            self.session.rollback()
-            raise
-        self.session.commit()
-        return True
+        queued = enqueue_task(
+            self.session,
+            target.id,
+            self.household_id,
+            IngestTaskKind.extract,
+            None,
+            limits.PRIORITY_EXTRACT,
+            where=where,
+            values=values,
+            commit=False,
+        )
+        if not queued:
+            return False
+        deleted = self.session.execute(
+            sa.delete(Job).where(
+                Job.id == source.id,
+                *self.repos.jobs.scope,
+                Job.row_version == source.row_version,
+                Job.status.in_(movable),
+                Job.task_state.is_(None),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+        return getattr(deleted, "rowcount", 0) == 1
 
     @staticmethod
     def _move_back(done: Sequence[tuple[Path, Path]]) -> None:
@@ -1756,7 +2012,8 @@ class ReviewService:
         One of a page's images, after the household check (§9). A turn a stop left staged is settled first
         (`settle_turns`), so the file served is the one the page's metadata, and so its ETag, describes; while that
         can't be done (a running task is turning the page, or a backup restore pauses writes) the file is served as
-        it is, with `settled` false.
+        it is, with `settled` false. A page that isn't in its folder may be in another card's, where a merge a stop
+        left half done put it: that is settled first too (`settle_merges`).
         """
         job = self.job(job_id)
         pages = {page.index: page for page in parse_pages(job.pages)}
@@ -1765,7 +2022,7 @@ class ReviewService:
 
         page_dir = storage.page_dir(self.group_id, job_id, index)
         settled = True
-        if images.has_staged(page_dir):
+        if images.has_staged(page_dir) or not page_dir.is_dir():
             job, settled = self._settle_to_read(job, index)
             pages = {page.index: page for page in parse_pages(job.pages)}
             if index not in pages:

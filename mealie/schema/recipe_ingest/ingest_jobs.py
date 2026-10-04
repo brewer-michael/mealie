@@ -19,6 +19,7 @@ from .ingest_enums import (
     IngestSource,
     IngestStatus,
     IngestTaskKind,
+    IngestTaskMode,
     IngestTaskState,
 )
 from .ingest_extraction import CardReadInfo
@@ -31,6 +32,14 @@ class RecipeIngestionJobTask(MealieModel):
 
     kind: IngestTaskKind
     state: IngestTaskState
+    mode: IngestTaskMode | None = None
+    """
+    What an `extract` task does (its `task_payload`): read the whole card (`reextract`, also a first read or a retry),
+    build the recipe again from the corrected text (`rebuild`), or parse chosen lines (`parse_lines`); None for a
+    region re-read
+    """
+    refs: list[str] = Field(default_factory=list)
+    """The ingredient lines (`referenceId`s) a `parse_lines` task parses"""
     progress_key: str | None = None
     """A translation key, e.g. `recipe-ingest.progress.reading-card`"""
     cancel_requested: bool = False
@@ -95,6 +104,11 @@ class RecipeIngestionJobSummary(MealieModel):
     """A card that failed because every provider was over its monthly limit is read again by then (UTC)"""
     expires_at: datetime | None = None
     """A failed card is removed then, with its photos (UTC)"""
+    household_recipes_public: bool = False
+    """
+    New recipes in the household can be seen without a login, so a card photo on one (its image or an attachment)
+    would be too; cards whose draft doesn't say leave it off then (`card_photo_default`, `card_cover_default`)
+    """
 
 
 class RecipeIngestionJobPagination(PaginationBase):
@@ -140,10 +154,10 @@ class RecipeIngestionJobOut(RecipeIngestionJobSummary):
     The name committing gives the recipe while `duplicate_of` has the draft's name: the first free "Name (n)", e.g.
     "Banana Bread (2)"; None when the name is only similar, or no free one is left
     """
-    household_recipes_public: bool = False
-    """New recipes in the household are public, so the card photo would be too"""
     card_photo_default: bool = True
     """Whether the card's photos are attached to the recipe when the draft doesn't say (not in public households)"""
+    card_cover_default: bool = True
+    """Whether the front of the card becomes the recipe's image when the draft doesn't say (not in public households)"""
 
 
 class RecipeIngestionJobState(MealieModel):

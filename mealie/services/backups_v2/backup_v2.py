@@ -25,7 +25,8 @@ class BackupV2(BaseService):
     RESTORE_FILES = {".secret"}
 
     # fork: files of the running instance rather than its data (recipe card ingestion's locks, pause marker, dispatcher
-    # heartbeat and kept results; the migration lock). Never backed up, and a restore leaves them alone
+    # heartbeat, kept results and the inbox's shared scan record; the migration lock). Never backed up, and a restore
+    # leaves them alone
     RUNTIME_FILES = {
         ".ai-ingest-lock",
         ".ai-ingest-lock.restore",
@@ -34,7 +35,7 @@ class BackupV2(BaseService):
         ".mealie-migrate.lock",
     }
     RUNTIME_FILES_REGEX = re.compile(r"^\.ai-ingest-paused\..+\.tmp$")  # the marker while it's being replaced
-    RUNTIME_DIRS = {".ai-ingest-results"}
+    RUNTIME_DIRS = {".ai-ingest-results", ".ai-ingest-inbox"}
 
     def __init__(self, db_url: str | None = None) -> None:
         super().__init__()

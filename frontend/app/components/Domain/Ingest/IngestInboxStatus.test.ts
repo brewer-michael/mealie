@@ -92,7 +92,7 @@ describe("IngestInboxStatus", () => {
       ],
     }));
 
-    expect(wrapper.get(".inbox-rejections .text-subtitle-2").text()).toBe("Not added from the inbox");
+    expect(wrapper.get(".inbox-rejections .text-title-small").text()).toBe("Not added from the inbox");
     const rows = wrapper.findAll(".inbox-rejection");
     expect(rows.map(row => row.get(".inbox-rejection-name").text()))
       .toEqual(["Grandma's card", "IMG_0001.JPG", "scan.png", "IMG_0002.jpg", "notes.txt"]);

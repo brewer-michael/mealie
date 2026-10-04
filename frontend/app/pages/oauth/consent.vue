@@ -10,7 +10,7 @@
       :aria-busy="busy"
     >
       <v-toolbar color="primary" dark>
-        <v-toolbar-title class="text-h5 text-center">
+        <v-toolbar-title class="text-headline-small text-center">
           Mealie
         </v-toolbar-title>
       </v-toolbar>
@@ -18,7 +18,7 @@
       <!-- Inside another site's frame, a click on Approve could be a trick (clickjacking): only in its own tab -->
       <template v-if="framed">
         <v-card-text class="pt-6">
-          <p class="text-body-1 mb-0 consent-framed">
+          <p class="text-body-large mb-0 consent-framed">
             {{ $t("mcp.consent.framed") }}
           </p>
         </v-card-text>
@@ -39,7 +39,7 @@
       <AppLoader v-else-if="state === 'loading' || !signedIn" />
 
       <template v-else-if="request && (state === 'ready' || busy)">
-        <v-card-title tag="h1" class="text-h6 text-wrap pt-6 consent-title">
+        <v-card-title tag="h1" class="text-title-large text-wrap pt-6 consent-title">
           <i18n-t keypath="mcp.consent.wants-access" tag="span">
             <template #client>
               <strong>{{ request.clientName }}</strong>
@@ -72,16 +72,16 @@
           >
             {{ $t("mcp.consent.decision-failed") }}
           </v-alert>
-          <p class="text-body-2 mt-4 mb-1 signed-in-as">
+          <p class="text-body-medium mt-4 mb-1 signed-in-as">
             {{ $t("mcp.consent.signed-in-as", { name: accountName }) }}
           </p>
-          <p class="text-caption text-medium-emphasis mb-1 redirect-notice">
+          <p class="text-body-small text-medium-emphasis mb-1 redirect-notice">
             {{ $t("mcp.consent.redirect-notice", { host: request.redirectHost }) }}
           </p>
-          <p class="text-caption text-medium-emphasis mb-0">
+          <p class="text-body-small text-medium-emphasis mb-0">
             {{ $t("mcp.consent.only-approve") }}
           </p>
-          <p v-if="state === 'redirecting'" class="text-body-2 mt-4 mb-0" role="status">
+          <p v-if="state === 'redirecting'" class="text-body-medium mt-4 mb-0" role="status">
             {{ $t("mcp.consent.redirecting", { host: request.redirectHost }) }}
           </p>
         </v-card-text>
@@ -119,7 +119,7 @@
           >
             {{ problemMessage }}
           </v-alert>
-          <p v-if="accountName" class="text-body-2 mt-4 mb-0">
+          <p v-if="accountName" class="text-body-medium mt-4 mb-0">
             {{ $t("mcp.consent.signed-in-as", { name: accountName }) }}
           </p>
         </v-card-text>

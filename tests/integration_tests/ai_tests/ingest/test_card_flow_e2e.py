@@ -145,12 +145,12 @@ def test_a_two_sided_card_from_the_phone_to_a_recipe(
     assert refused.status_code == 422, refused.text
     assert refused.json()["detail"]["code"] == "unresolved_flags"
 
-    # the reviewer types the microwave time into the blank, and attaches the card photo, which a household whose
-    # recipes are public (Mealie's default) leaves off unless asked
-    assert job["cardPhotoDefault"] is not job["householdRecipesPublic"]
-    assert draft["attachCardPhoto"] is None
+    # the reviewer types the microwave time into the blank, and attaches the card photo and makes it the cover, which
+    # a household whose recipes are public (Mealie's default) leaves off unless asked
+    assert job["cardPhotoDefault"] is job["cardCoverDefault"] is not job["householdRecipesPublic"]
+    assert draft["attachCardPhoto"] is draft["useCardAsCover"] is None
     draft["steps"][-1]["text"] = FILLED_STEP
-    draft["attachCardPhoto"] = True
+    draft["attachCardPhoto"] = draft["useCardAsCover"] = True
     saved = api_client.put(job_url(job_id), json={"draftVersion": 1, "draft": draft}, headers=user.token)
     assert saved.status_code == 200, saved.text
     assert saved.json()["draftVersion"] == 2

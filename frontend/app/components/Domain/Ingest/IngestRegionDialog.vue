@@ -8,11 +8,12 @@
     :submit-disabled="!current || !targetValue || locating"
     can-submit
     keep-open
+    disable-submit-on-enter
     max-width="900"
     @submit="submit"
   >
     <v-card-text class="ingest-region-dialog">
-      <p class="text-body-2 mb-4">
+      <p class="text-body-medium mb-4">
         {{ $t("recipe-ingest.review.reread-hint") }}
       </p>
       <div class="d-flex flex-wrap align-center ga-2 pt-1 mb-3">
@@ -46,7 +47,7 @@
           :label="$t('recipe-ingest.review.reread-for')"
         />
       </div>
-      <!-- arrow keys on the focused selection move it, Shift and arrow keys resize it -->
+      <!-- arrow keys on the focused selection move it, Shift and arrow keys resize it, and Enter sends it -->
       <div ref="frame" class="ingest-region-dialog__frame" @keydown="onKeydown">
         <!-- the server is saying where the line is on the card: the selection starts there once it has -->
         <div v-if="locating" class="ingest-region-dialog__locating d-flex align-center justify-center">
@@ -76,7 +77,7 @@
       </p>
       <p
         v-if="tooSmall"
-        class="text-error text-body-2 mt-2 mb-0 ingest-region-dialog__error"
+        class="text-error text-body-medium mt-2 mb-0 ingest-region-dialog__error"
         role="alert"
       >
         {{ $t("recipe-ingest.review.region-too-small") }}
@@ -307,10 +308,19 @@ let keyboardChange = false;
 const ARROW_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 
 function onKeydown(event: KeyboardEvent) {
-  if (!ARROW_KEYS.includes(event.key) || event.altKey || event.ctrlKey || event.metaKey) {
+  const send = event.key === "Enter";
+  if ((!send && !ARROW_KEYS.includes(event.key)) || event.altKey || event.ctrlKey || event.metaKey) {
     return;
   }
   if (!(event.target as HTMLElement | null)?.closest?.(".ingest-region-stencil")) {
+    return;
+  }
+  // Enter sends the selection from here only: on the list of what it's for, or a page button, it does what they do
+  if (send) {
+    event.preventDefault();
+    if (!props.locating) {
+      submit();
+    }
     return;
   }
   // the dialog doesn't scroll, whether or not the selection can go further

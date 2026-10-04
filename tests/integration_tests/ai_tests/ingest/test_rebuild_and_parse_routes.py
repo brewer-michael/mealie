@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from test_jobs_api import assert_code, banana_draft, job_row, job_url, seed_job, use_fake_flags
+from test_jobs_api import JOBS, assert_code, banana_draft, job_row, job_url, seed_job, set_columns, use_fake_flags
 
 from mealie.schema.recipe_ingest import (
     CardDraft,
@@ -98,6 +98,49 @@ def test_parse_lines_queues_the_lines_as_they_read_now(
         ],
     }
     assert wakes == [True]
+
+
+def test_a_page_loaded_while_the_task_runs_learns_what_it_does(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """
+    The task's mode and the lines it parses come with the job, its state and the list, so a page loaded meanwhile (a
+    reload, another device) says "Rebuilding" or "Parsing" rather than reading the whole card; never the payload's text
+    """
+    user = unique_user_fn_scoped
+
+    def described(job_id: UUID) -> list[dict[str, Any]]:
+        job = api_client.get(job_url(job_id), headers=user.token).json()
+        state = api_client.get(job_url(job_id, "state"), headers=user.token).json()
+        listed = api_client.get(JOBS, headers=user.token).json()["items"]
+        [summary] = [item for item in listed if item["id"] == str(job_id)]
+        return [job["task"], state["task"], summary["task"]]
+
+    rebuilt = seed_job(user)
+    assert _rebuild(api_client, user, rebuilt).status_code == 202
+    for task in described(rebuilt):
+        assert (task["kind"], task["mode"], task["refs"]) == ("extract", "rebuild", [])
+        assert "transcription" not in task
+
+    parsed = seed_job(user)
+    refs = _refs(parsed)
+    assert _parse(api_client, user, parsed, [refs[1], refs[0]]).status_code == 202
+    for task in described(parsed):
+        assert (task["kind"], task["mode"], task["refs"]) == ("extract", "parse_lines", [refs[1], refs[0]])
+
+    reread = seed_job(user)
+    assert api_client.post(job_url(reread, "reextract"), headers=user.token).status_code == 202
+    for task in described(reread):
+        assert (task["kind"], task["mode"], task["refs"]) == ("extract", "reextract", [])
+
+    region = seed_job(user)
+    body = {"page": 0, "x": 0, "y": 0, "width": 1, "height": 0.5, "target": {"field": "name"}}
+    assert api_client.post(job_url(region, "reread"), json=body, headers=user.token).status_code == 202
+    for task in described(region):
+        assert (task["kind"], task["mode"], task["refs"]) == ("reread", None, [])
+
+    # a payload this version doesn't know names no mode, rather than failing the page
+    set_columns(reread, task_payload={"mode": "something-newer"})
+    for task in described(reread):
+        assert (task["kind"], task["mode"], task["refs"]) == ("extract", None, [])
 
 
 def _marker_flag(kind: CardFlagKind, line: CardDraftIngredient, resolution: FlagResolution | None) -> CardFlag:

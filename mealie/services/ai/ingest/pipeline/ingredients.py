@@ -6,8 +6,8 @@ thread. Nothing is written: `IngestMatcher` only reads, and commit links the nam
    titles carry over. Lines that still hold a marker aren't parsed: they stay as text, and the marker is flagged.
 2. English cards (and cards of unknown language) get their lines ready for the parser first
    (`shorthand.prepare_line`): mixed numbers written with a dash joined, size words wherever they stand, a package
-   size in parentheses and a can number taken out (they lead the note), and card shorthand ("1 T.", "1/4 t.", "1
-   doz.") written out, case-sensitively.
+   size and a can number taken out (they lead the note), and card shorthand ("1 T.", "1/4 t.", "1 doz.") written out,
+   case-sensitively. A written-out unit is linked to the group's unit by any of its spellings, never by a near miss.
 3. English lines go to Mealie's NLP parser, with the matcher as its `data_matcher`. The brute parser links "pkg." to
    kilogram, so it isn't used. Lines in other languages go to upstream's AI ingredient parser, asking the card's own
    routed service (`CardIngredientParser`), so the job's local-only policy and the eval's pinned providers apply; if
@@ -44,7 +44,7 @@ from mealie.services.parser_services import get_parser
 from mealie.services.parser_services.openai.parser import OpenAIParser
 
 from ..matching import IngestMatcher
-from ..shorthand import PreparedLine, prepare_line
+from ..shorthand import PreparedLine, prepare_line, unit_spellings
 from .cardtext import canonical_markers, markers_in
 from .flags import ingredient_hash, is_english, keep_lost_amounts
 from .service import end_transaction
@@ -100,6 +100,26 @@ def _as_text(line: IngredientLine, text: str) -> CardDraftIngredient:
     return ingredient
 
 
+def _written_out_unit(
+    name: str, parsed: IngredientUnit | CreateIngredientUnit | None, matcher: IngestMatcher
+) -> IngredientUnit | CreateIngredientUnit:
+    """
+    The unit for a shorthand the line had written out (`name`: "square" for "sq.", "package" for "pkg."), as the
+    group has it by any of its spellings (`shorthand.unit_spellings`: the group's "pack" for "package"), else a new one.
+    The parser's own reading stands when it is one of those, never a unit its matcher took for a near miss ("square"
+    read as the group's "quart").
+    """
+    spellings = unit_spellings(name)
+    found = [unit for spelling in spellings if (unit := matcher.exact_unit(spelling)) is not None]
+    if isinstance(parsed, IngredientUnit):
+        if any(unit.id == parsed.id for unit in found):
+            return parsed
+    elif parsed is not None and unit_spellings(parsed.name) == spellings:
+        if not found:
+            return parsed  # not the group's, as the parser spelled it ("squares")
+    return found[0] if found else CreateIngredientUnit(name=name)
+
+
 def _from_parsed(
     line: IngredientLine, text: str, parsed: ParsedIngredient, prepared: PreparedLine, matcher: IngestMatcher
 ) -> CardDraftIngredient:
@@ -107,8 +127,12 @@ def _from_parsed(
     quantity = result.quantity or None
     unit = result.unit
     if unit is None and prepared.unit:
-        # "1 dozen eggs": the parser reads the dozen and drops it
-        unit = matcher.exact_unit(prepared.unit) or CreateIngredientUnit(name=prepared.unit)
+        # "1 dozen eggs": the parser reads the dozen and drops it, and reads "1/2 dozen" as 1
+        unit = _written_out_unit(prepared.unit, None, matcher)
+        quantity = prepared.quantity or quantity
+    elif unit is not None and prepared.shorthand:
+        # "2 sq. chocolate" is read as "2 square chocolate": the group's square, else a new one, never its quart
+        unit = _written_out_unit(prepared.shorthand[1], unit, matcher)
     # what was taken out before parsing leads the note
     note = ", ".join(part for part in (*prepared.notes, (result.note or "").strip()) if part)
     unit_ref, food_ref = _ref(unit), _ref(result.food)

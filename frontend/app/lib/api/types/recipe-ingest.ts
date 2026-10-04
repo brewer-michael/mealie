@@ -44,7 +44,8 @@ export type IngestRejectReason =
   | "duplicate"
   | "url_not_allowed"
   | "url_fetch_failed"
-  | "no_permission";
+  | "no_permission"
+  | "quota";
 export type IngestStatus = "processing" | "ready" | "failed" | "committing" | "committed";
 export type PageRotationSource = "none" | "ocr" | "user" | "model";
 export type IngestSource = "app" | "api" | "inbox";
@@ -65,6 +66,7 @@ export type IngestErrorCode =
   | "commit_interrupted";
 export type IngestTaskKind = "extract" | "reread";
 export type IngestTaskState = "queued" | "running";
+export type IngestTaskMode = "reextract" | "rebuild" | "parse_lines";
 export type IngestLimitedFeature = "suggestions" | "cross_read";
 export type RegionHintSource = "ocr" | "position";
 
@@ -104,7 +106,7 @@ export interface CardDraft {
   performTime?: string | null;
   totalTime?: string | null;
   attribution?: string | null;
-  useCardAsCover?: boolean;
+  useCardAsCover?: boolean | null;
   attachCardPhoto?: boolean | null;
   ingredients?: CardDraftIngredient[];
   steps?: CardDraftStep[];
@@ -442,6 +444,7 @@ export interface RecipeIngestionJobOut {
   committedAt?: string | null;
   autoRetryAt?: string | null;
   expiresAt?: string | null;
+  householdRecipesPublic?: boolean;
   pages?: PageOut[];
   transcription?: string | null;
   read?: CardReadInfo | null;
@@ -452,12 +455,14 @@ export interface RecipeIngestionJobOut {
   duplicateOf?: RecipeIngestionRecipeRef | null;
   duplicateJob?: RecipeIngestionJobRef | null;
   duplicateName?: string | null;
-  householdRecipesPublic?: boolean;
   cardPhotoDefault?: boolean;
+  cardCoverDefault?: boolean;
 }
 export interface RecipeIngestionJobTask {
   kind: IngestTaskKind;
   state: IngestTaskState;
+  mode?: IngestTaskMode | null;
+  refs?: string[];
   progressKey?: string | null;
   cancelRequested?: boolean;
 }
@@ -499,6 +504,7 @@ export interface RecipeIngestionJobSummary {
   committedAt?: string | null;
   autoRetryAt?: string | null;
   expiresAt?: string | null;
+  householdRecipesPublic?: boolean;
 }
 export interface RecipeIngestionSettingsOut {
   enabled?: boolean;

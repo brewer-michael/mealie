@@ -42,7 +42,7 @@
         >
           <v-icon :icon="$globals.icons.chevronLeft" />
         </v-btn>
-        <div class="flex-grow-1 text-center text-subtitle-2 ingest-review__position">
+        <div class="flex-grow-1 text-center text-title-small ingest-review__position">
           {{ headerText }}
           <v-chip
             v-if="job.localOnly"
@@ -182,7 +182,7 @@
                 <div
                   v-for="line in failedWhen"
                   :key="line"
-                  class="text-body-2 mt-1 ingest-review__failed-when"
+                  class="text-body-medium mt-1 ingest-review__failed-when"
                 >
                   {{ line }}
                 </div>
@@ -253,7 +253,7 @@
 
             <!-- the review itself -->
             <template v-else>
-              <p v-if="checksLine" class="text-body-2 text-medium-emphasis mb-2 ingest-review__checks">
+              <p v-if="checksLine" class="text-body-medium text-medium-emphasis mb-2 ingest-review__checks">
                 <v-icon
                   size="small"
                   class="mr-1"
@@ -264,7 +264,7 @@
               <p
                 v-for="info in cardInfos"
                 :key="info.id"
-                class="text-caption text-medium-emphasis mb-2 ingest-review__info"
+                class="text-body-small text-medium-emphasis mb-2 ingest-review__info"
               >
                 <v-icon size="x-small" :icon="$globals.icons.informationOutline" />
                 {{ info.title }}: {{ info.explanation }}
@@ -312,7 +312,7 @@
                 class="mb-3 ingest-review__reading"
               >
                 {{ readingText }}
-                <div v-if="readingCaption" class="text-caption">
+                <div v-if="readingCaption" class="text-body-small">
                   {{ readingCaption }}
                 </div>
                 <v-progress-linear indeterminate class="mt-2" />
@@ -491,8 +491,9 @@
                 </v-expansion-panel>
               </v-expansion-panels>
 
+              <!-- the card's photo as the recipe's image; off by default where new recipes are public -->
               <v-switch
-                v-model="review.draft.value.useCardAsCover"
+                v-model="review.useCardAsCover.value"
                 class="mt-3 ingest-review__cover"
                 color="primary"
                 hide-details
@@ -556,11 +557,13 @@
         :saving="review.pendingAction.value === 'eval'"
         @save="saveEvalCase"
       />
+      <!-- Return in the text being corrected starts a new line: it doesn't close the dialog -->
       <BaseDialog
         v-model="transcriptionDialog"
         :title="$t('recipe-ingest.review.what-the-card-says')"
         :icon="mdiTextRecognition"
         max-width="700"
+        disable-submit-on-enter
       >
         <v-card-text>
           <IngestTranscription
@@ -572,12 +575,14 @@
           />
         </v-card-text>
       </BaseDialog>
+      <!-- Enter discards only through the Confirm button: on Cancel it cancels -->
       <BaseDialog
         v-model="discardDialog"
         :title="$t('recipe-ingest.review.discard')"
         :icon="$globals.icons.delete"
         color="error"
         can-confirm
+        disable-submit-on-enter
         @confirm="review.discard()"
       >
         <v-card-text>
@@ -729,7 +734,13 @@ import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vu
 import IngestReviewBar from "~/components/Domain/Ingest/IngestReviewBar.vue";
 import IngestStepList from "~/components/Domain/Ingest/IngestStepList.vue";
 import IngestTranscription from "~/components/Domain/Ingest/IngestTranscription.vue";
-import { serverDate, useRecipeIngestSettings, useRecipeIngestText, type TranslateFn } from "~/composables/use-recipe-ingest";
+import {
+  recipeIngestSignedIn,
+  serverDate,
+  useRecipeIngestSettings,
+  useRecipeIngestText,
+  type TranslateFn,
+} from "~/composables/use-recipe-ingest";
 import {
   canLocateTarget,
   fieldAnchorId,
@@ -792,7 +803,8 @@ const leaveTo = ref<string | null>(null);
 let leaving = false;
 
 async function beforeLeaving(to: { fullPath: string }) {
-  if (leaving || (await review.saveBeforeLeaving())) {
+  // signed out (a logout, which already saved what it could): nothing can be saved now, so the page doesn't hold it
+  if (leaving || !recipeIngestSignedIn() || (await review.saveBeforeLeaving())) {
     return true;
   }
   leaveTo.value = to.fullPath;

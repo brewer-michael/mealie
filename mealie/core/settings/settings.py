@@ -86,12 +86,27 @@ def determine_secrets(data_dir: Path, secret: str, production: bool) -> str:
 
     data_dir.mkdir(parents=True, exist_ok=True)
     new_secret = secrets.token_hex(32)
-    tmp_file = secrets_file.with_suffix(".tmp")
-    with open(tmp_file, "w") as f:
-        f.write(new_secret)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp_file.replace(secrets_file)
+    # fork hook: processes starting together on a new DATA_DIR (a web and a recipe card worker container) agree on one
+    # secret. Each writes a temporary file of its own and links it in only while there's no secret yet; one that
+    # finds another's reads that. They shared one temporary name, and the last replace won while the others ran on
+    # the secrets they had made (or failed to find the file another had moved).
+    tmp_file = secrets_file.with_suffix(f".{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        with open(tmp_file, "w") as f:
+            f.write(new_secret)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp_file, secrets_file)
+        except FileExistsError:
+            existing_secret = secrets_file.read_text().strip()
+            if existing_secret:
+                return existing_secret
+            tmp_file.replace(secrets_file)  # an empty one: replaced, as before
+        except OSError:
+            tmp_file.replace(secrets_file)  # a filesystem without hard links: as before
+    finally:
+        tmp_file.unlink(missing_ok=True)
     return new_secret
 
 

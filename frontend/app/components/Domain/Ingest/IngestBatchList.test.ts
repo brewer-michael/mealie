@@ -1,6 +1,7 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import IngestBatchList from "./IngestBatchList.vue";
+import BaseDialog from "~/components/global/BaseDialog.vue";
 import {
   leaveRecipeIngestCommitNotice,
   resetRecipeIngestCounts,
@@ -148,12 +149,33 @@ function jobsCalls(): RecipeIngestJobsQuery[] {
 
 const wrappers: VueWrapper[] = [];
 
-async function mountList(props: { batchId?: string | null } = {}) {
+/**
+ * The real BaseDialog, on an overlay that hears every key pressed inside it as Vuetify's does, with its Cancel and
+ * Confirm buttons: what Enter does there is the dialog's to say
+ */
+const realDialog = {
+  BaseDialog,
+  VDialog: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  VBottomSheet: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  BaseDialogContent: {
+    props: ["title", "canConfirm"],
+    emits: ["cancel", "confirm"],
+    template: `
+      <div class="confirm-dialog" :data-title="title">
+        <slot />
+        <button type="button" class="dialog-cancel" @click="$emit('cancel')">Cancel</button>
+        <button v-if="canConfirm" type="button" class="dialog-confirm" @click="$emit('confirm')">OK</button>
+      </div>
+    `,
+  },
+};
+
+async function mountList(props: { batchId?: string | null } = {}, dialogStubs: Record<string, unknown> = {}) {
   const wrapper = mount(IngestBatchList, {
     props: { groupSlug: "home", ...props },
     global: {
-      mocks: { $globals: { icons: { lock: "lock", delete: "delete", alertCircle: "alert" } } },
-      stubs,
+      mocks: { $globals: { icons: { lock: "lock", delete: "delete", alertCircle: "alert" } }, $vuetify: { display: { xs: false } } },
+      stubs: { ...stubs, ...dialogStubs },
     },
   });
   wrappers.push(wrapper);
@@ -498,6 +520,26 @@ describe("IngestBatchList", () => {
     expect(toast.success).toHaveBeenCalledWith("Card discarded");
   });
 
+  test("Enter on the Discard question's Cancel doesn't discard the card", async () => {
+    serverJobs = [job(), job({ id: "j2", position: 1, title: "Pancakes" })];
+    api.discard.mockResolvedValue({ data: null, error: null });
+    const wrapper = await mountList({}, realDialog);
+
+    await wrapper.findAll(".job-discard")[0]!.trigger("click");
+    // a keyboard user on Cancel presses Enter (the browser then clicks Cancel)
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(api.discard).not.toHaveBeenCalled();
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("click");
+    expect(wrapper.find(".confirm-dialog").exists()).toBe(false);
+
+    // OK still discards
+    await wrapper.findAll(".job-discard")[0]!.trigger("click");
+    await wrapper.get(".confirm-dialog .dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.discard).toHaveBeenCalledExactlyOnceWith("j1");
+  });
+
   test("a refused discard says why", async () => {
     serverJobs = [job()];
     api.discard.mockResolvedValue({ data: null, error: { response: { status: 403, data: { detail: { code: "forbidden" } } } } });
@@ -815,6 +857,8 @@ describe("adding a batch's clean cards", () => {
     expect(dialog.attributes("data-title")).toBe("Add 2 cards as recipes?");
     expect(dialog.text()).toContain("Nothing is highlighted on these cards. They're added as they were read:");
     expect(dialog.findAll(".clean-card").map(item => item.text())).toEqual(["Banana Mug Cake", "Scones"]);
+    // the household's recipes need a login: nothing to warn about
+    expect(dialog.find(".clean-public").exists()).toBe(false);
 
     await wrapper.get(".dialog-confirm").trigger("click");
     await flushPromises();
@@ -939,6 +983,148 @@ describe("adding a batch's clean cards", () => {
     await flushPromises();
     expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("error");
     expect(wrapper.get(".commit-notice").text()).toContain("Couldn't add the cards");
+  });
+
+  test("a big batch goes 5 cards a request, one after another, saying how far it got; one notice sums it up", async () => {
+    serverJobs = Array.from({ length: 12 }, (_, i) => ({ ...clean(`c${i}`, i, `Card ${i}`), draftVersion: i + 1 }));
+    const answers: Array<() => void> = [];
+    let inFlight = 0;
+    let mostInFlight = 0;
+    api.commitClean.mockImplementation(async (_batchId: string, payload: { jobIds: string[]; draftVersions: Record<string, number> }) => {
+      inFlight += 1;
+      mostInFlight = Math.max(mostInFlight, inFlight);
+      await new Promise<void>(resolve => answers.push(resolve));
+      inFlight -= 1;
+      serverJobs = serverJobs.map(j => (payload.jobIds.includes(j.id) ? { ...j, status: "committed", committedAt: ago(0) } : j));
+      return {
+        data: { committed: payload.jobIds.map(id => ({ jobId: id, recipeId: `r-${id}`, slug: id })), skipped: [] },
+        error: null,
+      };
+    });
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("info");
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Adding 5 of 12 cards…");
+    answers.shift()!();
+    await flushPromises();
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Adding 10 of 12 cards…");
+    answers.shift()!();
+    await flushPromises();
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Adding 12 of 12 cards…");
+    answers.shift()!();
+    await flushPromises();
+
+    expect(api.commitClean.mock.calls.map(call => call[1])).toEqual([
+      { jobIds: ["c0", "c1", "c2", "c3", "c4"], draftVersions: { c0: 1, c1: 2, c2: 3, c3: 4, c4: 5 } },
+      { jobIds: ["c5", "c6", "c7", "c8", "c9"], draftVersions: { c5: 6, c6: 7, c7: 8, c8: 9, c9: 10 } },
+      { jobIds: ["c10", "c11"], draftVersions: { c10: 11, c11: 12 } },
+    ]);
+    expect(mostInFlight).toBe(1);
+    expect(wrapper.get(".commit-notice").attributes("data-type")).toBe("success");
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Added 12 cards");
+  });
+
+  test("more cards than the server takes in one request (100) are all added", async () => {
+    serverJobs = Array.from({ length: 120 }, (_, i) => clean(`c${i}`, i, `Card ${i}`));
+    commitAll();
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.commitClean).toHaveBeenCalledTimes(24);
+    expect(api.commitClean.mock.calls.every(call => (call[1] as { jobIds: string[] }).jobIds.length <= 5)).toBe(true);
+    expect(wrapper.get(".commit-notice-text").text()).toBe("Added 120 cards");
+  });
+
+  test("a request refused part way stops there and says what was added so far", async () => {
+    serverJobs = Array.from({ length: 12 }, (_, i) => clean(`c${i}`, i, `Card ${i}`));
+    commitAll();
+    const added = api.commitClean.getMockImplementation()!;
+    api.commitClean
+      .mockImplementationOnce(added)
+      .mockImplementationOnce(async () => ({ data: null, error: { response: { status: 504, data: {} } } }));
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.commitClean).toHaveBeenCalledTimes(2);
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.attributes("data-type")).toBe("warning");
+    expect(notice.get(".commit-notice-text").text()).toBe("Added 5 cards");
+    expect(notice.get(".commit-notice-detail").text()).toBe("The other 7 cards weren't added. Try again.");
+    // the 7 stay in the batch, clean, to add again
+    expect(wrapper.get(".batch-add-clean").text()).toBe("Add 7 clean cards");
+  });
+
+  test("a restore pausing the server stops the run: the cards it left wait, and the rest aren't sent", async () => {
+    serverJobs = Array.from({ length: 12 }, (_, i) => clean(`c${i}`, i, `Card ${i}`));
+    api.commitClean.mockImplementation(async (_batchId: string, payload: { jobIds: string[] }) => {
+      const [first, ...rest] = payload.jobIds;
+      serverJobs = serverJobs.map(j => (j.id === first ? { ...j, status: "committed", committedAt: ago(0) } : j));
+      return {
+        data: {
+          committed: [{ jobId: first, recipeId: "r", slug: "s" }],
+          skipped: rest.map(id => ({ jobId: id, code: "paused_for_restore" })),
+        },
+        error: null,
+      };
+    });
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+
+    expect(api.commitClean).toHaveBeenCalledOnce();
+    const notice = wrapper.get(".commit-notice");
+    expect(notice.get(".commit-notice-text").text()).toBe("Added 1 card");
+    expect(notice.get(".commit-notice-detail").text()).toBe("The other 7 cards weren't added. Try again. 4 were left to review:");
+    expect(notice.findAll(".commit-notice-item")).toHaveLength(4);
+    expect(notice.get(".commit-notice-item").text()).toBe("Card 1: wasn't added while a backup is restored");
+  });
+
+  test("Enter on the question's Cancel doesn't add the cards", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones")];
+    commitAll();
+    const wrapper = await mountList({}, realDialog);
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(api.commitClean).not.toHaveBeenCalled();
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("click");
+    expect(wrapper.find(".confirm-dialog").exists()).toBe(false);
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".confirm-dialog .dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.commitClean).toHaveBeenCalledOnce();
+  });
+
+  test("where the household's recipes are seen without a login, the question warns about the card photos turned on", async () => {
+    serverJobs = [clean("a", 0, "Banana Mug Cake"), clean("b", 1, "Scones")].map(j => ({ ...j, householdRecipesPublic: true }));
+    const wrapper = await mountList();
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    // there, a card's photo is the picture or attached only where someone turned that on for the card (§6.4)
+    expect(wrapper.get(".confirm-dialog .clean-public").text()).toBe(
+      "Recipes in this household can be seen without logging in. A card's photo is used as the recipe's picture, or "
+      + "attached, only where that was turned on for the card, and anyone can then see it. Open a card to check.",
+    );
   });
 
   test("a refusal the API client already showed (a restore running) isn't shown again", async () => {

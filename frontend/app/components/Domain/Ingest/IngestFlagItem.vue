@@ -14,8 +14,8 @@
       />
       <div class="flex-grow-1 ingest-flag-item__body">
         <div class="d-flex align-center flex-wrap ga-1">
-          <span class="text-subtitle-2 ingest-flag-item__title">{{ texts.title }}</span>
-          <span v-if="label" class="text-caption text-medium-emphasis">· {{ label }}</span>
+          <span class="text-title-small ingest-flag-item__title">{{ texts.title }}</span>
+          <span v-if="label" class="text-body-small text-medium-emphasis">· {{ label }}</span>
           <v-spacer />
           <v-btn
             v-if="item.state === 'resolved'"
@@ -37,10 +37,10 @@
             >{{ segment.text }}</span>
           </div>
           <!-- "Check this ingredient": what the parser made of the line, and what it lost -->
-          <div v-if="reading" class="text-body-2 mt-1 ingest-flag-item__reading">
+          <div v-if="reading" class="text-body-medium mt-1 ingest-flag-item__reading">
             {{ $t("recipe-ingest.flag.check_parse.read-as", { reading }) }}
           </div>
-          <div v-if="explanation" class="text-body-2 text-medium-emphasis mt-1 ingest-flag-item__explanation">
+          <div v-if="explanation" class="text-body-medium text-medium-emphasis mt-1 ingest-flag-item__explanation">
             {{ explanation }}
           </div>
 

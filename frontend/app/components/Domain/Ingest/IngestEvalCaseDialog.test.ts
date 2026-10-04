@@ -1,6 +1,7 @@
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, describe, expect, test } from "vitest";
 import IngestEvalCaseDialog from "./IngestEvalCaseDialog.vue";
+import BaseDialog from "~/components/global/BaseDialog.vue";
 
 const stubs = {
   BaseDialog: {
@@ -62,12 +63,31 @@ const stubs = {
   },
 };
 
+/**
+ * The real BaseDialog, on an overlay that hears every key pressed inside the dialog as Vuetify's does: what Enter does
+ * there is the dialog's to say
+ */
+const realDialog = {
+  BaseDialog,
+  VDialog: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  BaseDialogContent: {
+    props: ["title", "submitText", "submitDisabled"],
+    emits: ["submit"],
+    template: `
+      <div class="dialog" :data-title="title">
+        <slot />
+        <button type="button" class="submit" :disabled="submitDisabled" @click="$emit('submit')">{{ submitText }}</button>
+      </div>
+    `,
+  },
+};
+
 const wrappers: VueWrapper[] = [];
 
-function mountDialog(props: Record<string, unknown> = {}) {
+function mountDialog(props: Record<string, unknown> = {}, dialogStubs: Record<string, unknown> = {}) {
   const wrapper = mount(IngestEvalCaseDialog, {
     props: { modelValue: true, recipeName: "Banana Mug Cake", ...props },
-    global: { mocks: { $globals: { icons: {} } }, stubs },
+    global: { mocks: { $globals: { icons: {} }, $vuetify: { display: { xs: false } } }, stubs: { ...stubs, ...dialogStubs } },
   });
   wrappers.push(wrapper);
   return wrapper;
@@ -151,5 +171,23 @@ describe("IngestEvalCaseDialog", () => {
     expect(wrapper.get(".error").text()).toBe("An eval case with this name already exists");
     await wrapper.get(".slug input").setValue("banana-mug-cake-2");
     expect(wrapper.emitted("update:exists")).toEqual([[false]]);
+  });
+
+  test("Return in the notes starts a new line: it doesn't save the case; Return in the name does", async () => {
+    const wrapper = mountDialog({}, realDialog);
+
+    await wrapper.get(".notes textarea").setValue("Faded pencil");
+    for (const options of [{}, { shiftKey: true }, { isComposing: true }]) {
+      await wrapper.get(".notes textarea").trigger("keydown", { key: "Enter", ...options });
+    }
+    await wrapper.get(".verified input").trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("save")).toBeUndefined();
+    expect(wrapper.find(".overlay").exists()).toBe(true);
+
+    // a name being typed with an input method isn't sent mid-word
+    await wrapper.get(".slug input").trigger("keydown", { key: "Enter", isComposing: true });
+    expect(wrapper.emitted("save")).toBeUndefined();
+    await wrapper.get(".slug input").trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("save")).toEqual([[{ slug: "banana-mug-cake", verified: false, tags: [], notes: "Faded pencil" }]]);
   });
 });

@@ -6,6 +6,7 @@ eval cases and `recipes/` are never touched. Idempotent, and stopped by a backup
 
 import fcntl
 import os
+import threading
 import time
 from datetime import timedelta
 from typing import Any
@@ -352,3 +353,97 @@ def test_the_purge_removes_readings_a_restore_cut_off_that_no_task_used(seeder: 
 
     retention.purge_once(utcnow())
     assert not kept.exists()
+
+
+def test_an_undo_racing_the_purge_keeps_the_cards_photos(seeder: Seeder, monkeypatch: pytest.MonkeyPatch):
+    """
+    The purge picks a committed card, then an undo takes it back to review before the purge gets to it: the slimming
+    update no longer matches, and the folder (removed only once the row says so) stays with its photos
+    """
+    old = timedelta(days=get_ingest_settings().RETENTION_DAYS + 1)
+    committed = seeder.job(IngestStatus.committed, age=old)
+    real_execute = retention._execute
+
+    def undone_first(session: Any, stmt: Any) -> int:
+        if isinstance(stmt, sa.Update) and stmt.table.name == RecipeIngestionJob.__tablename__:
+            session.execute(  # what the undo's guarded update does
+                sa.update(RecipeIngestionJob)
+                .where(RecipeIngestionJob.id == committed)
+                .values(
+                    status=IngestStatus.ready.value,
+                    recipe_id=None,
+                    committed_at=None,
+                    row_version=RecipeIngestionJob.row_version + 1,
+                )
+            )
+            session.commit()
+        return real_execute(session, stmt)
+
+    monkeypatch.setattr(retention, "_execute", undone_first)
+    retention.purge_once(utcnow())
+
+    row = _row(committed)
+    assert row["status"] == "ready"
+    assert row["draft"] is not None
+    assert (seeder.dir(committed) / "pages" / "0" / "page.jpg").is_file()
+
+
+def test_files_a_purge_couldnt_remove_go_with_the_orphan_folders(seeder: Seeder, monkeypatch: pytest.MonkeyPatch):
+    retention_days = get_ingest_settings().RETENTION_DAYS
+    committed = seeder.job(IngestStatus.committed, age=timedelta(days=retention_days + 1))
+    recent = seeder.job(IngestStatus.committed, age=timedelta(days=retention_days - 1))
+    real_remove = storage.remove_job_dir
+
+    def remove_fails(group_id: UUID, job_id: UUID) -> bool:
+        raise PermissionError("not this time")
+
+    monkeypatch.setattr(storage, "remove_job_dir", remove_fails)
+    retention.purge_once(utcnow())
+    assert _row(committed)["draft"] is None  # slimmed, its folder still there
+    assert seeder.dir(committed).is_dir()
+
+    monkeypatch.setattr(storage, "remove_job_dir", real_remove)
+    stale = time.time() - limits.ORPHAN_DIR_AGE - 60
+    for job_id in (committed, recent):
+        os.utime(seeder.dir(job_id), (stale, stale))
+    retention.purge_once(utcnow())
+    assert not seeder.dir(committed).exists()
+    assert _row(committed) is not None  # the row stays, as for any slimmed card
+    assert seeder.dir(recent).is_dir()  # a card within retention keeps its files however old its folder
+
+
+def test_a_failed_card_being_merged_into_isnt_purged_under_the_merge(seeder: Seeder):
+    """
+    The purge takes the household's merge lock: a merge into a failed card past retention moves its page and changes
+    the card before the purge looks again, so the card and the moved page stay
+    """
+    from mealie.services.ai.ingest import review
+
+    failed = seeder.job(IngestStatus.failed, age=timedelta(days=get_ingest_settings().RETENTION_DAYS + 1))
+    entered, release = threading.Event(), threading.Event()
+
+    def merge() -> None:
+        with session_context() as session, review.household_merge_lock(session, seeder.household_id):
+            entered.set()
+            release.wait(10)
+            moved = seeder.dir(failed) / "pages" / "1"
+            moved.mkdir(parents=True)
+            (moved / "page.jpg").write_bytes(b"the source's page")
+            session.execute(
+                sa.update(RecipeIngestionJob)
+                .where(RecipeIngestionJob.id == failed)
+                .values(update_at=utcnow(), row_version=RecipeIngestionJob.row_version + 1)
+            )
+
+    merging = threading.Thread(target=merge)
+    merging.start()
+    assert entered.wait(10)
+    purging = threading.Thread(target=retention.purge_once, args=(utcnow(),))
+    purging.start()
+    time.sleep(0.5)  # the purge waits for the merge
+    release.set()
+    merging.join(30)
+    purging.join(30)
+
+    assert _row(failed) is not None
+    assert (seeder.dir(failed) / "pages" / "1" / "page.jpg").is_file()

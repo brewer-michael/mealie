@@ -1,7 +1,7 @@
 <template>
   <div class="ingest-batch-list">
     <div class="d-flex align-center flex-wrap ga-2 mb-2">
-      <h3 class="text-h6">
+      <h3 class="text-title-large">
         {{ $t("recipe-ingest.queue.title") }}
       </h3>
       <v-spacer />
@@ -16,7 +16,7 @@
       </v-btn>
     </div>
 
-    <div v-if="batchId && loaded && batchSummary" class="batch-summary text-body-2 mb-2">
+    <div v-if="batchId && loaded && batchSummary" class="batch-summary text-body-medium mb-2">
       {{ batchSummary }}
     </div>
     <!--
@@ -60,10 +60,10 @@
     >
       <div class="batch-header d-flex align-center flex-wrap ga-2">
         <div>
-          <div class="batch-title text-subtitle-1">
+          <div class="batch-title text-title-medium">
             {{ $t("recipe-ingest.queue.batch", { date: formatDate(batch.createdAt) }) }}
           </div>
-          <div class="batch-meta text-caption text-medium-emphasis">
+          <div class="batch-meta text-body-small text-medium-emphasis">
             {{ $t("recipe-ingest.queue.batch-cards", batch.jobs.length) }} · {{ sourceText(batch.source) }}
           </div>
         </div>
@@ -126,7 +126,7 @@
 
     <!-- more open cards than one load fetches: the oldest wait for this, rather than being left out unsaid -->
     <div v-if="openMore" class="load-older-open d-flex align-center flex-wrap ga-2 mb-4">
-      <span class="text-body-2 text-medium-emphasis">
+      <span class="text-body-medium text-medium-emphasis">
         {{ $t("recipe-ingest.queue.newest-shown", jobs.length) }}
       </span>
       <v-btn
@@ -142,7 +142,7 @@
     </div>
 
     <section v-if="recent.length" class="recently-added mt-6">
-      <h4 class="text-subtitle-1 mb-1">
+      <h4 class="text-title-medium mb-1">
         {{ $t("recipe-ingest.queue.recently-added") }}
       </h4>
       <v-list class="py-0" density="comfortable">
@@ -166,6 +166,7 @@
       </v-btn>
     </section>
 
+    <!-- these questions act on Enter only through their OK button: on Cancel it cancels -->
     <BaseDialog
       v-model="discardDialog"
       bottom-sheet
@@ -173,6 +174,7 @@
       color="error"
       :icon="$globals.icons.alertCircle"
       can-confirm
+      disable-submit-on-enter
       @confirm="confirmDiscard"
     >
       <v-card-text>
@@ -186,9 +188,21 @@
       :title="$t('recipe-ingest.queue.add-clean-title', cleanCards.length)"
       :icon="$globals.icons.check"
       can-confirm
+      disable-submit-on-enter
       @confirm="addClean"
     >
       <v-card-text>
+        <!-- recipes seen without a login: a card photo used as the picture, or attached, is public (§6.4); there both
+             switches are off unless someone turned them on for the card -->
+        <v-alert
+          v-if="cleanPublic"
+          class="clean-public mb-3"
+          type="warning"
+          variant="tonal"
+          density="compact"
+        >
+          {{ $t("recipe-ingest.queue.add-clean-public") }}
+        </v-alert>
         <p class="mb-2">
           {{ $t("recipe-ingest.queue.add-clean-confirm") }}
         </p>
@@ -221,6 +235,7 @@ import { carryReviewNotice } from "~/composables/use-recipe-ingest-review";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import { alert } from "~/composables/use-toast";
 import type {
+  BulkCommitSkipped,
   IngestSource,
   IngestStatus,
   RecipeIngestionJobCounts,
@@ -274,6 +289,11 @@ const RECENT_PER_PAGE = 50;
 const OPEN_STATUSES: IngestStatus[] = ["processing", "ready", "failed", "committing"];
 /** At least this many clean cards make "Add N clean cards" worth offering */
 const MIN_CLEAN_CARDS = 2;
+/**
+ * Clean cards added per request, one request after another: the server adds each card in the request (its photos,
+ * its recipe image), about a second each, so a request stays well inside a proxy's timeout however big the batch
+ */
+const CLEAN_CHUNK = 5;
 
 const i18n = useI18n();
 const api = useUserApi();
@@ -823,6 +843,8 @@ const cleanBatchId = ref<string | null>(null);
 /** The cards the question lists, in capture order, with the draft version each was checked at */
 const cleanCards = ref<Job[]>([]);
 let cleanVersions: Record<string, number> = {};
+/** The household's recipes are seen without a login: the question says what that means for the card photos */
+const cleanPublic = ref(false);
 
 function showNotice(
   batchId: string,
@@ -836,7 +858,8 @@ function showNotice(
 
 /**
  * "Add N clean cards": the batch is read again, so the question lists the cards as they are now, each with the draft
- * version it was read at, and only those are added (a card changed after this is left for review)
+ * version it was read at, and only those are added (a card changed after this is left for review). In a household
+ * whose recipes are seen without a login, the question warns that each card's photo goes as its own switches say.
  */
 async function askAddClean(batch: BatchView) {
   cleanBusy.value = batch.id;
@@ -859,6 +882,8 @@ async function askAddClean(batch: BatchView) {
     cleanBatchId.value = batch.id;
     cleanCards.value = listed;
     cleanVersions = versions;
+    // the cards' household says it (each card carries it)
+    cleanPublic.value = listed.some(job => job.householdRecipesPublic);
     cleanDialog.value = true;
   }
   finally {
@@ -872,51 +897,52 @@ function cleanSkipReason(code: string): string {
   return i18n.te(key) ? i18n.t(key) : ingestErrorText(code);
 }
 
-/** Adds the cards the question listed, one by one on the server; then says what was added and what was left */
+/**
+ * Adds the cards the question listed, `CLEAN_CHUNK` per request, one request after another, saying how far it got
+ * ("Adding 10 of 40 cards…"); then says what was added and what was left. A request refused (offline, a server error)
+ * or a restore pausing the server stops it: what was added so far is said, and the cards not sent stay to add again.
+ */
 async function addClean() {
   const batchId = cleanBatchId.value;
   const cards = cleanCards.value;
+  const versions = cleanVersions;
   if (!batchId || !cards.length) {
     return;
   }
   cleanBusy.value = batchId;
+  let added = 0;
+  const skipped: BulkCommitSkipped[] = [];
+  /** Cards sent so far (added or left) */
+  let sent = 0;
+  let refusal: unknown = null;
   try {
-    const { data, error } = await api.recipeIngest.commitClean(batchId, {
-      jobIds: cards.map(card => card.id),
-      draftVersions: cleanVersions,
-    });
-    if (disposed) {
-      return;
-    }
-    if (!data) {
-      // a message the API client showed (a restore running) isn't said again
-      if (!errorMessageOf(error)) {
-        showNotice(batchId, "error", i18n.t("recipe-ingest.queue.add-clean-failed"));
+    while (sent < cards.length) {
+      const ids = cards.slice(sent, sent + CLEAN_CHUNK).map(card => card.id);
+      showNotice(
+        batchId,
+        "info",
+        i18n.t("recipe-ingest.queue.adding-clean", { done: sent + ids.length, total: cards.length }, cards.length),
+      );
+      const { data, error } = await api.recipeIngest.commitClean(batchId, {
+        jobIds: ids,
+        draftVersions: Object.fromEntries(ids.map(id => [id, versions[id] as number])),
+      });
+      if (disposed) {
+        return;
+      }
+      if (!data) {
+        refusal = error ?? true;
+        break;
+      }
+      sent += ids.length;
+      added += data.committed?.length ?? 0;
+      skipped.push(...(data.skipped ?? []));
+      // the server stopped adding while a backup is restored: the rest wait too
+      if (data.skipped?.some(item => item.code === "paused_for_restore")) {
+        break;
       }
     }
-    else {
-      const added = data.committed?.length ?? 0;
-      const skipped = data.skipped ?? [];
-      const names = new Map(cards.map(card => [card.id, cardTitle(card)]));
-      const text = added
-        ? i18n.t("recipe-ingest.queue.added-clean", added)
-        : i18n.t("recipe-ingest.queue.added-clean-none");
-      if (!skipped.length) {
-        showNotice(batchId, "success", text);
-      }
-      else {
-        showNotice(
-          batchId,
-          added ? "warning" : "error",
-          text,
-          i18n.t("recipe-ingest.queue.clean-left", skipped.length),
-          skipped.map(item => i18n.t("recipe-ingest.queue.clean-skipped", {
-            title: names.get(item.jobId) ?? i18n.t("recipe-ingest.queue.untitled"),
-            reason: cleanSkipReason(item.code),
-          })),
-        );
-      }
-    }
+    reportClean(batchId, cards, added, skipped, cards.length - sent, refusal);
   }
   finally {
     cleanBusy.value = null;
@@ -929,6 +955,49 @@ async function addClean() {
     mergeBatch(batchId, items);
   }
   void refreshCounts();
+}
+
+/** What "Add N clean cards" did: the cards added, the ones left for review and why, and the ones not sent */
+function reportClean(
+  batchId: string,
+  cards: Job[],
+  added: number,
+  skipped: BulkCommitSkipped[],
+  notSent: number,
+  refusal: unknown,
+) {
+  if (refusal && !added && !skipped.length) {
+    // a message the API client showed (a restore running) isn't said again
+    if (errorMessageOf(refusal)) {
+      notice.value = null;
+    }
+    else {
+      showNotice(batchId, "error", i18n.t("recipe-ingest.queue.add-clean-failed"));
+    }
+    return;
+  }
+  const text = added
+    ? i18n.t("recipe-ingest.queue.added-clean", added)
+    : i18n.t("recipe-ingest.queue.added-clean-none");
+  if (!skipped.length && !notSent) {
+    showNotice(batchId, "success", text);
+    return;
+  }
+  const names = new Map(cards.map(card => [card.id, cardTitle(card)]));
+  const detail = [
+    notSent ? i18n.t("recipe-ingest.queue.clean-not-sent", notSent) : null,
+    skipped.length ? i18n.t("recipe-ingest.queue.clean-left", skipped.length) : null,
+  ].filter(Boolean).join(" ");
+  showNotice(
+    batchId,
+    added ? "warning" : "error",
+    text,
+    detail,
+    skipped.map(item => i18n.t("recipe-ingest.queue.clean-skipped", {
+      title: names.get(item.jobId) ?? i18n.t("recipe-ingest.queue.untitled"),
+      reason: cleanSkipReason(item.code),
+    })),
+  );
 }
 
 // ==========================================

@@ -1,16 +1,19 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import ReviewPage from "./[jobId].vue";
+import BaseDialog from "~/components/global/BaseDialog.vue";
 import IngestEvalCaseDialog from "~/components/Domain/Ingest/IngestEvalCaseDialog.vue";
 import IngestRegionDialog from "~/components/Domain/Ingest/IngestRegionDialog.vue";
 import {
   formatIngestDate,
   resetRecipeIngestCounts,
   resetRecipeIngestReviewState,
+  runRecipeIngestLogoutTasks,
+  setRecipeIngestSessionCheck,
   takeRecipeIngestCommitNotice,
 } from "~/composables/use-recipe-ingest";
 import { carryReviewNotice, resetCarriedReviewNotice, takeCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
-import type { CardFlag, RecipeIngestionJobOut } from "~/lib/api/types/recipe-ingest";
+import type { CardFlag, RecipeIngestionJobOut, RecipeIngestionJobTask } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
   getJob: vi.fn(),
@@ -214,16 +217,42 @@ const stubs = {
   },
 };
 
+/**
+ * The real BaseDialog, on an overlay that hears every key pressed inside the dialog as Vuetify's does: what Enter does
+ * there is the dialog's to say
+ */
+const realDialog = {
+  BaseDialog,
+  VDialog: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  BaseDialogContent: { props: ["title"], template: "<div class=\"dialog\" :data-title=\"title\"><slot /></div>" },
+};
+
+/** The real BaseDialog with its Cancel and Confirm buttons, to press keys on */
+const realConfirmDialog = {
+  ...realDialog,
+  BaseDialogContent: {
+    props: ["title", "canConfirm"],
+    emits: ["cancel", "confirm"],
+    template: `
+      <div class="dialog" :data-title="title">
+        <slot />
+        <button type="button" class="dialog-cancel" @click="$emit('cancel')">Cancel</button>
+        <button v-if="canConfirm" type="button" class="dialog-confirm" @click="$emit('confirm')">Confirm</button>
+      </div>
+    `,
+  },
+};
+
 const route = { params: { groupSlug: "home", jobId: "j1" }, query: {}, fullPath: "/g/home/recipes/cards/j1" };
 const wrappers: VueWrapper[] = [];
 const scrolled: string[] = [];
 
-async function mountPage(desktop = false) {
+async function mountPage(desktop = false, dialogStubs: Record<string, unknown> = {}) {
   const wrapper = mount(ReviewPage, {
     attachTo: document.body,
     global: {
       mocks: { $globals: { icons: {} }, $vuetify: { display: { mdAndUp: desktop } } },
-      stubs,
+      stubs: { ...stubs, ...dialogStubs },
     },
   });
   wrappers.push(wrapper);
@@ -337,6 +366,23 @@ describe("the recipe card review page", () => {
     // the cover is the recipe's image: public too
     await cover().get("input").setValue(true);
     expect(wrapper.find(".ingest-review__public").exists()).toBe(true);
+  });
+
+  test("the cover switch starts at the household's cover default while the draft hasn't chosen", async () => {
+    const draft = { ...job().draft!, useCardAsCover: null };
+    api.getJob.mockResolvedValue(ok(job({ draft, householdRecipesPublic: true, cardPhotoDefault: false, cardCoverDefault: false })));
+    const wrapper = await mountPage();
+    const cover = () => wrapper.findAll(".switch").find(s => s.text() === "Use the card photo as the recipe image")!;
+
+    expect((cover().get("input").element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.find(".ingest-review__public").exists()).toBe(false);
+
+    await cover().get("input").setValue(true);
+    expect((cover().get("input").element as HTMLInputElement).checked).toBe(true);
+    expect(wrapper.get(".ingest-review__public").text()).toBe("Recipes in this household are public: the card photo will be visible to anyone.");
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(api.updateJob.mock.calls[0]![1].draft).toMatchObject({ useCardAsCover: true });
   });
 
   test("a choice the draft holds wins over the default, and a private household gets no warning", async () => {
@@ -1013,6 +1059,35 @@ describe("the recipe card review page", () => {
     expect(await leaveGuard.current!({ fullPath: "/g/home/recipes" })).toBe(true);
   });
 
+  test("a logout saves the last edit while it can, and the page then lets the login page open without asking", async () => {
+    const wrapper = await mountPage();
+    const name = () => wrapper.findAll(".text-field").find(field => field.text().startsWith("Name"))!.get("input");
+
+    // typed a moment ago: the logout sends it before the session goes
+    await name().setValue("Banana Mug Cake for One");
+    await Promise.all(runRecipeIngestLogoutTasks());
+    expect(api.updateJob).toHaveBeenCalledOnce();
+    expect(api.updateJob.mock.calls[0]![1].draft).toMatchObject({ name: "Banana Mug Cake for One" });
+
+    // offline: the save fails, then the session is gone; nothing could be saved now, so the page doesn't hold the logout
+    api.updateJob.mockResolvedValue({ data: null, response: null, error: { message: "Network Error" } });
+    await name().setValue("Banana Mug Cake for Two");
+    await Promise.all(runRecipeIngestLogoutTasks());
+    expect(api.updateJob).toHaveBeenCalledTimes(2);
+    setRecipeIngestSessionCheck(() => false);
+    try {
+      expect(await leaveGuard.current!({ fullPath: "/login?direct=1" })).toBe(true);
+      await flushPromises();
+      expect(wrapper.find(".dialog[data-title=\"Changes not saved\"]").exists()).toBe(false);
+      // and the debounced save doesn't go out without a session
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(api.updateJob).toHaveBeenCalledTimes(2);
+    }
+    finally {
+      setRecipeIngestSessionCheck(null);
+    }
+  });
+
   test("Next with the last edit unsaved asks, then goes on the way the review does (replacing the page)", async () => {
     api.updateJob.mockResolvedValue({ data: null, response: null, error: { message: "Network Error" } });
     const wrapper = await mountPage();
@@ -1061,6 +1136,43 @@ describe("the recipe card review page", () => {
     expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Rebuilt from your text");
   });
 
+  test("Return while correcting What the card says starts a new line: the dialog stays open with the correction", async () => {
+    // on a phone this dialog is the only way to rebuild from the text
+    const wrapper = await mountPage(false, realDialog);
+
+    await button(wrapper, "What the card says").trigger("click");
+    const dialog = () => wrapper.find(".dialog[data-title=\"What the card says\"]");
+    await dialog().get(".ingest-transcription__edit").trigger("click");
+    await dialog().get(".ingest-transcription .textarea input").setValue("Banana Mug Cake");
+    await dialog().get(".ingest-transcription .textarea input").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+
+    expect(dialog().exists()).toBe(true);
+    expect((dialog().get(".ingest-transcription .textarea input").element as HTMLInputElement).value).toBe("Banana Mug Cake");
+    expect(api.rebuild).not.toHaveBeenCalled();
+  });
+
+  test("Enter on the Discard question's Cancel doesn't discard the card; only Confirm does", async () => {
+    api.discard.mockResolvedValue(ok(null));
+    const wrapper = await mountPage(false, realConfirmDialog);
+    const dialog = () => wrapper.find(".dialog[data-title=\"Discard\"]");
+
+    await wrapper.findAll(".menu-item").find(item => item.text() === "Discard")!.trigger("click");
+    // a keyboard user on Cancel presses Enter (the browser then clicks Cancel)
+    await dialog().get(".dialog-cancel").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(api.discard).not.toHaveBeenCalled();
+    await dialog().get(".dialog-cancel").trigger("click");
+    await flushPromises();
+    expect(dialog().exists()).toBe(false);
+    expect(api.discard).not.toHaveBeenCalled();
+
+    await wrapper.findAll(".menu-item").find(item => item.text() === "Discard")!.trigger("click");
+    await dialog().get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.discard).toHaveBeenCalledExactlyOnceWith("j1");
+  });
+
   test("on desktop the card panel's text is corrected in place", async () => {
     api.rebuild.mockResolvedValueOnce(idle({ task: extracting }));
     const wrapper = await mountPage(true);
@@ -1076,6 +1188,69 @@ describe("the recipe card review page", () => {
     expect(panel.find(".ingest-transcription .textarea").exists()).toBe(false);
     // nothing more can be rebuilt while it runs
     expect(panel.find(".ingest-transcription__edit").exists()).toBe(false);
+  });
+
+  test("opened while a Parse with AI runs (a reload, another device), the server's task says which lines: they show it, and what came of it", async () => {
+    const parsing: RecipeIngestionJobTask = { kind: "extract", state: "running", mode: "parse_lines", refs: ["i1"] };
+    api.getJob.mockResolvedValue(ok(job({ task: parsing })));
+    api.getJobState.mockResolvedValue(idle({ task: parsing }));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__reading").text()).toContain("Parsing with AI. You can edit the card when that's done.");
+    expect(wrapper.get(".ingest-ingredient__parsing").text()).toBe("Parsing with AI…");
+
+    const parsed = { ...job().draft!.ingredients![0]!, unit: { id: "u-tsp", name: "teaspoon" }, food: { id: "f-salt", name: "salt" }, parseConfidence: 0.95 };
+    api.getJobState.mockResolvedValue(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4, draft: { ...job().draft!, ingredients: [parsed] }, flags: [] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.find(".ingest-ingredient__parsing").exists()).toBe(false);
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Parsed with AI");
+  });
+
+  test("opened while a parse runs that then changes nothing, the page says so as if it had started it", async () => {
+    const parsing: RecipeIngestionJobTask = { kind: "extract", state: "running", mode: "parse_lines", refs: ["i1"] };
+    api.getJob.mockResolvedValue(ok(job({ task: parsing })));
+    api.getJobState.mockResolvedValue(idle({ task: parsing }));
+    const wrapper = await mountPage();
+
+    api.getJobState.mockResolvedValue(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4 })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Parse with AI didn't change the line.");
+  });
+
+  test("opened while a rebuild runs, the page says it's rebuilding, and where the recipe came from when it's done", async () => {
+    const rebuilding: RecipeIngestionJobTask = { kind: "extract", state: "queued", mode: "rebuild", refs: [] };
+    api.getJob.mockResolvedValue(ok(job({ task: rebuilding })));
+    api.getJobState.mockResolvedValue(idle({ task: rebuilding }));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__reading").text()).toContain("Rebuilding the recipe from your text. You can edit it when that's done.");
+    expect(wrapper.find(".ingest-ingredient__parsing").exists()).toBe(false);
+
+    api.getJobState.mockResolvedValue(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4, flags: [unsure] })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.find(".ingest-review__reading").exists()).toBe(false);
+    expect(wrapper.get(".ingest-review-bar__notice").text()).toContain("Rebuilt from your text");
+  });
+
+  test("opened while the whole card is read again, it says so, and nothing about a rebuild or parse when it's done", async () => {
+    const reading: RecipeIngestionJobTask = { kind: "extract", state: "running", mode: "reextract", refs: [] };
+    api.getJob.mockResolvedValue(ok(job({ task: reading })));
+    api.getJobState.mockResolvedValue(idle({ task: reading }));
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".ingest-review__reading").text()).toContain("The card is being read again");
+    api.getJobState.mockResolvedValue(idle({ draftVersion: 4 }));
+    api.getJob.mockResolvedValue(ok(job({ draftVersion: 4 })));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(wrapper.find(".ingest-review__reading").exists()).toBe(false);
+    expect(wrapper.find(".ingest-review-bar__notice").exists()).toBe(false);
   });
 
   test("Parse with AI on Check this ingredient parses that line; the line shows it, and takes the parse when done", async () => {

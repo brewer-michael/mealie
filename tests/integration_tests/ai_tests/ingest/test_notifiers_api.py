@@ -1,10 +1,15 @@
 """
 A notifier's "recipe cards ready" toggle and its test notification, `/api/ai/notifiers/{id}/events`
 (docs/ai/PHASE2.md §8, §9): the same permission checks as upstream's notifier routes, the household's notifiers only,
-and a 502 when the test wasn't delivered.
+and a 502 when the test wasn't delivered, for those who manage the household or group only (anyone else gets
+upstream's 204, so the test can't probe which internal services answer).
 """
 
 import json
+import socket
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -35,6 +40,11 @@ def create_notifier(user: TestUser, url: str = "jsons://homeassistant.local:8123
         )
     )
     return saved.id
+
+
+def manager(api_client: TestClient, admin_token: dict, user: TestUser) -> TestUser:
+    """Someone who manages `user`'s household"""
+    return household_member(api_client, admin_token, user, canManageHousehold=True)
 
 
 @pytest.fixture()
@@ -167,12 +177,16 @@ def test_the_test_notification(api_client: TestClient, unique_user_fn_scoped: Te
 
 def test_the_test_notification_that_wasnt_delivered_is_a_502(
     api_client: TestClient,
+    admin_token: dict,
     unique_user_fn_scoped: TestUser,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
-    """Home Assistant down, a wrong URL, or a notifier that raises: the page says the test failed, and why to look"""
-    user = unique_user_fn_scoped
+    """
+    Home Assistant down, a wrong URL, or a notifier that raises: the page says the test failed, and why to look, to
+    someone who manages the household
+    """
+    user = manager(api_client, admin_token, unique_user_fn_scoped)
     notifier_id = create_notifier(user, "jsons://secret-token@homeassistant.local:8123/api/webhook/mealie_cards")
     notify_calls: list[str] = []
 
@@ -208,11 +222,90 @@ def test_the_test_notification_that_wasnt_delivered_is_a_502(
     assert response.json()["detail"]["code"] == "notification_failed"
 
 
-def test_the_test_notifications_502_is_in_the_requests_language(api_client: TestClient, unique_user: TestUser):
+def test_the_test_notifications_502_is_in_the_requests_language(
+    api_client: TestClient, admin_token: dict, unique_user: TestUser
+):
     """Only en-US has the fork's texts yet: another language gets the English message, never the key"""
+    user = manager(api_client, admin_token, unique_user)
     notifier_id = create_notifier(unique_user, "nosuchservice://homeassistant.local/hook")
-    response = api_client.post(
-        f"{events_url(notifier_id)}/test", headers={**unique_user.token, "accept-language": "de-DE"}
-    )
+    response = api_client.post(f"{events_url(notifier_id)}/test", headers={**user.token, "accept-language": "de-DE"})
     assert response.status_code == 502
     assert response.json()["detail"]["message"].startswith("The test notification wasn't delivered.")
+
+
+class _Service(BaseHTTPRequestHandler):
+    """An internal service on 127.0.0.1: POSTs to `/ok` get 200, any other path 404"""
+
+    hits: list[str] = []
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.hits.append(self.path)
+        self.send_response(200 if self.path.startswith("/ok") else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+@pytest.fixture()
+def internal_service() -> Iterator[int]:
+    """The port of an `_Service`"""
+    _Service.hits = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        thread.join(10)
+        server.server_close()
+
+
+def _closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_the_test_cant_tell_a_member_which_internal_services_answer(
+    api_client: TestClient,
+    admin_token: dict,
+    unique_user_fn_scoped: TestUser,
+    internal_service: int,
+    caplog: pytest.LogCaptureFixture,
+):
+    """
+    Any member can point a notifier at any address, as upstream allows, and Apprise posts to it. Upstream's test
+    answers 204 whatever happened; so does this one for a member who can't manage the household or group, or the
+    204-or-502 answer would say whether an internal host:port/path takes a POST. The failure is still logged.
+    """
+    member = household_member(api_client, admin_token, unique_user_fn_scoped)
+    managers = [
+        manager(api_client, admin_token, unique_user_fn_scoped),
+        household_member(api_client, admin_token, unique_user_fn_scoped, canManage=True),
+        household_member(api_client, admin_token, unique_user_fn_scoped, admin=True),
+    ]
+    targets = {
+        f"json://127.0.0.1:{internal_service}/ok": 204,
+        f"json://127.0.0.1:{internal_service}/missing": 502,
+        f"json://127.0.0.1:{_closed_port()}/": 502,
+        "nosuchservice://127.0.0.1/hook": 502,
+    }
+    for url, managers_get in targets.items():
+        notifier_id = create_notifier(unique_user_fn_scoped, url)
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            response = api_client.post(f"{events_url(notifier_id)}/test", headers=member.token)
+        assert response.status_code == 204, (url, response.text)
+        assert response.content == b""
+        assert (str(notifier_id) in caplog.text) is (managers_get == 502), url
+
+        for user in managers:
+            response = api_client.post(f"{events_url(notifier_id)}/test", headers=user.token)
+            assert response.status_code == managers_get, (url, response.text)
+
+    # each test really was sent: Apprise reached the service every time
+    assert _Service.hits == ["/ok"] * 4 + ["/missing"] * 4

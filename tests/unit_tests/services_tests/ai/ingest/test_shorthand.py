@@ -1,5 +1,7 @@
 """Recipe card shorthand written out before the NLP parser sees a line (docs/ai/PHASE2.md §5, F6)"""
 
+import time
+
 import pytest
 
 from mealie.services.ai.ingest.shorthand import (
@@ -11,6 +13,9 @@ from mealie.services.ai.ingest.shorthand import (
     join_mixed_numbers,
     normalize_shorthand,
     prepare_line,
+    quantity_value,
+    standard_abbreviation,
+    unit_spellings,
 )
 
 
@@ -53,6 +58,17 @@ from mealie.services.ai.ingest.shorthand import (
         ("1 Env unflavored gelatin", "1 envelope unflavored gelatin"),
         ("2 sq. chocolate", "2 square chocolate"),
         ("1 sq unsweetened chocolate", "1 square unsweetened chocolate"),
+        # longer and plural spellings of a spoon or a package, in any case: the parser would read "tbls. sugar" as the
+        # food, with no unit and nothing to look at
+        ("2 tbls. sugar", "2 tbsp sugar"),
+        ("2 Tbls. sugar", "2 tbsp sugar"),
+        ("1 TBL. butter", "1 tbsp butter"),
+        ("1 tblsp. flour", "1 tbsp flour"),
+        ("2 tbs. sugar", "2 tbsp sugar"),
+        ("1 teasp. salt", "1 tsp salt"),
+        ("2 pkgs. yeast", "2 package yeast"),
+        ("2 Pkgs. yeast", "2 package yeast"),
+        ("3 envs. gelatin", "3 envelope gelatin"),
     ],
 )
 def test_shorthand_after_the_quantity_is_written_out(line: str, normalized: str):
@@ -124,6 +140,12 @@ def test_only_the_token_after_the_leading_quantity_changes():
         ("1 heaping T. flour (level)", "1 T. flour", "heaping, level"),
         ("Salt, a scant pinch", "Salt, a pinch", "scant"),
         ("- 1 lg. onion, chopped", "- 1 onion, chopped", "lg."),
+        # "Big" capitalized before a capitalized word starts a name; the abbreviations start none
+        ("1 c. Big Red soda", "1 c. Big Red soda", None),
+        ("1 (12 oz.) can Big Red", "1 (12 oz.) can Big Red", None),
+        ("1 Big onion", "1 onion", "Big"),
+        ("1 Lg Onion", "1 Onion", "Lg"),
+        ("2 Med. Potatoes", "2 Potatoes", "Med."),
     ],
 )
 def test_size_words_are_taken_out_wherever_they_stand(line: str, plain: str, size: str | None):
@@ -157,11 +179,78 @@ def test_the_pattern_finds_shorthand_once_size_words_are_out():
         ("1 can (10 3/4 oz.) soup", "1 can (10 3/4 oz.) soup", ()),
         ("2 (large) eggs", "2 (large) eggs", ()),
         ("1 #2 pencil", "1 #2 pencil", ()),
+        # a package's size without parentheses, before a container (the parser would read the food "pkg. cream cheese")
+        ("1 8-oz. pkg. cream cheese", "1 package cream cheese", ("8-oz.",)),
+        ("1 3-oz. pkg. Jello", "1 package Jello", ("3-oz.",)),
+        ("2 8-oz. cans tomato sauce", "2 cans tomato sauce", ("8-oz.",)),
+        ("1 8 oz. pkg. cream cheese", "1 package cream cheese", ("8 oz.",)),
+        ("1 10 3/4 oz. can soup", "1 can soup", ("10 3/4 oz.",)),
+        ("1 15.5-oz. can corn", "1 can corn", ("15.5-oz.",)),
+        # one amount: a mixed number and its unit, or a unit and the food
+        ("2 1/2 oz. pkg. yeast", "2 1/2 oz. pkg. yeast", ()),
+        ("1 lb. ground beef", "1 lb. ground beef", ()),
+        ("2 8 oz. steaks", "2 8 oz. steaks", ()),
+        # a can's number with a fraction (the parser would make "#2 1/2" a food, in its own fraction code), or "No."
+        ("1 #2 1/2 can peaches", "1 can peaches", ("#2 1/2",)),
+        ("1 #2½ can peaches", "1 can peaches", ("#2½",)),
+        ("1 #2-1/2 can peaches", "1 can peaches", ("#2 1/2",)),
+        ("2 #2 1/2 cans tomatoes", "2 cans tomatoes", ("#2 1/2",)),
+        ("1 No. 2 can corn", "1 can corn", ("No. 2",)),
+        ("1 (#2 1/2) can peaches", "1 can peaches", ("(#2 1/2)",)),
+        ("2 noodles", "2 noodles", ()),
     ],
 )
 def test_a_package_size_and_a_can_number_go_to_the_note(line: str, text: str, notes: tuple[str, ...]):
     prepared = prepare_line(line)
     assert (prepared.text, prepared.notes) == (text, notes)
+
+
+@pytest.mark.parametrize(
+    "line, text, notes",
+    [
+        # before a container the parser reads "1 large" as a second amount and drops it
+        ("1 large can pineapple", "1 can pineapple", ("large",)),
+        ("1 small can tomato sauce", "1 can tomato sauce", ("small",)),
+        ("2 large cans tomatoes", "2 cans tomatoes", ("large",)),
+        ("1 tall can evaporated milk", "1 can evaporated milk", ("tall",)),
+        ("1 Medium can peas", "1 can peas", ("Medium",)),
+        ("1 large jar salsa", "1 jar salsa", ("large",)),
+        # and it hid the shorthand after it
+        ("1 large pkg. Jello", "1 package Jello", ("large",)),
+        ("1 small (3 oz.) pkg. Jello", "1 package Jello", ("small", "(3 oz.)")),
+        # before the food it's the same note the parser makes of it
+        ("3 large eggs", "3 eggs", ("large",)),
+        ("1 extra large egg", "1 egg", ("extra large",)),
+        # anywhere else it may be the food's, and a size alone, or a choice of sizes, stays
+        ("2 c. small curd cottage cheese", "2 cup small curd cottage cheese", ()),
+        ("1 small", "1 small", ()),
+        ("2 large (or 3 small) eggs", "2 large (or 3 small) eggs", ()),
+    ],
+)
+def test_a_size_written_in_full_after_the_quantity_goes_to_the_note(line: str, text: str, notes: tuple[str, ...]):
+    prepared = prepare_line(line)
+    assert (prepared.text, prepared.notes) == (text, notes)
+
+
+@pytest.mark.parametrize(
+    "line, text",
+    [
+        # a second amount's shorthand: the parser would read "T. flour" as the food
+        ("1 c. plus 2 T. flour", "1 cup plus 2 tbsp flour"),
+        ("1 c. + 2 T. sugar", "1 cup + 2 tbsp sugar"),
+        ("1/2 c. plus 1 T. milk", "1/2 cup plus 1 tbsp milk"),
+        ("1 c. & 2 T. butter", "1 cup & 2 tbsp butter"),
+        ("2 c. flour (or 1 1/2 c. bread flour)", "2 cup flour (or 1 1/2 cup bread flour)"),
+        # at the end of the line it's no food's, and the note keeps it as written
+        ("1 c. sugar + 2 T.", "1 cup sugar + 2 T."),
+        # only after a joined amount, and case still matters
+        ("1 c. sugar, 1 c. flour", "1 cup sugar, 1 c. flour"),
+        ("1 c. or 2 t-bone steaks", "1 cup or 2 t-bone steaks"),
+        ("1 c. milk and Tabasco", "1 cup milk and Tabasco"),
+    ],
+)
+def test_shorthand_after_a_joined_amount_is_written_out(line: str, text: str):
+    assert prepare_line(line).text == text
 
 
 @pytest.mark.parametrize(
@@ -171,6 +260,49 @@ def test_a_package_size_and_a_can_number_go_to_the_note(line: str, text: str, no
 def test_a_dozen_is_kept_as_the_unit(line: str, unit: str | None):
     """The parser reads "1 dozen eggs" as 1 egg; the unit is set after parsing"""
     assert prepare_line(line).unit == unit
+
+
+@pytest.mark.parametrize(
+    "line, quantity",
+    [
+        ("1/2 doz. eggs", 0.5),
+        ("1 1/2 doz. cookies", 1.5),
+        ("½ doz. eggs", 0.5),
+        ("1½ dozen eggs", 1.5),
+        ("2 1/2 dozen rolls", 2.5),
+        ("1.5 dozen", 1.5),
+        ("1-2 dozen eggs", 1),  # a range's start; the note keeps its end
+        ("3 dozen", 3),
+        ("1 c. sugar", None),
+    ],
+)
+def test_a_dozen_keeps_the_lines_own_quantity(line: str, quantity: float | None):
+    """The parser folds the dozen into a fraction's amount ("#1$2 dozen") and reads "1/2 dozen eggs" as 1"""
+    assert prepare_line(line).quantity == quantity
+
+
+def test_quantities_read_as_numbers():
+    assert [quantity_value(text) for text in ("1/2", "1 1/2", "1½", "½", "2.5", "2,5", "3")] == [
+        0.5,
+        1.5,
+        1.5,
+        0.5,
+        2.5,
+        2.5,
+        3,
+    ]
+    assert [quantity_value(text) for text in ("1/0", "x", "")] == [None, None, None]
+
+
+def test_a_units_spellings():
+    """A group's unit may have only a name, and a card writes its abbreviation: the same unit"""
+    assert unit_spellings("Teaspoons") == unit_spellings("tsp.") == ("teaspoon", "tsp", "ts", "teasp")
+    assert unit_spellings("lbs") == unit_spellings("pound") == ("pound", "lb")
+    assert unit_spellings("Pack") == unit_spellings("pkg") == ("package", "pkg", "pack", "packet", "pk")
+    assert unit_spellings("fl. oz.") == ("fluid ounce", "fl oz")
+    assert unit_spellings("Splash") == ("splash",)
+    names = ("teaspoon", "Tablespoons", "pounds", "fluid ounce", "package", "pack", "tsp", "splash")
+    assert [standard_abbreviation(name) for name in names] == ["tsp", "tbsp", "lb", "fl oz", "pkg", "", "", ""]
 
 
 @pytest.mark.parametrize(
@@ -203,3 +335,28 @@ def test_every_unit_the_pattern_matches_has_a_name():
     assert set(alternatives) == set(UNITS)
     abbreviations = SHORTHAND.pattern.split("|(?i:")[1].split(")")[0].split("|")
     assert set(abbreviations) == set(ABBREVIATIONS)
+
+
+def test_long_runs_of_digits_or_spaces_are_prepared_in_linear_time():
+    """No pattern splits a long run of digits or spaces every way (a package size in parentheses took minutes)"""
+    space = " " * 5000
+    for line in (
+        "1" * 5000,
+        f"1 ({space}8",
+        f"1 ({space}#2",
+        f"1 8{space}-",
+        f"1 c. +{space}2",
+        f"-{space}1 T.",
+        f"1 lg.{space}egg",  # the spaces left where a size word was taken out
+        f"1 ({space}lg.{space}x",  # a size word in parentheses that don't close
+        f"1 c. sugar,{space}scant{space},{space})",
+    ):
+        started = time.perf_counter()
+        prepare_line(line)
+        assert time.perf_counter() - started < 0.2, line[:8]
+
+
+@pytest.mark.parametrize("text", ["9" * 400, "1 " + "9" * 400 + "/2", "9" * 400 + "/7", "9" * 400 + ".5"])
+def test_a_quantity_too_large_for_a_float_is_none(text: str):
+    assert quantity_value(text) is None
+    assert prepare_line(f"{text} doz. eggs").quantity is None  # the dozen's quantity is read with it

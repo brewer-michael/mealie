@@ -316,6 +316,20 @@ describe("text", () => {
     }
   });
 
+  test("the app knows every error code, flag and rejection reason the server's generated types list", () => {
+    const types = readFileSync(resolve(__dirname, "../../lib/api/types/recipe-ingest.ts"), "utf8");
+    const union = (name: string) => {
+      const found = new RegExp(`export type ${name} =([^;]+);`).exec(types);
+      expect(found, name).not.toBeNull();
+      return [...found![1]!.matchAll(/"([^"]+)"/g)].map(match => match[1]!).sort();
+    };
+    expect([...INGEST_REJECT_REASONS].sort()).toEqual(union("IngestRejectReason"));
+    expect([...INGEST_ERROR_CODES].sort()).toEqual(union("IngestErrorCode"));
+    expect([...CARD_FLAG_KINDS].sort()).toEqual(union("CardFlagKind"));
+    // a card over the group's or the uploader's limit, refused on its own in a request that added others
+    expect(rejectReasonText("quota", t)).toBe("Too many recipe cards are being read. Try again when some are done.");
+  });
+
   test("a rejection names the limit the file went over: the server's, or its defaults before they load", () => {
     expect(rejectReasonText("too_large", t)).toBe("This file is larger than 30 MB.");
     expect(rejectReasonText("too_many_pages", t)).toBe("A card can have at most 4 pages.");

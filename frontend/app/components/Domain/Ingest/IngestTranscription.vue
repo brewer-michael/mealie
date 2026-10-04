@@ -2,7 +2,7 @@
   <div class="ingest-transcription">
     <!-- "Rebuild from this text": the reviewer corrects what was read, and the recipe is built again from it -->
     <template v-if="editing">
-      <p class="text-body-2 text-medium-emphasis mb-2 ingest-transcription__hint">
+      <p class="text-body-medium text-medium-emphasis mb-2 ingest-transcription__hint">
         {{ $t("recipe-ingest.review.rebuild-hint") }}
       </p>
       <v-textarea

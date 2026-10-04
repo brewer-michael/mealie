@@ -43,17 +43,26 @@ class WebhookPublisher:
 
     def publish(self, event: Event, notification_urls: list[str]):
         from mealie.core.config import get_app_settings
+        from mealie.core.root_logger import get_logger
         from mealie.pkgs import safehttp
 
         event_payload = jsonable_encoder(event)
         settings = get_app_settings()
         for url in notification_urls:
-            r = safehttp.post(
-                url,
-                json=event_payload,
-                timeout=15,
-                allow_hosts=settings.http_allow_list,
-                deny_hosts=settings.http_disallow_list,
-            )
+            try:
+                r = safehttp.post(
+                    url,
+                    json=event_payload,
+                    timeout=15,
+                    allow_hosts=settings.http_allow_list,
+                    deny_hosts=settings.http_disallow_list,
+                )
+            except safehttp.UnsafeRedirectError as e:
+                # fork hook (safehttp/redirects.py): a webhook that redirects to plain http (or off http) isn't sent,
+                # and mustn't stop the household's other webhooks
+                if self.hard_fail:
+                    raise
+                get_logger().warning(f"Webhook not sent: {e}")
+                continue
             if self.hard_fail:
                 r.raise_for_status()

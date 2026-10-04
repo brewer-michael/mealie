@@ -542,6 +542,8 @@ def test_state(api_client: TestClient, unique_user_fn_scoped: TestUser):
         "task": {
             "kind": "reread",
             "state": "running",
+            "mode": None,  # a region re-read; an extract task names what it does
+            "refs": [],
             "progressKey": "recipe-ingest.progress.reading-card",
             "cancelRequested": False,
         },
@@ -579,6 +581,8 @@ def test_reread_queues_a_priority_task_with_its_region(api_client: TestClient, u
     assert response.json()["task"] == {
         "kind": "reread",
         "state": "queued",
+        "mode": None,
+        "refs": [],
         "progressKey": None,
         "cancelRequested": False,
     }

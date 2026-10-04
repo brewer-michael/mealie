@@ -12,6 +12,8 @@ import {
   errorCodeOf,
   errorStatusOf,
   leaveRecipeIngestCommitNotice,
+  onRecipeIngestLogout,
+  recipeIngestSignedIn,
   rememberedRecipeIngestBatch,
   rememberRecipeIngestBatch,
   useRecipeIngestCounts,
@@ -34,13 +36,13 @@ import type {
   EvalCaseTag,
   FlagResolution,
   IngestStatus,
+  IngestTaskMode,
   ProposalTarget,
   RecipeIngestionBatchJob,
   RecipeIngestionBatchOut,
   RecipeIngestionJobOut,
   RecipeIngestionJobState,
   RecipeIngestionJobSummary,
-  RecipeIngestionJobTask,
   RegionHintOut,
   RereadRequest,
   RotateRequest,
@@ -72,11 +74,13 @@ export const MAX_TRANSCRIPTION = 20_000;
 // ==========================================
 // Drafts
 
-/** A draft with every list and the cover switch present, so the editor never meets a missing field */
+/**
+ * A draft with every list present, so the editor never meets a missing field. The photo switches (`useCardAsCover`,
+ * `attachCardPhoto`) stay as stored: unset means the household's default, which the page reads from the job.
+ */
 export type ReviewDraft = CardDraft & {
   name: string;
   description: string;
-  useCardAsCover: boolean;
   ingredients: CardDraftIngredient[];
   steps: CardDraftStep[];
   notes: (CardDraftNote & { id: string; title: string; text: string })[];
@@ -97,7 +101,6 @@ export function normalizeDraft(draft: CardDraft | null | undefined): ReviewDraft
     ...source,
     name: source.name ?? "",
     description: source.description ?? "",
-    useCardAsCover: source.useCardAsCover ?? true,
     ingredients: (source.ingredients ?? []).map(ingredient => ({
       ...ingredient,
       referenceId: ingredient.referenceId || uuid4(),
@@ -1393,10 +1396,7 @@ export function suggestEvalSlug(name: string | null | undefined): string {
  * What an extract task on a card being reviewed does (the server's `IngestTaskMode`): read the whole card again,
  * rebuild the recipe from the reviewer's text ("Rebuild from this text"), or parse chosen lines ("Parse with AI")
  */
-export type ExtractTaskMode = "reextract" | "rebuild" | "parse_lines";
-
-/** A task as the server describes it, with the mode of an extract task and the lines "Parse with AI" parses */
-type DescribedTask = RecipeIngestionJobTask & { mode?: ExtractTaskMode | null; refs?: string[] | null };
+export type ExtractTaskMode = IngestTaskMode;
 
 /** What this page asked an extract task to do, while it runs: the draft version and lines as they were sent */
 interface StartedTask {
@@ -1491,7 +1491,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
    * says so, else this page knows what it started; any other extract task reads the whole card again.
    */
   const taskMode = computed<ExtractTaskMode | null>(() => {
-    const current = task.value as DescribedTask | null;
+    const current = task.value;
     if (!current || current.kind !== "extract" || job.value?.status !== "ready") {
       return null;
     }
@@ -1502,7 +1502,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     if (taskMode.value !== "parse_lines") {
       return [];
     }
-    return (task.value as DescribedTask).refs ?? startedTask.value?.refs ?? [];
+    const refs = task.value?.refs;
+    return refs?.length ? refs : startedTask.value?.refs ?? [];
   });
   const status = computed(() => job.value?.status ?? null);
   const readOnly = computed(() =>
@@ -1521,9 +1522,21 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       }
     },
   });
+  /**
+   * Whether commit makes the card's photo the recipe's image: the draft's switch, else the household's default
+   * (`cardCoverDefault`, off where new recipes are public). Turning the switch stores the choice in the draft.
+   */
+  const useCardAsCover = computed<boolean>({
+    get: () => draft.value.useCardAsCover ?? job.value?.cardCoverDefault ?? true,
+    set: (value) => {
+      if (!readOnly.value) {
+        draft.value.useCardAsCover = value;
+      }
+    },
+  });
   /** Whether anyone could see the card photo: new recipes here are public, and it's the cover or attached */
   const cardPhotoPublic = computed(() =>
-    !!job.value?.householdRecipesPublic && (draft.value.useCardAsCover || attachCardPhoto.value),
+    !!job.value?.householdRecipesPublic && (useCardAsCover.value || attachCardPhoto.value),
   );
 
   function hasPendingChanges() {
@@ -1859,12 +1872,15 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     notify("warning", i18n.t(added ? "recipe-ingest.review.save-refused-added" : "recipe-ingest.review.save-refused-changed"));
   }
 
-  /** Saves pending changes now; waits for a save in flight first. Does nothing in a conflict or when nothing changed. */
+  /**
+   * Saves pending changes now; waits for a save in flight first. Does nothing in a conflict, when nothing changed, or
+   * once the user is signed out (it couldn't be saved; the page lets itself be left then).
+   */
   async function save(): Promise<void> {
     while (saving) {
       await saving;
     }
-    if (conflict.value || job.value?.status !== "ready" || !hasPendingChanges()) {
+    if (conflict.value || job.value?.status !== "ready" || !hasPendingChanges() || !recipeIngestSignedIn()) {
       return;
     }
     const sending = sendSave();
@@ -2291,6 +2307,17 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     }
   }
 
+  // A rebuild or parse this page didn't start (sent before a reload, or from another device) ends as if it had: the
+  // server's task says what it does and which lines, and the draft is as it was sent while it runs (the editor waits)
+  watch(task, (current) => {
+    const mode = current?.kind === "extract" ? current.mode : null;
+    if (startedTask.value || job.value?.status !== "ready" || (mode !== "rebuild" && mode !== "parse_lines")) {
+      return;
+    }
+    const refs = mode === "parse_lines" ? [...(current?.refs ?? [])] : [];
+    startedTask.value = { mode, version: draftVersion.value, refs, lines: refs.map(lineJson) };
+  }, { immediate: true });
+
   /** Turns a page clockwise, then offers to read the card again (a failed card from the start) */
   async function rotate(pageIndex: number, degrees: RotateRequest["degrees"] = 90) {
     return await runAction("rotate", async () => {
@@ -2702,6 +2729,10 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
   // Leaving
 
   useEventListener("beforeunload", (event: BeforeUnloadEvent) => {
+    // signed out (an expired session's redirect to the login page): nothing could be saved, so nothing to ask about
+    if (!recipeIngestSignedIn()) {
+      return;
+    }
     if (!conflict.value && (saving || hasPendingChanges())) {
       event.preventDefault();
       event.returnValue = "";
@@ -2717,8 +2748,16 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     return job.value?.status !== "ready" || !hasPendingChanges();
   }
 
+  // a logout the user chose saves the edit still waiting for its autosave first, while the session is there
+  const stopLogoutSave = onRecipeIngestLogout(async () => {
+    if (hasPendingChanges()) {
+      await save();
+    }
+  });
+
   onBeforeUnmount(() => {
     unmounted = true;
+    stopLogoutSave();
     cancelRetry();
     clearNoticeTimer();
     // the debounced save would never run: send what's pending now
@@ -2764,6 +2803,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     readOnly,
     position,
     attachCardPhoto,
+    useCardAsCover,
     cardPhotoPublic,
     canMerge,
     previousCard: readonly(previousCard),

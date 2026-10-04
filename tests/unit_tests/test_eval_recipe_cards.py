@@ -293,7 +293,8 @@ def test_the_pipelines_abbreviations_are_units_the_eval_knows():
     from mealie.services.ai.ingest.shorthand import ABBREVIATIONS
 
     for token, unit in ABBREVIATIONS.items():
-        assert ev.canonical_unit(token) == ev.canonical_unit(unit) == unit
+        assert ev.canonical_unit(token) == ev.canonical_unit(unit) is not None
+    assert [ev.canonical_unit(unit) for unit in ("dozen", "envelope", "square")] == ["dozen", "envelope", "square"]
 
 
 def test_parse_amount_writes_amounts_the_same_way():

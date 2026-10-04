@@ -25,11 +25,13 @@
             "ai-not-enabled": "AI services are not enabled",
             "ai-request-failed": "The AI provider was unable to complete the request. Please try again",
             "image-provider-not-enabled": "AI image services are not enabled",
+            "insecure-redirect": "The page redirected to an insecure http:// address",
             "no-recipe-found": "No recipe was found in the provided source",
             "no-source": "No content, images, or URL were provided",
             "provider-returned-nothing": "The AI provider did not return a recipe",
             "unknown-error": "Something went wrong while creating the recipe. Please try again",
             "unreadable-source": "Unable to read any content from the provided source",
+            "unsafe-redirect": "The page redirected to an address that isn't http or https",
             "video-download-failed": "Unable to download the video. It may be private, removed, or from an unsupported site"
         },
         "create-progress": {
@@ -207,6 +209,7 @@
                 "url_not_allowed": "{count} from an address that isn't allowed | {count} from addresses that aren't allowed",
                 "url_fetch_failed": "{count} couldn't be downloaded",
                 "no_permission": "{count} Mealie may not move",
+                "quota": "{count} over the limit of cards being read",
                 "other": "{count} for another reason | {count} for other reasons"
             }
         },
@@ -216,7 +219,7 @@
             "too_large": "The file is larger than {mib} MB.",
             "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF.",
             "pdf_not_supported": "This PDF can't be opened. It may need a password or be damaged.",
-            "too_many_pixels": "The photo has too many pixels. The most is {megapixels} megapixels, or {jpeg_megapixels} megapixels for a JPEG.",
+            "too_many_pixels": "The photo has too many pixels. The most is {megapixels} megapixels, or {jpeg_megapixels} megapixels for a JPEG (fewer for a progressive JPEG).",
             "unreadable_image": "The image couldn't be read. It may be damaged or incomplete.",
             "too_many_pages": "A card can have at most {pages} pages.",
             "duplicate": "This card was already scanned.",
@@ -224,6 +227,7 @@
             "url_not_allowed": "Mealie may not download images from that address.",
             "url_fetch_failed": "The image couldn't be downloaded.",
             "no_permission": "Mealie may not move this out of the inbox folder. Its group needs write access to the household folder, and to a card folder itself (umask 002).",
+            "quota": "Too many recipe cards are being read. Try again when some are done.",
             "other": {
                 "symbolic-link": "It's a symbolic link, which is never followed.",
                 "unreadable": "It couldn't be opened ({error}).",
@@ -238,7 +242,7 @@
             "paused-for-restore": "Recipe card uploads are paused while a backup is restored. Try again in a minute.",
             "ingest-disabled": "Recipe card scanning is turned off on this server.",
             "too-many-jobs": "Too many recipe cards are waiting to be read. Try again when some have finished.",
-            "user-quota": "You can have at most {count} recipe card being read at once. Try again when it's done. | You can have at most {count} recipe cards being read at once. Try again when some are done.",
+            "user-quota": "You already have {count} recipe card being read, the most allowed. Try again when it's done. | You already have {count} recipe cards being read, the most allowed. Try again when some are done.",
             "too-large": "The upload is too large. The limit is {max} MB.",
             "unsupported-media-type": "Send recipe cards as images, a multipart form or JSON.",
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",

@@ -52,6 +52,8 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
 
 const router = { push: vi.fn() };
 const wrappers: VueWrapper[] = [];
+/** The in-memory token, as `useMealieAuth().token` gives it */
+const session = ref<string | null>("token");
 
 /** What the sidebar is given, and the Create menu's items as rendered */
 async function mountLayout() {
@@ -101,9 +103,10 @@ describe("DefaultLayout's recipe card entries", () => {
     resetRecipeIngestCounts();
     resetRecipeIngestUploads();
     loggedIn.isOwnGroup.value = true;
+    session.value = "token";
     vi.stubGlobal("useNuxtApp", () => ({ $globals: { icons: new Proxy({}, { get: (_target, name) => String(name) }) } }));
     vi.stubGlobal("useDisplay", () => ({ lgAndUp: ref(true) }));
-    vi.stubGlobal("useMealieAuth", () => ({ user: ref({ id: "u1", groupSlug: "home", householdId: "h1" }) }));
+    vi.stubGlobal("useMealieAuth", () => ({ user: ref({ id: "u1", groupSlug: "home", householdId: "h1" }), token: session }));
     vi.stubGlobal("useRoute", () => ({ params: { groupSlug: "home" }, path: "/g/home" }));
     vi.stubGlobal("useRouter", () => router);
     api.getSettings.mockResolvedValue({ data: settings(), error: null });
@@ -164,5 +167,23 @@ describe("DefaultLayout's recipe card entries", () => {
     await flushPromises();
     expect(topLinks(wrapper)).toContainEqual({ title: "Recipe cards (2)", badge: "" });
     close();
+  });
+
+  test("photos pending ask before the page is left, but not once the session has gone (an expired session's redirect)", async () => {
+    api.upload.mockReturnValue(new Promise(() => {}));
+    api.createBatch.mockResolvedValue({ data: { id: "b1", source: "app" }, error: null });
+    await mountLayout();
+    useRecipeIngestUploads().takePhoto(new File(["x"], "IMG_1.jpg", { type: "image/jpeg" }));
+    await flushPromises();
+
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    expect(leave()).toBe(true);
+    // the API client's 401 path: the token is cleared, then the page goes to the login page
+    session.value = null;
+    expect(leave()).toBe(false);
   });
 });

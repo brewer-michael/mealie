@@ -11,8 +11,11 @@ it's on, a URL is fetched by the server, so it's held to what a server-side fetc
   Assistant's address, say); `HTTP_DISALLOW_LIST` refuses whatever it names. The connection is pinned to the address
   that was checked (no DNS rebinding), TLS is verified, and no proxy from the environment is used.
 - **At most `MAX_REDIRECTS` redirects**, each checked like the first, and never off http(s) or from https to http.
-- **The body** is refused `too_large` from its `Content-Length`, or once the bytes received pass the cap (it isn't read
-  further), and spooled like a decoded base64 image. The whole download, redirects included, has
+- **The body** is asked for and taken uncompressed only (`Accept-Encoding: identity`, and curl decodes nothing): a few
+  MB of gzip could inflate to gigabytes before anything counted them, so a response encoded anyway is
+  `url_fetch_failed`, unread. It's refused `too_large` from its `Content-Length`, or once the bytes received pass the
+  cap: curl itself stops receiving there (`MAXFILESIZE_LARGE`), and a refused response's transfer is stopped rather
+  than drained. What's read is spooled like a decoded base64 image. The whole download, redirects included, has
   `AI_INGEST_URL_TIMEOUT` seconds.
 - **Logs name the host only**: a Home Assistant camera proxy URL carries its access token in the query. The image's
   name is the URL's last path segment, without the query or fragment.
@@ -30,6 +33,7 @@ from urllib.parse import unquote
 
 import anyio
 import httpx
+from curl_cffi import CurlECode, CurlOpt
 
 from mealie.core.config import get_app_settings
 from mealie.core.root_logger import get_logger
@@ -45,6 +49,8 @@ MAX_REDIRECTS = 3
 SPOOL_MAX_BYTES = 1024 * 1024
 """A downloaded image is kept in memory up to this size, then in an unnamed file in the system temp directory"""
 ACCEPT = "image/*,*/*;q=0.5"
+IDENTITY = "identity"
+"""The only content coding asked for and accepted"""
 
 _fetching: contextvars.ContextVar[bool] = contextvars.ContextVar("ingest_url_fetching", default=False)
 
@@ -102,9 +108,40 @@ def _host(url: str) -> str:
         return "?"
 
 
-def _transport(allow_hosts: list[str], deny_hosts: list[str], timeout: int) -> httpx.AsyncBaseTransport:
-    """A fresh SSRF-checking transport for one URL (tests serve their own responses behind the same checks)"""
-    return AsyncSafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout, verify=True)
+def _transport(allow_hosts: list[str], deny_hosts: list[str], timeout: int, max_bytes: int) -> httpx.AsyncBaseTransport:
+    """
+    A fresh SSRF-checking transport for one URL (tests serve their own responses behind the same checks). curl decodes
+    no content coding, and stops receiving a body (each hop's) past `max_bytes` (`_over_the_cap`).
+    """
+    return AsyncSafeTransport(
+        allow_hosts=allow_hosts,
+        deny_hosts=deny_hosts,
+        timeout=timeout,
+        verify=True,
+        curl_options={
+            CurlOpt.NOPROXY: "*",  # options of our own replace safehttp's default, which is this
+            CurlOpt.HTTP_CONTENT_DECODING: 0,
+            CurlOpt.MAXFILESIZE_LARGE: max_bytes,
+        },
+    )
+
+
+def _over_the_cap(error: BaseException) -> bool:
+    """Whether curl stopped a body at `MAXFILESIZE_LARGE`: its error as raised mid-body, or the transport's for it"""
+    return any(
+        getattr(candidate, "code", None) == CurlECode.FILESIZE_EXCEEDED for candidate in (error, error.__cause__)
+    )
+
+
+def _stop_transfer(response: httpx.Response) -> None:
+    """
+    Tells curl to drop the rest of a response's body: closing the response (curl_cffi's) otherwise waits for the whole
+    transfer, queueing every byte still to come. A response from another transport has nothing to stop.
+    """
+    curl_response = response.extensions.get("curl", {}).get("response")
+    quit_now = getattr(curl_response, "quit_now", None)
+    if quit_now is not None:
+        quit_now.set()
 
 
 def _check_url(url: str) -> httpx.URL:
@@ -124,7 +161,7 @@ async def _download(url: httpx.URL, max_bytes: int, timeout: int) -> FetchedImag
     app_settings = get_app_settings()
     settings = get_ingest_settings()
     transport = _transport(
-        [*app_settings.http_allow_list, *settings.url_allow_hosts], app_settings.http_disallow_list, timeout
+        [*app_settings.http_allow_list, *settings.url_allow_hosts], app_settings.http_disallow_list, timeout, max_bytes
     )
     async with httpx.AsyncClient(
         transport=transport,
@@ -135,33 +172,45 @@ async def _download(url: httpx.URL, max_bytes: int, timeout: int) -> FetchedImag
         trust_env=False,  # no proxy or `.netrc` credentials from the environment
         timeout=timeout,
     ) as client:
-        async with client.stream("GET", url, headers={"Accept": ACCEPT}) as response:
-            if not 200 <= response.status_code < 300:  # an error, or a redirect with nowhere to go
-                raise _Refused(IngestRejectReason.url_fetch_failed, f"HTTP {response.status_code}")
-            declared = response.headers.get("content-length", "")
-            if declared.isdigit() and int(declared) > max_bytes:
-                raise _Refused(IngestRejectReason.too_large, "its Content-Length is over the limit")
-
-            spooled: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
-            size = 0
+        headers = {"Accept": ACCEPT, "Accept-Encoding": IDENTITY}
+        async with client.stream("GET", url, headers=headers) as response:
             try:
-                async for chunk in response.aiter_bytes():  # as received: counted before the next is read
-                    size += len(chunk)
-                    if size > max_bytes:
-                        raise _Refused(IngestRejectReason.too_large, "its body is over the limit")
-                    spooled.write(chunk)
-                spooled.seek(0)
+                return await _read_body(response, max_bytes)
             except BaseException:
-                spooled.close()
+                _stop_transfer(response)  # a refusal (or the deadline) leaves the rest of the body unread
                 raise
-            return FetchedImage(cast(BinaryIO, spooled), size)
+
+
+async def _read_body(response: httpx.Response, max_bytes: int) -> FetchedImage:
+    if not 200 <= response.status_code < 300:  # an error, or a redirect with nowhere to go
+        raise _Refused(IngestRejectReason.url_fetch_failed, f"HTTP {response.status_code}")
+    encoding = response.headers.get("content-encoding", IDENTITY).strip().lower()
+    if encoding not in ("", IDENTITY):
+        raise _Refused(IngestRejectReason.url_fetch_failed, "its body is compressed, which wasn't asked for")
+    declared = response.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > max_bytes:
+        raise _Refused(IngestRejectReason.too_large, "its Content-Length is over the limit")
+
+    spooled: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
+    size = 0
+    try:
+        async for chunk in response.aiter_bytes():  # as received: counted before the next is read
+            size += len(chunk)
+            if size > max_bytes:
+                raise _Refused(IngestRejectReason.too_large, "its body is over the limit")
+            spooled.write(chunk)
+        spooled.seek(0)
+    except BaseException:
+        spooled.close()
+        raise
+    return FetchedImage(cast(BinaryIO, spooled), size)
 
 
 async def fetch_image(url: str, *, max_bytes: int = limits.MAX_FILE_BYTES) -> FetchedImage | IngestRejectReason:
     """
     Downloads one image URL, or says why not: `url_not_allowed` (fetching is off, the URL isn't plain http(s), or it
-    leads somewhere it may not go), `url_fetch_failed` (network error, timeout, an HTTP error, too many redirects) or
-    `too_large` (more than `max_bytes`). The caller closes the file.
+    leads somewhere it may not go), `url_fetch_failed` (network error, timeout, an HTTP error, too many redirects, a
+    compressed body) or `too_large` (more than `max_bytes`). The caller closes the file.
     """
     settings = get_ingest_settings()
     host = _host(url)
@@ -188,6 +237,9 @@ async def fetch_image(url: str, *, max_bytes: int = limits.MAX_FILE_BYTES) -> Fe
         logger.info(f"An image URL on {host} wasn't fetched: more than {MAX_REDIRECTS} redirects")
         return IngestRejectReason.url_fetch_failed
     except Exception as e:
+        if _over_the_cap(e):
+            logger.info(f"An image URL on {host} wasn't fetched: its body is over the limit")
+            return IngestRejectReason.too_large
         # network errors (by type only: their messages name the URL)
         logger.info(f"An image URL on {host} wasn't fetched ({type(e).__name__})")
         return IngestRejectReason.url_fetch_failed

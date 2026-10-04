@@ -8,7 +8,10 @@ through the household-scoped repositories, so another household's notifier is a 
 `ai_event_notifier_options` side table, never in upstream's notifier options.
 
 The test answers 502 `notification_failed` (with a message) when the notifier didn't get it: Apprise couldn't read
-its URL, or the service it sends to refused or couldn't be reached.
+its URL, or the service it sends to refused or couldn't be reached. Only to someone who manages the household or the
+group (or an admin): anyone else gets upstream's 204 whatever happened, with the failure in the server log. Any member
+can point a notifier at any address (upstream's routes check none, and Home Assistant is usually on the LAN), so a
+204-or-502 answer would tell them whether an internal host:port/path takes a POST.
 """
 
 from fastapi import APIRouter, status
@@ -30,6 +33,10 @@ NOTIFICATION_FAILED = "notification_failed"
 
 @controller(router)
 class AINotifierEventsController(IngestController):
+    def _sees_delivery(self) -> bool:
+        """Whether the user is told a test wasn't delivered: they manage the household or the group"""
+        return self.user.can_manage_household or self.user.can_manage or self.user.admin
+
     def _notifier(self, notifier_id: UUID4) -> GroupEventNotifierPrivate:
         """The household's notifier, else 404"""
         notifier = self.repos.group_event_notifier.get_one(notifier_id, override_schema=GroupEventNotifierPrivate)
@@ -60,12 +67,14 @@ class AINotifierEventsController(IngestController):
     def test_notifier_events(self, notifier_id: UUID4) -> None:
         """
         Sends a test "recipe cards ready" notification through this notifier, whether or not it's switched on for
-        it: the same event and data shape, with the household's current counts. 502 when it wasn't delivered.
+        it: the same event and data shape, with the household's current counts. 502 when it wasn't delivered, for a
+        manager only (see the module's docstring); a failure is logged either way.
         """
         notifier = self._notifier(notifier_id)
         translator = with_fallback(self.translator)
         target = events.NotifierURL(notifier.id, notifier.name, notifier.apprise_url)
-        if not events.send_test_notification(self.session, self.group_id, self.household_id, target, translator):
+        delivered = events.send_test_notification(self.session, self.group_id, self.household_id, target, translator)
+        if not delivered and self._sees_delivery():
             raise ingest_error(
                 status.HTTP_502_BAD_GATEWAY,
                 NOTIFICATION_FAILED,

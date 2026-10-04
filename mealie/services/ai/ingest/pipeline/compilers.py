@@ -9,8 +9,10 @@ page's field and the commit's note title already say), the reader's `unsure` lis
 the image reader says each page must turn go on the `CardWorkflowContext`.
 
 A two-sided card is one request with both pages. Some local vision models take one image per request and fail it; then
-each page is read on its own and the readings are joined (`ONE_IMAGE_PROVIDERS` remembers such a provider, so its
-later cards are read page by page at once).
+each page is read on its own and the readings are joined. `ONE_IMAGE_PROVIDERS` remembers such a provider, so its
+later cards are read page by page at once, but only once it failed that way on `ONE_IMAGE_STRIKES` cards in a row, and
+never for an answer that was the model's own trouble (a cut-off or malformed answer, a refusal): one passing error
+mustn't make every later card take twice the requests.
 """
 
 import asyncio
@@ -19,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
+
+import pydantic
 
 from mealie.core import exceptions
 from mealie.core.config import get_app_settings
@@ -30,6 +34,8 @@ from mealie.services import ocr
 from mealie.services.ai.errors import (
     AIProviderLimitReachedError,
     AIProviderLocalOnlyError,
+    AIProviderOutputTruncatedError,
+    AIProviderRefusedError,
     IngestBusyError,
     IngestPaused,
     describe_provider_error,
@@ -55,9 +61,13 @@ logger = get_logger(__name__)
 
 ONE_IMAGE_PROVIDERS: set[tuple[UUID, str]] = set()
 """
-Providers (by id and model) that failed a request with several images and then read each one on its own: this
-process reads their cards page by page from then on
+Providers (by id and model) that failed a request with several images and then read each one on its own, on
+`ONE_IMAGE_STRIKES` cards in a row: this process reads their cards page by page from then on
 """
+ONE_IMAGE_STRIKES = 2
+"""How many cards in a row a provider must fail with several images, and read page by page, to be remembered"""
+MULTI_IMAGE_FAILURES: dict[tuple[UUID, str], int] = {}
+"""Providers' failed requests with several images since the last one they answered, for `ONE_IMAGE_STRIKES`"""
 
 NOT_ABOUT_IMAGES: tuple[type[BaseException], ...] = (
     exceptions.RateLimitError,
@@ -174,11 +184,29 @@ def may_take_fewer_images(error: BaseException) -> bool:
     return not is_rate_limit_error(error.__cause__ or error)
 
 
+def is_model_output_error(error: BaseException | None) -> bool:
+    """
+    Whether a provider's answer failed for the model's own trouble, not the images': malformed or cut off, filtered or
+    refused. The card may still be read page by page, but the provider isn't remembered for it.
+    """
+    import openai
+
+    return isinstance(
+        error,
+        pydantic.ValidationError
+        | openai.LengthFinishReasonError
+        | openai.ContentFilterFinishReasonError
+        | AIProviderRefusedError
+        | AIProviderOutputTruncatedError,
+    )
+
+
 @contextmanager
 def answered_attempts(ai: OpenAIService, feature: str) -> Iterator[list[tuple[AIProviderOut, bool]]]:
     """
     Every provider attempt for `feature` (a response schema's name) on `ai`'s runtime meanwhile, as `(provider,
-    answered)`: watched where the runtime logs each attempt, so routing, fallbacks and the usage log run as they are
+    answered)`: watched where the runtime logs each attempt, so routing, fallbacks and the usage log run as they are.
+    An attempt that failed for the model's own trouble (`is_model_output_error`) isn't listed.
     """
     runtime = ai.runtime
     attempts: list[tuple[AIProviderOut, bool]] = []
@@ -187,13 +215,36 @@ def answered_attempts(ai: OpenAIService, feature: str) -> Iterator[list[tuple[AI
     def watch(provider: AIProviderOut, **kwargs: Any) -> None:
         record(provider, **kwargs)
         if kwargs.get("feature") == feature:
-            attempts.append((provider, kwargs.get("error") is None and kwargs.get("error_type") is None))
+            error = kwargs.get("error")
+            if is_model_output_error(error):
+                return  # neither answered nor a failure about the images
+            attempts.append((provider, error is None and kwargs.get("error_type") is None))
 
     runtime.record_attempt = watch  # type: ignore[method-assign]
     try:
         yield attempts
     finally:
         del runtime.record_attempt  # the class's method again
+
+
+def _remember_one_image_providers(
+    multi: Sequence[tuple[AIProviderOut, bool]], single: Sequence[tuple[AIProviderOut, bool]]
+) -> None:
+    """
+    After a card's request with several images (`multi`'s attempts) and, when it failed, its pages read one by one
+    (`single`'s): a provider that answered with several images starts over, and one that failed them but answered
+    each page on its own counts a strike; at `ONE_IMAGE_STRIKES` it's remembered (`ONE_IMAGE_PROVIDERS`)
+    """
+    for provider, answered in multi:
+        if answered:
+            MULTI_IMAGE_FAILURES.pop((provider.id, provider.model), None)
+    failed = {(provider.id, provider.model) for provider, answered in multi if not answered}
+    struck = {key for provider, answered in single if answered and (key := (provider.id, provider.model)) in failed}
+    for key in struck:
+        MULTI_IMAGE_FAILURES[key] = MULTI_IMAGE_FAILURES.get(key, 0) + 1
+        if MULTI_IMAGE_FAILURES[key] >= ONE_IMAGE_STRIKES:
+            ONE_IMAGE_PROVIDERS.add(key)
+            del MULTI_IMAGE_FAILURES[key]
 
 
 def reads_one_image_at_a_time(ai: OpenAIService) -> bool:
@@ -251,12 +302,10 @@ class CardImageCompiler(ImageCompiler):
             logger.info(f"Reading a {count}-page card in one request failed ({reason}); reading each page on its own")
             with answered_attempts(ctx.ai, feature) as single:
                 compiled = await self._compile_page_by_page(ctx)
-            failed = {(provider.id, provider.model) for provider, answered in multi if not answered}
-            ONE_IMAGE_PROVIDERS.update(
-                key for provider, answered in single if answered and (key := (provider.id, provider.model)) in failed
-            )
+            _remember_one_image_providers(multi, single)
             return compiled
 
+        _remember_one_image_providers(multi, [])
         if response is not None:
             ctx.rotations = _rotations(ctx.pages, response.rotation_clockwise)
         return _compiled(ctx, response, IngestReadPath.image)

@@ -52,7 +52,7 @@
           <tr v-for="row in rows" :key="`${row.providerId ?? 'deleted'}-${row.providerName}-${row.model}`">
             <td>
               {{ row.providerName }}
-              <span v-if="!row.providerId" class="text-caption text-medium-emphasis">
+              <span v-if="!row.providerId" class="text-body-small text-medium-emphasis">
                 {{ $t("group.ai-provider-settings.deleted-provider") }}
               </span>
             </td>

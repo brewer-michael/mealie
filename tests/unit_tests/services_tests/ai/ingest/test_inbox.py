@@ -7,8 +7,12 @@ and the pause. Runs on SQLite and PostgreSQL.
 import calendar
 import errno
 import io
+import json
 import os
+import shutil
 import stat
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -1329,6 +1333,112 @@ def test_a_card_folder_mealie_may_not_move_is_listed_until_it_can(
     monkeypatch.setattr(os, "rename", real_rename)
     assert inbox.scan_once() == 1
     assert not card.exists()
+    assert _status(reader).rejections == []
+
+
+_OTHER_PROCESS_STATUS = """
+import json, sys
+from mealie.services.ai.ingest import inbox
+status = inbox.household_status(sys.argv[1], sys.argv[2])
+print(json.dumps({"waiting": status.waiting, "stuck": [[item.name, item.reason] for item in status.rejections]}))
+"""
+
+
+def _status_in_another_process(root: Path, user: TestUser) -> dict[str, Any]:
+    """The household's inbox status as a process that never scanned it reads it: a web process beside a worker"""
+    environment = {**os.environ, "AI_INGEST_INBOX_DIR": str(root), "AI_INGEST_WORKER": "false"}
+    completed = subprocess.run(
+        [sys.executable, "-c", _OTHER_PROCESS_STATUS, *_slugs(user)],
+        env=environment,
+        capture_output=True,
+        timeout=120,
+        check=True,
+    )
+    return json.loads(completed.stdout.decode().strip().splitlines()[-1])
+
+
+def test_what_the_scan_may_not_move_is_listed_by_every_process(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    # a worker process scans; the web process answering the settings page doesn't, and a restarted one hasn't yet
+    folder = _folder(root, reader)
+    card = folder / "card"
+    card.mkdir()
+    _drop(card, "front.jpg")
+    real_rename = os.rename
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if src == "card":
+            raise PermissionError(errno.EACCES, "Permission denied", "card")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert _scan_twice() == 0
+    found = _status(reader).rejections
+    assert [(item.name, item.reason) for item in found] == [("card", IngestRejectReason.no_permission)]
+
+    inbox.reset_state()  # this process restarted: it remembers nothing of its scans
+    status = _status(reader)
+    assert [(item.name, item.reason, item.at) for item in status.rejections] == [
+        ("card", IngestRejectReason.no_permission, found[0].at)  # first found when the first scan did
+    ]
+    assert status.waiting == 0
+    assert _status_in_another_process(root, reader) == {"waiting": 0, "stuck": [["card", "no_permission"]]}
+    assert (get_app_dirs().DATA_DIR / inbox.STATE_DIR_NAME / inbox.BLOCKED_FILE).is_file()  # a runtime file
+
+    # its scan finding it again keeps when it was first found; once it's taken, no process lists it
+    assert _scan_twice() == 0
+    assert [item.at for item in _status(reader).rejections] == [found[0].at]
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert inbox.scan_once() == 1
+    assert _status(reader).rejections == []
+    inbox.reset_state()
+    assert _status(reader).rejections == []
+    assert _status_in_another_process(root, reader) == {"waiting": 0, "stuck": []}
+
+
+def test_a_stuck_entry_gone_from_the_folder_leaves_the_shared_record(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, warnings: list[str]
+):
+    folder = _folder(root, reader)
+    photo = _drop(folder, "locked.jpg")
+    real_rename = os.rename
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if src == "locked.jpg":
+            raise PermissionError(errno.EPERM, "Operation not permitted", "locked.jpg")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert _scan_twice() == 0
+    photo.unlink()
+    inbox.reset_state()  # a process that never blocked it prunes it all the same
+    assert inbox.scan_once() == 0
+    group_slug, household_slug = _slugs(reader)
+    assert inbox._blocked(f"{group_slug}/{household_slug}") == {}
+
+    # a photo by that name put back with the right permissions isn't listed as stuck while it settles
+    monkeypatch.setattr(os, "rename", real_rename)
+    _drop(folder, "locked.jpg")
+    assert _status(reader).rejections == []
+
+
+def test_another_inboxs_record_isnt_read(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    folder = _folder(root, reader)
+    _drop(folder, "locked.jpg")
+    real_rename = os.rename
+
+    def rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if src == "locked.jpg":
+            raise PermissionError(errno.EACCES, "Permission denied", "locked.jpg")
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    assert _scan_twice() == 0
+    inbox.reset_state()
+    other = tmp_path / "other-inbox"
+    shutil.copytree(root, other)  # the inbox moved: the same folders, the same names
+    monkeypatch.setattr(inbox, "inbox_root", lambda: other)
     assert _status(reader).rejections == []
 
 

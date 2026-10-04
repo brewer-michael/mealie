@@ -1,6 +1,6 @@
 <template>
   <div v-if="visibleCards.length || sealingCount" class="ingest-upload-queue">
-    <p v-if="sealingCount" class="sealing d-flex align-center text-body-2 mb-2">
+    <p v-if="sealingCount" class="sealing d-flex align-center text-body-medium mb-2">
       <v-progress-circular
         indeterminate
         size="16"
@@ -29,7 +29,7 @@
           {{ $t("recipe-ingest.capture.card-number", { number: card.position + 1 }) }}
         </v-list-item-title>
         <!-- the browser can't show the photo: its name tells the cards apart -->
-        <div v-if="unshownName(card)" class="upload-name text-caption text-medium-emphasis">
+        <div v-if="unshownName(card)" class="upload-name text-body-small text-medium-emphasis">
           {{ unshownName(card) }}
         </div>
         <div v-if="card.duplicateOf" class="already-scanned d-flex flex-wrap align-center ga-1 mt-1">
@@ -52,13 +52,13 @@
             {{ $t("recipe-ingest.capture.scan-again") }}
           </v-btn>
         </div>
-        <div v-else class="upload-status text-body-2">
+        <div v-else class="upload-status text-body-medium">
           {{ statusText(card) }}
         </div>
-        <div v-if="detailText(card)" class="upload-detail text-caption">
+        <div v-if="detailText(card)" class="upload-detail text-body-small">
           {{ detailText(card) }}
         </div>
-        <ul v-if="rejections(card).length" class="upload-rejected text-caption pl-4 mb-0">
+        <ul v-if="rejections(card).length" class="upload-rejected text-body-small pl-4 mb-0">
           <li v-for="rejected in rejections(card)" :key="rejected.index">
             {{ $t("recipe-ingest.capture.rejected", { reason: rejectionText(card, rejected) }) }}
           </li>

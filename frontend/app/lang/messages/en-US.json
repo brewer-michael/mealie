@@ -1436,7 +1436,9 @@
       "storage-failed": "Photos can't be kept on this device, so keep this page open until they're uploaded.",
       "scan-again": "Scan again",
       "logout-pending": "{count} photo hasn't been uploaded. Log out anyway? | {count} photos haven't been uploaded. Log out anyway?",
-      "local-only-blocked": "Your group keeps cards on this server, but no AI provider on your network can read them. Ask a group manager to add one."
+      "local-only-blocked": "Your group keeps cards on this server, but no AI provider on your network can read them. Ask a group manager to add one.",
+      "queue-elsewhere": "Your recipe cards are being added in another tab of this browser. Carry on there, or use this tab instead.",
+      "use-this-tab": "Use this tab"
     },
     "queue": {
       "title": "Cards",
@@ -1498,7 +1500,10 @@
       "cancel": "Cancel",
       "batch-unavailable": "That batch isn't available any more.",
       "newest-shown": "Showing the newest {count} card. | Showing the newest {count} cards.",
-      "load-older": "Load older cards"
+      "load-older": "Load older cards",
+      "adding-clean": "Adding {done} of {total} card… | Adding {done} of {total} cards…",
+      "clean-not-sent": "{count} other card wasn't added. Try again. | The other {count} cards weren't added. Try again.",
+      "add-clean-public": "Recipes in this household can be seen without logging in. A card's photo is used as the recipe's picture, or attached, only where that was turned on for the card, and anyone can then see it. Open a card to check."
     },
     "review": {
       "card-of": "Card {number} of {total}",
@@ -1833,7 +1838,8 @@
       "cannot-shrink": "This photo is too large, and this browser can't make it smaller. Take it again or upload it from the phone.",
       "url_not_allowed": "Images can't be fetched from this address on this server.",
       "url_fetch_failed": "The image couldn't be downloaded from its address.",
-      "no_permission": "Mealie may not move this out of the inbox folder. Give Mealie's group write access to the household folder, and to a card folder itself (umask 002)."
+      "no_permission": "Mealie may not move this out of the inbox folder. Give Mealie's group write access to the household folder, and to a card folder itself (umask 002).",
+      "quota": "Too many recipe cards are being read. Try again when some are done."
     },
     "progress": {
       "queued": "Waiting to be read",
@@ -1871,7 +1877,8 @@
       "load-failed": "Couldn't load this notifier's recipe card setting",
       "save-failed": "Couldn't save the notifier's recipe card setting",
       "saved-at-once": "Saved right away. The options above wait for Save.",
-      "gone": "This notifier no longer exists."
+      "gone": "This notifier no longer exists.",
+      "test-sent-unchecked": "Test notification sent. Only household managers are told when one isn't delivered."
     },
     "settings": {
       "title": "Recipe cards",

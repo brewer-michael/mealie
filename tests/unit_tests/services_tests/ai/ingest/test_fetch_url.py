@@ -1,12 +1,18 @@
 """
 Image URLs in the upload API (`fetch_url`, docs/ai/PHASE2.md §1.2): off by default, only public addresses unless
-allowed, redirects checked hop by hop, the size cap from the header and the stream, the deadline, and nothing of the URL
-but its host in the logs. No network: hostnames resolve through a patched `getaddrinfo`, and responses are served by an
-httpx `MockTransport` behind safehttp's own address checks.
+allowed, redirects checked hop by hop, the size cap from the header and the stream, no compressed bodies, the deadline,
+and nothing of the URL but its host in the logs. No network: hostnames resolve through a patched `getaddrinfo`, and
+responses are served by an httpx `MockTransport` behind safehttp's own address checks, or (for what curl itself does
+with a body) by a local server on 127.0.0.1.
 """
 
 import asyncio
+import http.server
 import socket
+import threading
+import time
+import tracemalloc
+import zlib
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
@@ -50,7 +56,9 @@ class Served:
         self.handler = handler
         self.requests: list[httpx.Request] = []
 
-    def transport(self, allow_hosts: list[str], deny_hosts: list[str], timeout: int) -> httpx.AsyncBaseTransport:
+    def transport(
+        self, allow_hosts: list[str], deny_hosts: list[str], timeout: int, max_bytes: int
+    ) -> httpx.AsyncBaseTransport:
         safe = AsyncSafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout)
         mock = httpx.MockTransport(self.serve)
 
@@ -283,6 +291,28 @@ def test_the_default_cap_is_a_files(monkeypatch: pytest.MonkeyPatch, serve):
     )
 
 
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br", "gzip, identity"])
+def test_an_encoded_body_is_refused_unread(serve, monkeypatch: pytest.MonkeyPatch, encoding: str):
+    settings(monkeypatch)
+    pulled: list[int] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        pulled.append(1)
+        yield b"\x1f\x8b" + b"\0" * 100
+
+    served = serve(lambda request: httpx.Response(200, content=body(), headers={"Content-Encoding": encoding}))
+    assert fetch("http://camera.example/card.jpg") == IngestRejectReason.url_fetch_failed
+    assert pulled == []
+    [request] = served.requests
+    assert request.headers["accept-encoding"] == "identity"  # it was never asked for
+
+
+def test_an_identity_encoding_is_read(serve, monkeypatch: pytest.MonkeyPatch):
+    settings(monkeypatch)
+    serve(lambda request: httpx.Response(200, content=JPEG, headers={"Content-Encoding": "Identity"}))
+    assert body_of(fetch("http://camera.example/card.jpg")) == JPEG
+
+
 @pytest.mark.parametrize("status", [404, 403, 500, 503, 304])
 def test_an_http_error_fails(serve, monkeypatch: pytest.MonkeyPatch, status: int):
     settings(monkeypatch)
@@ -318,6 +348,124 @@ def test_a_network_error_fails(serve, monkeypatch: pytest.MonkeyPatch):
     serve(unreachable)
     assert fetch("http://camera.example/card.jpg") == IngestRejectReason.url_fetch_failed
     assert fetch("http://nowhere.example/card.jpg") == IngestRejectReason.url_not_allowed  # doesn't resolve
+
+
+# ==========================================
+# The body over a real connection: curl's own transport, from a server on 127.0.0.1 (allowed)
+
+
+class LocalServer:
+    """
+    A local HTTP/1.0 server answering every GET with `body` (sent in 1 MiB blocks), and what it saw: each request's
+    headers and how many body bytes it got out before the client hung up
+    """
+
+    BLOCK = 1024 * 1024
+
+    def __init__(self) -> None:
+        self.headers: dict[str, str] = {}
+        self.body = b""
+        self.repeat = 1
+        self.sent = 0
+        self.requests: list[dict[str, str]] = []
+        served = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"  # no Content-Length: the body ends when the connection closes
+
+            def do_GET(self) -> None:
+                served.requests.append({name.lower(): value for name, value in self.headers.items()})
+                try:
+                    self.send_response(200)
+                    for name, value in served.headers.items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    for _ in range(served.repeat):
+                        for start in range(0, len(served.body), served.BLOCK):
+                            block = served.body[start : start + served.BLOCK]
+                            self.wfile.write(block)
+                            served.sent += len(block)
+                except OSError:
+                    pass  # the client hung up
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/card.jpg"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+@pytest.fixture()
+def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
+    settings(monkeypatch, URL_ALLOW_HOSTS="127.0.0.1")
+    server = LocalServer()
+    yield server
+    server.close()
+
+
+def fetch_measured(url: str, max_bytes: int) -> tuple[FetchedImage | IngestRejectReason, int]:
+    """`fetch`, and the most memory Python objects took meanwhile (every chunk curl hands over is one)"""
+    tracemalloc.start()
+    try:
+        result = fetch(url, max_bytes=max_bytes)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+def test_an_image_is_fetched_over_a_real_connection(local_server: LocalServer):
+    local_server.headers = {"Content-Type": "image/jpeg", "Content-Length": str(len(JPEG))}
+    local_server.body = JPEG
+    assert body_of(fetch(local_server.url)) == JPEG
+    [request] = local_server.requests
+    assert request["accept-encoding"] == "identity"
+
+
+def test_a_compressed_body_is_never_inflated(local_server: LocalServer):
+    # 128 KiB of gzip that would inflate to 128 MiB, against a 1 MiB cap
+    inflated = 128 * limits.MIB
+    compressor = zlib.compressobj(9, zlib.DEFLATED, 31)
+    local_server.body = b"".join(compressor.compress(b"\0" * limits.MIB) for _ in range(inflated // limits.MIB))
+    local_server.body += compressor.flush()
+    local_server.headers = {"Content-Type": "image/jpeg", "Content-Encoding": "gzip"}
+
+    result, peak = fetch_measured(local_server.url, limits.MIB)
+    assert result == IngestRejectReason.url_fetch_failed  # an encoding it didn't ask for
+    assert peak < 8 * limits.MIB, f"{peak / limits.MIB:.0f} MiB held while refusing a gzip body"
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_a_body_over_the_cap_stops_the_transfer(local_server: LocalServer, declared: bool):
+    # 128 MiB from a fast server, against a 1 MiB cap: curl stops receiving at the cap, and the refusal stops the
+    # transfer rather than waiting for the rest of the body
+    local_server.body = b"\1" * LocalServer.BLOCK
+    local_server.repeat = 128
+    local_server.headers = {"Content-Type": "image/jpeg"}
+    if declared:
+        local_server.headers["Content-Length"] = str(128 * LocalServer.BLOCK)
+
+    result, peak = fetch_measured(local_server.url, limits.MIB)
+    assert result == IngestRejectReason.too_large
+    assert peak < 16 * limits.MIB, f"{peak / limits.MIB:.0f} MiB held while refusing a body over the cap"
+    time.sleep(0.2)  # the server notices the closed connection
+    assert local_server.sent < 32 * limits.MIB, f"{local_server.sent / limits.MIB:.0f} MiB sent"
+
+
+def test_a_body_at_the_cap_is_read(local_server: LocalServer):
+    data = b"\xff\xd8\xff\xe0" + b"\2" * (limits.MIB - 4)
+    local_server.body = data
+    assert body_of(fetch(local_server.url, max_bytes=limits.MIB)) == data
 
 
 # ==========================================

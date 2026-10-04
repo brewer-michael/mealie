@@ -53,7 +53,7 @@
     <!-- below the buttons, so the Back side shutter stays where Take photo was (the top half of a phone screen) -->
     <div v-if="pendingFront" class="pending-front d-flex flex-wrap align-center ga-2 mt-3">
       <IngestCapturePhoto :photo="pendingFront" :label="$t('recipe-ingest.capture.front')" :show-name="false" />
-      <span class="text-body-2 mr-2">{{ $t("recipe-ingest.capture.front") }}</span>
+      <span class="text-body-medium mr-2">{{ $t("recipe-ingest.capture.front") }}</span>
       <v-btn class="no-back" variant="tonal" @click="noBack">
         {{ $t("recipe-ingest.capture.no-back") }}
       </v-btn>
@@ -61,7 +61,7 @@
         {{ $t("recipe-ingest.capture.retake") }}
       </v-btn>
     </div>
-    <p v-if="openBatchCardCount" class="cards-queued text-caption mt-2 mb-0">
+    <p v-if="openBatchCardCount" class="cards-queued text-body-small mt-2 mb-0">
       {{ $t("recipe-ingest.capture.cards-queued", openBatchCardCount) }}
     </p>
     <!-- chosen or dropped files the server can't use; under the buttons, so they don't move -->
@@ -76,7 +76,7 @@
     >
       <div v-if="skipped.unsupported.length" class="skipped-unsupported">
         {{ $t("recipe-ingest.capture.skipped-unsupported", { count: skipped.unsupported.length }, skipped.unsupported.length) }}
-        <div class="skipped-names text-caption">
+        <div class="skipped-names text-body-small">
           {{ fileList(skipped.unsupported) }}
         </div>
       </div>
@@ -86,7 +86,7 @@
         :class="{ 'mt-2': skipped.unsupported.length }"
       >
         {{ $t("recipe-ingest.capture.skipped-too-many-pages", { count: skipped.tooManyPages.length, max: maxPagesPerCard }, skipped.tooManyPages.length) }}
-        <div class="skipped-names text-caption">
+        <div class="skipped-names text-body-small">
           {{ fileList(skipped.tooManyPages) }}
         </div>
       </div>
@@ -120,10 +120,10 @@
           md="4"
         >
           <v-card class="draft-card" variant="outlined">
-            <v-card-title class="text-subtitle-2">
+            <v-card-title class="text-title-small">
               {{ $t("recipe-ingest.capture.card-number", { number: index + 1 }) }}
               <!-- a PDF or a multi-page TIFF: how many pages the card gets from it -->
-              <span v-if="documentPages(card.photos)" class="draft-pages text-caption text-medium-emphasis">· {{ $t("recipe-ingest.capture.pages", documentPages(card.photos) ?? 0) }}</span>
+              <span v-if="documentPages(card.photos)" class="draft-pages text-body-small text-medium-emphasis">· {{ $t("recipe-ingest.capture.pages", documentPages(card.photos) ?? 0) }}</span>
             </v-card-title>
             <div class="d-flex ga-2 px-4">
               <figure
@@ -132,7 +132,7 @@
                 class="draft-photo ma-0"
               >
                 <IngestCapturePhoto :photo="photo" :label="sideLabel(card.photos.length, side)" />
-                <figcaption v-if="card.photos.length > 1" class="text-caption text-center">
+                <figcaption v-if="card.photos.length > 1" class="text-body-small text-center">
                   {{ sideLabel(card.photos.length, side) }}
                 </figcaption>
               </figure>
@@ -201,7 +201,7 @@
     >
       <v-icon :icon="mdiImagePlus" size="large" class="mb-2" />
       <div>{{ $t("recipe-ingest.capture.drop-zone") }}</div>
-      <div class="text-caption">
+      <div class="text-body-small">
         {{ $t("recipe-ingest.capture.drop-zone-hint") }}
       </div>
     </div>

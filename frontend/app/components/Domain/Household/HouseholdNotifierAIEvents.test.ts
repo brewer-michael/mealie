@@ -11,12 +11,17 @@ const api = vi.hoisted(() => ({
   getSettings: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
+/** Who is signed in: a household manager unless a test says otherwise */
+const auth = vi.hoisted(() => ({ user: { value: null as null | Record<string, boolean> } }));
 
 vi.mock("~/composables/api", () => ({
   useUserApi: () => ({ recipeIngest: api }),
 }));
 vi.mock("~/composables/use-toast", () => ({
   alert: toast,
+}));
+vi.mock("~/composables/use-mealie-auth", () => ({
+  useMealieAuth: () => auth,
 }));
 
 const wrappers: VueWrapper[] = [];
@@ -99,6 +104,7 @@ describe("HouseholdNotifierAIEvents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetRecipeIngestSettings();
+    auth.user.value = { canManageHousehold: true, canManage: false, admin: false };
     api.getNotifierEvents.mockResolvedValue({ data: { recipeIngestionReady: false }, error: null });
     api.getSettings.mockResolvedValue({ data: settings(), error: null });
   });
@@ -182,6 +188,30 @@ describe("HouseholdNotifierAIEvents", () => {
 
     await wrapper.get(".test-result .alert-close").trigger("click");
     expect(wrapper.find(".test-result").exists()).toBe(false);
+  });
+
+  test("someone who doesn't manage the household is told the test was sent, not that it arrived", async () => {
+    // the server answers 204 to them whatever happened (it says 502 only to managers), so "sent" can't promise more
+    api.testNotifierEvents.mockResolvedValue({ data: null, error: null });
+    const send = async (wrapper: VueWrapper) => {
+      await button(wrapper, "Send test notification").trigger("click");
+      await flushPromises();
+      return wrapper.get(".test-result").text();
+    };
+
+    auth.user.value = { canManageHousehold: false, canManage: false, admin: false };
+    const member = mountToggle();
+    await flushPromises();
+    expect(await send(member)).toBe("Test notification sent. Only household managers are told when one isn't delivered.");
+    expect(member.get(".test-result").attributes("data-type")).toBe("success");
+
+    // a group manager or an admin is told when it fails, like a household manager
+    for (const user of [{ canManage: true }, { admin: true }]) {
+      auth.user.value = { canManageHousehold: false, canManage: false, admin: false, ...user };
+      const manager = mountToggle();
+      await flushPromises();
+      expect(await send(manager)).toBe("Test notification sent");
+    }
   });
 
   test("a notifier that didn't get the test (502): Test failed, and why", async () => {

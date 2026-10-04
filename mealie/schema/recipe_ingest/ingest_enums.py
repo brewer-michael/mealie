@@ -89,6 +89,11 @@ class IngestRejectReason(StrEnum):
     An inbox photo or card folder Mealie may not move out of the household folder (its group needs write access there,
     and to a card folder itself: umask 002); it stays where it is, and the inbox status lists it
     """
+    quota = "quota"
+    """
+    A card of an upload that already has some in, refused because it would take the group past its processing jobs or
+    the uploader past `AI_INGEST_MAX_PROCESSING_PER_USER` (counted in its own insert; the request's first card is a 429)
+    """
 
 
 class IngestReadPath(StrEnum):

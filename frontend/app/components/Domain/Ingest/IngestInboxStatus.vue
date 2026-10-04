@@ -11,19 +11,19 @@
       {{ waitingText }}
     </v-alert>
     <div v-if="rejections.length" class="inbox-rejections mb-2">
-      <div class="text-subtitle-2">
+      <div class="text-title-small">
         {{ $t("recipe-ingest.inbox.rejections-title") }}
       </div>
-      <ul class="inbox-rejection-list text-body-2 ps-4">
+      <ul class="inbox-rejection-list text-body-medium ps-4">
         <li v-for="(item, index) in rejections" :key="`${index}-${item.name}`" class="inbox-rejection">
           <span class="inbox-rejection-name font-weight-medium">{{ item.name }}</span>:
           <span class="inbox-rejection-reason">{{ reasonText(item) }}</span>
-          <span v-if="whenText(item)" class="inbox-rejection-time text-caption text-medium-emphasis">
+          <span v-if="whenText(item)" class="inbox-rejection-time text-body-small text-medium-emphasis">
             · {{ whenText(item) }}
           </span>
         </li>
       </ul>
-      <p v-if="folder && movedToFailed" class="inbox-failed-folder text-caption text-medium-emphasis mb-0">
+      <p v-if="folder && movedToFailed" class="inbox-failed-folder text-body-small text-medium-emphasis mb-0">
         {{ $t("recipe-ingest.inbox.failed-folder", { folder }) }}
       </p>
     </div>

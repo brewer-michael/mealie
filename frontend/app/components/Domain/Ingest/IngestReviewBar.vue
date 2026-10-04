@@ -9,11 +9,11 @@
         :class="`ingest-review-bar__notice--${notice.kind}`"
       >
         <v-icon size="small" :color="notice.kind" :icon="$globals.icons[noticeIcon]" />
-        <div class="flex-grow-1 text-body-2 ingest-review-bar__notice-body">
+        <div class="flex-grow-1 text-body-medium ingest-review-bar__notice-body">
           <div class="ingest-review-bar__notice-text">
             {{ notice.text }}
           </div>
-          <div v-if="notice.detail" class="text-caption ingest-review-bar__notice-detail">
+          <div v-if="notice.detail" class="text-body-small ingest-review-bar__notice-detail">
             {{ notice.detail }}
           </div>
         </div>
@@ -51,7 +51,7 @@
       </v-btn>
       <span
         v-if="saveLabel"
-        class="text-caption ingest-review-bar__saved"
+        class="text-body-small ingest-review-bar__saved"
         :class="{ 'text-error': saveState === 'error', 'text-medium-emphasis': saveState !== 'error' }"
         aria-live="polite"
       >

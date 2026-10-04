@@ -109,6 +109,7 @@ export const INGEST_REJECT_REASONS = [
   "url_not_allowed",
   "url_fetch_failed",
   "no_permission",
+  "quota",
 ] as const satisfies readonly IngestRejectReason[];
 
 const PROGRESS_PREFIX = "recipe-ingest.progress.";
@@ -655,6 +656,42 @@ export function takeRecipeIngestCommitNotice(): RecipeIngestCommitNotice | null 
 export function resetRecipeIngestReviewState() {
   rememberedBatches.clear();
   commitNotice = null;
+}
+
+// ==========================================
+// The session, for what happens around a logout
+
+/** How the default layout tells whether the session is still there; none until it says */
+let sessionCheck: (() => boolean) | null = null;
+
+/** The default layout says how to tell whether the user is still signed in (the in-memory token) */
+export function setRecipeIngestSessionCheck(check: (() => boolean) | null) {
+  sessionCheck = check;
+}
+
+/**
+ * Whether the user is still signed in. A page asking before it's left ("photos haven't been uploaded", "changes not
+ * saved") lets the page go when they aren't: an expired session's redirect to the login page clears the token first,
+ * and nothing could be uploaded or saved without it.
+ */
+export function recipeIngestSignedIn(): boolean {
+  return sessionCheck ? sessionCheck() : true;
+}
+
+/** What a logout the user chose waits for (briefly) before the session goes: a review page's edit not saved yet */
+const logoutTasks = new Set<() => Promise<unknown>>();
+
+/** Runs `task` before a logout the user chose clears the session; returns what to call when it's no longer needed */
+export function onRecipeIngestLogout(task: () => Promise<unknown>): () => void {
+  logoutTasks.add(task);
+  return () => {
+    logoutTasks.delete(task);
+  };
+}
+
+/** Starts what a logout waits for; each settles, whether it worked or not (`prepareRecipeIngestLogout` times them) */
+export function runRecipeIngestLogoutTasks(): Promise<unknown>[] {
+  return [...logoutTasks].map(task => Promise.resolve().then(task).catch(error => console.error(error)));
 }
 
 /** The text helpers bound to the component's i18n */

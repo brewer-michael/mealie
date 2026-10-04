@@ -6,7 +6,8 @@ Tesseract reads the page every way up, and the page turns only when the best rea
 `ORIENT_MIN_RATIO` times the upright one: handwriting scores low every way, and a wrong turn makes every later read
 worse. The same run's text and confidence are kept (`PageMeta.ocr`) for the OCR fallback, read at the chosen
 rotation, so they match the stored page, with the box of each line it found (`PageOCR.lines`), from which a re-read's
-selection starts at the line it's about (`regions.region_hint`).
+selection starts at the line it's about (`regions.region_hint`). A run that read too little to tell which way up the
+page is (`OrientDecision.sure`) keeps its text but leaves the orientation open, so the image reader's turn applies.
 
 `decide_orientation` only decides: it writes no file, so the runner can stage the turned files, store their metadata
 and swap them in, and a crash between those steps is recovered (`images.recover_staged`). `orient_page` decides and
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 
 from mealie.schema.recipe_ingest import OCRLine, PageMeta, PageOCR, PageRotationSource
 from mealie.services import ocr
+from mealie.services.ocr.tesseract import MIN_TURN_SCORE
 
 from .. import images, limits, storage
 from ..settings import get_ingest_settings
@@ -44,8 +46,16 @@ class OrientDecision:
     """What Tesseract read, at that rotation (so it matches the page once turned); None when it didn't run or failed"""
     settled: bool
     """
-    Whether the page's orientation is now settled: false without Tesseract (the review page offers Rotate) or when it
-    timed out or failed (the next extraction tries again, and the OCR fallback reads the page itself)
+    Whether Tesseract read the page, so what it decided is stored: false without Tesseract (the review page offers
+    Rotate) or when it timed out or failed (the next extraction tries again, and the OCR fallback reads the page
+    itself)
+    """
+    sure: bool = True
+    """
+    Whether Tesseract could tell which way up the page is (`_decided`). When it couldn't (handwriting it can't read, a
+    blurred photo), the text is stored but the page isn't marked oriented (`oriented_meta`): a turn the image reader
+    reports still applies (`compilers` and the runner turn only pages not yet oriented), and the next extraction
+    probes again.
     """
 
 
@@ -76,17 +86,33 @@ def decide_orientation(page: CardPage) -> OrientDecision:
         rotation=result.rotation % 360,
         ocr=PageOCR(text=result.text, confidence=result.confidence, lines=lines),
         settled=True,
+        sure=_decided(result),
     )
+
+
+def _decided(result: ocr.OCRResult) -> bool:
+    """
+    Whether a Tesseract run told which way up the page is: it turned the page, or the upright reading scored
+    `MIN_TURN_SCORE` or more, or more than every other way up. One that read too little every way (zero words, all
+    scores under the floor with another as high) only fell back to upright. A result with no scores (nothing probed)
+    is taken at its word.
+    """
+    scores = result.rotation_scores
+    if result.rotation % 360 or not scores:
+        return True
+    upright = scores.get(0, 0.0)
+    return upright >= MIN_TURN_SCORE or all(upright > score for turn, score in scores.items() if turn % 360)
 
 
 def oriented_meta(meta: PageMeta, decision: OrientDecision) -> PageMeta:
     """
-    A page's metadata once `decision` is applied without turning it (rotation 0): settled, with the OCR text. A turn's
-    metadata comes from the files it writes (`images.rotate_page_files`, or the staged rotation the runner stores).
+    A page's metadata once `decision` is applied without turning it (rotation 0): with the OCR text, and settled
+    unless Tesseract couldn't tell which way up the page is (`OrientDecision.sure`). A turn's metadata comes from the
+    files it writes (`images.rotate_page_files`, or the staged rotation the runner stores).
     """
     if not decision.settled:
         return meta
-    return meta.model_copy(update={"oriented": True, "ocr": decision.ocr})
+    return meta.model_copy(update={"oriented": decision.sure, "ocr": decision.ocr})
 
 
 def orient_page(page: CardPage) -> PageMeta:

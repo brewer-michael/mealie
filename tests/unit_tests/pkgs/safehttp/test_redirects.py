@@ -106,10 +106,20 @@ def test_a_response_that_isnt_a_redirect_passes():
         check_redirect(response)
 
 
-def test_unsafe_redirects_are_reported_like_blocked_hosts():
-    """Callers (image downloads, the scraper) already map `InvalidDomainError` to "not an allowed domain" """
+def test_unsafe_redirects_are_still_refused_by_callers_of_blocked_hosts():
+    """A caller that only catches `InvalidDomainError` still refuses it; the routes catch it first to say why"""
     assert issubclass(UnsafeRedirectError, InvalidDomainError)
     assert safehttp.UnsafeRedirectError is UnsafeRedirectError
+
+
+@pytest.mark.parametrize(("location", "downgrade"), [("http://recipes.example/r", True), ("file:///etc/passwd", False)])
+def test_a_refused_redirect_says_whether_it_was_a_downgrade(location: str, downgrade: bool):
+    response = httpx.Response(
+        302, headers={"Location": location}, request=httpx.Request("GET", "https://recipes.example/r")
+    )
+    with pytest.raises(UnsafeRedirectError) as raised:
+        check_redirect(response)
+    assert raised.value.downgrade is downgrade
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +140,7 @@ def _settings(**overrides) -> SimpleNamespace:
 @pytest.mark.asyncio
 async def test_resilient_fetch_refuses_a_redirect_to_a_file(monkeypatch: pytest.MonkeyPatch):
     server = Server({"https://recipes.example/r": (302, "file:///etc/passwd")})
-    monkeypatch.setattr(fetch, "_build_transport", lambda impersonate, proxy=None: server.transport())
+    monkeypatch.setattr(fetch, "_build_transport", lambda impersonate, proxy=None, max_bytes=None: server.transport())
     monkeypatch.setattr(fetch, "get_app_settings", _settings)
 
     with pytest.raises(UnsafeRedirectError):
@@ -146,7 +156,7 @@ async def test_resilient_fetch_refuses_a_downgrade_and_follows_an_upgrade(monkey
             "http://recipes.example/r": (301, "https://recipes.example/r"),
         }
     )
-    monkeypatch.setattr(fetch, "_build_transport", lambda impersonate, proxy=None: server.transport())
+    monkeypatch.setattr(fetch, "_build_transport", lambda impersonate, proxy=None, max_bytes=None: server.transport())
     monkeypatch.setattr(fetch, "get_app_settings", _settings)
 
     with pytest.raises(UnsafeRedirectError):

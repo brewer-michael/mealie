@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 import pytest
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageFile
 
 from mealie.schema.recipe_ingest import IngestRejectReason, PageMeta, PageRotationSource
 from mealie.services.ai.ingest import images, limits
@@ -555,6 +555,203 @@ def test_a_jpeg_over_260_megapixels_is_refused_before_decoding(page_dir: Path, m
     assert e.value.reason == IngestRejectReason.too_many_pixels
 
 
+def _jpeg_header_only(
+    width: int, height: int, sampling: list[tuple[int, int]], *, progressive: bool, scan_components: int
+) -> bytes:
+    """A JPEG's markers up to its first scan, which holds `scan_components` of the frame's components; no image data"""
+
+    def segment(marker: int, data: bytes) -> bytes:
+        return bytes([0xFF, marker]) + struct.pack(">H", len(data) + 2) + data
+
+    components = b"".join(bytes([number, h << 4 | v, 0]) for number, (h, v) in enumerate(sampling, start=1))
+    frame = struct.pack(">BHHB", 8, height, width, len(sampling)) + components
+    scan = bytes([scan_components]) + b"".join(bytes([number, 0]) for number in range(1, scan_components + 1))
+    return (
+        b"\xff\xd8"
+        + segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")
+        + b"\xff\xff"  # a fill byte
+        + segment(0xC2 if progressive else 0xC0, frame)
+        + segment(0xDA, scan + bytes([0, 63, 0]))
+        + b"\x00" * 64
+        + b"\xff\xd9"
+    )
+
+
+FULL = [(1, 1), (1, 1), (1, 1)]
+"""4:4:4"""
+HALF = [(2, 2), (1, 1), (1, 1)]
+"""4:2:0, a phone's"""
+
+
+@pytest.fixture()
+def small_coefficient_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 512 x 512 JPEG's coefficients take 1.5 MB at 4:4:4 and 0.8 MB at 4:2:0"""
+    monkeypatch.setattr(images, "MAX_JPEG_COEFFICIENT_BYTES", 1_000_000)
+
+
+@pytest.mark.parametrize("subsampling", [0, 2])
+def test_a_baseline_jpeg_isnt_held_to_the_coefficient_budget(page_dir: Path, small_coefficient_budget, subsampling):
+    raw = _encoded(_left_third_red(512, 512), "JPEG", subsampling=subsampling)
+    assert normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None).width == 512
+
+
+def test_a_progressive_jpeg_over_the_coefficient_budget_is_refused_before_decoding(
+    page_dir: Path, small_coefficient_budget, monkeypatch: pytest.MonkeyPatch
+):
+    def no_decoding(*args, **kwargs):
+        raise AssertionError("decoded")
+
+    raw = _encoded(_left_third_red(512, 512), "JPEG", progressive=True, subsampling=0)
+    with monkeypatch.context() as patched:
+        patched.setattr(ImageFile.ImageFile, "load", no_decoding)
+        with pytest.raises(PageRejected) as e:
+            normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+    assert not any(page_dir.iterdir())
+
+    # the same pixels at 4:2:0 fit
+    raw = _encoded(_left_third_red(512, 512), "JPEG", progressive=True, subsampling=2)
+    assert normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None).width == 512
+
+
+def test_a_jpeg_whose_components_are_in_scans_of_their_own_is_held_to_the_budget(
+    page_dir: Path, small_coefficient_budget
+):
+    # sequential, but its first scan holds one component of three: libjpeg keeps every coefficient, as for a
+    # progressive JPEG, which Pillow doesn't say it is. Its decoding would fail (no data): refused before that.
+    raw = _jpeg_header_only(512, 512, FULL, progressive=False, scan_components=1)
+    with Image.open(io.BytesIO(raw)) as image:
+        assert not image.info.get("progressive")
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+
+
+def test_a_small_progressive_file_claiming_a_huge_frame_is_refused_before_decoding(page_dir: Path):
+    # the finding's 2.9 MB progressive 4:4:4 JPEG of 16100 x 16100 pixels: 1.5 GB of coefficients to decode it
+    raw = _jpeg_header_only(16100, 16100, FULL, progressive=True, scan_components=3)
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(raw), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.too_many_pixels
+
+
+@pytest.mark.parametrize(
+    "width, height, sampling, progressive, scan_components, expected",
+    [
+        (16320, 12240, HALF, False, 3, 0),  # a 200-megapixel phone photo: decoded a row of blocks at a time
+        (16320, 12240, HALF, True, 3, 599_270_400),  # the same, saved progressive: just within the budget
+        (10000, 10000, FULL, True, 3, 600_000_000),  # 100 megapixels at 4:4:4: the budget
+        (10000, 10000, FULL, False, 1, 600_000_000),  # its components in scans of their own
+        (16100, 16100, FULL, True, 3, 3 * 2013 * 2013 * 128),
+        (17, 9, HALF, True, 3, (4 * 2 + 2 * 2) * 128),  # blocks rounded up to the sampling factors
+        (8000, 8000, [(1, 1)] * 4, True, 4, 4 * 1000 * 1000 * 128),  # CMYK
+    ],
+)
+def test_the_coefficient_memory_of_a_jpeg(
+    width: int,
+    height: int,
+    sampling: list[tuple[int, int]],
+    progressive: bool,
+    scan_components: int,
+    expected: int,
+):
+    raw = io.BytesIO(
+        _jpeg_header_only(width, height, sampling, progressive=progressive, scan_components=scan_components)
+    )
+    frame = images._jpeg_frame(raw)
+    assert frame is not None
+    assert images._jpeg_coefficient_bytes(frame) == expected
+
+
+def test_the_coefficient_budget_is_a_100_megapixel_444_jpegs():
+    assert images.MAX_JPEG_COEFFICIENT_BYTES == 10000 * 10000 * 3 * 2
+
+
+def test_the_checks_leave_the_file_where_pillow_left_it():
+    raw = io.BytesIO(_encoded(_left_third_red(64, 64), "JPEG", progressive=True))
+    raw.seek(5)
+    images._check_jpeg_decoding(raw)
+    assert raw.tell() == 5
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _jpeg_header_only(800, 600, HALF, progressive=True, scan_components=3).replace(b"\xff\xda", b"\xff\xd9"),
+        b"\xff\xd8"
+        + b"\xff\xfe\x00\x02" * 5000
+        + _jpeg_header_only(80, 60, HALF, progressive=True, scan_components=3)[2:],
+        b"\xff\xd8\xff\xe0\x00\x10" + os.urandom(64 * 1024 + 100).replace(b"\xff", b"\x00"),
+    ],
+    ids=["no scan", "too many segments", "too many stray bytes"],
+)
+def test_a_jpeg_header_that_cant_be_read_is_refused_before_decoding(page_dir: Path, raw: bytes):
+    with pytest.raises(PageRejected) as e:
+        images._check_jpeg_decoding(io.BytesIO(raw))
+    assert e.value.reason == IngestRejectReason.unreadable_image
+
+
+def _scans(raw: bytes) -> list[int]:
+    """Where each of a JPEG's scans starts (its SOS marker): a stuffed FF DA can't occur in scan data"""
+    starts, position = [], 0
+    while (position := raw.find(b"\xff\xda", position)) >= 0:
+        starts.append(position)
+        position += 2
+    return starts
+
+
+def _with_extra_scans(raw: bytes, count: int) -> bytes:
+    """`raw` with its last scan sent again `count` times: libjpeg decodes the repeats too (a bogus progression)"""
+    end = raw.rindex(b"\xff\xd9")
+    last = raw[_scans(raw)[-1] : end]
+    return raw[:end] + last * count + raw[end:]
+
+
+def test_scans_are_counted_past_stuffed_bytes_restart_markers_and_tables():
+    raw = _encoded(
+        Image.frombytes("RGB", (256, 256), os.urandom(256 * 256 * 3)), "JPEG", progressive=True, restart_marker_blocks=4
+    )
+    assert b"\xff\x00" in raw and b"\xff\xd0" in raw  # its scans' data has stuffed bytes and restart markers
+
+    def counted(raw: bytes, limit: int = 1000) -> int:
+        raw = raw.replace(b"\xff\xd9", b"\xff\xfe\x00\x06\xff\xda\xff\xda\xff\xd9")  # a comment that looks like scans
+        frame = images._jpeg_frame(io.BytesIO(raw))
+        assert frame is not None and frame.multi_scan
+        return images._jpeg_scans(io.BytesIO(raw), frame, limit)
+
+    assert counted(raw) == 10  # libjpeg's default progression
+    assert counted(_with_extra_scans(raw, 5)) == 15
+    assert counted(_with_extra_scans(raw, 500), limit=100) == 101  # it stops counting there
+
+
+def test_a_progressive_jpeg_with_too_many_scans_is_refused_before_decoding(
+    page_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # each scan is gone over once, however little data it holds: thousands of empty ones take minutes
+    raw = _encoded(_left_third_red(400, 300), "JPEG", progressive=True)
+    with_more = _with_extra_scans(raw, images.MAX_JPEG_SCANS - 10)  # 10 scans, plus 90
+    assert normalize_page(io.BytesIO(with_more), page_dir, 0, original_filename=None).width == 400
+
+    def no_decoding(*args, **kwargs):
+        raise AssertionError("decoded")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", no_decoding)
+    too_many = _with_extra_scans(raw, images.MAX_JPEG_SCANS - 9)
+    with pytest.raises(PageRejected) as e:
+        images._check_jpeg_decoding(io.BytesIO(too_many))
+    assert e.value.reason == IngestRejectReason.unreadable_image
+    with pytest.raises(PageRejected) as e:
+        normalize_page(io.BytesIO(too_many), page_dir, 0, original_filename=None)
+    assert e.value.reason == IngestRejectReason.unreadable_image
+
+
+def test_a_baseline_jpegs_scans_arent_counted(page_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    counted: list[int] = []
+    monkeypatch.setattr(images, "_jpeg_scans", lambda *args: counted.append(1) or 1)
+    normalize_page(io.BytesIO(_encoded(_left_third_red(64, 64), "JPEG")), page_dir, 0, original_filename=None)
+    assert counted == []
+
+
 def test_pillows_own_pixel_limit_is_left_alone(page_dir: Path, small_pixel_caps):
     before = Image.MAX_IMAGE_PIXELS
     normalize_page(io.BytesIO(_encoded(_left_third_red(3000, 2000), "JPEG")), page_dir, 0, original_filename=None)
@@ -853,30 +1050,75 @@ def test_a_renderer_that_crashes_is_a_refusal_not_an_error(fake_renderer):
     assert e.value.reason == IngestRejectReason.pdf_not_supported
 
 
+_FRAME_WRITER = (
+    "import json, os, sys\n"
+    "def frame(kind, data):\n"
+    "    sys.stdout.buffer.write(kind + len(data).to_bytes(8, 'big') + data)\n"
+    "    sys.stdout.buffer.flush()\n"
+)
+"""A fake renderer's start: `frame(kind, data)` writes one of the renderer's stdout frames"""
+
+
 def test_the_renderer_gets_none_of_the_servers_environment(fake_renderer, monkeypatch: pytest.MonkeyPatch):
+    # the page it sends is the environment it got
     fake_renderer(
-        "import json, os, sys\n"
-        "from pathlib import Path\n"
-        "Path(sys.argv[2], 'environment.json').write_text(json.dumps(dict(os.environ)))\n"
-        "Path(sys.argv[2], 'page-1.png').write_bytes(b'')\n"
-        "print(json.dumps({'pages': 1}))\n"
+        _FRAME_WRITER + "frame(b'P', json.dumps(dict(os.environ)).encode())\nframe(b'R', b'{\"pages\": 1}')\n"
     )
     monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
-    seen: dict = {}
-    real_copy = images.shutil.copyfileobj
-
-    def copyfileobj(source, target, *args):
-        name = getattr(source, "name", "")
-        if isinstance(name, str) and name.endswith("page-1.png"):
-            seen.update(json.loads((Path(name).parent / "environment.json").read_text()))
-        return real_copy(source, target, *args)
-
-    monkeypatch.setattr(images.shutil, "copyfileobj", copyfileobj)
     pages = images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
-    images.close_pages(pages)
+    try:
+        seen = json.loads(pages[0].file.read())
+    finally:
+        images.close_pages(pages)
 
     assert "OPENAI_API_KEY" not in seen
     assert set(seen) <= set(images._CHILD_ENVIRONMENT) | {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("frame(b'P', b'png')\n", id="no result"),
+        pytest.param("frame(b'P', b'png')\nframe(b'R', b'{\"pages\": 2}')\n", id="fewer pages than it says"),
+        pytest.param("sys.stdout.buffer.write(b'P' + (1 << 40).to_bytes(8, 'big'))\n", id="a page too large"),
+        pytest.param("frame(b'X', b'')\nframe(b'R', b'{\"pages\": 0}')\n", id="an unknown frame"),
+        pytest.param("frame(b'R', b'[1]')\n", id="a result that isn't an object"),
+        pytest.param("frame(b'P', b'png')\nframe(b'R', b'{\"pages\": 1}')\nsys.exit(3)\n", id="a failed exit"),
+    ],
+)
+def test_a_renderer_answer_that_doesnt_add_up_is_a_refusal(fake_renderer, script: str):
+    fake_renderer(_FRAME_WRITER + script)
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+
+
+def test_a_renderer_that_keeps_writing_is_stopped(fake_renderer, monkeypatch: pytest.MonkeyPatch):
+    fake_renderer(_FRAME_WRITER + "frame(b'P', b'png')\nwhile True:\n    frame(b'P', b'png')\n")
+    with pytest.raises(PageRejected) as e:
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+
+
+def test_the_renderer_writes_its_pages_to_stdout_not_files(monkeypatch: pytest.MonkeyPatch):
+    """It gets no output folder: nothing but the document is in its work folder, before and after"""
+    seen: list[list[str]] = []
+    real = images._run_renderer
+
+    def run_renderer(document: Path):
+        seen.append(sorted(path.name for path in document.parent.iterdir()))
+        frames = real(document)
+        seen.append(sorted(path.name for path in document.parent.iterdir()))
+        return frames
+
+    monkeypatch.setattr(images, "_run_renderer", run_renderer)
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 400)
+    pages = images.expand_document(io.BytesIO(_pdf_of(RED, BLUE)))
+    try:
+        assert [Image.open(page.file).format for page in pages] == ["PNG", "PNG"]
+    finally:
+        images.close_pages(pages)
+    assert seen == [["document.pdf"], ["document.pdf"]]
 
 
 def test_normalize_page_alone_still_refuses_a_pdf(page_dir: Path):

@@ -64,13 +64,23 @@ def _slim_pages(pages: object) -> list | None:
     return slimmed
 
 
+def _slimmed() -> sa.ColumnElement[bool]:
+    """A committed card the purge has slimmed: its files are no longer needed"""
+    return sa.and_(
+        Job.status == IngestStatus.committed.value, *(getattr(Job, column).is_(None) for column in SLIMMED_COLUMNS)
+    )
+
+
 def _purge_committed(session: Session, cutoff: datetime) -> int:
-    """Committed cards past retention: their files go, their card text is cleared, the row stays"""
-    not_slim = sa.or_(*(getattr(Job, column).is_not(None) for column in SLIMMED_COLUMNS))
-    stmt = sa.select(Job.id, Job.group_id, Job.pages).where(
+    """
+    Committed cards past retention: their card text is cleared, the row stays, and then their files go. The row first:
+    a card an undo took back to review since it was picked keeps its photos, as the update no longer matches it (and
+    an undo after it finds the card purged). Files left by a removal that failed go with the orphan folders.
+    """
+    stmt = sa.select(Job.id, Job.group_id, Job.pages, Job.row_version).where(
         Job.status == IngestStatus.committed.value,
         sa.func.coalesce(Job.committed_at, Job.update_at) < cutoff,
-        not_slim,
+        sa.not_(_slimmed()),
     )
     rows = session.execute(stmt).all()
     session.commit()
@@ -78,12 +88,26 @@ def _purge_committed(session: Session, cutoff: datetime) -> int:
     purged = 0
     for row in rows:
         with storage.ingest_write():
-            storage.remove_job_dir(row.group_id, row.id)
             values: dict[str, object] = dict.fromkeys(SLIMMED_COLUMNS)
             values["pages"] = _slim_pages(row.pages) or []
             values["row_version"] = Job.row_version + 1
-            update = sa.update(Job).where(Job.id == row.id, Job.status == IngestStatus.committed.value).values(**values)
-            purged += _execute(session, update)
+            update = (
+                sa.update(Job)
+                .where(
+                    Job.id == row.id,
+                    Job.row_version == row.row_version,  # unchanged since it was picked: committed, past retention
+                    Job.status == IngestStatus.committed.value,
+                )
+                .values(**values)
+            )
+            if _execute(session, update) == 1:
+                purged += 1
+                try:
+                    storage.remove_job_dir(row.group_id, row.id)
+                except OSError:
+                    logger.exception(
+                        f"Couldn't remove the files of recipe card job {row.id}; the orphan folders' purge retries"
+                    )
     return purged
 
 
@@ -108,7 +132,9 @@ def _purge_failed(session: Session, cutoff: datetime) -> int:
     Failed cards past retention: row and files. A card waiting for the monthly limits to reset is kept until
     `RETENTION_DAYS` after its automatic retry, which reads it again before then.
     """
-    stmt = sa.select(Job.id, Job.group_id).where(
+    from .review import household_merge_lock
+
+    stmt = sa.select(Job.id, Job.group_id, Job.household_id).where(
         Job.status == IngestStatus.failed.value,
         Job.task_state.is_(None),
         _failed_since() < cutoff,
@@ -118,7 +144,9 @@ def _purge_failed(session: Session, cutoff: datetime) -> int:
 
     purged = 0
     for row in rows:
-        with storage.ingest_write():
+        # under the household's merge lock: a merge into this card moving a page into its folder meanwhile either
+        # finished first (and changed the card, which the delete then no longer matches) or finds it gone
+        with storage.ingest_write(), household_merge_lock(session, row.household_id):
             delete = sa.delete(Job).where(
                 Job.id == row.id,
                 Job.status == IngestStatus.failed.value,
@@ -168,10 +196,11 @@ def _job_dirs() -> list[tuple[UUID, UUID, float]]:
 
 
 def _existing_jobs(session: Session, job_ids: Sequence[UUID]) -> set[UUID]:
+    """Those of `job_ids` whose rows still need their folders: every one but a slimmed committed card's"""
     existing: set[UUID] = set()
     for start in range(0, len(job_ids), 500):
         chunk = list(job_ids[start : start + 500])
-        existing.update(session.execute(sa.select(Job.id).where(Job.id.in_(chunk))).scalars())
+        existing.update(session.execute(sa.select(Job.id).where(Job.id.in_(chunk), sa.not_(_slimmed()))).scalars())
     session.commit()
     return existing
 
@@ -179,7 +208,8 @@ def _existing_jobs(session: Session, job_ids: Sequence[UUID]) -> set[UUID]:
 def _purge_orphan_dirs(session: Session, now: datetime) -> int:
     """
     Job directories with no row, untouched for `ORPHAN_DIR_AGE` (a crash before the insert, a discard racing a task, a
-    restore mismatch). The age keeps an intake that is still inserting its row safe.
+    restore mismatch), or a slimmed committed card's that `_purge_committed` couldn't remove. The age keeps an intake
+    that is still inserting its row safe.
     """
     oldest = now.replace(tzinfo=UTC).timestamp() - limits.ORPHAN_DIR_AGE
     candidates = [(group_id, job_id) for group_id, job_id, mtime in _job_dirs() if mtime < oldest]
@@ -193,7 +223,7 @@ def _purge_orphan_dirs(session: Session, now: datetime) -> int:
             continue
         with storage.ingest_write():
             # a job inserted since the first look keeps its directory
-            if session.execute(sa.select(Job.id).where(Job.id == job_id)).first() is None:
+            if session.execute(sa.select(Job.id).where(Job.id == job_id, sa.not_(_slimmed()))).first() is None:
                 shutil.rmtree(storage.job_dir(group_id, job_id), ignore_errors=True)
                 removed += 1
             session.commit()

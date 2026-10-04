@@ -1,5 +1,17 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { isForkFile, parseErrors } from "./typecheck-fork.mjs";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Every file under `dir`, relative to `frontend/` */
+function filesUnder(dir: string): string[] {
+  return readdirSync(join(root, dir), { recursive: true, withFileTypes: true })
+    .filter(entry => entry.isFile())
+    .map(entry => relative(root, join(entry.parentPath, entry.name)).split("\\").join("/"));
+}
 
 describe("typecheck:fork", () => {
   test("reads vue-tsc's errors, with their continuation lines", () => {
@@ -43,5 +55,14 @@ describe("typecheck:fork", () => {
     ]) {
       expect(isForkFile(file), file).toBe(false);
     }
+  });
+
+  test("the fork's templates use Vuetify 4's type scale: Vuetify 3's classes no longer exist and do nothing", () => {
+    // Vuetify 4 kept only the Material 3 names (text-body-small, text-title-medium, ...); see its styles/main.css
+    const vuetify3 = /\btext-(caption|overline|body-[12]|subtitle-[12]|h[1-6])\b/g;
+    const found = filesUnder("app")
+      .filter(file => file.endsWith(".vue") && isForkFile(file))
+      .flatMap(file => [...readFileSync(join(root, file), "utf8").matchAll(vuetify3)].map(match => `${file}: ${match[0]}`));
+    expect(found).toEqual([]);
   });
 });

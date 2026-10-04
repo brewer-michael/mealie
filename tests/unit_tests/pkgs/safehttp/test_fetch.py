@@ -122,7 +122,7 @@ def _patch_responses(
         state["attempts"] += 1
         return _FakeClient(state["queue"].pop(0))
 
-    def fake_build_transport(impersonate: str, proxy: str | None = None):
+    def fake_build_transport(impersonate: str, proxy: str | None = None, max_bytes: int | None = None):  # fork: cap
         state["proxies"].append(proxy)
         return None
 

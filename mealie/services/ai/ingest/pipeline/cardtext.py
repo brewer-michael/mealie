@@ -226,15 +226,21 @@ def describe_token(token: SalientToken) -> str:
 _FROM_TITLE_WORD = "from"
 
 
+_LEADING_FROM = re.compile(rf"^{_FROM_TITLE_WORD}(?:\s*:\s*|\s+|$)", re.IGNORECASE)
+
+
 def strip_from_prefix(text: str, title: str = "From") -> str:
     """
-    An attribution without its own leading "From" (or the title's word, as the note it becomes is titled), with or
-    without a colon: the review page's field is labelled "From" and commit makes it a note titled "From", so "From
-    Grandma Jo" is kept as "Grandma Jo", never shown as "From: From Grandma Jo"
+    An attribution without its own leading "From", with or without a colon, or the title's word in the job's language
+    (as the note it becomes is titled) followed by a colon: the review page's field is labelled "From" and commit makes
+    it a note titled "From", so "From Grandma Jo" is kept as "Grandma Jo", never shown as "From: From Grandma Jo". The
+    translated word needs its colon: it may begin a name too ("Van der Berg" when it is Dutch "Van", "De la Torre").
     """
-    words = sorted({_FROM_TITLE_WORD, title.strip().lower()} - {""}, key=len, reverse=True)
-    leading = re.compile(rf"^(?:{'|'.join(map(re.escape, words))})(?:\s*:\s*|\s+|$)", re.IGNORECASE)
-    return leading.sub("", text.strip(), count=1).strip()
+    text = _LEADING_FROM.sub("", text.strip(), count=1)
+    word = title.strip()
+    if word and word.lower() != _FROM_TITLE_WORD:
+        text = re.sub(rf"^{re.escape(word)}\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def without_list_marker(text: str) -> tuple[str, int]:

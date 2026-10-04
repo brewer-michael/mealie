@@ -4,9 +4,11 @@ it needs was over its monthly token limit (`limit_reached`) isn't left for the u
 `auto_retry_at` to the next reset (the first instant of next month, UTC), and the dispatcher's retry phase (every
 `HOUSEKEEPING_INTERVAL`) reads it again, as a manual retry does (`IngestQueue.retry_after_limit`), once that time has
 come, or sooner once the limit no longer applies: a manager raised it, or added or changed a provider. That check is
-made at most every `LIMIT_RECHECK_INTERVAL` per group and policy, under the policy the card is read with (its own
-`local_only`, or its group's setting as it is now), with the same rule as the capture page's warning
-(`intake.reading_readiness`): the default slot builds every recipe, and the image slot reads the photo unless OCR can.
+made once per run per group and policy, under the policy the card is read with (its own `local_only`, or its group's
+setting as it is now), with the same rule as the capture page's warning (`intake.reading_readiness`): the default slot
+builds every recipe, and the image slot reads the photo unless OCR can. Only a "still applies" answer is kept, for
+`LIMIT_RECHECK_INTERVAL`: a card a lift queued that fails `limit_reached` again (the raised budget ran out after a few
+cards) waits for a check that says so, rather than being read again at every run while a "lifted" answer is kept.
 
 Everything here is a conditional update on the card still waiting, so every worker process running it is harmless.
 """
@@ -31,9 +33,12 @@ from .classify import safe_trace
 
 logger = get_logger(__name__)
 
-_checked: dict[tuple[UUID, bool], tuple[float, bool]] = {}
-"""(group, local only) -> (when it was last checked, by `time.monotonic()`; whether the limit was lifted then)"""
-_checked_lock = threading.Lock()
+_LimitKey = tuple[UUID, bool]
+"""(group, local only)"""
+
+_still_applies: dict[_LimitKey, float] = {}
+"""When the limit was last found to still apply (by `time.monotonic()`), kept for `LIMIT_RECHECK_INTERVAL`"""
+_still_applies_lock = threading.Lock()
 
 
 def _slot_over_limit(service: OpenAIService, slot: AIProviderSlot) -> bool | None:
@@ -67,29 +72,39 @@ def limit_applies(group_id: UUID, household_id: UUID, *, local_only: bool) -> bo
     return image
 
 
-def _lifted(wait: LimitWait, group_local_only: bool) -> bool:
-    """Whether the card's limit no longer applies (checked once per `LIMIT_RECHECK_INTERVAL` per group and policy)"""
+def _lifted(wait: LimitWait, group_local_only: bool, this_run: dict[_LimitKey, bool]) -> bool:
+    """
+    Whether the card's limit no longer applies: checked once per run (`this_run`) per group and policy, and not again
+    for `LIMIT_RECHECK_INTERVAL` once it said the limit still applies
+    """
     local_only = wait.local_only or group_local_only
     key = (wait.group_id, local_only)
+    if key in this_run:
+        return this_run[key]
     now = time.monotonic()
-    with _checked_lock:
-        checked = _checked.get(key)
-        if checked is not None and now - checked[0] < limits.LIMIT_RECHECK_INTERVAL:
-            return checked[1]
+    with _still_applies_lock:
+        checked = _still_applies.get(key)
+        if checked is not None and now - checked < limits.LIMIT_RECHECK_INTERVAL:
+            this_run[key] = False
+            return False
     try:
         lifted = limit_applies(wait.group_id, wait.household_id, local_only=local_only) is False
     except Exception as e:
         logger.warning(f"Recipe card group {wait.group_id}: couldn't check its monthly limits ({type(e).__name__})")
         lifted = False
-    with _checked_lock:
-        _checked[key] = (now, lifted)
+    this_run[key] = lifted
+    with _still_applies_lock:
+        if lifted:
+            _still_applies.pop(key, None)
+        else:
+            _still_applies[key] = now
     return lifted
 
 
 def forget_checks() -> None:
     """Clears the per-group limit checks (tests)"""
-    with _checked_lock:
-        _checked.clear()
+    with _still_applies_lock:
+        _still_applies.clear()
 
 
 def retry_waiting(now: datetime) -> int:
@@ -105,6 +120,7 @@ def retry_waiting(now: datetime) -> int:
         return 0
 
     group_local_only: dict[UUID, bool] = {}
+    this_run: dict[_LimitKey, bool] = {}
     retried = 0
     for wait in waiting:
         if storage.is_paused():
@@ -118,7 +134,7 @@ def retry_waiting(now: datetime) -> int:
                             IngestRepos(session, wait.group_id, None).settings.get().local_only
                         )
                         session.commit()
-                if not _lifted(wait, group_local_only[wait.group_id]):
+                if not _lifted(wait, group_local_only[wait.group_id], this_run):
                     continue
             with session_context() as session:
                 if IngestQueue(session).retry_after_limit(wait.job_id, wait.household_id):

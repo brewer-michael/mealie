@@ -54,6 +54,14 @@ class InvalidDomainError(Exception):
     pass
 
 
+class UnsafeRedirectError(InvalidDomainError):  # fork hook (safehttp/redirects.py)
+    """The URL redirected from https to http (`downgrade`) or off http(s): routes report it on its own"""
+
+    def __init__(self, message: str, *, downgrade: bool) -> None:
+        super().__init__(message)
+        self.downgrade = downgrade
+
+
 class RecipeDataService(BaseService):
     minifier: img.ABCMinifier
 
@@ -133,6 +141,8 @@ class RecipeDataService(BaseService):
         try:
             # FlareSolverr returns HTML, not image bytes, so it can't serve an image download.
             r = await safehttp.resilient_fetch(image_url, allow_flaresolverr=False, max_bytes=max_bytes)
+        except safehttp.UnsafeRedirectError as e:  # fork hook: a refused redirect isn't a blocked domain
+            raise UnsafeRedirectError(str(e), downgrade=e.downgrade) from e
         except safehttp.InvalidDomainError as e:
             # Re-raised as this module's error so callers only need one exception vocabulary.
             raise InvalidDomainError(str(e)) from e

@@ -376,3 +376,59 @@ def test_editing_and_downloading_are_for_group_managers(
     put = api_client.put(eval_case_item("managed"), json={"verified": True}, headers=not_a_manager.token)
     download = api_client.get(f"{eval_case_item('managed')}/download", headers=not_a_manager.token)
     assert (put.status_code, download.status_code) == (403, 403)
+
+
+def _group_manager(user: TestUser) -> TestUser:
+    found = user.repos.users.get_one(user.user_id)
+    assert found
+    found.can_manage = True
+    user.repos.users.update(found.id, found)
+    return user
+
+
+def _slugs(api_client: TestClient, user: TestUser) -> set[str]:
+    response = api_client.get(EVAL_CASES, headers=user.token)
+    assert response.status_code == 200
+    return {case["slug"] for case in response.json()}
+
+
+def test_a_case_is_seen_only_by_its_households_managers(
+    api_client: TestClient, unique_user: TestUser, h2_user: TestUser, unique_admin: TestUser, jobs: list[UUID]
+):
+    # a group manager of another household doesn't see (or download, change or delete) a case saved from this
+    # household's card: its photos and text are the household's. Cases added by hand are the group's.
+    other_manager = _group_manager(h2_user)
+    job_id = seed_job(unique_user)
+    jobs.append(job_id)
+    assert api_client.post(eval_case_url(job_id), json={"slug": "ours"}, headers=unique_user.token).status_code == 201
+    directory = storage.eval_cards_dir(UUID(unique_user.group_id))
+    saved = CardFixture.model_validate_json((directory / "ours.json").read_text())
+    assert saved.origin is not None and saved.origin.household_id == str(unique_user.household_id)
+
+    by_hand = saved.model_copy(update={"origin": None, "source": "by-hand.jpg"})
+    (directory / "by-hand.json").write_text(by_hand.model_dump_json(exclude_none=True))
+    (directory / "by-hand.jpg").write_bytes((directory / "ours-1.jpg").read_bytes())
+    # saved before cases recorded their household: the household of the card it came from, while its row is there
+    assert saved.origin is not None
+    legacy = saved.model_copy(update={"origin": saved.origin.model_copy(update={"household_id": None})})
+    (directory / "legacy.json").write_text(legacy.model_dump_json(exclude_none=True))
+    gone = saved.model_copy(
+        update={"origin": saved.origin.model_copy(update={"household_id": None, "job_id": str(uuid4())})}
+    )
+    (directory / "gone.json").write_text(gone.model_dump_json(exclude_none=True))
+
+    assert _slugs(api_client, unique_user) == {"ours", "by-hand", "legacy"}
+    assert _slugs(api_client, other_manager) == {"by-hand"}
+    assert _slugs(api_client, unique_admin) == {"ours", "by-hand", "legacy", "gone"}
+
+    for slug in ("ours", "legacy", "gone"):
+        download = api_client.get(f"{eval_case_item(slug)}/download", headers=other_manager.token)
+        put = api_client.put(eval_case_item(slug), json={"verified": True}, headers=other_manager.token)
+        delete = api_client.delete(eval_case_item(slug), headers=other_manager.token)
+        assert (download.status_code, put.status_code, delete.status_code) == (404, 404, 404), slug
+        assert (directory / f"{slug}.json").is_file()
+    assert (directory / "ours-1.jpg").is_file()
+
+    assert api_client.get(f"{eval_case_item('by-hand')}/download", headers=other_manager.token).status_code == 200
+    assert api_client.get(f"{eval_case_item('gone')}/download", headers=unique_admin.token).status_code == 200
+    assert api_client.delete(eval_case_item("ours"), headers=unique_user.token).status_code == 204

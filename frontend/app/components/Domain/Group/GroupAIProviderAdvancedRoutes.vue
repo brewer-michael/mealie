@@ -1,11 +1,11 @@
 <template>
   <v-expansion-panels variant="accordion">
     <v-expansion-panel>
-      <v-expansion-panel-title class="text-subtitle-2" expand-icon="$expand" collapse-icon="$expand">
+      <v-expansion-panel-title class="text-title-small" expand-icon="$expand" collapse-icon="$expand">
         {{ $t('search.advanced') }}
       </v-expansion-panel-title>
       <v-expansion-panel-text>
-        <p class="text-body-2 mb-4">
+        <p class="text-body-medium mb-4">
           {{ $t('group.ai-provider-settings.advanced-routes-description') }}
         </p>
         <GroupAIProviderRouteSelect

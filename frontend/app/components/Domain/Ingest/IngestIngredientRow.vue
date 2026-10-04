@@ -4,7 +4,7 @@
     class="ingest-ingredient"
     :class="[severity ? `ingest-ingredient--${severity}` : undefined, { 'ingest-ingredient--expanded': expanded }]"
   >
-    <div v-if="model.title && !expanded" class="ingest-ingredient__section text-subtitle-2 pt-2">
+    <div v-if="model.title && !expanded" class="ingest-ingredient__section text-title-small pt-2">
       {{ model.title }}
     </div>
     <div
@@ -66,7 +66,7 @@
     </div>
     <!-- "Parse with AI" is reading this line -->
     <div v-if="parsing" class="ingest-ingredient__parsing pb-1" role="status">
-      <div class="text-caption text-medium-emphasis">
+      <div class="text-body-small text-medium-emphasis">
         {{ $t("recipe-ingest.review.parsing") }}
       </div>
       <v-progress-linear indeterminate color="primary" height="2" />
@@ -137,11 +137,11 @@
       <div
         v-for="info in infoTexts"
         :key="info.id"
-        class="text-caption text-medium-emphasis mt-1 ingest-ingredient__info"
+        class="text-body-small text-medium-emphasis mt-1 ingest-ingredient__info"
       >
         {{ info.title }}: {{ info.explanation }}
       </div>
-      <div v-if="model.originalText" class="text-caption text-medium-emphasis mt-2 ingest-ingredient__original">
+      <div v-if="model.originalText" class="text-body-small text-medium-emphasis mt-2 ingest-ingredient__original">
         {{ $t("recipe-ingest.review.on-the-card", { text: model.originalText }) }}
       </div>
       <div v-if="!readonly" class="d-flex flex-wrap align-center ga-1 mt-1">

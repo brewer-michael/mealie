@@ -17,6 +17,7 @@ from mealie.services.ai.ingest import limits
 from mealie.services.ai.ingest.pipeline import (
     CardPage,
     OrientDecision,
+    compilers,
     decide_orientation,
     orient_page,
     orientation_available,
@@ -296,6 +297,39 @@ def test_the_orientation_is_decided_without_writing_a_file(
         )
     if not decision.settled:
         assert oriented_meta(page.meta, decision) == page.meta
+
+
+@pytest.mark.parametrize(
+    ("scores", "sure"),
+    [
+        (UPRIGHT, True),
+        ({0: 300.0, 90: 100.0, 180: 80.0, 270: 60.0}, True),  # little, but best upright
+        ({0: 0.0, 90: 135.0, 180: 83.0, 270: 0.0}, False),  # the banana card blurred: too little read any way up
+        ({0: 0.0, 90: 0.0, 180: 0.0, 270: 0.0}, False),  # no words at all
+        (FAINT, False),  # handwriting that reads badly every way, upright no better than the rest
+        ({}, True),  # nothing probed: taken at its word
+    ],
+)
+def test_a_reading_too_poor_to_tell_leaves_the_orientation_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scores: dict[int, float], sure: bool
+):
+    """
+    Tesseract that read too little to tell which way up the page is fell back to upright: its text is kept, but the
+    page isn't marked oriented, so a turn the image reader reports still applies (`compilers._rotations`, the runner's
+    `_turn_as_read`), where it used to be dropped for good
+    """
+    (page,) = make_pages(tmp_path)
+    result = ocr.OCRResult(text="Banana", confidence=20.0, rotation=0, rotation_scores=scores)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)
+    monkeypatch.setattr(ocr, "extract_text", lambda path, **_: result)
+
+    decision = decide_orientation(page)
+
+    assert (decision.rotation, decision.settled, decision.sure) == (0, True, sure)
+    meta = oriented_meta(page.meta, decision)
+    assert (meta.oriented, meta.ocr) == (sure, PageOCR(text="Banana", confidence=20.0))
+    assert compilers._rotations([CardPage(dir=page.dir, meta=meta)], [90]) == ({} if sure else {0: 90})
+    assert orient_page(page) == meta  # the eval's copies alike
 
 
 def test_a_page_already_oriented_or_without_tesseract_is_decided_at_once(

@@ -6,11 +6,12 @@ every 10 minutes per group, under the card's own policy), as a manual retry woul
 
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from ingest_runner_testing import FakeHandlers, Jobs, run, settle
 
+from mealie.db.db_setup import session_context
 from mealie.repos.repository_recipe_ingest import IngestQueue, LimitWait, naive_utc, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
@@ -20,7 +21,7 @@ from mealie.services.ai.errors import AIProviderLimitReachedError
 from mealie.services.ai.ingest import limits
 from mealie.services.ai.ingest.runner import retries
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
-from mealie.services.ai.ingest.runner.finalize import next_limit_reset
+from mealie.services.ai.ingest.runner.finalize import finalize_failure, next_limit_reset
 from mealie.services.ai.ingest.runner.retries import retry_waiting
 from mealie.services.ai.ingest.runner.types import TaskContext
 from tests.utils.fixture_schemas import TestUser
@@ -158,6 +159,36 @@ def test_a_raised_limit_reads_waiting_cards_at_the_next_check(
 
     monkeypatch.setattr(limits, "LIMIT_RECHECK_INTERVAL", 0)
     assert retry_waiting(utcnow()) == 2
+    assert _queued_again(jobs, first) and _queued_again(jobs, second)
+
+
+def test_a_card_that_fails_again_after_a_lift_waits_for_a_new_check(jobs: Jobs, limit: LimitChecks):
+    """
+    A "lifted" answer isn't kept for the next ticks: a card it queued that fails `limit_reached` again (the raised
+    budget ran out after a few cards) waits for a check that says so, rather than being read again every minute
+    """
+    job_id = _waiting(jobs)
+    limit.set(False)  # a manager raised the limit a little
+    assert retry_waiting(utcnow()) == 1
+    assert _queued_again(jobs, job_id)
+
+    # read, and over the limit again: finalize puts it back to waiting
+    token = uuid4()
+    with session_context() as session:
+        assert IngestQueue(session).claim(job_id, token=token, owner="test", now=utcnow(), group_cap=0)
+        finalize_failure(session, job_id, token, IngestErrorCode.limit_reached)
+    limit.set(True)
+    for _ in range(3):  # the next housekeeping ticks
+        assert retry_waiting(utcnow()) == 0
+    assert len(limit) == 2  # checked again once, then that answer kept
+    assert jobs.row(job_id)["status"] == IngestStatus.failed
+
+
+def test_a_lift_is_checked_once_per_tick_for_a_groups_cards(jobs: Jobs, limit: LimitChecks):
+    first, second = _waiting(jobs), _waiting(jobs)
+    limit.set(False)
+    assert retry_waiting(utcnow()) == 2
+    assert len(limit) == 1
     assert _queued_again(jobs, first) and _queued_again(jobs, second)
 
 

@@ -30,6 +30,7 @@ from mealie.services.ai.ingest.pipeline.flags import (
     flag_id,
     ingredient_hash,
     ingredient_line,
+    keep_lost_amounts,
     ocr_check_lines,
 )
 from mealie.services.recipe.import_workflow.steps import ResolveOrganizersStep
@@ -350,6 +351,24 @@ def test_shorthand_read_only_when_the_unit_was_written_differently(text: str, fl
         (ingredient("1 wax bean", quantity=1, food="wax bean", linked=False), False),
         (ingredient("1 big onion", quantity=1, food="big onion", linked=False), False),
         (ingredient("2 ripe bananas", quantity=2, food="ripe bananas", linked=False), False),
+        # a longer abbreviation of a unit, with its dot, as the parser leaves one it doesn't know in the food
+        (ingredient("2 tbls. sugar", quantity=2, food="tbls. sugar", linked=False), True),
+        (ingredient("1 tblsp. flour", quantity=1, food="tblsp. flour", linked=False), True),
+        (ingredient("1 teasp. salt", quantity=1, food="teasp. salt", linked=False), True),
+        (ingredient("2 pkgs. yeast", quantity=2, food="pkgs. yeast", linked=False), True),
+        (ingredient("3 envs. gelatin", quantity=3, food="envs. gelatin", linked=False), True),
+        (ingredient("2 pkges. yeast", quantity=2, food="pkges. yeast", linked=False), True),
+        (ingredient("3 sqrs. chocolate", quantity=3, food="sqrs. chocolate", linked=False), True),
+        (ingredient("2 Tbsps. butter", quantity=2, food="Tbsps. butter", linked=False), True),
+        # a food read with the line's full stop, and a size, aren't
+        (ingredient("2 eggs.", quantity=2, food="egg"), False),
+        (ingredient("2 pears.", quantity=2, food="pears.", linked=False), False),
+        (ingredient("1 lemon.", quantity=1, food="lemon."), False),
+        (ingredient("2 limes.", quantity=2, food="limes.", linked=False), False),
+        (ingredient("1 tomato.", quantity=1, food="tomato.", linked=False), False),
+        (ingredient("2 Med. Potatoes", quantity=2, food="Potatoes", note="Med.", linked=False), False),
+        (ingredient("2 Large. eggs", quantity=2, food="Large. eggs", linked=False), False),
+        (ingredient("2 tablespoon. butter", quantity=2, food="tablespoon. butter", linked=False), False),
     ],
 )
 def test_unit_unclear(line: CardDraftIngredient, flagged: bool):
@@ -524,6 +543,34 @@ def test_an_amount_the_parsed_fields_keep_is_not(line: CardDraftIngredient):
     assert CardFlagKind.check_parse not in kinds(flags)
 
 
+@pytest.mark.parametrize(
+    ("line", "quantity", "unit", "food", "note", "kept", "value"),
+    [
+        # the parser kept the word joining the amount on its own: the note says it once ("plus, plus 2 T." before)
+        ("1 c. sugar plus 2 T.", 1, "cup", "sugar", "plus", "plus 2 T.", "2"),
+        ("1 c. sugar plus 2 T.", 1, "cup", "sugar", "melted, plus", "melted, plus 2 T.", "2"),
+        ("1 c. sugar + 2 T.", 1, "cup", "sugar", "", "+ 2 T.", "2"),
+        # a size the note leads with (taken out before parsing) isn't the amount's unit too ("lg., or 2 lg." before)
+        ("3 eggs or 2 lg.", 3, None, "egg", "lg.", "lg., or 2", "2"),
+        ("2 or 3 eggs", 2, None, "egg", "", "or 3 eggs", "3"),
+        # a package's size joined to its unit by a hyphen: the note keeps the size, not the rest of the line again
+        # ("8-oz. pkg. cream cheese" before); nothing is lost then
+        ("1 8-oz. pkg. cream cheese", 1, None, "pkg. cream cheese", "", "8-oz.", None),
+    ],
+)
+def test_what_the_note_keeps_of_a_lost_amount(
+    line: str, quantity: float, unit: str | None, food: str, note: str, kept: str, value: str | None
+):
+    assert keep_lost_amounts(line, quantity, unit, food, note)[0] == kept
+
+    # and the flag still finds the amount from the note parsing made
+    parsed = ingredient(line, quantity=quantity, unit=unit, food=food, note=kept)
+    flags = compute_flags(draft(ingredients=[parsed]), ExtractionMeta(language="English"), {})
+    assert [flag.params["value"] for flag in flags if flag.kind == CardFlagKind.check_parse] == (
+        [value] if value else []
+    )
+
+
 def test_the_banana_card_reads_clean():
     """The real card's lines raise nothing highlighted, besides the gap it leaves on purpose"""
     card = draft(
@@ -637,6 +684,24 @@ CUP = ["cup", "cups", "c"]
         # a size word the parser took out doesn't hide the food's name
         (ingredient("1 med onion", quantity=1, food="onion", note="med"), ["onion"], None),
         (ingredient("1 c. sugar (scant)", quantity=1, unit="cup", food="sugar", note="scant"), ["sugar"], CUP),
+        # a group's unit with only a name (as commit creates them): the card's abbreviation is the unit's own
+        (ingredient("1 tsp. salt", quantity=1, unit="teaspoon", food="salt"), None, ["teaspoon", "teaspoons"]),
+        (ingredient("1/4 t. salt", quantity=0.25, unit="teaspoon", food="salt"), None, ["teaspoon"]),
+        (ingredient("1 T. coconut oil (melted)", quantity=1, unit="tablespoon", food="oil"), None, ["tablespoon"]),
+        (ingredient("2 Tbsp. butter", quantity=2, unit="tablespoon", food="butter"), None, ["tablespoon"]),
+        (ingredient("2 tbs. sugar", quantity=2, unit="tablespoon", food="sugar"), None, ["tablespoon", "tbsp"]),
+        (ingredient("1 lb. ground beef", quantity=1, unit="pound", food="ground beef"), None, ["pound"]),
+        (ingredient("2 lbs. potatoes", quantity=2, unit="pound", food="potato"), None, ["pound", "pounds"]),
+        (ingredient("8 oz. cheese", quantity=8, unit="ounce", food="cheese"), None, ["ounce"]),
+        (ingredient("1 qt. milk", quantity=1, unit="quart", food="milk"), None, ["quart"]),
+        (
+            ingredient("2 fl. oz. lemon juice", quantity=2, unit="fluid ounce", food="lemon juice"),
+            None,
+            ["fluid ounce"],
+        ),
+        (ingredient("250 g flour", quantity=250, unit="gram", food="flour"), None, ["gram"]),
+        # and the card's "pkg." is a group's "pack"
+        (ingredient("1 pkg. dry yeast", quantity=1, unit="pack", food="dry yeast"), None, ["pack", "packs"]),
     ],
 )
 def test_an_exact_or_alias_link_is_not_flagged(
@@ -671,6 +736,16 @@ def test_a_food_or_unit_linked_by_a_near_miss_name_is_flagged():
     assert by_kind["food"].id == f"linked_fuzzy:ingredients:{ref}"
     assert by_kind["unit"].id == f"linked_fuzzy:ingredients:{ref}#unit"
     assert by_kind["unit"].ref == ref and by_kind["unit"].params["name"] == "cup"
+
+
+def test_a_unit_linked_by_a_near_miss_is_flagged_whatever_its_spellings():
+    """ "sq." read as "square" and matched to the group's quart is no spelling of a quart's"""
+    line = ingredient("2 sq. chocolate", quantity=2, unit="quart", food="chocolate")
+    linked = _names(line, food=["chocolate"], unit=["quart", "quarts", "qt"])
+
+    flags = compute_flags(draft(ingredients=[line]), ExtractionMeta(language="English"), {}, linked=linked)
+
+    assert [flag.params["name"] for flag in flags if flag.kind == CardFlagKind.linked_fuzzy] == ["quart"]
 
 
 def test_a_fuzzy_link_follows_the_line():
@@ -1070,3 +1145,47 @@ def test_the_ocr_check_runs_only_on_a_clear_printed_reading():
     )
     assert ocr_check_lines([printed, None], IngestReadPath.image, transcription) is None
     assert ocr_check_lines([PageOCR(text="Pound Cake", confidence=95.0)], IngestReadPath.image, transcription) is None
+
+
+SPACES = " " * 3000
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"2 c. sugar +{SPACES}flour",
+        f"2 c. sugar,{SPACES},{SPACES}flour",
+        f"1 -{SPACES};{SPACES}sugar",
+        f"1{SPACES}/2 c. sugar",
+        f"350{SPACES}degrees",
+        f"1 c. sugar (or{SPACES}2 T.{SPACES}honey",
+    ],
+)
+def test_long_runs_of_spaces_take_linear_time(line: str):
+    """No pattern tries a run of spaces every way: a joiner before a few thousand spaces took seconds to minutes"""
+    import time
+
+    started = time.perf_counter()
+    keep_lost_amounts(line, 2.0, "cup", "sugar", "")
+    draft = CardDraft(
+        name="Sugar",
+        ingredients=[CardDraftIngredient(original_text=line, quantity=2, unit=CardDraftRef(name="cup"))],
+        steps=[CardDraftStep(text=line)],
+    )
+    compute_flags(draft, None, {}, transcription=line, units=["cup"], ocr_lines=[line])
+    assert time.perf_counter() - started < 0.5, line.split()[:3]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"{'9' * 400} cups flour",
+        f"1 c. flour ({'9' * 400} oz.)",
+        f"1 {'9' * 400}/2 c. sugar",
+    ],
+)
+def test_a_number_too_large_for_a_float_is_no_quantity(line: str):
+    """300 digits read off a card: the amount is kept in the note, nothing raises OverflowError"""
+    note, lost = keep_lost_amounts(line, 1.0, "cup", "flour", "")
+    assert lost
+    assert "9" * 400 in note or any("9" * 400 in amount.value for amount in lost)

@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from test_jobs_api import banana_draft, fake_compute_flags, job_row, seed_job, set_columns, use_fake_flags
 
 from mealie.core.config import get_app_dirs
@@ -61,7 +62,7 @@ def published(monkeypatch: pytest.MonkeyPatch, unique_user_fn_scoped: TestUser) 
 
 
 def ready_job(user: TestUser, **kwargs: Any) -> UUID:
-    draft = banana_draft(attach_card_photo=True)
+    draft = banana_draft(attach_card_photo=True, use_card_as_cover=True)
     flags: list[CardFlag] = [
         flag.model_copy(update={"resolution": FlagResolution.kept}) if flag.severity == "error" else flag
         for flag in fake_compute_flags(draft, None, {})
@@ -191,6 +192,94 @@ def test_a_crash_after_each_step_is_resumed_without_duplicates(
     card_commit.resume_stale_commits(after_the_lease() + timedelta(minutes=5))
     assert published == ["banana-mug-cake"]
     assert len(group_recipes(user)) == 1
+
+
+def _failing_create(error: Exception) -> Callable[..., Any]:
+    def create(*args: Any) -> Any:
+        raise error
+
+    return create
+
+
+@pytest.mark.parametrize(
+    "error",
+    [IntegrityError("INSERT INTO recipes", {}, Exception("unique")), RuntimeError("the insert failed")],
+    ids=["integrity", "other"],
+)
+def test_a_create_that_made_no_recipe_sends_the_card_back_for_review(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str], error: Exception
+):
+    """
+    With no recipe row made, nothing is half done: the card is ready again (and can be committed again) rather than
+    left committing, which housekeeping would resume into the same failure for good
+    """
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    real = card_commit._create_recipe
+    monkeypatch.setattr(card_commit, "_create_recipe", _failing_create(error))
+
+    if isinstance(error, IntegrityError):
+        with pytest.raises(JobActionError) as refused:
+            run_commit(user, job_id)
+        assert (refused.value.status_code, refused.value.code) == (409, "commit_interrupted")
+    else:
+        with pytest.raises(RuntimeError):
+            run_commit(user, job_id)
+    row = job_row(job_id)
+    assert (row["status"], row["error_code"], row["commit_started_at"]) == ("ready", "commit_interrupted", None)
+    assert not (get_app_dirs().RECIPE_DATA_DIR / str(row["commit_recipe_id"])).exists()
+    assert card_commit.resume_stale_commits(after_the_lease()) == 0
+
+    monkeypatch.setattr(card_commit, "_create_recipe", real)
+    assert run_commit(user, job_id).created
+    assert job_row(job_id)["status"] == "committed"
+    assert len(group_recipes(user)) == 1
+
+
+def test_a_resumed_commit_whose_create_keeps_failing_gives_up(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str]
+):
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    monkeypatch.setattr(card_commit, "_create_recipe", crash_once(card_commit._create_recipe, before=True))
+    with pytest.raises(Crash):
+        run_commit(user, job_id)
+    assert job_row(job_id)["status"] == "committing"
+
+    monkeypatch.setattr(card_commit, "_create_recipe", _failing_create(RuntimeError("the insert failed")))
+    assert card_commit.resume_stale_commits(after_the_lease()) == 1
+    row = job_row(job_id)
+    assert (row["status"], row["error_code"]) == ("ready", "commit_interrupted")
+    assert card_commit.resume_stale_commits(after_the_lease() + timedelta(minutes=5)) == 0
+    assert group_recipes(user) == []
+    assert published == []
+
+
+def test_a_create_that_failed_after_making_the_recipe_is_resumed(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, published: list[str]
+):
+    """A recipe row with the commit's id: the commit stays committing and is finished, never made twice"""
+    user = unique_user_fn_scoped
+    job_id = ready_job(user)
+    real = card_commit._create_recipe
+    armed = [True]
+
+    def create_then_fail(*args: Any) -> Any:
+        created = real(*args)
+        if armed[0]:
+            armed[0] = False
+            raise RuntimeError("after the insert")
+        return created
+
+    monkeypatch.setattr(card_commit, "_create_recipe", create_then_fail)
+    with pytest.raises(RuntimeError):
+        run_commit(user, job_id)
+    assert job_row(job_id)["status"] == "committing"
+
+    assert card_commit.resume_stale_commits(after_the_lease()) == 1
+    assert job_row(job_id)["status"] == "committed"
+    assert len(group_recipes(user)) == 1
+    assert published == ["banana-mug-cake"]
 
 
 def test_a_crash_after_the_finish_sends_the_event_later_once(

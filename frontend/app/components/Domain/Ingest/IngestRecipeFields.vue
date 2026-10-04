@@ -30,7 +30,7 @@
       />
     </div>
 
-    <div class="d-flex flex-wrap ga-x-4">
+    <div class="d-flex flex-wrap gc-4">
       <div
         v-for="field in detailFields"
         :id="fieldAnchorId(field.key)"

@@ -138,7 +138,7 @@
         <v-col :cols="10">
           <v-card-text>
             {{ provider.name }}
-            <div v-if="unreadableKeyProviderIds.includes(provider.id)" class="text-caption text-warning mt-1">
+            <div v-if="unreadableKeyProviderIds.includes(provider.id)" class="text-body-small text-warning mt-1">
               {{ $t("group.ai-provider-settings.api-key-unreadable") }}
             </div>
           </v-card-text>

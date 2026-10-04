@@ -5,9 +5,12 @@ Turning an uploaded photo into a card page, and the page operations after that (
 outlive it: what's stored is an upright, metadata-free JPEG plus two smaller copies. One Pillow path covers every
 accepted format and enforces the pixel caps before anything is decoded: `limits.MAX_PIXELS` for every format, after a
 JPEG's reduced-scale decoding (`draft`), so a 200-megapixel phone JPEG (up to `MAX_JPEG_SOURCE_PIXELS`) is read at
-half size. Images are opened with their format's own Pillow opener, not `Image.open`, whose decompression-bomb check
-would refuse those photos (and warn from about 89 megapixels): these caps apply instead, and Pillow's global
-`MAX_IMAGE_PIXELS` is never changed.
+half size. A progressive JPEG, or one whose components are in scans of their own, also has its decoding's memory
+capped (`MAX_JPEG_COEFFICIENT_BYTES`: libjpeg keeps all its coefficients at full resolution, whatever the scale) and
+its scans (`MAX_JPEG_SCANS`: each goes over them all).
+Images are opened with their format's own Pillow opener, not `Image.open`, whose decompression-bomb check would refuse
+those photos (and warn from about 89 megapixels): these caps apply instead, and Pillow's global `MAX_IMAGE_PIXELS` is
+never changed.
 
 **Turning a page is staged**, so a crash can't leave its files turned and its stored metadata not (or the reverse):
 1. `stage_rotation` writes the turned page beside the current one (`page.next.jpg` first, then `view.next.jpg` and
@@ -23,6 +26,7 @@ stored metadata were committed and are swapped in; any others are discarded. Cal
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -30,6 +34,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -65,6 +71,23 @@ MAX_JPEG_SOURCE_PIXELS = 260_000_000
 """
 The most pixels a JPEG may have. A JPEG is decoded at 1/2, 1/4 or 1/8 scale when the page is that much smaller
 (`draft`), and the decoded size must still fit `limits.MAX_PIXELS`: a 200-megapixel phone photo is read at half size.
+That bounds a baseline JPEG's decoding, which goes a row of blocks at a time; a multi-scan one's is bounded by
+`MAX_JPEG_COEFFICIENT_BYTES` as well.
+"""
+MAX_JPEG_COEFFICIENT_BYTES = 600_000_000
+"""
+The most memory a multi-scan JPEG's coefficients may take while it's decoded (`_jpeg_coefficient_bytes`). A progressive
+JPEG, or one whose components are in scans of their own, is decoded by keeping every DCT coefficient of the image (2
+bytes a sample at full resolution, whatever scale `draft` chose), so a 3 MB progressive file of 16100 x 16100 pixels
+would take 1.5 GB. This is what a 100-megapixel 4:4:4 one takes, the cap every image had before JPEGs got their own,
+and what a 200-megapixel 4:2:0 phone photo saved progressive takes.
+"""
+MAX_JPEG_SCANS = 100
+"""
+The most scans a multi-scan JPEG may have. Its decoding goes over the coefficients of every scan's components once,
+however little data the scan has, and libjpeg carries on through a progression that makes no sense: an 8 MB file of
+300,000 empty scans takes six minutes to decode at 12 megapixels. libjpeg's own tools write at most 100; its default
+progression has 10.
 """
 
 _HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"}
@@ -229,6 +252,163 @@ def _open_image(raw: BinaryIO, kind: str) -> Image.Image:
         except SyntaxError, IndexError, TypeError, struct.error:
             continue  # not this format after all: the next opener, as `Image.open` goes on
     raise UnidentifiedImageError(f"Not a {kind} image")
+
+
+_JPEG_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+"""Start-of-frame markers (DHT, JPG and DAC share their range)"""
+_JPEG_PROGRESSIVE_SOF = frozenset({0xC2, 0xC6, 0xCA, 0xCE})
+_JPEG_SOS = 0xDA
+_JPEG_EOI = 0xD9
+_JPEG_NO_SEGMENT = frozenset({0x01, *range(0xD0, 0xD9)})
+"""Markers with no segment after them: TEM, RST0-7 and SOI"""
+_JPEG_MAX_SEGMENTS = 4096
+"""Segments read before the first scan: a header with more isn't read"""
+_JPEG_MAX_SKIPPED = 64 * 1024
+"""Stray bytes skipped between segments (libjpeg skips them too): a header with more isn't read"""
+
+
+class _JpegFrame(NamedTuple):
+    """A JPEG's first image as its markers describe it, up to its first scan"""
+
+    width: int
+    height: int
+    sampling: tuple[tuple[int, int], ...]
+    """Each component's horizontal and vertical sampling factors"""
+    progressive: bool
+    first_scan_components: int
+    first_scan_data: int
+    """Where the first scan's entropy-coded data starts"""
+
+    @property
+    def multi_scan(self) -> bool:
+        """
+        Decoded with all its coefficients kept (libjpeg's `has_multiple_scans`): progressive, or its first scan doesn't
+        hold every component
+        """
+        return self.progressive or self.first_scan_components < len(self.sampling)
+
+
+def _jpeg_marker(raw: BinaryIO) -> int | None:
+    """The next marker's code, past stray bytes and fill bytes; None at the end of the file or after too many strays"""
+    skipped = 0
+    while True:
+        byte = raw.read(1)
+        while byte and byte != b"\xff":
+            skipped += 1
+            if skipped > _JPEG_MAX_SKIPPED:
+                return None
+            byte = raw.read(1)
+        while byte == b"\xff":
+            byte = raw.read(1)  # fill bytes
+        if not byte:
+            return None
+        if byte != b"\x00":  # FF 00 is a stuffed data byte, not a marker
+            return byte[0]
+        skipped += 2
+
+
+def _jpeg_frame(raw: BinaryIO) -> _JpegFrame | None:
+    """
+    The first image's frame header and its first scan's, from the markers before that scan (every other segment
+    skipped by its length); None when they can't be read
+    """
+    raw.seek(0)
+    if raw.read(2) != b"\xff\xd8":
+        return None
+    frame: tuple[int, int, tuple[tuple[int, int], ...], bool] | None = None
+    for _ in range(_JPEG_MAX_SEGMENTS):
+        marker = _jpeg_marker(raw)
+        if marker is None or marker == _JPEG_EOI:
+            return None
+        if marker in _JPEG_NO_SEGMENT:
+            continue
+        length_bytes = raw.read(2)
+        length = int.from_bytes(length_bytes, "big")
+        if len(length_bytes) < 2 or length < 2:
+            return None
+        if marker == _JPEG_SOS:
+            count = raw.read(1)
+            if frame is None or not count:
+                return None
+            width, height, sampling, progressive = frame
+            return _JpegFrame(width, height, sampling, progressive, count[0], raw.tell() + length - 3)
+        if marker in _JPEG_SOF and frame is None:
+            segment = raw.read(length - 2)
+            if len(segment) < 6 or len(segment) < 6 + 3 * segment[5] or segment[5] < 1:
+                return None
+            height, width = int.from_bytes(segment[1:3], "big"), int.from_bytes(segment[3:5], "big")
+            factors = segment[7 : 6 + 3 * segment[5] : 3]
+            sampling = tuple((factor >> 4, factor & 0x0F) for factor in factors)
+            if any(h < 1 or v < 1 for h, v in sampling):
+                return None
+            frame = (width, height, sampling, marker in _JPEG_PROGRESSIVE_SOF)
+        else:
+            raw.seek(length - 2, os.SEEK_CUR)
+    return None
+
+
+def _jpeg_coefficient_bytes(frame: _JpegFrame) -> int:
+    """
+    The memory libjpeg keeps for the image's DCT coefficients while decoding it (`MAX_JPEG_COEFFICIENT_BYTES`): none
+    to speak of for a single-scan JPEG (decoded a row of blocks at a time), all of them for a multi-scan one: each
+    component's blocks, rounded up to its sampling factors, of 64 coefficients of 2 bytes
+    """
+    if not frame.multi_scan:
+        return 0
+    h_max = max(h for h, _ in frame.sampling)
+    v_max = max(v for _, v in frame.sampling)
+    blocks = 0
+    for h, v in frame.sampling:
+        across = math.ceil(frame.width * h / (h_max * 8))
+        down = math.ceil(frame.height * v / (v_max * 8))
+        blocks += math.ceil(across / h) * h * math.ceil(down / v) * v
+    return blocks * 64 * 2
+
+
+def _jpeg_scans(raw: BinaryIO, frame: _JpegFrame, limit: int) -> int:
+    """
+    How many scans the image has, counted from its first to its end (`EOI`) and at most to `limit` + 1: each scan's
+    entropy-coded data is passed over (stuffed bytes and restart markers), other segments by their lengths
+    """
+    raw.seek(frame.first_scan_data)
+    data = raw.read()
+    scans = 1
+    position = 0
+    while scans <= limit:
+        position = data.find(b"\xff", position)
+        if position < 0 or position + 1 >= len(data):
+            break
+        marker = data[position + 1]
+        if marker == 0x00 or marker == 0xFF or marker in _JPEG_NO_SEGMENT:
+            position += 1  # a stuffed byte, a fill byte or a restart marker
+            continue
+        if marker == _JPEG_EOI:
+            break
+        if marker == _JPEG_SOS:
+            scans += 1
+        position += 2 + int.from_bytes(data[position + 2 : position + 4], "big")  # the segment, then its data
+    return scans
+
+
+def _check_jpeg_decoding(raw: BinaryIO) -> None:
+    """
+    `PageRejected` for a JPEG whose decoding would cost too much, before anything is decoded: a multi-scan JPEG's
+    coefficients over `MAX_JPEG_COEFFICIENT_BYTES` (`too_many_pixels`), or more than `MAX_JPEG_SCANS` scans
+    (`unreadable_image`); a header that can't be read is `unreadable_image` too. Leaves `raw` where it was.
+    """
+    position = raw.tell()
+    try:
+        frame = _jpeg_frame(raw)
+        if frame is None:
+            raise PageRejected(IngestRejectReason.unreadable_image)
+        if not frame.multi_scan:
+            return
+        if _jpeg_coefficient_bytes(frame) > MAX_JPEG_COEFFICIENT_BYTES:
+            raise PageRejected(IngestRejectReason.too_many_pixels)
+        if _jpeg_scans(raw, frame, MAX_JPEG_SCANS) > MAX_JPEG_SCANS:
+            raise PageRejected(IngestRejectReason.unreadable_image)
+    finally:
+        raw.seek(position)
 
 
 def _hash_stream(raw: BinaryIO) -> tuple[str, int]:
@@ -465,10 +645,95 @@ PDF_RENDER_TIMEOUT = 60
 _PDF_RENDERER = Path(__file__).with_name("pdf_render.py")
 _CHILD_ENVIRONMENT = ("SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
 """What the renderer's process gets of the server's environment: nothing secret"""
+_PAGE_FRAME, _RESULT_FRAME, _FRAME_HEADER = b"P", b"R", 9
+"""The renderer's stdout: frames of a kind byte and an 8-byte big-endian length (`pdf_render`)"""
+MAX_RENDERED_PAGE_BYTES = 256 * 1024 * 1024
+"""A larger page frame is a broken renderer (its own limit is the same)"""
+MAX_RESULT_BYTES = 64 * 1024
+_sandbox_logged = False
+
+
+class _RenderedFrames:
+    """What the renderer wrote to stdout, read on a thread of its own: its pages, spooled, and its result"""
+
+    def __init__(self) -> None:
+        self.pages: list[SpooledTemporaryFile[bytes]] = []
+        self.result: dict | None = None
+        self.broken = False
+
+    def read(self, stream: BinaryIO) -> None:
+        try:
+            while self.result is None:
+                header = stream.read(_FRAME_HEADER)
+                if len(header) < _FRAME_HEADER:
+                    return  # it ended without a result: crashed, or killed
+                kind, length = header[:1], int.from_bytes(header[1:], "big")
+                if (
+                    kind == _PAGE_FRAME
+                    and length <= MAX_RENDERED_PAGE_BYTES
+                    and len(self.pages) < limits.MAX_PAGES_PER_CARD
+                ):
+                    self._read_page(stream, length)
+                elif kind == _RESULT_FRAME and length <= MAX_RESULT_BYTES:
+                    self.result = self._read_result(stream, length)
+                else:
+                    self.broken = True  # an unknown frame, too large, or a page too many: nothing after it is read
+                    return
+        except OSError, ValueError, _BrokenFrame:
+            self.broken = True
+
+    def _read_page(self, stream: BinaryIO, length: int) -> None:
+        page: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
+        self.pages.append(page)
+        left = length
+        while left:
+            chunk = stream.read(min(left, 1024 * 1024))
+            if not chunk:
+                raise _BrokenFrame()
+            page.write(chunk)
+            left -= len(chunk)
+        page.seek(0)
+
+    @staticmethod
+    def _read_result(stream: BinaryIO, length: int) -> dict:
+        data = stream.read(length)
+        if len(data) < length:
+            raise _BrokenFrame()
+        result = json.loads(data)
+        if not isinstance(result, dict):
+            raise _BrokenFrame()
+        return result
+
+    def close(self) -> None:
+        for page in self.pages:
+            page.close()
+
+
+class _BrokenFrame(Exception):
+    pass
+
+
+def _log_sandbox(protections: object) -> None:
+    """Once per process: how the renderer was confined (`pdf_render.sandbox`)"""
+    global _sandbox_logged
+    if _sandbox_logged:
+        return
+    _sandbox_logged = True
+    applied = [str(item) for item in protections] if isinstance(protections, list) else []
+    if any(item.startswith("landlock-files") for item in applied):
+        logger.info(f"PDF pages are rendered in a confined process: {', '.join(applied)}")
+    else:
+        logger.warning(
+            "PDF pages are rendered in a process the kernel can't confine to its own files (no Landlock), with: "
+            + (", ".join(applied) or "time and memory limits only")
+        )
 
 
 def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentPage]:
-    """A PDF's pages rendered as PNG files by `pdf_render` in a child process; spooled into unnamed temporary files"""
+    """
+    A PDF's pages rendered as PNG images by `pdf_render` in a confined child process, which writes them to its stdout;
+    read from there into unnamed temporary files
+    """
     if not sys.executable:
         logger.error("Couldn't start the PDF renderer: the Python interpreter's path is unknown")
         raise PageRejected(IngestRejectReason.pdf_not_supported)
@@ -477,77 +742,91 @@ def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentP
         with document.open("wb") as copy:
             shutil.copyfileobj(raw, copy)
         raw.seek(0)
+        frames = _run_renderer(document)
 
-        try:
-            completed = subprocess.run(  # the renderer's path and our own numbers: no shell, no user input
-                [
-                    sys.executable,
-                    "-I",
-                    str(_PDF_RENDERER),
-                    str(document),
-                    work,
-                    str(limits.PAGE_MAX_SIDE),
-                    str(limits.MAX_PIXELS),
-                    str(limits.MAX_PAGES_PER_CARD),
-                ],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=PDF_RENDER_TIMEOUT,
-                env={name: os.environ[name] for name in _CHILD_ENVIRONMENT if name in os.environ},
-                check=False,
-            )
-        except subprocess.TimeoutExpired as e:
-            logger.info(f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds")
-            raise PageRejected(IngestRejectReason.pdf_not_supported) from e
-        except OSError as e:
-            logger.error(f"Couldn't start the PDF renderer: {e}")
-            raise PageRejected(IngestRejectReason.pdf_not_supported) from e
-
-        result = _renderer_result(completed)
+    try:
+        result = frames.result or {}
+        _log_sandbox(result.get("sandbox"))
         if result.get("error") == IngestRejectReason.too_many_pages.value:
             raise PageRejected(IngestRejectReason.too_many_pages)
         count = result.get("pages")
-        if not isinstance(count, int) or not 1 <= count <= limits.MAX_PAGES_PER_CARD:
+        if not isinstance(count, int) or not 1 <= count <= limits.MAX_PAGES_PER_CARD or count != len(frames.pages):
             raise PageRejected(IngestRejectReason.pdf_not_supported)
-
-        pages: list[DocumentPage] = []
-        try:
-            for number in range(1, count + 1):
-                rendered: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
-                pages.append(
-                    DocumentPage(
-                        rendered,  # type: ignore[arg-type]
-                        "png",
-                        raw_sha256 if count == 1 else _page_identity(raw_sha256, number),
-                        raw_bytes,
-                        number=None if count == 1 else number,
-                        format="pdf",
-                        rendered=True,
-                    )
-                )
-                with (Path(work) / f"page-{number}.png").open("rb") as png:
-                    shutil.copyfileobj(png, rendered)
-                rendered.seek(0)
-        except BaseException as e:
-            close_pages(pages)
-            if isinstance(e, OSError):
-                raise PageRejected(IngestRejectReason.pdf_not_supported) from e
-            raise
-        return pages
+        return [
+            DocumentPage(
+                rendered,  # type: ignore[arg-type]
+                "png",
+                raw_sha256 if count == 1 else _page_identity(raw_sha256, number),
+                raw_bytes,
+                number=None if count == 1 else number,
+                format="pdf",
+                rendered=True,
+            )
+            for number, rendered in enumerate(frames.pages, start=1)
+        ]
+    except BaseException:
+        frames.close()
+        raise
 
 
-def _renderer_result(completed: subprocess.CompletedProcess[bytes]) -> dict:
-    """The renderer's JSON answer; empty when it crashed or answered nothing usable"""
-    lines = completed.stdout.decode("utf-8", errors="replace").strip().splitlines()
+def _run_renderer(document: Path) -> _RenderedFrames:
+    """The renderer's run on `document` within `PDF_RENDER_TIMEOUT`; `PageRejected` when it didn't end in time"""
+    deadline = time.monotonic() + PDF_RENDER_TIMEOUT
     try:
-        result = json.loads(lines[-1]) if completed.returncode == 0 and lines else {}
-    except ValueError:
-        result = {}
-    if not isinstance(result, dict) or not result:
+        process = subprocess.Popen(  # the renderer's path and our own numbers: no shell, no user input
+            [
+                sys.executable,
+                "-I",
+                str(_PDF_RENDERER),
+                str(document),
+                str(limits.PAGE_MAX_SIDE),
+                str(limits.MAX_PIXELS),
+                str(limits.MAX_PAGES_PER_CARD),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={name: os.environ[name] for name in _CHILD_ENVIRONMENT if name in os.environ},
+            close_fds=True,
+        )
+    except OSError as e:
+        logger.error(f"Couldn't start the PDF renderer: {e}")
+        raise PageRejected(IngestRejectReason.pdf_not_supported) from e
+
+    frames = _RenderedFrames()
+    assert process.stdout is not None
+    reader = threading.Thread(target=frames.read, args=(process.stdout,), name="pdf-render-output", daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        reader.join(max(0.0, deadline - time.monotonic()))
+        if reader.is_alive():  # still rendering at the deadline
+            timed_out = True
+        elif not frames.broken:
+            try:
+                process.wait(max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out or frames.broken:
+            process.kill()
+            reader.join()
+        returncode = process.wait()
+    except BaseException:
+        process.kill()  # this thread was interrupted: the renderer doesn't outlive it
+        raise
+    finally:
+        process.stdout.close()
+
+    if timed_out:
+        frames.close()
+        logger.info(f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds")
+        raise PageRejected(IngestRejectReason.pdf_not_supported)
+    if frames.result is None or frames.broken or returncode != 0:
         # killed by a resource limit, or PDFium crashed: logged without the document's content
-        logger.info(f"The PDF renderer failed (exit status {completed.returncode})")
-        return {}
-    return result
+        logger.info(f"The PDF renderer failed (exit status {returncode})")
+        frames.close()
+        raise PageRejected(IngestRejectReason.pdf_not_supported)
+    return frames
 
 
 def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filename: str | None) -> PageMeta:
@@ -595,6 +874,7 @@ def normalize_document_page(
             if kind == "jpeg":
                 if image.width * image.height > MAX_JPEG_SOURCE_PIXELS:
                     raise PageRejected(IngestRejectReason.too_many_pixels)
+                _check_jpeg_decoding(raw)  # a multi-scan JPEG: all its coefficients held, and gone over each scan
                 # decoded at 1/2, 1/4 or 1/8 scale when the page is that much smaller: never below the page's size
                 image.draft(None, _draft_size(image.size, limits.PAGE_MAX_SIDE))
             if image.width * image.height > limits.MAX_PIXELS:  # a JPEG's as it will be decoded

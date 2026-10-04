@@ -15,6 +15,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -30,6 +31,7 @@ from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestion
 from mealie.repos.repository_recipe_ingest import IngestJobsRepo, IngestRepos
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate
 from mealie.schema.recipe_ingest import (
+    IngestRejectReason,
     IngestSource,
     IngestStatus,
     IngestTaskKind,
@@ -327,7 +329,10 @@ def test_429_at_the_per_user_cap_on_cards_being_read(
     response = post_card(api_client, uploader, jpeg())
     detail = assert_summary(response, 429)
     assert detail["code"] == "user_quota"
-    assert detail["message"] == "You can have at most 2 recipe cards being read at once. Try again when some are done."
+    assert (
+        detail["message"]
+        == "You already have 2 recipe cards being read, the most allowed. Try again when some are done."
+    )
     assert response.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
     assert job_count(uploader) == stored  # refused before the body
 
@@ -342,7 +347,7 @@ def test_429_at_the_per_user_cap_on_cards_being_read(
     # one at most: the message says so in the singular
     _per_user_cap(monkeypatch, 1)
     message = post_card(api_client, housemate, jpeg()).json()["detail"]["message"]
-    assert message == "You can have at most 1 recipe card being read at once. Try again when it's done."
+    assert message == "You already have 1 recipe card being read, the most allowed. Try again when it's done."
 
     # 0 is off
     _per_user_cap(monkeypatch, 0)
@@ -365,7 +370,167 @@ def test_the_per_user_cap_is_counted_only_when_its_on(
     assert counted == []
     _per_user_cap(monkeypatch, 50)
     assert post_card(api_client, reader, jpeg()).status_code == 202
-    assert counted == [reader.user_id]
+    assert counted == [reader.user_id, reader.user_id]  # before the body, and in the first card's insert
+
+
+def _user_processing(user: TestUser) -> int:
+    with session_context() as session:
+        repos = IngestRepos(session, UUID(user.group_id), UUID(user.household_id))
+        return repos.jobs.count_processing_by_user(UUID(str(user.user_id)))
+
+
+def _job_dirs(user: TestUser) -> set[str]:
+    root = storage.ingest_root(UUID(user.group_id))
+    return {path.name for path in root.iterdir()} if root.exists() else set()
+
+
+def _quota_refused(response: Any) -> list[int]:
+    """The indexes of the request's images refused `quota`, checking that nothing else was refused"""
+    rejected = response.json()["rejected"]
+    assert {item["reason"] for item in rejected} <= {IngestRejectReason.quota.value}
+    return [item["index"] for item in rejected]
+
+
+def test_a_request_stops_at_the_per_user_cap(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the request gets in under the cap, and each card is counted again: the ones past it are refused on their own
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    _per_user_cap(monkeypatch, 2)
+    assert post_card(api_client, user, jpeg()).status_code == 202
+
+    response = post_card(api_client, user, jpeg(), jpeg(), jpeg(), split=True)
+    assert response.status_code == 202
+    assert len(response.json()["jobs"]) == 1
+    assert _quota_refused(response) == [1, 2]
+    assert _user_processing(user) == 2
+    assert post_card(api_client, user, jpeg()).status_code == 429
+
+
+def test_a_request_stops_at_the_groups_cap(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    with session_context() as session:
+        processing = IngestRepos(session, UUID(user.group_id), None).processing_jobs_in_group()
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", processing + 2)
+
+    response = post_card(api_client, user, jpeg(), jpeg(), jpeg(), jpeg(), split=True)
+    assert response.status_code == 202
+    assert len(response.json()["jobs"]) == 2
+    assert _quota_refused(response) == [2, 3]
+    with session_context() as session:
+        assert IngestRepos(session, UUID(user.group_id), None).processing_jobs_in_group() == processing + 2
+
+
+def test_uploads_of_two_households_at_once_stop_at_the_groups_cap(
+    api_client: TestClient, unique_user: TestUser, h2_user: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # two households of a group upload at once, each passing the group's count before either inserted: every card is
+    # counted in its insert, under the group's lock too, so together they stop exactly at the cap
+    provider_settings = unique_user.repos.group_ai_provider_settings.get_one(unique_user.repos.group_id)
+    if provider_settings is None or provider_settings.default_provider_id is None:  # the module's user may have them
+        configure_card_reading(unique_user)
+    with session_context() as session:
+        processing = IngestRepos(session, UUID(unique_user.group_id), None).processing_jobs_in_group()
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", processing + 3)
+    real = upload_service.reading_readiness
+    together = threading.Barrier(2, timeout=30)
+
+    def readiness(*args: Any, **kwargs: Any) -> intake.ReadingReadiness:
+        value = real(*args, **kwargs)
+        together.wait()
+        return value
+
+    monkeypatch.setattr(upload_service, "reading_readiness", readiness)
+    responses: dict[str, Any] = {}
+
+    def send(user: TestUser) -> None:
+        responses[str(user.user_id)] = post_card(api_client, user, jpeg(), jpeg(), jpeg(), split=True)
+
+    threads = [threading.Thread(target=send, args=(user,)) for user in (unique_user, h2_user)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert len(responses) == 2
+    added = 0
+    for response in responses.values():
+        if response.status_code == 429:
+            assert response.json()["detail"]["code"] == "too_many_jobs"
+            continue
+        assert response.status_code == 202
+        added += len(response.json()["jobs"])
+        assert len(response.json()["jobs"]) + len(_quota_refused(response)) == 3
+    assert added == 3
+    with session_context() as session:
+        assert IngestRepos(session, UUID(unique_user.group_id), None).processing_jobs_in_group() == processing + 3
+
+
+def test_two_uploads_at_once_dont_both_pass_the_per_user_cap(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # two Shortcut runs at once: both read the uploader's count (1 of 2) before either inserted. Each card is counted
+    # again in its insert's transaction, under the household's intake lock, so one card of one request gets in.
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    _per_user_cap(monkeypatch, 2)
+    assert post_card(api_client, user, jpeg()).status_code == 202
+    real = upload_service.reading_readiness
+    together = threading.Barrier(2, timeout=30)
+
+    def readiness(*args: Any, **kwargs: Any) -> intake.ReadingReadiness:
+        value = real(*args, **kwargs)
+        together.wait()
+        return value
+
+    monkeypatch.setattr(upload_service, "reading_readiness", readiness)
+    responses: dict[str, Any] = {}
+
+    def send(name: str) -> None:
+        responses[name] = post_card(api_client, user, jpeg(), jpeg(), jpeg(), split=True)
+
+    threads = [threading.Thread(target=send, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert sorted(response.status_code for response in responses.values()) == [202, 429]
+    refused = next(response for response in responses.values() if response.status_code == 429)
+    detail = assert_summary(refused, 429)
+    assert detail["code"] == "user_quota"
+    assert refused.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
+    accepted = next(response for response in responses.values() if response.status_code == 202)
+    assert len(accepted.json()["jobs"]) == 1
+    assert _quota_refused(accepted) == [1, 2]
+    assert _user_processing(user) == 2  # the cap, never past it
+
+
+def test_an_upload_past_the_groups_quota_on_a_stale_count_puts_nothing_in(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    assert post_card(api_client, user, jpeg()).status_code == 202
+    with session_context() as session:
+        processing = IngestRepos(session, UUID(user.group_id), None).processing_jobs_in_group()
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", processing)
+
+    # the count read before the body had room: other uploads got in while this one's body arrived
+    real = upload_service.reading_readiness
+    monkeypatch.setattr(
+        upload_service, "reading_readiness", lambda *args, **kwargs: replace(real(*args, **kwargs), processing=0)
+    )
+    stored, dirs = job_count(user), _job_dirs(user)
+    response = post_card(api_client, user, jpeg(), jpeg(), split=True)
+    detail = assert_summary(response, 429)
+    assert detail["code"] == "too_many_jobs"
+    assert response.headers["Retry-After"] == str(limits.QUOTA_RETRY_AFTER)
+    assert (job_count(user), _job_dirs(user)) == (stored, dirs)
 
 
 def test_the_checks_before_the_body_run_in_one_worker_thread_call(

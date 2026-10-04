@@ -13,14 +13,15 @@ dropped value.
 - the expected values come from the reviewed draft. A field whose text held a `[blank]` when the card was read keeps
   it, even when the reviewer has since filled it in, and is listed in `blanks`: the transcription still has the
   marker, and `restore_blanks` puts it back in the reviewed wording;
-- `origin` records the job, the provider and model that drafted it and the Mealie commit, so the report can mark runs
-  scored against a provider's own drafts;
+- `origin` records the job, its household, the provider and model that drafted it and the Mealie commit, so the
+  report can mark runs scored against a provider's own drafts, and only that household's managers see the case;
 - the reviewer's tags (`handwritten`, `printed`, `faded`) and notes go into the fixture, next to the tags found from
   the card itself (`sideways`, `two-sided`, `blank`).
 
 **Managing cases:** `update_eval_case` changes a case's `verified_by_owner`, the reviewer's tags and its notes in
 place; `eval_case_archive` zips its JSON and photos for download (to move a redacted card into `tests/data/cards/` or
-run the eval elsewhere).
+run the eval elsewhere). The list and each of these see only the cases an `EvalCaseViewer` may: a household manager's
+own household's and the ones added by hand; an admin's, all of them.
 """
 
 import io
@@ -199,6 +200,8 @@ class FixtureOrigin(_FixtureModel):
     """Where a case saved from the review page came from"""
 
     job_id: str | None = None
+    household_id: str | None = None
+    """The household whose card it is: only its managers (and admins) see the case"""
     drafted_by: FixtureDraftedBy | None = None
     """The provider and model whose draft the expected values were reviewed from"""
     exported_at: datetime | None = None
@@ -244,7 +247,7 @@ QUANTITY_TOLERANCE = 0.02
 
 UNIT_ALIASES: dict[str, tuple[str, ...]] = {
     "tbsp": ("tablespoon", "tablespoons", "tbsps", "tbs", "tbl", "tbls", "tblsp", "tb"),
-    "tsp": ("teaspoon", "teaspoons", "tsps", "ts", "tspn"),
+    "tsp": ("teaspoon", "teaspoons", "tsps", "ts", "tspn", "teasp"),
     "cup": ("cups", "c"),
     "oz": ("ounce", "ounces", "ozs"),
     "fl oz": ("fluid ounce", "fluid ounces", "floz"),
@@ -265,7 +268,7 @@ UNIT_ALIASES: dict[str, tuple[str, ...]] = {
     "slice": ("slices",),
     # the pipeline's other card abbreviations (`shorthand.ABBREVIATIONS`)
     "dozen": ("dozens", "doz"),
-    "envelope": ("envelopes", "env"),
+    "envelope": ("envelopes", "env", "envs"),
     "square": ("squares", "sq"),
 }
 """Units an ingredient line may start with, after its quantity, and their other spellings, matched ignoring case"""
@@ -739,6 +742,7 @@ def build_eval_case(
         local_only=bool(job.local_only),
         origin=FixtureOrigin(
             job_id=str(job.id),
+            household_id=str(job.household_id),
             drafted_by=FixtureDraftedBy(provider=extraction.provider, model=extraction.model) if extraction else None,
             exported_at=now or datetime.now(UTC),
             mealie_commit=mealie_commit(),
@@ -844,10 +848,51 @@ def _summary(path: Path, fixture: CardFixture | None) -> EvalCaseSummary:
     )
 
 
-def list_eval_cases(group_id: UUID) -> list[EvalCaseSummary]:
-    """The group's eval cases, by slug. A case whose JSON doesn't validate is listed without a name, so it can be
-    deleted."""
-    return [_summary(path, _read_fixture(path)) for path in _case_jsons(storage.eval_cards_dir(group_id))]
+@dataclass(frozen=True)
+class EvalCaseViewer:
+    """
+    Who is looking at the group's eval cases: a manager of `household_id` sees the cases saved from that household's
+    cards and the ones added by hand (with no `origin`), every other case is not found for them; an admin
+    (`household_id` None) sees them all. A case saved before cases recorded their household is the household's of the
+    card it came from, `job_households` (job id to household id) as long as the card's row is there, else an admin's
+    only, as is a case whose JSON doesn't validate.
+    """
+
+    household_id: UUID | None = None
+    job_households: dict[str, UUID] | None = None
+
+    @classmethod
+    def everyone(cls) -> Self:
+        return cls()
+
+    def sees(self, fixture: CardFixture | None) -> bool:
+        if self.household_id is None:
+            return True
+        if fixture is None:
+            return False
+        origin = fixture.origin
+        if origin is None or (origin.job_id is None and origin.household_id is None):
+            return True  # added by hand: the group's
+        saved_by = origin.household_id or str((self.job_households or {}).get(origin.job_id or "", ""))
+        return saved_by == str(self.household_id)
+
+
+def legacy_case_job_ids(group_id: UUID) -> list[str]:
+    """The jobs of the group's cases saved before cases recorded their household (`EvalCaseViewer.job_households`)"""
+    found = []
+    for path in _case_jsons(storage.eval_cards_dir(group_id)):
+        fixture = _read_fixture(path)
+        if fixture and fixture.origin and fixture.origin.job_id and not fixture.origin.household_id:
+            found.append(fixture.origin.job_id)
+    return found
+
+
+def list_eval_cases(group_id: UUID, viewer: EvalCaseViewer | None = None) -> list[EvalCaseSummary]:
+    """The group's eval cases the viewer sees (every one by default), by slug. A case whose JSON doesn't validate is
+    listed without a name, so it can be deleted."""
+    viewer = viewer or EvalCaseViewer.everyone()
+    cases = [(path, _read_fixture(path)) for path in _case_jsons(storage.eval_cards_dir(group_id))]
+    return [_summary(path, fixture) for path, fixture in cases if viewer.sees(fixture)]
 
 
 def _case_json(group_id: UUID, slug: str) -> Path | None:
@@ -857,16 +902,27 @@ def _case_json(group_id: UUID, slug: str) -> Path | None:
     return path if path.is_file() else None
 
 
-def update_eval_case(group_id: UUID, slug: str, update: EvalCaseUpdate) -> EvalCaseSummary | None:
-    """
-    Changes a saved case in place: `verified_by_owner`, the reviewer's tags (the ones found from the card stay) and
-    its notes; a field the update leaves out keeps its value. None when there's no such case. Raises `EvalCaseError`
-    for a case whose JSON doesn't validate. Callers hold the ingest write lock.
-    """
+def _visible_case(group_id: UUID, slug: str, viewer: EvalCaseViewer | None) -> tuple[Path, CardFixture | None] | None:
+    """A case's JSON and fixture, when the viewer sees it"""
     path = _case_json(group_id, slug)
     if path is None:
         return None
     fixture = _read_fixture(path)
+    return (path, fixture) if (viewer or EvalCaseViewer.everyone()).sees(fixture) else None
+
+
+def update_eval_case(
+    group_id: UUID, slug: str, update: EvalCaseUpdate, viewer: EvalCaseViewer | None = None
+) -> EvalCaseSummary | None:
+    """
+    Changes a saved case in place: `verified_by_owner`, the reviewer's tags (the ones found from the card stay) and
+    its notes; a field the update leaves out keeps its value. None when there's no such case the viewer sees. Raises
+    `EvalCaseError` for a case whose JSON doesn't validate. Callers hold the ingest write lock.
+    """
+    found = _visible_case(group_id, slug, viewer)
+    if found is None:
+        return None
+    path, fixture = found
     if fixture is None:
         raise EvalCaseError()
 
@@ -875,8 +931,8 @@ def update_eval_case(group_id: UUID, slug: str, update: EvalCaseUpdate) -> EvalC
         changes["verified_by_owner"] = update.verified
     if update.tags is not None:
         chosen = {tag.value for tag in EvalCaseTag}
-        found = [tag for tag in fixture.tags if tag not in chosen]
-        changes["tags"] = [*(tag.value for tag in update.tags), *found]
+        from_card = [tag for tag in fixture.tags if tag not in chosen]
+        changes["tags"] = [*(tag.value for tag in update.tags), *from_card]
     if update.notes is not None:
         changes["notes"] = update.notes.strip()
     if changes:
@@ -885,15 +941,16 @@ def update_eval_case(group_id: UUID, slug: str, update: EvalCaseUpdate) -> EvalC
     return _summary(path, fixture)
 
 
-def eval_case_archive(group_id: UUID, slug: str) -> bytes | None:
+def eval_case_archive(group_id: UUID, slug: str, viewer: EvalCaseViewer | None = None) -> bytes | None:
     """
     A zip of a case's JSON and the photos it lists (only files next to it, by plain name), to download; None when
-    there's no such case. Callers hold the ingest write lock, so a restore can't replace the files mid-read.
+    there's no such case the viewer sees. Callers hold the ingest write lock, so a restore can't replace the files
+    mid-read.
     """
-    path = _case_json(group_id, slug)
-    if path is None:
+    found = _visible_case(group_id, slug, viewer)
+    if found is None:
         return None
-    fixture = _read_fixture(path)
+    path, fixture = found
     names = [path.name]
     if fixture:
         directory = path.parent
@@ -916,10 +973,10 @@ def _own_image_names(slug: str, names: Iterable[str]) -> set[str]:
     return {name for name in names if pattern.match(name)}
 
 
-def delete_eval_case(group_id: UUID, slug: str) -> bool:
+def delete_eval_case(group_id: UUID, slug: str, viewer: EvalCaseViewer | None = None) -> bool:
     """
     Deletes an eval case: its JSON and its images, but never a file another case lists. Whether there was anything
-    to delete. Callers hold the ingest write lock.
+    to delete; nothing is, for a case the viewer doesn't see. Callers hold the ingest write lock.
     """
     if not _SLUG_RE.match(slug):
         return False
@@ -929,6 +986,11 @@ def delete_eval_case(group_id: UUID, slug: str) -> bool:
 
     json_path = directory / f"{slug}.json"
     fixture = _read_fixture(json_path) if json_path.is_file() else None
+    viewer = viewer or EvalCaseViewer.everyone()
+    if json_path.is_file() and not viewer.sees(fixture):
+        return False
+    if not json_path.is_file() and viewer.household_id is not None:
+        return False  # images without a case: whose they were isn't known
     files = {path.name for path in directory.iterdir() if path.is_file()}
     candidates = _own_image_names(slug, files)
     if fixture:

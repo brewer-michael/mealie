@@ -7,7 +7,7 @@
     density="compact"
     :icon="false"
   >
-    <div v-if="label" class="text-caption text-medium-emphasis">
+    <div v-if="label" class="text-body-small text-medium-emphasis">
       {{ label }}
     </div>
     <div class="ingest-proposal__text">
@@ -21,7 +21,7 @@
         {{ $t("recipe-ingest.review.proposal-unreadable") }}
       </template>
     </div>
-    <div v-if="proposal.viaOcr" class="text-caption text-medium-emphasis">
+    <div v-if="proposal.viaOcr" class="text-body-small text-medium-emphasis">
       {{ $t("recipe-ingest.review.proposal-via-ocr") }}
     </div>
     <div class="ingest-proposal__actions d-flex flex-wrap ga-1 mt-1">

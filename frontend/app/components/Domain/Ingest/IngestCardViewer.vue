@@ -20,7 +20,7 @@
           alt=""
           class="ingest-card-strip__thumb"
         >
-        <span class="text-body-2">{{ pageLabel(selected) }}</span>
+        <span class="text-body-medium">{{ pageLabel(selected) }}</span>
         <v-spacer />
         <v-icon :icon="$globals.icons.chevronDown" />
       </button>

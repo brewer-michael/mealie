@@ -6,11 +6,13 @@ parsed by the AI parser, AI parsing of chosen lines, a rebuild from an edited tr
 a printed card's numbers.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 
@@ -36,6 +38,8 @@ from mealie.services.ai.ingest.pipeline import (
     rebuild_from_transcription,
 )
 from mealie.services.ai.ingest.pipeline import compilers as compilers_module
+from mealie.services.ai.ingest.pipeline.cardtext import strip_from_prefix
+from mealie.services.ai.ingest.pipeline.llm_schemas import OpenAIRecipeCardTranscription
 from mealie.services.ai.ingest.pipeline.service import JobOpenAIService, end_transaction
 from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import (
     BANANA_RECIPE,
@@ -62,8 +66,10 @@ NO_ORGANIZERS = CardPipelineOptions(suggest_organizers=False)
 def no_tesseract_and_fresh_providers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(ocr, "is_available", lambda: False)
     compilers_module.ONE_IMAGE_PROVIDERS.clear()
+    compilers_module.MULTI_IMAGE_FAILURES.clear()
     yield
     compilers_module.ONE_IMAGE_PROVIDERS.clear()
+    compilers_module.MULTI_IMAGE_FAILURES.clear()
 
 
 def _vision_and_text(user: TestUser) -> None:
@@ -125,11 +131,64 @@ async def test_a_two_sided_card_is_read_page_by_page_when_both_pages_fail_togeth
     assert _usage(user, "OpenAIRecipeCardTranscription") == [False, True, True]
     assert result.extraction.read_path == IngestReadPath.image
 
-    # the next card on that provider is read page by page at once
+    # once is no proof (a passing error), twice in a row is: the card after that is read page by page at once
     fake.calls.clear()
     second = await _extract(user, make_pages(tmp_path / "second", 2))
+    assert [call.images for call in fake.calls if call.schema == "OpenAIRecipeCardTranscription"] == [2, 1, 1]
+    fake.calls.clear()
+    third = await _extract(user, make_pages(tmp_path / "third", 2))
     assert [call.images for call in fake.calls if call.schema == "OpenAIRecipeCardTranscription"] == [1, 1]
-    assert second.transcription == result.transcription
+    assert second.transcription == third.transcription == result.transcription
+
+
+def _malformed_answer() -> pydantic.ValidationError:
+    """What reading a cut-off answer raises"""
+    try:
+        OpenAIRecipeCardTranscription.parse_openai_response('{"contains_recipe": true, "content": "1 banana')
+    except pydantic.ValidationError as e:
+        return e
+    raise AssertionError("a cut-off answer was read")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "two_images_fail", "reads"),
+    [
+        # a passing server error (one the SDK's retries didn't outlast): a card read in one request starts over
+        (provider_failure, [True, False, True, False], [[2, 1, 1], [2], [2, 1, 1], [2]]),
+        # the model's own trouble (a cut-off answer) never counts, however often
+        (_malformed_answer, [True, True, True], [[2, 1, 1], [2, 1, 1], [2, 1, 1]]),
+    ],
+    ids=["server error", "malformed answer"],
+)
+async def test_a_provider_that_reads_two_images_isnt_remembered_for_a_passing_failure(
+    unique_user_fn_scoped: TestUser,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Callable[[], BaseException],
+    two_images_fail: list[bool],
+    reads: list[list[int]],
+):
+    """
+    A two-image request that fails once, read page by page, doesn't make every later two-sided card take two
+    requests (`ONE_IMAGE_STRIKES` cards in a row do)
+    """
+    user = unique_user_fn_scoped
+    _vision_and_text(user)
+    schedule = iter(two_images_fail)
+
+    def answer(call: Call) -> Any:
+        if call.images > 1 and next(schedule):
+            return failure()
+        return _transcription()
+
+    fake = FakeCardAI(banana_answers(OpenAIRecipeCardTranscription=answer)).install(monkeypatch)
+    for index, expected in enumerate(reads):
+        fake.calls.clear()
+        result = await _extract(user, make_pages(tmp_path / str(index), 2))
+        assert [call.images for call in fake.calls if call.schema == "OpenAIRecipeCardTranscription"] == expected
+        assert result.extraction.read_path == IngestReadPath.image
+    assert compilers_module.ONE_IMAGE_PROVIDERS == set()
 
 
 @pytest.mark.asyncio
@@ -271,6 +330,13 @@ async def test_the_attribution_doesnt_repeat_from(
         ("From Grandma Jo. A family favorite.", "A family favorite."),
         ("Grandma Jo's favorite cake.", "Grandma Jo's favorite cake."),  # more than the attribution: kept
         ("No sugar, gluten free", "No sugar, gluten free"),
+        # the rest as written, line breaks too
+        (
+            "No sugar, gluten free.\n\nGreat for breakfast!\nKeeps 3 days.",
+            "No sugar, gluten free.\n\nGreat for breakfast!\nKeeps 3 days.",
+        ),
+        ("A family favorite.\n\nGreat warm.\n\nFrom Grandma Jo", "A family favorite.\n\nGreat warm."),
+        ("From Grandma Jo.\nA family favorite.\nServes 4.", "A family favorite.\nServes 4."),
     ],
 )
 async def test_an_attribution_copied_into_the_description_is_removed(
@@ -287,6 +353,30 @@ async def test_an_attribution_copied_into_the_description_is_removed(
     result = await _extract(user, make_pages(tmp_path))
 
     assert result.draft.description == kept
+
+
+@pytest.mark.parametrize(
+    ("written", "title", "kept"),
+    [
+        ("From Grandma Jo", "Van", "Grandma Jo"),
+        ("Van: Oma", "Van", "Oma"),
+        ("van : Oma", "Van", "Oma"),
+        # the job's language's "From" begins names too: only with its colon is it the label's word
+        ("Van der Berg", "Van", "Van der Berg"),
+        ("van Dijk family", "Van", "van Dijk family"),
+        ("De la Torre", "De", "De la Torre"),
+        ("Von Trapp", "Von", "Von Trapp"),
+        ("Da Silva", "Da", "Da Silva"),
+        # English as before
+        ("From: Aunt Mae", "From", "Aunt Mae"),
+        ("from Mom", "From", "Mom"),
+        ("Fromage Family", "From", "Fromage Family"),
+    ],
+)
+def test_a_translated_from_is_taken_off_only_with_its_colon(written: str, title: str, kept: str):
+    assert strip_from_prefix(written, title) == kept
+    ctx = SimpleNamespace(translator=SimpleNamespace(t=lambda key, *_: title))
+    assert compilers_module.attribution_text(cast(Any, ctx), written) == kept
 
 
 # ==========================================

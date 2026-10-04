@@ -13,13 +13,15 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
 4. **Files** into `recipes/<id>/`, once a page turn a stop left half done is settled (`review.settle_turns`): each
    `page.jpg` as `assets/recipe-card-<token>-<n>.jpg` when the card photo is attached (`attaches_card_photo`: the
    draft's switch, else not in a household whose recipes are public), and the front's `view.jpg` as the cover when the
-   draft asks for it, a portrait card letterboxed to 4:3 (`cover_image`).
+   card is the recipe's image (`uses_card_as_cover`, by the same rule), a portrait card letterboxed to 4:3
+   (`cover_image`).
 5. **Build and create** (`draft_to_recipe`, then `RecipeService.create_one`): a line kept as written with a marker
    that no save parsed parsed around it (`review.parse_kept_lines`), ingredients re-linked through a fresh
    `IngestMatcher` (§5), organizers looked up in the group by id (or created by name, for a committer who can
    organize), the kept markers converted, the attribution as a
    note titled "From", the card assets when attached, and settings from the household with `show_assets` on when
-   they are.
+   they are. A name another recipe of the group has becomes the first free "Name (n)" (`review.free_recipe_name`)
+   before the create: upstream's create only tries "(1)" to "(9)" itself.
 6. **Cover key:** `update_image(slug)` when the cover was written, and upstream's `is_ocr_recipe` set.
 7. **Finish:** `committing → committed` with `recipe_id`; whichever call wins it publishes `recipe_created`, holding
    `recipe_event_claimed_at` from the finish, and records `recipe_event_sent_at` once it went out. Housekeeping sends
@@ -27,9 +29,10 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    once, even when the process stops between the finish and the send.
 
 A validation error before `create_one` returns the job to `ready` with `commit_invalid` (and removes `recipes/<id>`
-when no recipe has that id). Once `create_one` has been called the job never goes back to `ready`: any failure leaves
-it `committing`, and the next request for it or the dispatcher's housekeeping resumes it at step 3 once its lease
-(`COMMIT_LEASE`) has passed.
+when no recipe has that id), and so does a `create_one` that fails without making the recipe (`commit_interrupted`).
+Once a recipe with the reserved id exists the job never goes back to `ready`: any failure leaves it `committing`, and
+the next request for it or the dispatcher's housekeeping resumes it at step 3 once its lease (`COMMIT_LEASE`) has
+passed.
 
 **The lease fences every write after the claim.** `commit_started_at` is set by the claim, by each takeover and by
 the renewal after the files, and the caller keeps the value it set: the renewal, the return to `ready` (and the
@@ -73,7 +76,7 @@ from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
 from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, IngestRepos, utcnow
 from mealie.schema.household.household import HouseholdInDB
-from mealie.schema.recipe.recipe import Recipe, RecipeCategory, RecipeTag, RecipeTool
+from mealie.schema.recipe.recipe import Recipe, RecipeCategory, RecipeTag, RecipeTool, create_recipe_slug
 from mealie.schema.recipe.recipe_asset import RecipeAsset
 from mealie.schema.recipe.recipe_category import CategorySave, TagSave
 from mealie.schema.recipe.recipe_image_types import RecipeImageTypes
@@ -112,6 +115,7 @@ from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import images, limits, storage
 from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.matching import IngestMatcher
+from mealie.services.ai.ingest.pipeline.cardtext import strip_from_prefix
 from mealie.services.ai.ingest.review import (
     COMMIT_INVALID,
     FORBIDDEN,
@@ -128,6 +132,7 @@ from mealie.services.ai.ingest.review import (
     ReviewService,
     amount_marker_note,
     attaches_card_photo,
+    free_recipe_name,
     invalid_status,
     is_slimmed,
     not_found,
@@ -135,8 +140,10 @@ from mealie.services.ai.ingest.review import (
     parse_kept_lines,
     parse_pages,
     settle_turns,
+    uses_card_as_cover,
     version_conflict,
 )
+from mealie.services.ai.ingest.shorthand import standard_abbreviation
 from mealie.services.event_bus_service.event_bus_service import EventBusService
 from mealie.services.event_bus_service.event_types import EventOperation, EventRecipeData, EventTypes
 from mealie.services.recipe.recipe_data_service import RecipeDataService
@@ -259,8 +266,10 @@ class IngredientLinker:
         key = IngredientUnitModel.normalize(name)
         if key not in self._new_units:
             try:
+                # with its standard abbreviation ("tsp" for teaspoon), which upstream's recipe page and the card
+                # flags' linked-unit check (`shorthand.unit_spellings`) both use
                 self._new_units[key] = self.repos.ingredient_units.create(
-                    SaveIngredientUnit(name=name, group_id=self.group_id)
+                    SaveIngredientUnit(name=name, abbreviation=standard_abbreviation(name), group_id=self.group_id)
                 )
             except IntegrityError:
                 # `create` has rolled back: another commit in the group created it just now
@@ -493,12 +502,11 @@ def draft_to_recipe(
 
 def _attribution_text(attribution: str, title: str) -> str:
     """
-    The attribution as the note titled `title` ("From") holds it: a card's own leading "From" (or the title's word),
-    with or without a colon, isn't repeated, so "From Grandma Jo" reads "From: Grandma Jo", not "From: From Grandma Jo"
+    The attribution as the note titled `title` ("From") holds it: a card's own leading "From", with or without a colon,
+    or the title's word with one, isn't repeated, so "From Grandma Jo" reads "From: Grandma Jo", not "From: From
+    Grandma Jo"; the same rule as the draft's (`cardtext.strip_from_prefix`), so "Van der Berg" keeps its "Van"
     """
-    words = sorted({"from", title.strip().lower()} - {""}, key=len, reverse=True)
-    leading = re.compile(rf"^(?:{'|'.join(map(re.escape, words))})(?:\s*:\s*|\s+|$)", re.IGNORECASE)
-    return leading.sub("", attribution.strip(), count=1).strip()
+    return strip_from_prefix(attribution, title)
 
 
 def _build_recipe(
@@ -697,9 +705,7 @@ def _renew_lease(session: Session, job: RecipeIngestionJob, lease: datetime) -> 
 
 def _recipe_dir_without_row(session: Session, recipe_id: UUID) -> None:
     """Removes `recipes/<id>` when no recipe has that id; a directory with a row is never deleted"""
-    exists = session.execute(sa.select(RecipeModel.id).where(RecipeModel.id == recipe_id)).first() is not None
-    session.commit()
-    if not exists:
+    if not _recipe_exists(session, recipe_id):
         shutil.rmtree(get_app_dirs().RECIPE_DATA_DIR / str(recipe_id), ignore_errors=True)
 
 
@@ -792,11 +798,12 @@ def cover_image(view: Path) -> Path | bytes:
 
 
 def _write_files(
-    job: RecipeIngestionJob, draft: CardDraft, pages: Sequence[PageMeta], token: str, attach: bool = True
+    job: RecipeIngestionJob, pages: Sequence[PageMeta], token: str, attach: bool = True, cover: bool = True
 ) -> None:
     """
-    Step 4: the card assets when the card photo is attached (`attach`), and the cover when the draft asks for it. Only
-    `recipes/<new id>/` is created. Assets an earlier attempt wrote are removed when the photo isn't attached now.
+    Step 4: the card assets when the card photo is attached (`attach`), and the cover when the card is the recipe's
+    image (`cover`). Only `recipes/<new id>/` is created. Assets and a cover an earlier attempt wrote are removed when
+    they aren't wanted now.
     """
     recipe_id = job.commit_recipe_id
     if recipe_id is None:
@@ -809,9 +816,31 @@ def _write_files(
             continue
         source = images.page_file(storage.page_dir(job.group_id, job.id, page.index), "page")
         storage.atomic_write_bytes(asset, source.read_bytes())
-    if draft.use_card_as_cover and pages:
+    if cover and pages:
         view = images.page_file(storage.page_dir(job.group_id, job.id, pages[0].index), "view")
         data.write_image(cover_image(view), "jpg")
+    else:
+        data.delete_image()
+
+
+def _named(session: Session, job: RecipeIngestionJob, recipe: Recipe) -> Recipe:
+    """
+    The recipe with the name it's created under (`review.free_recipe_name`), chosen while the job can still go back to
+    ready: its own while its slug is free, else the first free "Name (n)", as the review page said. Upstream's create
+    only tries "(1)" to "(9)" itself, then fails. Raises `DraftInvalid` when every "Name (n)" is taken.
+    """
+    name = free_recipe_name(session, job.group_id, recipe.name or "")
+    if name is None:
+        raise DraftInvalid(["name"])
+    if name == recipe.name:
+        return recipe
+    return recipe.model_copy(update={"name": name, "slug": create_recipe_slug(name)})
+
+
+def _recipe_exists(session: Session, recipe_id: UUID) -> bool:
+    exists = session.execute(sa.select(RecipeModel.id).where(RecipeModel.id == recipe_id)).first() is not None
+    session.commit()
+    return exists
 
 
 def _create_recipe(
@@ -821,13 +850,13 @@ def _create_recipe(
     return RecipeService(repos, user, household, translator).create_one(recipe)
 
 
-def _set_cover_key(session: Session, job: RecipeIngestionJob, draft: CardDraft | None, slug: str) -> None:
+def _set_cover_key(session: Session, job: RecipeIngestionJob, cover: bool, slug: str) -> None:
     """Step 6: gives the recipe its image key when the cover was written (upstream's `create_one` doesn't)"""
     recipe_id = job.commit_recipe_id
-    if recipe_id is None or draft is None or not draft.use_card_as_cover:
+    if recipe_id is None or not cover:
         return
-    cover = get_app_dirs().RECIPE_DATA_DIR / str(recipe_id) / "images" / RecipeImageTypes.original.value
-    if not cover.exists():
+    image = get_app_dirs().RECIPE_DATA_DIR / str(recipe_id) / "images" / RecipeImageTypes.original.value
+    if not image.exists():
         return
     recipes = get_repositories(session, group_id=job.group_id, household_id=None).recipes
     recipe = recipes.get_one(recipe_id, "id")
@@ -1019,6 +1048,7 @@ def _run(
             # around its markers now, as a save would have; the stored draft keeps it as it is
             draft = parse_kept_lines(repos, job, draft)
             attach = attaches_card_photo(draft, household)
+            cover = uses_card_as_cover(draft, household)
             settings = recipe_settings(household, show_assets=attach)
             build = partial(
                 draft_to_recipe,
@@ -1033,11 +1063,12 @@ def _run(
             # a turn a stop left half done is settled first, so the files copied are the ones the pages describe (a
             # committing job has no task, so every page is settled)
             settle_turns(IngestRepos(session, job.group_id, job.household_id), job)
-            _write_files(job, draft, pages, token, attach)
+            _write_files(job, pages, token, attach, cover)
             lease = _renew_lease(session, job, lease)
             linker = IngredientLinker(repos, job.group_id, can_create_foods=bool(user.can_organize))
             organizers = OrganizerMaker(repos, job.group_id) if user.can_organize else None
             recipe, warnings = build(draft, settings=settings, linker=linker, organizers=organizers)
+            recipe = _named(session, job, recipe)
         except _LeaseLost as e:
             # taken over while this caller wrote the files: the new owner finishes the commit
             raise invalid_status(IngestStatus.committing.value) from e
@@ -1055,13 +1086,30 @@ def _run(
             _back_to_ready(session, job, lease, COMMIT_INTERRUPTED, None)
             raise
 
-        # from here on the job never goes back to ready: a failure leaves it committing, to be resumed
-        created = _create_recipe(repos, user, household, translator, recipe)
+        # from here on the job goes back to ready only while no recipe has its id: once one does, a failure leaves it
+        # committing, to be resumed
+        try:
+            created = _create_recipe(repos, user, household, translator, recipe)
+        except Exception as e:
+            session.rollback()
+            if _recipe_exists(session, recipe_id):
+                raise
+            # nothing was created (another recipe took the name and every "(n)" upstream tries meanwhile, or the
+            # insert failed): the card can be committed again rather than resumed into the same failure for good
+            logger.error(f"Recipe card job {job.id}: the recipe couldn't be created ({type(e).__name__})")
+            refusal = _refused(session, job, lease, status.HTTP_409_CONFLICT, COMMIT_INTERRUPTED)
+            if isinstance(e, IntegrityError) or refusal.code != COMMIT_INTERRUPTED:
+                raise refusal from e
+            raise
         slug, name = created.slug, created.name or ""
     else:
         slug, name = existing.slug, existing.name or ""
+        household = get_repositories(session, group_id=job.group_id, household_id=job.household_id).households.get_one(
+            job.household_id
+        )
+        cover = draft is not None and uses_card_as_cover(draft, household)
 
-    _set_cover_key(session, job, draft, slug)
+    _set_cover_key(session, job, cover, slug)
     _mark_card_recipe(session, job)
     published = _finish(session, job, lease, utcnow())
     return _Outcome(recipe_id=recipe_id, slug=slug, name=name, published=published, warnings=warnings)
@@ -1325,6 +1373,22 @@ def _edited_since(recipe: Recipe, committed_at: datetime | None) -> bool:
     return _naive_utc(recipe.date_updated) > _naive_utc(committed_at) + UNCOMMIT_GRACE
 
 
+_COMMIT_COLUMNS = (
+    "draft_version",
+    "recipe_id",
+    "commit_recipe_id",
+    "commit_asset_token",
+    "committed_by",
+    "commit_started_at",
+    "committed_at",
+    "recipe_event_claimed_at",
+    "recipe_event_sent_at",
+    "error_code",
+    "error_params",
+)
+"""What undoing a commit changes on the card besides its status, and puts back when the recipe couldn't be deleted"""
+
+
 def uncommit_job(
     repos: IngestRepos,
     user: PrivateUser,
@@ -1336,13 +1400,16 @@ def uncommit_job(
     background: BackgroundTasks | None = None,
 ) -> RecipeIngestionJobState:
     """
-    Undoes a commit (back to review): deletes the recipe through upstream's recipe service (its files go too, and
-    `recipe_deleted` is published as for any delete), then puts the card back to `ready` with its stored draft in
-    one guarded update, with a new `draft_version` and the commit's ids and times cleared, so its next commit makes a
-    new recipe. For the committer or a household manager, who must also be allowed to delete the recipe (its owner,
-    or an admin). A recipe edited since the commit is a 409 `recipe_edited` unless `force`; one already deleted just
-    lets the card go back. The caller holds the ingest write lock, so the retention purge can't remove the card's
-    files meanwhile.
+    Undoes a commit (back to review): puts the card back to `ready` with its stored draft in one guarded update, with
+    a new `draft_version` and the commit's ids and times cleared, so its next commit makes a new recipe; then deletes
+    the recipe through upstream's recipe service (its files go too, and `recipe_deleted` is published as for any
+    delete). For the committer or a household manager, who must also be allowed to delete the recipe (its owner, or an
+    admin). A recipe edited since the commit is a 409 `recipe_edited` unless `force`; one already deleted just lets the
+    card go back.
+
+    The card's update comes first and is committed with the delete (upstream's delete commits as it goes), so a change
+    to the card meanwhile (the retention purge removing its photos and draft, another undo) leaves the recipe as it is
+    and answers 409; a delete that fails once the card's update is committed puts the card back as it was.
 
     Raises `JobActionError`: 404, 403 `forbidden`, 409 `invalid_status` / `purged` / `recipe_edited`.
     """
@@ -1356,9 +1423,11 @@ def uncommit_job(
         raise JobActionError(status.HTTP_409_CONFLICT, PURGED)
     if job.committed_by != user.id and not user.can_manage_household:
         raise JobActionError(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+    committed = {column: getattr(job, column) for column in _COMMIT_COLUMNS}
 
     recipe_id = job.recipe_id
     recipe = None
+    service: RecipeService | None = None
     if recipe_id is not None:
         recipe = get_repositories(session, group_id=job.group_id, household_id=None).recipes.get_one(recipe_id, "id")
     if recipe is not None:
@@ -1372,17 +1441,7 @@ def uncommit_job(
         if not request.force and _edited_since(recipe, job.committed_at):
             raise JobActionError(status.HTTP_409_CONFLICT, RECIPE_EDITED)
 
-        deleted = service.delete_one(recipe.slug)
-        EventBusService(background, session, translator).dispatch(
-            integration_id=integration_id,
-            group_id=deleted.group_id,
-            household_id=deleted.household_id,
-            event_type=EventTypes.recipe_deleted,
-            document_data=EventRecipeData(operation=EventOperation.delete, recipe_slug=deleted.slug),
-            message=translator.t("notifications.generic-deleted", name=deleted.name),
-        )
-
-    stmt = (
+    back_to_review = (
         sa.update(Job)
         .where(
             Job.id == job_id,
@@ -1392,26 +1451,72 @@ def uncommit_job(
             Job.recipe_id.is_(None) if recipe_id is None else Job.recipe_id == recipe_id,
         )
         .values(
-            status=IngestStatus.ready.value,
-            draft_version=Job.draft_version + 1,
-            recipe_id=None,
-            commit_recipe_id=None,
-            commit_asset_token=None,
-            committed_by=None,
-            commit_started_at=None,
-            committed_at=None,
-            recipe_event_claimed_at=None,
-            recipe_event_sent_at=None,
-            error_code=None,
-            error_params=None,
-            row_version=Job.row_version + 1,
+            {
+                **dict.fromkeys(_COMMIT_COLUMNS[1:]),
+                "status": IngestStatus.ready.value,
+                "draft_version": Job.draft_version + 1,
+                "row_version": Job.row_version + 1,
+            }
         )
     )
-    if not _update(session, stmt):
+    try:
+        moved = _rowcount(session.execute(back_to_review, execution_options={"synchronize_session": False})) == 1
+    except BaseException:
+        session.rollback()
+        raise
+    if not moved:
+        session.rollback()
         current = review.job(job_id)
+        if is_slimmed(current):
+            raise JobActionError(status.HTTP_409_CONFLICT, PURGED)
         if current.status != IngestStatus.ready.value:
             raise invalid_status(current.status)
+        return review.get_state(job_id)  # undone meanwhile
+    if recipe is None or service is None:
+        session.commit()
+        return review.get_state(job_id)
+
+    try:
+        deleted = service.delete_one(recipe.slug)  # commits the card's update with it
+        session.commit()
+    except BaseException:
+        session.rollback()
+        _put_back_committed(session, job_id, recipe_id, committed)
+        raise
+    EventBusService(background, session, translator).dispatch(
+        integration_id=integration_id,
+        group_id=deleted.group_id,
+        household_id=deleted.household_id,
+        event_type=EventTypes.recipe_deleted,
+        document_data=EventRecipeData(operation=EventOperation.delete, recipe_slug=deleted.slug),
+        message=translator.t("notifications.generic-deleted", name=deleted.name),
+    )
     return review.get_state(job_id)
+
+
+def _put_back_committed(session: Session, job_id: UUID, recipe_id: UUID | None, committed: dict[str, Any]) -> None:
+    """
+    An undo whose recipe delete failed after the card's update was committed (upstream's delete commits in steps): the
+    card is committed again as it was, while the recipe is still there and nobody changed the card since
+    """
+    if recipe_id is None or not _recipe_exists(session, recipe_id):
+        return
+    stmt = (
+        sa.update(Job)
+        .where(
+            Job.id == job_id,
+            Job.status == IngestStatus.ready.value,
+            Job.draft_version == committed["draft_version"] + 1,
+            Job.commit_recipe_id.is_(None),
+        )
+        .values({**committed, "status": IngestStatus.committed.value, "row_version": Job.row_version + 1})
+    )
+    try:
+        _update(session, stmt)
+    except Exception as e:
+        logger.error(
+            f"Recipe card job {job_id}: couldn't put the card back after its recipe wasn't deleted ({type(e).__name__})"
+        )
 
 
 def resend_recipe_events(now: datetime) -> int:

@@ -1,9 +1,10 @@
 """
 Intake (docs/ai/PHASE2.md §2): turning one card's uploaded files into a job. Each file gives its pages (a multi-page
-TIFF or a PDF several, a PDF's rendered in a child process before the write lock); inside the ingest write lock they
-are normalized into the new job's directory, then one transaction checks for a duplicate, touches the batch (unsealed
-only) and inserts the job with its extraction queued; the dispatcher is woken. The uploaded bytes never reach
-`DATA_DIR`. Used by the upload route and the inbox.
+TIFF or a PDF several, a PDF's rendered in a child process first, in a render slot rather than an intake slot, so a PDF
+slow to render holds up other PDFs but no photo); inside the ingest write lock they are normalized into the new job's
+directory, then one transaction checks for a duplicate, touches the batch (unsealed only) and inserts the job with its
+extraction queued; the dispatcher is woken. The uploaded bytes never reach `DATA_DIR`. Used by the upload route and the
+inbox.
 
 **One household's intakes take turns.** The transaction starts with the household's intake lock
 (`lock_household_intake`): a transaction-level advisory lock on PostgreSQL, the database's write lock on SQLite (plus
@@ -21,11 +22,15 @@ Public interface:
 - `IntakeAccepted`, `IntakeRejected` (`IntakeOutcome`): what became of the card.
 - `IntakeService(session, group_id, household_id)`: `ingest(card, options, *, confirm=None)` (blocking, takes one of
   the process's intake slots and the write lock; raises `IngestPaused`, `NoEntryFound` for an unknown batch,
-  `ClaimLost`) and `ingest_async(...)`, which waits for a slot on the event loop and runs `ingest` in a worker thread.
+  `ClaimLost`, `QuotaReached`) and `ingest_async(...)`, which waits for a slot on the event loop and runs `ingest` in a
+  worker thread.
+- `QuotaReached`: the group's or the uploader's processing cap (`IntakeOptions.group_cap`, `user_cap`), counted under
+  the household's intake lock (and the group's, `lock_group_cap`, for the group cap), was reached before the insert.
 - `in_intake_slot(work)`: other memory-heavy upload work (a JSON body's decoding) under the same slots, the inbox's
   included.
 - `ClaimLost`: the inbox's claimed file moved away before the insert (another scanner retried it).
-- `lock_household_intake(session, household_id)`: the household's intake lock, held until the transaction ends.
+- `lock_household_intake(session, household_id)`: the household's intake lock, held until the transaction ends;
+  `lock_group_cap(session, group_id)` the group's, taken after it when a card counts against the group cap.
 - `ReadingReadiness` and `reading_readiness(session, group_id, household_id)`: whether the group can read cards, with
   local providers only or at all, its own local-only setting, its processing jobs (the upload's checks 3 and 4,
   and the inbox's), whether the monthly token limits stop a card being read now (the capture page's warning), and
@@ -79,6 +84,16 @@ _intake_limiter = anyio.CapacityLimiter(limits.INTAKE_CONCURRENCY)
 _intake_slots = threading.BoundedSemaphore(limits.INTAKE_CONCURRENCY)
 """The same bound for every caller of `ingest`, the inbox's scan included: one large photo takes hundreds of MB"""
 
+RENDER_CONCURRENCY = 1
+"""PDFs rendered at once per process"""
+_render_limiter = anyio.CapacityLimiter(RENDER_CONCURRENCY)
+"""Uploads whose PDFs wait to be rendered wait on the event loop"""
+_render_slots = threading.BoundedSemaphore(RENDER_CONCURRENCY)
+"""
+The same bound for every caller of `ingest`, apart from the intake slots: a PDF can take `images.PDF_RENDER_TIMEOUT`
+to render (in a process of its own, with its own memory limit), and holds up other PDFs meanwhile, never photos
+"""
+
 
 _household_locks: dict[UUID, threading.Lock] = {}
 """This process's intake lock per household, taken before the database's (`lock_household_intake`)"""
@@ -87,6 +102,17 @@ _household_locks_guard = threading.Lock()
 
 class ClaimLost(Exception):
     """The inbox's claimed file was no longer at its path before the insert: another scanner is retrying it"""
+
+
+class QuotaReached(Exception):
+    """
+    The group already has `IntakeOptions.group_cap` processing jobs (`which` is "group"), or the uploader
+    `IntakeOptions.user_cap` of their own ("user"), counted in the insert's transaction: nothing was inserted
+    """
+
+    def __init__(self, which: Literal["group", "user"]) -> None:
+        super().__init__(f"the {which}'s processing cap is reached")
+        self.which = which
 
 
 def _household_lock(household_id: UUID) -> threading.Lock:
@@ -113,6 +139,20 @@ def lock_household_intake(session: Session, household_id: UUID) -> None:
         return
     batch = RecipeIngestionBatch.__table__
     session.connection().execute(sa.update(batch).where(sa.false()).values(id=batch.c.id))
+
+
+def lock_group_cap(session: Session, group_id: UUID) -> None:
+    """
+    Takes the group's cap lock for the session's transaction, after the household's intake lock (always in that
+    order), so cards of the group's households counted against `IntakeOptions.group_cap` at once can't both pass it.
+    PostgreSQL: `pg_advisory_xact_lock` on the group's key. SQLite: nothing more, the database's write lock that
+    `lock_household_intake` took already serializes every intake.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        digest = hashlib.sha256(b"ai-ingest-group-cap:" + group_id.bytes).digest()
+        session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": int.from_bytes(digest[:8], "big", signed=True)}
+        )
 
 
 @dataclass
@@ -151,6 +191,10 @@ class IntakeOptions:
     allow_duplicate: bool = False
     locale: str | None = None
     integration_id: str | None = None
+    group_cap: int | None = None
+    """Refuse the card (`QuotaReached`) when the group already has this many `processing` jobs, every household's"""
+    user_cap: int | None = None
+    """The same for `created_by`'s own `processing` cards (`AI_INGEST_MAX_PROCESSING_PER_USER`)"""
 
 
 @dataclass(frozen=True)
@@ -169,6 +213,25 @@ class IntakeRejected:
 
 
 IntakeOutcome = IntakeAccepted | IntakeRejected
+
+_Rendered = dict[int, list[images.DocumentPage]]
+"""A card's PDFs' pages, by the file's place in the card"""
+
+
+def _is_pdf(upload: IntakePage) -> bool:
+    upload.file.seek(0)
+    try:
+        return images.sniff(upload.file.read(images.SNIFF_BYTES)) == "pdf"
+    finally:
+        upload.file.seek(0)
+
+
+def _has_pdf(card: IntakeCard) -> bool:
+    return any(_is_pdf(upload) for upload in card.pages)
+
+
+def _close_rendered(rendered: _Rendered) -> None:
+    images.close_pages(page for pages in rendered.values() for page in pages)
 
 
 async def in_intake_slot[T](work: Callable[[], T]) -> T:
@@ -223,14 +286,30 @@ class IntakeService:
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
     ) -> IntakeOutcome:
         """
-        `ingest` from async code: waits for one of the process's intake slots on the event loop, so waiting uploads
-        hold no worker thread, then runs in a worker thread.
+        `ingest` from async code: a card's PDFs are rendered once one of the process's render slots is free, then it
+        waits for one of its intake slots; it waits on the event loop each time, so waiting uploads hold no worker
+        thread, and runs in worker threads.
         """
+        rejected = self._check_card(card)
+        if rejected is not None:
+            return rejected
+        rendered: _Rendered | None = None
+        if await anyio.to_thread.run_sync(_has_pdf, card):
+            rendering = await anyio.to_thread.run_sync(self._render, card, limiter=_render_limiter)
+            if isinstance(rendering, IntakeRejected):
+                return rendering
+            rendered = rendering
 
         def run() -> IntakeOutcome:
-            return self.ingest(card, options, confirm=confirm)  # takes one of `_intake_slots` itself
+            if rendered is None:
+                return self.ingest(card, options, confirm=confirm)  # takes one of `_intake_slots` itself
+            return self._ingest(card, options, confirm, rendered)
 
-        return await anyio.to_thread.run_sync(run, limiter=_intake_limiter)
+        try:
+            return await anyio.to_thread.run_sync(run, limiter=_intake_limiter)
+        finally:
+            if rendered is not None:
+                _close_rendered(rendered)  # also when cancelled while waiting for a slot
 
     def ingest(
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
@@ -238,16 +317,28 @@ class IntakeService:
         """
         Turns one card into a job, holding one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one),
         and the ingest write lock from its directory's creation through the insert. Each file gives its pages first
-        (`images.expand_document`: a multi-page TIFF or a PDF fills several, at most `MAX_PAGES_PER_CARD` in all);
-        then each page is normalized into `pages/<n>/`, and one transaction takes the household's intake lock,
-        chooses and touches the batch (choosing again if it was sealed meanwhile), checks for a duplicate (unless
-        allowed), calls `confirm` (the inbox checks that its claimed file is still there) and inserts the job,
-        `processing` with its extraction queued. The dispatcher is woken.
+        (`images.expand_document`: a multi-page TIFF or a PDF fills several, at most `MAX_PAGES_PER_CARD` in all; a
+        PDF is rendered before the intake slot, in one of the process's render slots); then each page is normalized
+        into `pages/<n>/`, and one transaction takes the household's intake lock, chooses and touches the batch
+        (choosing again if it was sealed meanwhile), checks for a duplicate (unless allowed), calls `confirm` (the
+        inbox checks that its claimed file is still there) and inserts the job, `processing` with its extraction
+        queued. The dispatcher is woken.
 
-        A rejected file or a duplicate is an `IntakeRejected` (naming the file), and leaves nothing on disk. Raises
-        `IngestPaused` (nothing written) while a restore pauses ingestion, `NoEntryFound` for an unknown batch and
-        `ClaimLost` when `confirm` says no. Blocking: call it from a worker thread.
+        A rejected file or a duplicate is an `IntakeRejected` (naming the file: a PDF's refusal comes first), and
+        leaves nothing on disk. Raises `IngestPaused` (nothing written) while a restore pauses ingestion,
+        `NoEntryFound` for an unknown batch, `ClaimLost` when `confirm` says no and `QuotaReached` at a cap the options
+        set (nothing left on disk either). Blocking: call it from a worker thread.
         """
+        rejected = self._check_card(card)
+        if rejected is not None:
+            return rejected
+        rendered = self._render(card)
+        if isinstance(rendered, IntakeRejected):
+            return rendered
+        return self._ingest(card, options, confirm, rendered)
+
+    @staticmethod
+    def _check_card(card: IntakeCard) -> IntakeRejected | None:
         if not card.pages:
             raise ValueError("A card needs at least one page")
         if len(card.pages) > limits.MAX_PAGES_PER_CARD:
@@ -255,42 +346,74 @@ class IntakeService:
             return IntakeRejected(
                 extra.index, images.sanitize_filename(extra.filename), IngestRejectReason.too_many_pages
             )
+        return None
 
+    def _ingest(
+        self, card: IntakeCard, options: IntakeOptions, confirm: Callable[[], bool] | None, rendered: _Rendered
+    ) -> IntakeOutcome:
+        """`ingest` once the card's PDFs are rendered (`_render`); closes their pages"""
         job_id = uuid4()
         accepted = False
-        # the slot first: a restore waiting for the write lock never waits for a card that's waiting for a slot
-        with _intake_slots:
-            # a PDF's pages are rendered before the write lock, which a restore may be waiting for
-            expanded = self._expand(card)
-            if isinstance(expanded, IntakeRejected):
-                return expanded
-            try:
-                with storage.ingest_write():
-                    try:
-                        storage.create_job_dir(self.group_id, job_id, len(expanded))
-                        outcome = self._normalize_and_insert(job_id, card, expanded, options, confirm)
-                        accepted = isinstance(outcome, IntakeAccepted)
-                    finally:
-                        if not accepted:
-                            self._remove_job_dir(job_id)
-            finally:
-                images.close_pages(page for _, page in expanded)
+        try:
+            # the slot first: a restore waiting for the write lock never waits for a card that's waiting for a slot
+            with _intake_slots:
+                expanded = self._expand(card, rendered)
+                if isinstance(expanded, IntakeRejected):
+                    return expanded
+                try:
+                    with storage.ingest_write():
+                        try:
+                            storage.create_job_dir(self.group_id, job_id, len(expanded))
+                            outcome = self._normalize_and_insert(job_id, card, expanded, options, confirm)
+                            accepted = isinstance(outcome, IntakeAccepted)
+                        finally:
+                            if not accepted:
+                                self._remove_job_dir(job_id)
+                finally:
+                    images.close_pages(page for _, page in expanded)
+        finally:
+            _close_rendered(rendered)
 
         if accepted:
             _wake_dispatcher()
         return outcome
 
     @staticmethod
-    def _expand(card: IntakeCard) -> list[tuple[IntakePage, images.DocumentPage]] | IntakeRejected:
+    def _render(card: IntakeCard) -> _Rendered | IntakeRejected:
         """
-        The card's pages in order, each uploaded file's own (`images.expand_document`: a multi-page TIFF or a PDF
-        gives several), with the file each came from; or the rejection of the first file that can't be used, or that
-        takes the card over `MAX_PAGES_PER_CARD` pages
+        The card's PDFs' pages (`images.expand_document`), each PDF rendered in one of the process's render slots
+        (waiting for one) and before the write lock, which a restore may be waiting for; or the rejection of the
+        first that can't be rendered, or that takes the card over `MAX_PAGES_PER_CARD` pages. Empty without a PDF.
+        """
+        rendered: _Rendered = {}
+        try:
+            for position, upload in enumerate(card.pages):
+                if not _is_pdf(upload):
+                    continue
+                with _render_slots:
+                    rendered[position] = images.expand_document(upload.file)
+                if sum(len(pages) for pages in rendered.values()) > limits.MAX_PAGES_PER_CARD:
+                    raise images.PageRejected(IngestRejectReason.too_many_pages)
+        except images.PageRejected as e:
+            _close_rendered(rendered)
+            return IntakeRejected(upload.index, images.sanitize_filename(upload.filename), e.reason)
+        except BaseException:
+            _close_rendered(rendered)
+            raise
+        return rendered
+
+    @staticmethod
+    def _expand(card: IntakeCard, rendered: _Rendered) -> list[tuple[IntakePage, images.DocumentPage]] | IntakeRejected:
+        """
+        The card's pages in order, each uploaded file's own (`images.expand_document`: a multi-page TIFF gives
+        several; a PDF's are `rendered` already), with the file each came from; or the rejection of the first file
+        that can't be used, or that takes the card over `MAX_PAGES_PER_CARD` pages
         """
         expanded: list[tuple[IntakePage, images.DocumentPage]] = []
         try:
-            for upload in card.pages:
-                expanded += [(upload, page) for page in images.expand_document(upload.file)]
+            for position, upload in enumerate(card.pages):
+                pages = rendered[position] if position in rendered else images.expand_document(upload.file)
+                expanded += [(upload, page) for page in pages]
                 if len(expanded) > limits.MAX_PAGES_PER_CARD:
                     raise images.PageRejected(IngestRejectReason.too_many_pages)
         except images.PageRejected as e:
@@ -363,6 +486,12 @@ class IntakeService:
             # first in the transaction: waits for another intake of the household to commit, so everything read
             # below (the open batch, a duplicate, the next position) includes its rows
             lock_household_intake(session, self.household_id)
+            if options.group_cap is not None:
+                lock_group_cap(session, self.group_id)  # another household's upload counts for the group too
+            # the caps as they are now: an upload checked them before its body arrived, and another upload of the
+            # household (the same user's, say) or the group may have inserted since; the locks make this count and the
+            # insert one
+            self._check_caps(repos, options)
             now = utcnow()
             batch_id = self._join_batch(repos, options, now)
 
@@ -415,6 +544,18 @@ class IntakeService:
             raise
 
         return IntakeAccepted(job_id=job_id, batch_id=batch_id, page_count=len(pages))
+
+    @staticmethod
+    def _check_caps(repos: IngestRepos, options: IntakeOptions) -> None:
+        """`QuotaReached` when the group, or the uploader, is at a cap the options set"""
+        if options.group_cap is not None and repos.processing_jobs_in_group() >= options.group_cap:
+            raise QuotaReached("group")
+        if (
+            options.user_cap is not None
+            and options.created_by is not None
+            and repos.jobs.count_processing_by_user(options.created_by) >= options.user_cap
+        ):
+            raise QuotaReached("user")
 
     def _join_batch(self, repos: IngestRepos, options: IntakeOptions, now: datetime) -> UUID:
         """

@@ -29,7 +29,12 @@ import {
 } from "../use-recipe-ingest-uploads";
 import type { DraftCard, UploadQueueAction, UploadQueueState } from "../use-recipe-ingest-uploads";
 import { classicPdf, file, objectStreamPdf, tiff } from "./use-recipe-ingest-files.fixtures";
-import { resetRecipeIngestCounts, useRecipeIngestCounts } from "../use-recipe-ingest";
+import {
+  onRecipeIngestLogout,
+  resetRecipeIngestCounts,
+  setRecipeIngestSessionCheck,
+  useRecipeIngestCounts,
+} from "../use-recipe-ingest";
 import { clearComposableCaches } from "../use-clear-composable-caches";
 import { carryReviewNotice, takeCarriedReviewNotice } from "../use-recipe-ingest-review";
 import { memoryUploadStorage } from "../use-recipe-ingest-upload-storage";
@@ -1487,6 +1492,47 @@ describe("the queue kept on this device", () => {
     expect(queue.storageFailed.value).toBe(false);
     vi.restoreAllMocks();
   });
+
+  test("storage that fills up later: cards stored before that upload are deleted from it, so the next visit doesn't send them again", async () => {
+    const storage = memoryUploadStorage();
+    const save = storage.save;
+    // the write with the third photo goes over the quota, as a whole (an IndexedDB transaction)
+    storage.save = vi.fn((change, tab) => ([...change.putPhotos.values()].some(p => (p as File).name === "two.jpg")
+      ? Promise.reject(new DOMException("Quota exceeded", "QuotaExceededError"))
+      : save(change, tab)));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const answers = new Map<string, (value: unknown) => void>();
+    api.upload.mockImplementation((photos: File[]) => new Promise(resolve => answers.set(photos[0]!.name, resolve)));
+    const queue = useRecipeIngestUploads();
+    await queue.connect("u1", () => storage);
+
+    queue.takePhoto(photo("kept.jpg"));
+    await flushPromises();
+    queue.takePhoto(photo("one.jpg"));
+    await flushPromises();
+    queue.takePhoto(photo("two.jpg"));
+    await flushPromises();
+    expect(queue.storageFailed.value).toBe(true);
+    expect([...storage.records.keys()].filter(key => key.startsWith("card:"))).toHaveLength(2);
+
+    // the cards upload (two at a time); the first never answers (still on its way when the page closes)
+    answers.get("one.jpg")!({ data: accepted("b1", "j1"), error: null, response: null });
+    await flushPromises();
+    answers.get("two.jpg")!({ data: accepted("b1", "j2"), error: null, response: null });
+    await flushPromises();
+    expect([...storage.records.keys()].filter(key => key.startsWith("card:"))).toHaveLength(1);
+    expect(storage.photos.size).toBe(1);
+
+    // the next visit sends only the card that was still on its way
+    resetRecipeIngestUploads();
+    api.upload.mockReset();
+    api.upload.mockImplementation(() => ok(accepted()));
+    const after = useRecipeIngestUploads();
+    await after.connect("u1", () => storage);
+    await flushPromises();
+    expect(uploadedPhotos().map(sent => sent.map(file => (file as File).name))).toEqual([["kept.jpg"]]);
+    vi.restoreAllMocks();
+  });
 });
 
 // ==========================================
@@ -1530,6 +1576,56 @@ describe("logging out", () => {
 
     await prepareRecipeIngestLogout();
     expect(api.sealBatch).toHaveBeenCalledExactlyOnceWith("b1", { suppressAlert: true });
+  });
+
+  test("a review page's edit not saved yet is saved first, while the session is still there", async () => {
+    const saved = deferred<undefined>();
+    const save = vi.fn(() => saved.promise);
+    const stop = onRecipeIngestLogout(save);
+    let finished = false;
+    void prepareRecipeIngestLogout().then(() => {
+      finished = true;
+    });
+    await flushPromises();
+    expect(save).toHaveBeenCalledOnce();
+    expect(finished).toBe(false);
+
+    saved.resolve(undefined);
+    await flushPromises();
+    expect(finished).toBe(true);
+    stop();
+    await prepareRecipeIngestLogout();
+    expect(save).toHaveBeenCalledOnce();
+  });
+
+  test("a save that doesn't answer doesn't hold the logout up either", async () => {
+    vi.useFakeTimers();
+    const stop = onRecipeIngestLogout(() => new Promise(() => {}));
+    let finished = false;
+    void prepareRecipeIngestLogout(3000).then(() => {
+      finished = true;
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(finished).toBe(true);
+    stop();
+  });
+
+  test("photos pending ask before the page is left, unless the session has gone (an expired session's redirect)", async () => {
+    api.upload.mockImplementation(() => new Promise(() => {}));
+    const queue = useRecipeIngestUploads();
+    queue.takePhoto(photo());
+    await flushPromises();
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    let signedIn = true;
+    setRecipeIngestSessionCheck(() => signedIn);
+    expect(leave()).toBe(true);
+    signedIn = false;
+    expect(leave()).toBe(false);
+    setRecipeIngestSessionCheck(null);
   });
 
   test("a sealing server that doesn't answer doesn't hold the logout up", async () => {

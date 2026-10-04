@@ -100,23 +100,50 @@
         {{ $t("recipe-ingest.capture.limit-reached", { date: dateText(nextLimitReset(), true) }) }}
       </v-alert>
       <!-- cards are read, but an optional part of the read is skipped this month: a soft note, not a warning -->
-      <p v-if="limitedFeatures.length" class="limited-features text-caption text-medium-emphasis mb-3">
+      <p v-if="limitedFeatures.length" class="limited-features text-body-small text-medium-emphasis mb-3">
         <span v-for="feature in limitedFeatures" :key="feature" class="limited-feature d-block">
           {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
         </span>
       </p>
-      <IngestPrivacyChip
-        v-model:local-only="localOnly"
-        class="mb-3 mb-sm-4"
-        :settings="settings"
-        :already-sent="sentBeforeLocalOnlyChange"
-        :finished-batch="localOnlyFinishedBatch"
-      />
-      <IngestCapture v-if="!localOnlyBlocked" :max-pages-per-card="settings?.limits?.maxPagesPerCard" />
+      <!-- another tab of this browser keeps the user's queue (it uploads it): this one only says so, and can take it -->
+      <v-alert
+        v-if="queueElsewhere"
+        class="queue-elsewhere mb-4"
+        type="info"
+        variant="tonal"
+      >
+        {{ $t("recipe-ingest.capture.queue-elsewhere") }}
+        <template #append>
+          <v-btn
+            class="use-this-tab"
+            size="small"
+            variant="text"
+            :loading="takingOver"
+            @click="useThisTab"
+          >
+            {{ $t("recipe-ingest.capture.use-this-tab") }}
+          </v-btn>
+        </template>
+      </v-alert>
+      <template v-else>
+        <IngestPrivacyChip
+          v-model:local-only="localOnly"
+          class="mb-3 mb-sm-4"
+          :settings="settings"
+          :already-sent="sentBeforeLocalOnlyChange"
+          :finished-batch="localOnlyFinishedBatch"
+        />
+        <IngestCapture v-if="!localOnlyBlocked" :max-pages-per-card="settings?.limits?.maxPagesPerCard" />
+      </template>
       <IngestUploadQueue class="mt-4" :group-slug="groupSlug" />
     </section>
+    <!--
+      without the capture section (scanning off, no reader, settings that didn't load), photos already queued still show
+      here: their uploads fail until cards can be read, and Retry or Remove is how the user gets them out
+    -->
+    <IngestUploadQueue v-if="queueWithoutCapture" class="upload-queue-alone mb-6" :group-slug="groupSlug" />
 
-    <p v-if="inboxFolder" class="inbox-hint text-body-2 text-medium-emphasis mb-6">
+    <p v-if="inboxFolder" class="inbox-hint text-body-medium text-medium-emphasis mb-6">
       {{ $t("recipe-ingest.settings.inbox-hint", { folder: inboxFolder }) }}
     </p>
     <!-- photos waiting in the household's inbox folder and why, and the ones it refused lately -->
@@ -144,7 +171,8 @@ import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads"
  * named can't be opened. It warns when nothing on the server reads cards, notes optional parts of the read a monthly
  * limit skips, and shows the household's inbox: photos waiting there and why, and the ones it refused. Those change
  * by themselves, so while the page is visible the settings are asked again every minute, and on coming back to it.
- * Fork-owned.
+ * When another tab of this browser keeps the user's upload queue, the page says so instead of capturing, with "Use this
+ * tab". Fork-owned.
  */
 definePageMeta({
   middleware: ["group-only"],
@@ -169,7 +197,14 @@ const {
   loadFailed: settingsLoadFailed,
   load: loadSettings,
 } = useRecipeIngestSettings();
-const { localOnly, sentBeforeLocalOnlyChange, localOnlyFinishedBatch, openCardsPage } = useRecipeIngestUploads();
+const {
+  localOnly,
+  sentBeforeLocalOnlyChange,
+  localOnlyFinishedBatch,
+  openCardsPage,
+  queueElsewhere,
+  takeOverQueue,
+} = useRecipeIngestUploads();
 const { dateText } = useRecipeIngestText();
 
 /** While the page is visible, the settings (the reader, the inbox) are asked again this often */
@@ -185,7 +220,29 @@ const localOnlyBlocked = computed(() => !!settings.value?.localOnly && !settings
 const inboxFolder = computed(() => (settings.value?.inbox?.enabled && settings.value.inbox.folder) || null);
 /** The list waits for the settings, unless they failed to load (it then says itself whether it can load) */
 const showList = computed(() => (settingsLoaded.value ? settings.value?.enabled !== false : settingsLoadFailed.value));
+/** The capture section, with its upload queue, is shown: the alerts above it say why it isn't */
+const showCapture = computed(() => {
+  if (settingsLoaded.value && (settings.value?.enabled === false || !canReadCards.value)) {
+    return false;
+  }
+  return !(settingsLoadFailed.value && !settingsLoaded.value) && canReadCards.value;
+});
+/** Once the settings have answered (or failed to), the queue shows without the capture section */
+const queueWithoutCapture = computed(() => !showCapture.value && (settingsLoaded.value || settingsLoadFailed.value));
 const batchUnavailable = computed(() => route.query.unavailable === "1");
+
+/** "Use this tab" is waiting for the other tab to hand the queue over */
+const takingOver = ref(false);
+
+async function useThisTab() {
+  takingOver.value = true;
+  try {
+    await takeOverQueue();
+  }
+  finally {
+    takingOver.value = false;
+  }
+}
 
 function dismissBatchUnavailable() {
   const { unavailable: _unavailable, ...query } = route.query;

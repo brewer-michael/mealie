@@ -2,6 +2,7 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { ref } from "vue";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import GroupRecipeCardSettings from "./GroupRecipeCardSettings.vue";
+import BaseDialog from "~/components/global/BaseDialog.vue";
 import { resetRecipeIngestSettings, useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
 import type { EvalCaseSummary, RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 
@@ -78,16 +79,38 @@ function failure(status: number | null, detail: Record<string, unknown> = {}) {
 const slot = (tag = "div", className = "") => ({ template: `<${tag} class="${className}"><slot /></${tag}>` });
 const wrappers: VueWrapper[] = [];
 
-async function mountSettings() {
+/**
+ * The real BaseDialog, on an overlay that hears every key pressed inside it as Vuetify's does, with its Cancel and
+ * Confirm buttons: what Enter does there is the dialog's to say
+ */
+const realDialog = {
+  BaseDialog,
+  VDialog: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  VBottomSheet: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  BaseDialogContent: {
+    props: ["title", "canConfirm"],
+    emits: ["cancel", "confirm"],
+    template: `
+      <div class="confirm-dialog" :data-title="title">
+        <slot />
+        <button type="button" class="dialog-cancel" @click="$emit('cancel')">Cancel</button>
+        <button v-if="canConfirm" type="button" class="dialog-confirm" @click="$emit('confirm')">Confirm</button>
+      </div>
+    `,
+  },
+};
+
+async function mountSettings(dialogStubs: Record<string, unknown> = {}) {
   const wrapper = mount(GroupRecipeCardSettings, {
     global: {
-      mocks: { $globals: { icons: { delete: "delete", alertCircle: "alert" } } },
+      mocks: { $globals: { icons: { delete: "delete", alertCircle: "alert" } }, $vuetify: { display: { xs: false } } },
       stubs: {
+        ...dialogStubs,
         BaseCardSectionTitle: {
           props: ["title"],
           template: "<h3>{{ title }}</h3>",
         },
-        BaseDialog: {
+        BaseDialog: dialogStubs.BaseDialog ?? {
           props: ["modelValue", "title"],
           emits: ["confirm", "update:modelValue"],
           template: `
@@ -570,6 +593,24 @@ describe("GroupRecipeCardSettings", () => {
     expect(api.deleteEvalCase).toHaveBeenCalledExactlyOnceWith("banana-mug-cake");
     expect(wrapper.findAll(".eval-case").map(item => item.get(".item-title").text())).toEqual(["fudge"]);
     expect(toast.success).toHaveBeenCalledExactlyOnceWith("Eval case deleted");
+  });
+
+  test("Enter on the delete question's Cancel doesn't delete the eval case", async () => {
+    api.deleteEvalCase.mockResolvedValue({ data: null, error: null });
+    const wrapper = await mountSettings(realDialog);
+
+    await button(wrapper, "Delete", ".eval-case").trigger("click");
+    // a keyboard user on Cancel presses Enter (the browser then clicks Cancel)
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(api.deleteEvalCase).not.toHaveBeenCalled();
+    await wrapper.get(".confirm-dialog .dialog-cancel").trigger("click");
+    expect(wrapper.find(".confirm-dialog").exists()).toBe(false);
+
+    await button(wrapper, "Delete", ".eval-case").trigger("click");
+    await wrapper.get(".confirm-dialog .dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(api.deleteEvalCase).toHaveBeenCalledExactlyOnceWith("banana-mug-cake");
   });
 
   test("deleting a case that's already gone shows the list as it is now", async () => {

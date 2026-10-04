@@ -4,7 +4,7 @@
     class="ingest-needs-a-look"
     variant="outlined"
   >
-    <v-card-title class="d-flex align-center text-subtitle-1 font-weight-medium">
+    <v-card-title class="d-flex align-center text-title-medium font-weight-medium">
       <v-icon
         class="mr-2"
         size="small"

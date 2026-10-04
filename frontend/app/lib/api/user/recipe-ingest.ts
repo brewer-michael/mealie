@@ -385,7 +385,10 @@ export class RecipeIngestAPI extends BaseAPI {
     );
   }
 
-  /** 204 when the notifier got it; 502 `notification_failed` when it didn't (Apprise or the service refused) */
+  /**
+   * 204 when the notifier got it; 502 `notification_failed` when it didn't (Apprise or the service refused), for
+   * household or group managers and admins only (others always get 204)
+   */
   async testNotifierEvents(notifierId: string, config: RecipeIngestRequestConfig = {}) {
     return await this.requests.post<null>(routes.notifiersIdEventsTest(notifierId), {}, requestOptions(config));
   }

@@ -9,10 +9,11 @@
     :loading="saving"
     can-submit
     keep-open
+    disable-submit-on-enter
     @submit="save"
   >
     <v-card-text class="ingest-eval-dialog">
-      <p class="text-body-2 mb-4">
+      <p class="text-body-medium mb-4">
         {{ $t("recipe-ingest.eval.description") }}
       </p>
       <v-text-field
@@ -24,6 +25,7 @@
         :error-messages="slugError"
         autocapitalize="off"
         spellcheck="false"
+        @keydown.enter="saveOnEnter"
       />
       <v-checkbox
         v-model="verified"
@@ -31,7 +33,7 @@
         :label="$t('recipe-ingest.eval.verified')"
       />
       <!-- what the card is like, which the eval report groups scores by -->
-      <p id="ingest-eval-tags-label" class="text-body-2 mt-2 mb-1">
+      <p id="ingest-eval-tags-label" class="text-body-medium mt-2 mb-1">
         {{ $t("recipe-ingest.review.eval-tags") }}
       </p>
       <v-chip-group
@@ -123,6 +125,13 @@ const slugError = computed(() => {
   }
   return slug.value && !EVAL_CASE_SLUG.test(slug.value) ? i18n.t("recipe-ingest.eval.slug-hint") : "";
 });
+
+// Return saves from the name only: in the notes it starts a new line (the dialog doesn't submit on Enter)
+function saveOnEnter(event: KeyboardEvent) {
+  if (!event.isComposing) {
+    save();
+  }
+}
 
 function save() {
   if (valid.value && !props.saving) {

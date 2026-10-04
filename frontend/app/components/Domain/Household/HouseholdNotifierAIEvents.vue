@@ -65,6 +65,7 @@
 
 <script setup lang="ts">
 import { useUserApi } from "~/composables/api";
+import { useMealieAuth } from "~/composables/use-mealie-auth";
 import { errorCodeOf, errorStatusOf, useRecipeIngestSettings, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import { alert } from "~/composables/use-toast";
 
@@ -72,8 +73,9 @@ import { alert } from "~/composables/use-toast";
  * A household notifier's "Recipe cards ready to review" switch and its test notification (docs/ai/PHASE2.md §8), on
  * the notifiers page under each notifier's options. The switch is the fork's own option, saved on its own, and says
  * so. The test's outcome shows under its button: sent, or why it failed (the notifier didn't get it: 502
- * `notification_failed`). While BASE_URL is left at a local address, it warns that the links won't open on a phone.
- * Fork-owned.
+ * `notification_failed`, which the server tells household or group managers and admins only; anyone else gets 204
+ * whatever happened, so they're told it was sent, not that it arrived). While BASE_URL is left at a local address, it
+ * warns that the links won't open on a phone. Fork-owned.
  */
 const props = defineProps<{
   notifierId: string;
@@ -81,8 +83,15 @@ const props = defineProps<{
 
 const api = useUserApi();
 const i18n = useI18n();
+const auth = useMealieAuth();
 const { ingestErrorText } = useRecipeIngestText();
 const ingestSettings = useRecipeIngestSettings();
+
+/** Whether the server says when a test wasn't delivered (502): to household or group managers and admins only */
+const seesDelivery = computed(() => {
+  const user = auth.user.value;
+  return !!(user?.canManageHousehold || user?.canManage || user?.admin);
+});
 
 const recipeCardsReady = ref(false);
 const loaded = ref(false);
@@ -163,7 +172,7 @@ async function sendTest() {
     const { error } = await api.recipeIngest.testNotifierEvents(props.notifierId, { suppressAlert: true });
     testResult.value = error
       ? { ok: false, text: i18n.t("recipe-ingest.notifier.test-failed", { reason: testFailure(error) }) }
-      : { ok: true, text: i18n.t("recipe-ingest.notifier.test-sent") };
+      : { ok: true, text: i18n.t(seesDelivery.value ? "recipe-ingest.notifier.test-sent" : "recipe-ingest.notifier.test-sent-unchecked") };
   }
   finally {
     testing.value = false;

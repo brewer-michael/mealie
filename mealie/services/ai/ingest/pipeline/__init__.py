@@ -156,19 +156,21 @@ def _description(description: str, attribution: str | None) -> str:
     """
     The description without the attribution the build step may have copied into it, despite its rules (the reader
     keeps "From Grandma Jo" in the transcription): dropped when it says only that, ignoring case, punctuation and a
-    leading "From"; a first or last sentence that says only that is taken off
+    leading "From"; a first or last sentence that says only that is taken off, with the space or line break that
+    parted it from the rest. The rest is kept as written, its line breaks too.
     """
     key = _comparable(attribution or "")
     if not key or not description.strip():
         return description
     if _comparable(description) == key:
         return ""
-    sentences = re.split(r"(?<=[.!?])\s+", description.strip())
-    if sentences and _comparable(sentences[-1]) == key:
-        sentences.pop()
-    if sentences and _comparable(sentences[0]) == key:
-        sentences.pop(0)
-    return " ".join(sentences)
+    pieces = re.split(r"((?<=[.!?])\s+)", description.strip())  # sentence, what parts it from the next, sentence, ...
+    start, end = 0, len(pieces)
+    if _comparable(pieces[end - 1]) == key:
+        end -= 2  # the last sentence, and what parts it from the one before
+    if end > start and _comparable(pieces[start]) == key:
+        start += 2  # the first sentence, and what parts it from the one after
+    return "".join(pieces[start:end])
 
 
 def _draft(

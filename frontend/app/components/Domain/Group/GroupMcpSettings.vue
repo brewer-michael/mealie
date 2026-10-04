@@ -26,7 +26,7 @@
       </template>
     </v-text-field>
     <!-- API tokens are behind the profile's "Show advanced features" -->
-    <i18n-t keypath="mcp.api-token-note" tag="p" class="text-caption text-medium-emphasis mb-6 api-token-note">
+    <i18n-t keypath="mcp.api-token-note" tag="p" class="text-body-small text-medium-emphasis mb-6 api-token-note">
       <template #tokens>
         <nuxt-link to="/user/profile/api-tokens">{{ $t("mcp.api-token-note-tokens") }}</nuxt-link>
       </template>
@@ -41,7 +41,7 @@
       variant="outlined"
       class="mb-6 new-secret"
     >
-      <v-card-title tag="h4" class="text-subtitle-1 text-wrap">
+      <v-card-title tag="h4" class="text-title-medium text-wrap">
         {{ $t("mcp.new-secret-title", { name: newSecret.clientName }) }}
       </v-card-title>
       <v-card-text>
@@ -90,7 +90,7 @@
             />
           </template>
         </v-text-field>
-        <p class="text-body-2 mb-0">
+        <p class="text-body-medium mb-0">
           {{ $t("mcp.new-secret-instructions") }}
         </p>
       </v-card-text>
@@ -114,11 +114,11 @@
         />
       </template>
     </BaseCardSectionTitle>
-    <p class="text-body-2 mb-4">
+    <p class="text-body-medium mb-4">
       {{ $t("mcp.oauth-clients-description") }}
     </p>
     <!-- Another secret would replace the one shown before it's been copied -->
-    <div v-if="newSecret" class="text-body-2 font-weight-medium mt-2 mb-4 secret-pending">
+    <div v-if="newSecret" class="text-body-medium font-weight-medium mt-2 mb-4 secret-pending">
       {{ $t("mcp.secret-pending") }}
     </div>
 
@@ -138,7 +138,7 @@
       </div>
     </v-alert>
     <AppLoader v-if="!loaded && loading" />
-    <p v-else-if="loaded && !clients.length" class="text-body-2 text-medium-emphasis no-clients">
+    <p v-else-if="loaded && !clients.length" class="text-body-medium text-medium-emphasis no-clients">
       {{ $t("mcp.no-clients") }}
     </p>
 
@@ -149,7 +149,7 @@
       class="mb-4 mcp-client"
     >
       <v-card-item>
-        <v-card-title tag="h4" class="text-subtitle-1">
+        <v-card-title tag="h4" class="text-title-medium">
           {{ client.name }}
         </v-card-title>
         <v-card-subtitle class="text-wrap">

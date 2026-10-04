@@ -85,8 +85,11 @@ class CardDraft(MealieModel):
     total_time: str | None = None
     attribution: str | None = None
     """Who the recipe is from, exactly as on the card ("From Grandma Jo"); becomes a note titled "From" at commit"""
-    use_card_as_cover: bool = True
-    """Whether commit makes the front of the card the recipe's image"""
+    use_card_as_cover: bool | None = None
+    """
+    Whether commit makes the front of the card the recipe's image; None means the household's default (the card is the
+    image unless the household's recipes are public: the image is served without a login, like the assets)
+    """
     attach_card_photo: bool | None = None
     """
     Whether commit attaches the card's photos to the recipe as assets; None means the household's default (attached

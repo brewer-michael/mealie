@@ -3,11 +3,15 @@ Saving reviewed cards as eval cases, and managing them (docs/ai/PHASE2.md §9, �
 
 Cases live in `DATA_DIR/groups/<group_id>/eval-cards/`, the group's private eval set that
 `python -m mealie.scripts.eval_recipe_cards --cards …` reads. The job is looked up in the manager's own household, like
-every other job route; the list, update, download and delete cover the whole group's set. Saving, updating, deleting
-and downloading touch files under `groups/`, so they run in the ingest write section and answer 503 while a backup
-restore pauses ingestion.
+every other job route; the list, update, download and delete cover the cases saved from that household's cards and
+the ones added by hand: another household's case is not found (an admin sees every case, `_viewer`). Saving, updating,
+deleting and downloading touch files under `groups/`, so they run in the ingest write section and answer 503 while a
+backup restore pauses ingestion.
 """
 
+from uuid import UUID
+
+import sqlalchemy as sa
 from fastapi import APIRouter, Path, Response, status
 from pydantic import UUID4
 
@@ -68,10 +72,31 @@ class RecipeIngestEvalCasesController(IngestController):
             raise ingest_error(status.HTTP_409_CONFLICT, BUSY)
         return job
 
+    def _viewer(self) -> eval_export.EvalCaseViewer:
+        """The manager's view of the cases: their household's and the ones added by hand; every one for an admin"""
+        if self.user.admin:
+            return eval_export.EvalCaseViewer.everyone()
+        job_households: dict[str, UUID] = {}
+        legacy = []
+        for job_id in eval_export.legacy_case_job_ids(self.group_id):
+            try:
+                legacy.append(UUID(job_id))
+            except ValueError:
+                continue
+        if legacy:
+            rows = self.session.execute(
+                sa.select(RecipeIngestionJob.id, RecipeIngestionJob.household_id).where(
+                    RecipeIngestionJob.group_id == self.group_id, RecipeIngestionJob.id.in_(legacy)
+                )
+            )
+            job_households = {str(job_id): household_id for job_id, household_id in rows}
+            self.session.commit()
+        return eval_export.EvalCaseViewer(household_id=self.household_id, job_households=job_households)
+
     @router.get("/eval-cases", response_model=list[EvalCaseSummary])
     def list_eval_cases(self) -> list[EvalCaseSummary]:
         self.checks.can_manage()
-        return eval_export.list_eval_cases(self.group_id)
+        return eval_export.list_eval_cases(self.group_id, self._viewer())
 
     @router.put("/eval-cases/{slug}", response_model=EvalCaseSummary)
     def update_eval_case(
@@ -83,7 +108,7 @@ class RecipeIngestEvalCasesController(IngestController):
 
         try:
             with write_section(self.translator):
-                summary = eval_export.update_eval_case(self.group_id, slug, data)
+                summary = eval_export.update_eval_case(self.group_id, slug, data, self._viewer())
         except eval_export.EvalCaseError as e:
             raise ingest_error(status.HTTP_409_CONFLICT, e.code) from e
         if summary is None:
@@ -101,7 +126,7 @@ class RecipeIngestEvalCasesController(IngestController):
         require_not_paused(self.translator)
 
         with write_section(self.translator):
-            archive = eval_export.eval_case_archive(self.group_id, slug)
+            archive = eval_export.eval_case_archive(self.group_id, slug, self._viewer())
         if archive is None:
             raise ingest_error(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         return Response(
@@ -120,6 +145,6 @@ class RecipeIngestEvalCasesController(IngestController):
         require_not_paused(self.translator)
 
         with write_section(self.translator):
-            deleted = eval_export.delete_eval_case(self.group_id, slug)
+            deleted = eval_export.delete_eval_case(self.group_id, slug, self._viewer())
         if not deleted:
             raise ingest_error(status.HTTP_404_NOT_FOUND, NOT_FOUND)

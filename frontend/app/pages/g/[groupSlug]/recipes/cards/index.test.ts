@@ -6,7 +6,8 @@ import { resetRecipeIngestSettings } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({ getSettings: vi.fn() }));
-const uploads = vi.hoisted(() => ({ closeCardsPage: vi.fn(), openCardsPage: vi.fn() }));
+const uploads = vi.hoisted(() => ({ closeCardsPage: vi.fn(), openCardsPage: vi.fn(), takeOverQueue: vi.fn() }));
+const queueElsewhere = ref(false);
 
 vi.mock("~/composables/api", () => ({
   useUserApi: () => ({ recipeIngest: api }),
@@ -18,6 +19,8 @@ vi.mock("~/composables/use-recipe-ingest-uploads", async importOriginal => ({
     sentBeforeLocalOnlyChange: ref(0),
     localOnlyFinishedBatch: ref(false),
     openCardsPage: uploads.openCardsPage,
+    queueElsewhere,
+    takeOverQueue: uploads.takeOverQueue,
   }),
 }));
 
@@ -92,6 +95,8 @@ describe("the recipe cards page", () => {
     resetRecipeIngestSettings();
     route.query = {};
     uploads.openCardsPage.mockReturnValue(uploads.closeCardsPage);
+    uploads.takeOverQueue.mockResolvedValue(undefined);
+    queueElsewhere.value = false;
     vi.stubGlobal("definePageMeta", vi.fn());
     vi.stubGlobal("useSeoMeta", vi.fn());
     vi.stubGlobal("useRoute", () => route);
@@ -308,5 +313,51 @@ describe("the recipe cards page", () => {
 
     expect(wrapper.get(".cannot-read").text()).toContain("A group manager can set it up in the group settings.");
     expect(wrapper.find(".capture-buttons").exists()).toBe(false);
+  });
+
+  test.each([
+    ["the group can't read cards", () => ({ data: settings({ canReadCards: false }), error: null })],
+    ["scanning is turned off on the server", () => ({ data: settings({ enabled: false, canReadCards: false }), error: null })],
+    ["the settings didn't load", () => ({ data: null, error: { message: "Network Error" } })],
+  ])("photos already queued still show when %s, so their Retry and Remove can be reached", async (_name, answer) => {
+    api.getSettings.mockResolvedValue(answer());
+    const wrapper = await mountPage();
+
+    expect(wrapper.find(".capture-buttons").exists()).toBe(false);
+    expect(wrapper.findAll(".upload-queue")).toHaveLength(1);
+  });
+
+  test("while another tab keeps the queue, the page says so instead of capturing, and Use this tab takes it", async () => {
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    queueElsewhere.value = true;
+    const wrapper = await mountPage();
+
+    expect(wrapper.get(".queue-elsewhere").text()).toContain(
+      "Your recipe cards are being added in another tab of this browser. Carry on there, or use this tab instead.",
+    );
+    expect(wrapper.find(".capture-buttons").exists()).toBe(false);
+    expect(wrapper.find(".privacy-chip").exists()).toBe(false);
+
+    await wrapper.get(".queue-elsewhere .btn").trigger("click");
+    expect(uploads.takeOverQueue).toHaveBeenCalledOnce();
+    // the other tab hands it over
+    queueElsewhere.value = false;
+    await flushPromises();
+    expect(wrapper.find(".queue-elsewhere").exists()).toBe(false);
+    expect(wrapper.find(".capture-buttons").exists()).toBe(true);
+  });
+
+  test("the queue shows once: under the capture buttons when they're there, not before the settings answer", async () => {
+    let answer: (value: unknown) => void = () => {};
+    api.getSettings.mockReturnValue(new Promise((resolve) => {
+      answer = resolve;
+    }));
+    const wrapper = await mountPage();
+    expect(wrapper.find(".upload-queue").exists()).toBe(false);
+
+    answer({ data: settings(), error: null });
+    await flushPromises();
+    expect(wrapper.findAll(".upload-queue")).toHaveLength(1);
+    expect(wrapper.find(".capture .upload-queue").exists()).toBe(true);
   });
 });

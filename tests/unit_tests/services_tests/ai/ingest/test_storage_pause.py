@@ -791,7 +791,9 @@ def test_where_data_dir_has_no_locks_a_shared_local_lock_is_used(
         path = storage.lock_path()
         assert storage.lock_path() == path  # decided once
     digest = hashlib.sha1(str(data_dir.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
-    assert path == storage.FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{digest}.lock"
+    folder = storage.FALLBACK_LOCK_DIR / f"mealie-ai-ingest-{os.geteuid()}"
+    assert path == folder / f"mealie-ai-ingest-{digest}.lock"
+    assert folder.stat().st_mode & 0o777 == 0o700  # this user's own: nobody else can create the lock first
     assert storage.restore_lock_path() == path.with_name(f"{path.name}{storage.RESTORE_LOCK_SUFFIX}")
     [warning] = [record for record in caplog.records if "doesn't support file locks" in record.getMessage()]
     assert str(path) in warning.getMessage()
@@ -801,6 +803,59 @@ def test_where_data_dir_has_no_locks_a_shared_local_lock_is_used(
     with storage.ingest_write():
         assert not _flock_from_another_process(path)  # a write section holds it
     assert _flock_from_another_process(path)
+
+
+def _foreign_folder(fallback: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The private lock folder's name, taken by a folder this process's user doesn't own (it runs as another uid)"""
+    other_user = os.geteuid() + 4321
+    monkeypatch.setattr(os, "geteuid", lambda: other_user)
+    folder = fallback / f"mealie-ai-ingest-{other_user}"
+    folder.mkdir(mode=0o700)
+    return folder
+
+
+def _open_folder(fallback: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    folder = fallback / f"mealie-ai-ingest-{os.geteuid()}"
+    folder.mkdir()
+    folder.chmod(0o777)  # anyone could create the lock in it first
+    return folder
+
+
+def _linked_folder(fallback: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    target = fallback / "elsewhere"
+    target.mkdir(mode=0o700)
+    folder = fallback / f"mealie-ai-ingest-{os.geteuid()}"
+    folder.symlink_to(target)
+    return folder
+
+
+@pytest.mark.parametrize("taken", [_foreign_folder, _open_folder, _linked_folder], ids=["foreign", "open", "link"])
+def test_a_lock_folder_someone_else_could_hold_isnt_used(
+    taken: Callable[[Path, pytest.MonkeyPatch], Path],
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """
+    In a shared temporary folder another local user could create the lock file first and hold it, stalling every write
+    and refusing every restore: a folder of the private one's name that isn't this user's own, owner only, is left
+    alone, and the marker applies alone, as wherever locks don't work
+    """
+    _no_locks_in(data_dir, monkeypatch)
+    folder = taken(storage.FALLBACK_LOCK_DIR, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        path = storage.lock_path()
+    assert path == data_dir / storage.LOCK_FILE_NAME
+    assert not any(folder.iterdir())
+    assert any("AI_INGEST_LOCK_DIR" in r.getMessage() and str(folder) in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING):
+        assert not storage.flock_supported()
+        with storage.ingest_write():  # writes carry on, under the marker alone
+            pass
+    ran: list[bool] = []
+    storage.pauses_ingest(lambda: ran.append(storage.is_paused()))()
+    assert ran == [True]
 
 
 def _flock_from_another_process(path: Path) -> bool:

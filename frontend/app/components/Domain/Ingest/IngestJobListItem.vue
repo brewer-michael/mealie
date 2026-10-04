@@ -27,7 +27,7 @@
             {{ title }}
           </template>
         </v-list-item-title>
-        <div v-if="subtitle" class="job-source text-caption text-medium-emphasis">
+        <div v-if="subtitle" class="job-source text-body-small text-medium-emphasis">
           {{ subtitle }}
         </div>
         <div class="d-flex flex-wrap align-center ga-1 mt-1">
@@ -57,11 +57,11 @@
           </v-chip>
         </div>
         <!-- why it failed, or what's being done: wraps, where a chip would cut it -->
-        <div v-if="chip.caption" class="job-caption text-caption mt-1" :class="chip.color === 'error' ? 'text-error' : 'text-medium-emphasis'">
+        <div v-if="chip.caption" class="job-caption text-body-small mt-1" :class="chip.color === 'error' ? 'text-error' : 'text-medium-emphasis'">
           {{ chip.caption }}
         </div>
         <!-- a failed card: when it's read again by itself (over the monthly limit), else when it's removed -->
-        <div v-if="failedWhen" class="job-when text-caption text-medium-emphasis">
+        <div v-if="failedWhen" class="job-when text-body-small text-medium-emphasis">
           {{ failedWhen }}
         </div>
       </div>

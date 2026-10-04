@@ -176,10 +176,10 @@ def align_ingredient(line: str, lines: Sequence[str], after: int = -1) -> int | 
 
 def _chunks(words: Sequence[str]) -> list[tuple[int, int]]:
     """
-    The transcript's lines as the units a step's windows are made of, `(start, end)` in line indices: each line on its
-    own, but a run of more than `STEP_MAX_LINES` short lines (`SHORT_LINE`) in pieces of `CHUNK_LENGTH` letters or
-    more. A page read one word per line would otherwise give a step of 600 letters a hundred lines to grow its windows
-    over, from every one of its lines.
+    The transcript's lines as the units a step's longer windows (more than `STEP_MAX_LINES` lines) grow by,
+    `(start, end)` in line indices: each line on its own, but a run of more than `STEP_MAX_LINES` short lines
+    (`SHORT_LINE`) in pieces of `CHUNK_LENGTH` letters or more. A page read one word per line would otherwise give a
+    step of 600 letters a hundred lines to grow its windows over, from every one of its lines.
     """
     chunks: list[tuple[int, int]] = []
     line = 0
@@ -209,19 +209,44 @@ def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
     by `ratio` wins: by `partial_ratio` alone, any one line of a wrapped step that both reads word for word scores 100,
     and beats the whole step's window when the reads differ by a word elsewhere in it.
 
-    It runs on every save, so the work stays near linear in the transcript, however long the step and however short
-    its lines: windows are made of whole lines, or of runs of short lines (`_chunks`); a longer window is compared
-    whole, by `ratio` alone (`partial_ratio` on strings that long takes far more than linear time), and a window whose
-    length alone keeps its `ratio` below what it needs (the best so far, or `STEP_MIN_SCORE`) is skipped.
+    Every line starts windows of up to `STEP_MAX_LINES` lines, so a short step ("Add eggs.", "Preheat oven to 350°.")
+    finds its own line among the short lines around it (ingredient lines, other terse steps). It runs on every save,
+    so the work stays near linear in the transcript, however long the step and however short its lines: the longer
+    windows grow by whole lines, or by runs of short lines (`_chunks`), and are compared first, whole, by `ratio` alone
+    (`partial_ratio` on strings that long takes far more than linear time); a window whose length alone keeps its
+    `ratio` below what it needs (the best so far, or `STEP_MIN_SCORE`) is skipped, so a long step's best window rules
+    out nearly every short one unscored.
     """
     target = letters_only(text)
     if not target:
         return None
 
     words = [letters_only(line) for line in lines]
-    chunks = _chunks(words)
     best: tuple[float, float, int, int] | None = None
     best_window: tuple[int, int] | None = None
+
+    def consider(start: int, end: int, length: int, longer: bool) -> None:
+        nonlocal best, best_window
+        # candidates rank by `ratio` first, which is at most what the two lengths allow
+        needed = max(best[0] if best else 0, STEP_MIN_SCORE if longer else 0)
+        if 200 * min(length, len(target)) / (length + len(target)) < needed - 1e-9:
+            return
+        window = " ".join(word for word in words[start:end] if word)
+        ratio = fuzz.ratio(target, window, score_cutoff=needed)
+        if ratio < needed:
+            return
+        if longer:
+            partial = ratio
+        else:
+            partial = fuzz.partial_ratio(target, window, score_cutoff=STEP_MIN_SCORE)
+            if partial < STEP_MIN_SCORE:
+                return
+        score = (ratio, partial, -(end - start), -start)
+        if best is None or score > best:
+            best, best_window = score, (start, end)
+
+    # longer windows, from each chunk, grown chunk by chunk
+    chunks = _chunks(words)
     for first, (start, _) in enumerate(chunks):
         length = 0  # of the window's text: its lines' words, joined by spaces
         for chunk_start, end in chunks[first:]:
@@ -233,25 +258,17 @@ def align_step(text: str, lines: Sequence[str]) -> tuple[int, int] | None:
                     length += len(word) + (1 if length else 0)
             if longer and length > MAX_WINDOW_GROWTH * len(target):
                 break
-            if not length:
-                continue
-            # candidates rank by `ratio` first, which is at most what the two lengths allow
-            needed = max(best[0] if best else 0, STEP_MIN_SCORE if longer else 0)
-            if 200 * min(length, len(target)) / (length + len(target)) < needed - 1e-9:
-                continue
-            window = " ".join(word for word in words[start:end] if word)
-            ratio = fuzz.ratio(target, window, score_cutoff=needed)
-            if ratio < needed:
-                continue
-            if longer:
-                partial = ratio
-            else:
-                partial = fuzz.partial_ratio(target, window, score_cutoff=STEP_MIN_SCORE)
-                if partial < STEP_MIN_SCORE:
-                    continue
-            score = (ratio, partial, -(end - start), -start)
-            if best is None or score > best:
-                best, best_window = score, (start, end)
+            if longer and length:
+                consider(start, end, length, longer=True)
+
+    # windows of up to `STEP_MAX_LINES` lines, from every line
+    for start in range(len(words)):
+        length = 0
+        for end in range(start + 1, min(start + STEP_MAX_LINES, len(words)) + 1):
+            if words[end - 1]:
+                length += len(words[end - 1]) + (1 if length else 0)
+            if length:
+                consider(start, end, length, longer=False)
 
     return best_window
 

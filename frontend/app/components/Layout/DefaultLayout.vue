@@ -96,7 +96,7 @@
 <script setup lang="ts">
 import { mdiCardTextOutline } from "@mdi/js";
 import { useLoggedInState } from "~/composables/use-logged-in-state";
-import { useRecipeIngestNav } from "~/composables/use-recipe-ingest";
+import { setRecipeIngestSessionCheck, useRecipeIngestNav } from "~/composables/use-recipe-ingest";
 import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
 import type { SideBarLink } from "~/types/application-types";
 import { useGroupSelf } from "~/composables/use-groups";
@@ -139,9 +139,12 @@ const cookbooks = computed(() => {
 const showAIImport = computed(() => group.value?.aiProviderSettings?.aiEnabled);
 
 // Fork: recipe cards (docs/ai/PHASE2.md §1.1): the sidebar's "Recipe cards (N)" and the Create-menu item, kept
-// current by useRecipeIngestNav, and the signed-in user's card upload queue, which a reload resumes.
+// current by useRecipeIngestNav, and the signed-in user's card upload queue, which a reload resumes. Leaving a page
+// with photos pending asks first, unless the session has gone (the token is cleared before an expired session's
+// redirect to the login page).
 const router = useRouter();
 const cardUploads = useRecipeIngestUploads();
+setRecipeIngestSessionCheck(() => !!auth.token.value);
 watch(() => auth.user.value?.id ?? null, (userId) => {
   void cardUploads.connect(userId);
 }, { immediate: true });

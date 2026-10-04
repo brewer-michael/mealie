@@ -3,7 +3,7 @@
     <v-card variant="outlined" style="border-color: lightgray;">
       <v-card-text>
         <BaseCardSectionTitle :title="$t('recipe-ingest.settings.title')" />
-        <p class="text-body-2 mb-4">
+        <p class="text-body-medium mb-4">
           {{ $t("recipe-ingest.settings.description") }}
         </p>
 
@@ -75,7 +75,7 @@
               {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
             </div>
           </v-alert>
-          <p v-if="settings.ocrAvailable" class="text-caption text-medium-emphasis mb-2 ocr-available">
+          <p v-if="settings.ocrAvailable" class="text-body-small text-medium-emphasis mb-2 ocr-available">
             {{ $t("recipe-ingest.settings.ocr-available") }}
           </p>
 
@@ -90,10 +90,10 @@
             @update:model-value="value => save({ localOnly: !!value })"
           />
           <div v-if="readiness" class="ms-4 mb-4 readiness">
-            <div class="text-subtitle-2 mt-2">
+            <div class="text-title-small mt-2">
               {{ $t("recipe-ingest.settings.readiness-title") }}
             </div>
-            <ul class="text-body-2 ms-6 readiness-slots">
+            <ul class="text-body-medium ms-6 readiness-slots">
               <li v-for="slot in readinessSlots" :key="slot.key" :class="`readiness-${slot.key}`">
                 {{ $t(`recipe-ingest.settings.readiness-${slot.key}`, { names: slot.names }) }}
               </li>
@@ -129,10 +129,10 @@
             @update:model-value="value => save({ crossRead: !!value })"
           />
 
-          <div class="text-subtitle-2">
+          <div class="text-title-small">
             {{ $t("recipe-ingest.settings.inbox-title") }}
           </div>
-          <p class="text-body-2 mb-4 inbox">
+          <p class="text-body-medium mb-4 inbox">
             <template v-if="settings.inbox?.enabled && settings.inbox.folder">
               {{ $t("recipe-ingest.settings.inbox-hint", { folder: settings.inbox.folder }) }}
             </template>
@@ -144,7 +144,7 @@
           <IngestInboxStatus class="mb-4" :settings="settings" />
 
           <!-- The notifiers page is behind the profile's "Show advanced features" -->
-          <p class="text-body-2 mb-4 notifications">
+          <p class="text-body-medium mb-4 notifications">
             <nuxt-link v-if="advanced" to="/household/notifiers">
               {{ $t("recipe-ingest.settings.notifications") }}
             </nuxt-link>
@@ -180,7 +180,7 @@
               </v-btn>
             </div>
           </v-alert>
-          <p v-else-if="evalCases && !evalCases.length" class="text-body-2 text-medium-emphasis no-eval-cases">
+          <p v-else-if="evalCases && !evalCases.length" class="text-body-medium text-medium-emphasis no-eval-cases">
             {{ $t("recipe-ingest.eval.empty") }}
           </p>
           <v-list v-if="evalCases?.length" density="compact" class="py-0 eval-cases">
@@ -236,7 +236,7 @@
                   @update:model-value="value => updateEvalCase(evalCase, { verified: !!value })"
                 />
               </div>
-              <p v-if="evalCase.notes" class="text-caption text-medium-emphasis eval-case-notes">
+              <p v-if="evalCase.notes" class="text-body-small text-medium-emphasis eval-case-notes">
                 {{ evalCase.notes }}
               </p>
               <template #append>
@@ -265,6 +265,7 @@
       </v-card-text>
     </v-card>
 
+    <!-- Enter deletes only through the Confirm button: on Cancel it cancels -->
     <BaseDialog
       v-model="deleteDialogOpen"
       bottom-sheet
@@ -272,6 +273,7 @@
       color="error"
       :icon="$globals.icons.alertCircle"
       can-confirm
+      disable-submit-on-enter
       @confirm="deleteEvalCase"
     >
       <v-card-text>

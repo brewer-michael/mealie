@@ -52,6 +52,8 @@ class SlowOCR:
 
     def __init__(self, readings: dict[int, int | Exception] | None = None) -> None:
         self.readings: dict[int, int | Exception] = {0: 90, **(readings or {})}
+        self.scores: dict[int, dict[int, float]] = {}
+        """A page's `rotation_scores`, when the test gives them"""
         self.entered = threading.Event()
         self.release = threading.Event()
         self.pages: list[int] = []
@@ -67,7 +69,9 @@ class SlowOCR:
         reading = self.readings.get(index, 0)
         if isinstance(reading, Exception):
             raise reading
-        return ocr.OCRResult(text="Banana Mug Cake", confidence=80, rotation=reading)
+        return ocr.OCRResult(
+            text="Banana Mug Cake", confidence=80, rotation=reading, rotation_scores=self.scores.get(index, {})
+        )
 
 
 @pytest.fixture()
@@ -464,6 +468,25 @@ def test_a_page_tesseract_or_the_reviewer_oriented_ignores_the_image_reader(
     back = _stored_matches_disk(jobs, job_id, 1)
     assert (back.rotation, back.rotation_source) == (0, PageRotationSource.user)
     assert [_files(jobs, job_id, 0), _files(jobs, job_id, 1)] == files_before
+
+
+def test_a_turn_tesseract_couldnt_decide_is_left_to_the_image_reader(
+    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+):
+    # a handwritten card: Tesseract kept it upright but read nothing there (its best score was turned a quarter, too
+    # low to turn it), so its text is kept and the page isn't settled; the image reader's quarter turn applies
+    _reader_says(monkeypatch, {0: 90})
+    reader.readings[0] = 0
+    reader.scores[0] = {0: 0, 90: 135, 180: 83, 270: 0}
+    reader.release.set()
+    job_id = card_job(pages=1)
+    token = _claim(db, job_id)
+
+    run(tasks.handle_extract(_context(jobs, job_id, token)))
+
+    front = _stored_matches_disk(jobs, job_id, 0)
+    assert (front.rotation, front.rotation_source, front.oriented) == (90, PageRotationSource.model, True)
+    assert (front.width, front.height) == (SIDEWAYS[1], SIDEWAYS[0])
 
 
 def test_a_manual_rotate_in_progress_and_the_tasks_turn_never_mix_their_staged_files(

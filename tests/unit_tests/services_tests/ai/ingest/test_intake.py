@@ -646,6 +646,77 @@ def test_a_lost_inbox_claim_writes_nothing(db: Session, unique_user: TestUser):
     assert (_dirs(unique_user), _counts(unique_user)) == before
 
 
+def _processing(user: TestUser) -> tuple[int, int]:
+    """The group's processing jobs, and the user's own"""
+    with session_context() as session:
+        repos = IngestRepos(session, UUID(user.group_id), UUID(user.household_id))
+        return repos.processing_jobs_in_group(), repos.jobs.count_processing_by_user(UUID(str(user.user_id)))
+
+
+def test_a_card_at_the_users_cap_is_refused_in_the_inserts_transaction(db: Session, unique_user_fn_scoped: TestUser):
+    user = unique_user_fn_scoped
+    _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user, user_cap=2)))  # 1 of 2
+    _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user, user_cap=2)))  # 2 of 2
+    before = _dirs(user), _counts(user)
+
+    with pytest.raises(intake.QuotaReached) as e:
+        _service(db, user).ingest(_card(_jpeg()), _options(user, user_cap=2))
+    assert e.value.which == "user"
+    assert (_dirs(user), _counts(user)) == before  # nothing on disk, no row
+
+    # without a cap (an inbox card, or an upload's later card), it goes in
+    _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user)))
+    assert _processing(user)[1] == 3
+
+
+def test_a_card_at_the_groups_cap_is_refused_in_the_inserts_transaction(
+    db: Session, unique_user_fn_scoped: TestUser, h2_user: TestUser
+):
+    user = unique_user_fn_scoped
+    _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user)))
+    group_processing, _ = _processing(user)
+    before = _dirs(user), _counts(user)
+
+    with pytest.raises(intake.QuotaReached) as e:
+        _service(db, user).ingest(_card(_jpeg()), _options(user, group_cap=group_processing, user_cap=100))
+    assert e.value.which == "group"
+    assert (_dirs(user), _counts(user)) == before
+    _accepted(_service(db, user).ingest(_card(_jpeg()), _options(user, group_cap=group_processing + 1)))
+
+
+def test_the_caps_count_what_another_intake_inserted_after_the_uploads_check(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # two uploads of the same user at once, both past check 4 on a count of 0 (cap 1): the household's intake lock
+    # orders their inserts, and the second one counts the first's job
+    user = unique_user_fn_scoped
+    real_insert = IntakeService._insert
+    together = threading.Barrier(2, timeout=30)
+    outcomes: dict[str, Any] = {}
+
+    def insert(self: IntakeService, *args: Any) -> Any:
+        together.wait()  # both normalized their pages, and go for the lock at once
+        return real_insert(self, *args)
+
+    monkeypatch.setattr(IntakeService, "_insert", insert)
+
+    def send(name: str) -> None:
+        with session_context() as session:
+            try:
+                outcomes[name] = _service(session, user).ingest(_card(_jpeg()), _options(user, user_cap=1))
+            except intake.QuotaReached as e:
+                outcomes[name] = e
+
+    threads = [threading.Thread(target=send, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert sorted(type(outcome).__name__ for outcome in outcomes.values()) == ["IntakeAccepted", "QuotaReached"]
+    assert _processing(user)[1] == 1
+
+
 def test_a_database_error_removes_the_jobs_directory(
     db: Session, unique_user: TestUser, monkeypatch: pytest.MonkeyPatch
 ):
@@ -738,6 +809,78 @@ def test_intake_runs_two_cards_at_a_time_whoever_calls_it(
     for thread in threads:
         thread.join(10)
     assert most == {"expand": limits.INTAKE_CONCURRENCY, "normalize": limits.INTAKE_CONCURRENCY}
+
+
+PDF = b"%PDF-1.7\n% a card scanned to PDF\n"
+
+
+@pytest.fixture()
+def slow_pdfs(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[threading.Semaphore, threading.Event]]:
+    """PDFs whose rendering hangs until released (then they're refused): what started, and the release"""
+    started, release = threading.Semaphore(0), threading.Event()
+
+    def pdf_pages(raw: Any, raw_sha256: str, raw_bytes: int) -> list[images.DocumentPage]:
+        started.release()
+        release.wait(60)
+        raise images.PageRejected(IngestRejectReason.pdf_not_supported)
+
+    monkeypatch.setattr(images, "_pdf_pages", pdf_pages)
+    yield started, release
+    release.set()
+
+
+def test_pdfs_slow_to_render_hold_up_other_pdfs_not_photos(
+    db: Session, unique_user_fn_scoped: TestUser, slow_pdfs: tuple[threading.Semaphore, threading.Event]
+):
+    # a PDF renders in a slot of its own, not an intake slot: two uploads of PDFs that take PDF_RENDER_TIMEOUT to
+    # render (each) leave the photos of everyone else going in meanwhile
+    user = unique_user_fn_scoped
+    started, release = slow_pdfs
+    outcomes: list[Any] = []
+
+    async def main() -> None:
+        service = _service(db, user)
+        async with anyio.create_task_group() as group:
+            for name in ("a.pdf", "b.pdf"):
+                group.start_soon(service.ingest_async, _card(PDF, names=[name]), _options(user))
+            await anyio.to_thread.run_sync(started.acquire)  # one is rendering
+            with anyio.fail_after(30):
+                outcomes.append(await service.ingest_async(_card(_jpeg()), _options(user)))
+            release.set()
+
+    anyio.run(main)
+    _accepted(outcomes[0])
+
+
+def test_the_inboxs_pdfs_slow_to_render_hold_up_no_intake_slot(
+    db: Session, unique_user_fn_scoped: TestUser, slow_pdfs: tuple[threading.Semaphore, threading.Event]
+):
+    # the inbox's scan (or two) calls `ingest` directly: its PDF renders before it takes an intake slot
+    user = unique_user_fn_scoped
+    started, release = slow_pdfs
+    outcomes: list[Any] = []
+
+    def scan(name: str) -> None:
+        with session_context() as session:
+            outcomes.append(_service(session, user).ingest(_card(PDF, names=[name]), _options(user)))
+
+    scans = [threading.Thread(target=scan, args=(name,)) for name in ("a.pdf", "b.pdf")]
+    for thread in scans:
+        thread.start()
+    assert started.acquire(timeout=30)
+    try:
+        photo = threading.Thread(
+            target=lambda: outcomes.append(_service(db, user).ingest(_card(_jpeg()), _options(user)))
+        )
+        photo.start()
+        photo.join(30)
+        assert not photo.is_alive()
+        _accepted(outcomes[0])
+    finally:
+        release.set()
+        for thread in scans:
+            thread.join(30)
+    assert [outcome.reason for outcome in outcomes[1:]] == [IngestRejectReason.pdf_not_supported] * 2
 
 
 # ==========================================

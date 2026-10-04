@@ -7,15 +7,18 @@ writes already in flight, background tasks included.
 import asyncio
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import anyio
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from mealie.app import app
 from mealie.core.config import get_app_settings
 from mealie.services.ai.ingest import limits, restore_guard, storage
 from mealie.services.recipe.recipe_data_service import RecipeDataService
@@ -391,3 +394,192 @@ def test_a_lock_file_that_cant_be_opened_leaves_writes_unguarded(
     response = api_client.post(api_routes.recipes, json={"name": random_string()}, headers=unique_user.token)
     assert response.status_code == 201
     assert "Writes can't wait for a backup restore" in caplog.text
+
+
+# ======================================================================================================================
+# A request still arriving holds nothing
+
+
+def test_a_write_whose_body_is_still_arriving_doesnt_hold_a_restore_off(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The section starts once the body is in: a client with no account that sends half a body and stalls (uvicorn has no
+    body timeout) used to hold every restore off, and make every other write 503 while each one waited
+    """
+    monkeypatch.setattr(limits, "RESTORE_LOCK_WAIT", 2)
+
+    async def scenario() -> tuple[list[bool], int]:
+        sent_half, finish = asyncio.Event(), asyncio.Event()
+
+        async def body() -> AsyncIterator[bytes]:
+            yield b'{"name": "'
+            sent_half.set()
+            await finish.wait()
+            yield b'stalled"}'
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            request = asyncio.create_task(
+                client.post(api_routes.recipes, content=body(), headers={"content-type": "application/json"})
+            )
+            await sent_half.wait()
+            await asyncio.sleep(0.2)
+            assert storage._writers == 0
+
+            restored: list[bool] = []
+            started = time.monotonic()
+            await asyncio.to_thread(storage.pauses_ingest(lambda: restored.append(True)))
+            assert time.monotonic() - started < 1  # at once, not after RESTORE_LOCK_WAIT
+
+            finish.set()
+            response = await request
+        return restored, response.status_code
+
+    restored, status = asyncio.run(scenario())
+    assert restored == [True]
+    assert status == 401  # no account: refused once its body was in, as before
+
+
+def _http_scope(body_length: int | None, method: str = "POST", path: str = "/api/recipes") -> dict[str, Any]:
+    headers = [] if body_length is None else [(b"content-length", str(body_length).encode())]
+    return {"type": "http", "method": method, "path": path, "headers": headers}
+
+
+class _Client:
+    """The server's side of a request: its body in chunks (then the client leaves, or stays until answered)"""
+
+    def __init__(self, chunks: list[bytes], *, leaves: bool = False) -> None:
+        self.chunks = list(chunks)
+        self.leaves = leaves
+        self.reads = 0
+        self.sent: list[dict[str, Any]] = []
+        self.answered = asyncio.Event()
+
+    async def receive(self) -> dict[str, Any]:
+        self.reads += 1
+        if self.chunks:
+            chunk = self.chunks.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": bool(self.chunks) or self.leaves}
+        if not self.leaves:
+            await self.answered.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(self, message: dict[str, Any]) -> None:
+        self.sent.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body"):
+            self.answered.set()
+
+
+class _Echo:
+    """A route that reads the request's body, answers with it, then waits for the client to leave"""
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+        self.writers_inside: int | None = None
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        self.writers_inside = storage._writers
+        body = b""
+        while True:
+            message = await receive()
+            self.messages.append(message)
+            body += message.get("body", b"")
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+        self.messages.append(await receive())
+
+
+@pytest.mark.parametrize("in_memory", [1024 * 1024, 5], ids=["in memory", "spooled to a file"])
+def test_the_route_gets_the_body_read_before_the_section(in_memory: int, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(limits, "GUARD_BODY_IN_MEMORY", in_memory)
+    monkeypatch.setattr(restore_guard._Body, "_BLOCK", 7)  # handed on from the file in several messages
+    chunks = [b"first chunk ", b"", b"second ", b"and the last one"]
+    client, app = _Client(chunks), _Echo()
+
+    asyncio.run(restore_guard.RestoreGuardMiddleware(app)(_http_scope(35), client.receive, client.send))
+
+    assert client.sent[1]["body"] == b"".join(chunks)
+    assert app.writers_inside == 1  # inside its section
+    body_messages = app.messages[:-1]
+    assert all(m["type"] == "http.request" for m in body_messages)
+    assert [m["more_body"] for m in body_messages] == [True] * (len(body_messages) - 1) + [False]
+    assert len(body_messages) == (1 if in_memory > 35 else 5)  # 35 bytes, 7 to a message
+    assert app.messages[-1] == {"type": "http.disconnect"}  # after the body, the client's own messages
+    assert storage._writers == 0
+
+
+def test_a_client_that_leaves_while_sending_its_body_runs_nothing(monkeypatch: pytest.MonkeyPatch):
+    client, app = _Client([b"half a body"], leaves=True), _App()
+    asyncio.run(restore_guard.RestoreGuardMiddleware(app)(_http_scope(100), client.receive, client.send))
+    assert app.calls == 0
+    assert client.sent == []  # nobody to answer
+    assert storage._writers == 0
+
+
+def test_a_write_during_a_restore_is_refused_before_its_body_is_read():
+    client, app = _Client([b"a large upload"]), _App()
+    with Restore():
+        wait_until_paused()
+        asyncio.run(restore_guard.RestoreGuardMiddleware(app)(_http_scope(14), client.receive, client.send))
+    assert client.reads == 0
+    assert app.calls == 0
+    assert client.sent[0]["status"] == 503
+
+
+def test_a_restore_that_starts_while_the_body_arrives_refuses_the_write():
+    entered: list[bool] = []
+    restore = Restore()
+
+    async def receive() -> dict[str, Any]:
+        restore.__enter__()
+        await asyncio.to_thread(wait_until_paused)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        entered.append(True)
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    try:
+        asyncio.run(restore_guard.RestoreGuardMiddleware(app)(_http_scope(2), receive, send))
+    finally:
+        restore.__exit__()
+    assert entered == []
+    assert sent[0]["status"] == 503
+    assert restore.error is None
+
+
+# ======================================================================================================================
+# The guard's own threads
+
+
+def test_writes_dont_wait_for_the_event_loops_default_threads():
+    """
+    Upstream's video imports and OCR image imports can fill the loop's default thread pool for minutes
+    (`asyncio.to_thread`): a write waiting for one of those threads to let it into its section would wait as long
+    """
+    app = _App()
+
+    async def scenario() -> float:
+        loop = asyncio.get_running_loop()
+        busy = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(busy)
+        release = threading.Event()
+        blocker = loop.run_in_executor(None, release.wait, 10)
+        try:
+            started = time.monotonic()
+            await asyncio.wait_for(restore_guard.RestoreGuardMiddleware(app)(_scope(), _no_receive, _ignore), timeout=5)
+            return time.monotonic() - started
+        finally:
+            release.set()
+            await blocker
+
+    took = asyncio.run(scenario())
+    assert app.calls == 1
+    assert took < 1

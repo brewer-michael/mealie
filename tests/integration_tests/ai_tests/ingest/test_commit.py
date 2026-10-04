@@ -91,8 +91,11 @@ def kept(flags: list[CardFlag]) -> list[CardFlag]:
 
 
 def ready_to_commit(user: TestUser, **kwargs: Any) -> UUID:
-    """A ready job whose errors were all kept as written; unless `draft` says otherwise, the card photo is attached"""
-    draft = kwargs.pop("draft", None) or banana_draft(attach_card_photo=True)
+    """
+    A ready job whose errors were all kept as written; unless `draft` says otherwise, the card photo is attached and is
+    the cover (a test user's household is public or not at random)
+    """
+    draft = kwargs.pop("draft", None) or banana_draft(attach_card_photo=True, use_card_as_cover=True)
     return seed_job(user, draft=draft, flags=kept(fake_compute_flags(draft, None, {})), **kwargs)
 
 
@@ -780,8 +783,8 @@ def test_a_landscape_card_is_the_cover_as_it_is(tmp_path: Any):
 def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
     api_client: TestClient, unique_user_fn_scoped: TestUser
 ):
-    """Assets are served without a login, so in a household whose recipes are public the card photo is off unless
-    the reviewer turns it on; elsewhere it's on unless they turn it off"""
+    """Assets and the recipe image are served without a login, so in a household whose recipes are public the card
+    photo and the cover are off unless the reviewer turns them on; elsewhere they're on unless they turn them off"""
     user = unique_user_fn_scoped
 
     def committed(draft: Any) -> tuple[dict[str, Any], list[str]]:
@@ -798,36 +801,43 @@ def test_the_card_photo_is_attached_unless_recipes_are_seen_without_a_login(
     preferences.update({"privateHousehold": True, "recipePublic": True})
     assert api_client.put(api_routes.households_preferences, json=preferences, headers=user.token).status_code == 200
     job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"]) == (False, True)
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (False, True, True)
 
     _set_recipes_public(api_client, user, True)
     job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["draft"]["attachCardPhoto"]) == (
-        True,
-        False,
-        None,
-    )
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (True, False, False)
+    assert (job["draft"]["attachCardPhoto"], job["draft"]["useCardAsCover"]) == (None, None)
+    listed = api_client.get("/api/ai/ingest/jobs", headers=user.token).json()["items"]
+    assert {item["householdRecipesPublic"] for item in listed} == {True}  # for the batch's "Add clean cards"
 
     recipe, files = committed(banana_draft(name="Public default"))
     assert (recipe["assets"], files) == ([], [])
     assert recipe["settings"]["showAssets"] is False  # the household's own default
-    assert recipe["image"]  # the cover is its own switch
+    assert recipe["image"] is None
+    assert not (recipe_dir(recipe["id"]) / "images" / "original.webp").exists()
 
     recipe, files = committed(banana_draft(name="Public attached", attach_card_photo=True))
     assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
     assert len(files) == 1
     assert recipe["settings"]["showAssets"] is True
+    assert recipe["image"] is None  # the cover is its own switch
+
+    recipe, files = committed(banana_draft(name="Public cover", use_card_as_cover=True))
+    assert (recipe["assets"], files) == ([], [])
+    assert recipe["image"]
 
     _set_recipes_public(api_client, user, False)
     job = api_client.get(job_url(ready_to_commit(user, draft=banana_draft())), headers=user.token).json()
-    assert (job["householdRecipesPublic"], job["cardPhotoDefault"]) == (False, True)
+    assert (job["householdRecipesPublic"], job["cardPhotoDefault"], job["cardCoverDefault"]) == (False, True, True)
 
     recipe, files = committed(banana_draft(name="Private default"))
     assert [asset["name"] for asset in recipe["assets"]] == ["Recipe card"]
     assert len(files) == 1
+    assert recipe["image"]
 
-    recipe, files = committed(banana_draft(name="Private detached", attach_card_photo=False))
+    recipe, files = committed(banana_draft(name="Private detached", attach_card_photo=False, use_card_as_cover=False))
     assert (recipe["assets"], files) == ([], [])
+    assert recipe["image"] is None
 
 
 def test_a_resumed_commit_that_no_longer_attaches_removes_the_written_assets(
@@ -1076,3 +1086,38 @@ def test_an_organizer_another_commit_creates_meanwhile_is_used_once(
     recipe = recipe_of(api_client, user, out.json()["slug"])
     assert [tag["id"] for tag in recipe["tags"]] == [str(theirs.id)]
     assert _organizer_names(user, "tags") == ["Weeknight"]
+
+
+@pytest.mark.parametrize(
+    "attribution, title, text",
+    [
+        ("Van der Berg", "Van", "Van der Berg"),
+        ("De la Torre", "De", "De la Torre"),
+        ("Van: Oma", "Van", "Oma"),
+        ("From Grandma Jo", "Van", "Grandma Jo"),
+        ("From Grandma Jo", "From", "Grandma Jo"),
+    ],
+)
+def test_the_attribution_follows_the_drafts_rule(attribution: str, title: str, text: str):
+    """The title's translated word goes only with a colon after it: it may begin a surname (`strip_from_prefix`)"""
+    assert card_commit._attribution_text(attribution, title) == text
+
+
+def test_a_unit_commit_creates_gets_its_standard_abbreviation(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    # the card flags accept a linked unit's abbreviation; a unit commit creates has one, as the seeded units do
+    user = unique_user_fn_scoped
+    draft = banana_draft(
+        ingredients=[
+            CardDraftIngredient(
+                original_text="2 tablespoons honey", quantity=2, unit=CardDraftRef(name="tablespoons"), food=None
+            ),
+            CardDraftIngredient(original_text="1 scoop ice", quantity=1, unit=CardDraftRef(name="scoop"), food=None),
+        ]
+    )
+    response = commit(api_client, user, ready_to_commit(user, draft=draft))
+    assert response.status_code == 201, response.text
+
+    [tablespoons] = units_named(user, "tablespoons")
+    assert tablespoons.abbreviation == "tbsp"
+    [scoop] = units_named(user, "scoop")
+    assert scoop.abbreviation == ""

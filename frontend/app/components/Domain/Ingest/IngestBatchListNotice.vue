@@ -7,14 +7,14 @@
     aria-live="polite"
   >
     <v-icon size="small" :color="notice.kind" :icon="$globals.icons[icon]" />
-    <div class="commit-notice-body flex-grow-1 text-body-2">
+    <div class="commit-notice-body flex-grow-1 text-body-medium">
       <div class="commit-notice-text">
         {{ notice.text }}
       </div>
-      <div v-if="notice.detail" class="commit-notice-detail text-caption">
+      <div v-if="notice.detail" class="commit-notice-detail text-body-small">
         {{ notice.detail }}
       </div>
-      <ul v-if="notice.items.length" class="commit-notice-items text-caption ps-4">
+      <ul v-if="notice.items.length" class="commit-notice-items text-body-small ps-4">
         <li v-for="(item, index) in notice.items" :key="index" class="commit-notice-item">
           {{ item }}
         </li>

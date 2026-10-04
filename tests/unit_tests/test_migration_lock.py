@@ -14,12 +14,14 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
 
 from mealie.core.config import get_app_settings
 from mealie.core.settings.db_providers import PostgresProvider, SQLiteProvider
+from mealie.core.settings.settings import determine_secrets
 from mealie.db import migration_lock as lock_module
 from mealie.db.migration_lock import MIGRATION_LOCK_ID, MigrationLockTimeout, migration_lock
 
@@ -79,6 +81,39 @@ def test_a_waiting_holder_gets_the_lock_once_it_is_released(caplog: pytest.LogCa
     assert "waiting for it to finish" in caplog.text
 
 
+class _StopWaiting(Exception):
+    pass
+
+
+def test_a_waiting_process_never_gives_up_while_the_holder_migrates(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """
+    A migration can outlast any deadline (a large database on a Raspberry Pi), and the lock goes when its holder
+    dies, so a waiting worker waits for as long as the holder migrates, saying so every minute. Giving up failed the
+    worker's startup, and uvicorn then stopped every worker, the migrating one included.
+    """
+    clock = SimpleNamespace(now=1000.0, polls=0)
+
+    def sleep(seconds: float) -> None:
+        clock.polls += 1
+        clock.now += 30  # half a minute a poll
+        if clock.polls == 240:  # two hours on
+            raise _StopWaiting
+
+    with migration_lock():
+        monkeypatch.setattr(lock_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+        with caplog.at_level("INFO"), pytest.raises(_StopWaiting), migration_lock():
+            pytest.fail("took a lock another holder has")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("waiting for it to finish" in message for message in messages) == 1
+    progress = [message for message in messages if "Still waiting" in message]
+    assert len(progress) == 119  # every minute after the first
+    assert "(1 min" in progress[0]
+    assert "(119 min" in progress[-1]
+
+
 def test_the_lock_is_released_when_the_holder_raises():
     with pytest.raises(RuntimeError), migration_lock():
         raise RuntimeError("migration failed")
@@ -100,6 +135,66 @@ def test_the_lock_is_the_databases(monkeypatch: pytest.MonkeyPatch):
             other.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": MIGRATION_LOCK_ID})
     finally:
         engine.dispose()
+
+
+def _holders() -> list[tuple[int, str]]:
+    """The PostgreSQL backends holding the migration lock, and their state"""
+    engine = sa.create_engine(get_app_settings().DB_URL, poolclass=sa.pool.NullPool)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                sa.text(
+                    "SELECT l.pid, a.state FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                    "WHERE l.locktype = 'advisory' AND l.granted AND l.database = "
+                    "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+                    "AND l.classid = :high AND l.objid = :low AND l.objsubid = 1"
+                ),
+                {"high": MIGRATION_LOCK_ID >> 32, "low": MIGRATION_LOCK_ID & 0xFFFFFFFF},
+            ).all()
+    finally:
+        engine.dispose()
+    return [(row[0], row[1]) for row in rows]
+
+
+def test_the_lock_is_held_by_an_open_transaction():
+    """
+    PostgreSQL: a transaction's advisory lock, held by keeping that transaction open, works behind PgBouncer in
+    transaction pooling mode, which keeps a client on one server connection only while it's in a transaction. A
+    session's lock taken and released in separate statements could land on different server connections there: two
+    workers both held it, and the lock outlived every Mealie process on a pooled connection.
+    """
+    if not is_postgres():
+        pytest.skip("SQLite uses a file lock")
+
+    with migration_lock():
+        [(_, state)] = _holders()
+        assert state == "idle in transaction"
+    assert _holders() == []
+
+
+def test_a_server_timeout_for_idle_transactions_doesnt_release_it(monkeypatch: pytest.MonkeyPatch):
+    """
+    PostgreSQL: the lock's transaction sits idle while the migration runs on other connections, so a database set to
+    end idle transactions (`idle_in_transaction_session_timeout`) would end it mid-migration, and let another worker
+    migrate too. The lock's transaction turns that off for itself.
+    """
+    if not is_postgres():
+        pytest.skip("SQLite uses a file lock")
+
+    url = sa.make_url(get_app_settings().DB_URL).update_query_dict(
+        {"options": "-c idle_in_transaction_session_timeout=200"}
+    )
+    monkeypatch.setattr(
+        lock_module, "get_app_settings", lambda: SimpleNamespace(DB_URL=url.render_as_string(hide_password=False))
+    )
+    with migration_lock():
+        [(holder, _)] = _holders()
+        time.sleep(0.8)
+        assert _holders() == [(holder, "idle in transaction")]
+        with pytest.raises(MigrationLockTimeout):
+            with migration_lock(timeout=0.3):
+                pytest.fail("took a lock another holder has")
+    assert _holders() == []
 
 
 @pytest.mark.skipif(lock_module.fcntl is None, reason="needs fcntl")
@@ -207,6 +302,10 @@ def _counts(env: dict[str, str]) -> tuple[int, int, int]:
 def test_two_workers_start_together_on_an_empty_database(tmp_path: Path):
     """Without the lock, one of them failed: "table groups already exists" (SQLite), a unique violation (PostgreSQL)"""
     env, database = _new_database(tmp_path)
+    # as uvicorn's parent does before it starts the workers (mealie/main.py imports the settings): two processes
+    # creating the secrets at once is another race, of upstream's, that only bare processes like these meet
+    for secret in (".secret", ".session_secret"):
+        determine_secrets(tmp_path, secret, production=True)
     try:
         env["START_AT"] = str(time.time() + 15)  # both are importing Mealie by then, and start migrating together
         workers = [

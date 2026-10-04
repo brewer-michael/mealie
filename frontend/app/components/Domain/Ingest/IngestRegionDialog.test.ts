@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { defineComponent } from "vue";
 import IngestRegionDialog from "./IngestRegionDialog.vue";
 import IngestRegionStencil from "./IngestRegionStencil.vue";
+import BaseDialog from "~/components/global/BaseDialog.vue";
 import { normalizeDraft, rereadTargets, rereadTargetValue } from "~/composables/use-recipe-ingest-review";
 import type { PageOut, RegionHintOut } from "~/lib/api/types/recipe-ingest";
 
@@ -112,6 +113,25 @@ const stubs = {
   },
 };
 
+/**
+ * The real BaseDialog, on an overlay that hears every key pressed inside the dialog as Vuetify's does: what Enter does
+ * there is the dialog's to say
+ */
+const realDialog = {
+  BaseDialog,
+  VDialog: { props: ["modelValue"], template: "<div v-if=\"modelValue\" class=\"overlay\"><slot /></div>" },
+  BaseDialogContent: {
+    props: ["title", "submitText", "submitDisabled"],
+    emits: ["submit"],
+    template: `
+      <div class="dialog" :data-title="title">
+        <slot />
+        <button type="button" class="submit" :disabled="submitDisabled" @click="$emit('submit')">{{ submitText }}</button>
+      </div>
+    `,
+  },
+};
+
 const wrappers: VueWrapper[] = [];
 
 type DialogProps = {
@@ -122,10 +142,10 @@ type DialogProps = {
   locating?: boolean;
 };
 
-function mountDialog(props: DialogProps = {}) {
+function mountDialog(props: DialogProps = {}, dialogStubs: Record<string, unknown> = {}) {
   const wrapper = mount(IngestRegionDialog, {
     props: { modelValue: true, pages: [page(0), page(1)], targets, ...props },
-    global: { stubs },
+    global: { mocks: { $vuetify: { display: { xs: false } } }, stubs: { ...stubs, ...dialogStubs } },
   });
   wrappers.push(wrapper);
   return wrapper;
@@ -253,10 +273,35 @@ describe("IngestRegionDialog", () => {
     await selection.trigger("keydown", { key: "ArrowUp", shiftKey: true });
     expect(lastTransform()).toEqual({ left: 153.6, top: 1024, width: 1228.8, height: 163.84 });
 
-    // other keys, and arrows anywhere else in the dialog, leave it alone
-    await selection.trigger("keydown", { key: "Enter" });
+    // other keys (Enter sends it), and arrows anywhere else in the dialog, leave it alone
+    await selection.trigger("keydown", { key: "Home" });
     await wrapper.get(".cropper").trigger("keydown", { key: "ArrowDown" });
     expect(cropper.setCoordinates).toHaveBeenCalledTimes(4);
+  });
+
+  test("Enter on the selection sends it; on the list or a page it only does what they do", async () => {
+    const wrapper = mountDialog({ initialTarget: rereadTargetValue(targets, "steps", "s2") }, realDialog);
+    await flushPromises();
+
+    // a keyboard user opening the list of what it's for, or turning to the back, isn't sending yet
+    await wrapper.get("select").trigger("keydown", { key: "Enter" });
+    await wrapper.findAll(".pages button")[1]!.trigger("keydown", { key: "Enter" });
+    await wrapper.get(".ingest-region-stencil").trigger("keydown", { key: "Enter", ctrlKey: true });
+    expect(wrapper.emitted("submit")).toBeUndefined();
+    expect(wrapper.find(".overlay").exists()).toBe(true);
+
+    await wrapper.get(".ingest-region-stencil").trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("submit")).toEqual([[{ page: 0, x: 0.1, y: 0.5, width: 0.8, height: 0.1, target: { field: "steps", ref: "s2" } }]]);
+    expect(wrapper.emitted("update:modelValue")).toEqual([[false]]);
+  });
+
+  test("Enter on the selection before it's said what it's for sends nothing", async () => {
+    const wrapper = mountDialog({}, realDialog);
+    await flushPromises();
+
+    await wrapper.get(".ingest-region-stencil").trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("submit")).toBeUndefined();
+    expect(wrapper.find(".overlay").exists()).toBe(true);
   });
 
   test("after an arrow key a screen reader hears where the selection is", async () => {

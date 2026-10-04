@@ -59,7 +59,8 @@ class IngestSettings(BaseSettings):
     GROUP_CONCURRENCY: int = Field(0, ge=0)
     """At most this many cards of one group are read at once, across worker processes; 0: no cap"""
     MAX_PROCESSING_PER_USER: int = Field(0, ge=0)
-    """At most this many of one user's cards wait to be read; more uploads are refused with 429. 0: no cap"""
+    """An upload is refused with 429 while this many of its sender's cards wait to be read, counted before its body
+    and again when its first card goes in; a request that gets in queues all its cards (at most 20). 0: no cap"""
     URL_FETCH: bool = False
     """Accept image URLs in the upload API's JSON (`{"images": [{"url": ...}]}`), downloaded by the server; off: they
     are refused `url_not_allowed` and nothing is fetched"""

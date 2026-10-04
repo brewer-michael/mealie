@@ -114,9 +114,14 @@ locks don't work).
 RESTORE_LOCK_WAIT = 45
 """
 How long a restore waits for in-flight writers before giving up, having changed nothing ("try again"). Write sections
-take seconds; this stays under the 60 s that reverse proxies commonly allow a request, so the browser sees the answer.
+take seconds (an upstream write's starts once its body is in); this stays under the 60 s that reverse proxies commonly
+allow a request, so the browser sees the answer.
 """
 RESTORE_LOCK_POLL = 0.25
+GUARD_THREADS = 4
+"""Threads per process on which upstream writes enter their write section (`restore_guard`)"""
+GUARD_BODY_IN_MEMORY = MIB
+"""An upstream write's body, read before its write section starts, is kept in memory up to this, the rest in a file"""
 PAUSED_TASK_POLL = 5
 """How often a task that hit the pause checks whether it's over"""
 PAUSED_RELEASE_DELAY = 60
