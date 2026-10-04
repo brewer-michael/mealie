@@ -1,4 +1,4 @@
-# Phase 2: Recipe card ingestion v2 (design)
+# Phase 2: Recipe card ingestion v2 (design, as built)
 
 Implements the "Phase 2" row of [`AI_INTEGRATION_PLAN.md`](../AI_INTEGRATION_PLAN.md) §9: jobs, batch upload, a
 review page, ingredient linking, the card kept as an asset, an inbox folder, events and the eval harness. The exit
@@ -1667,3 +1667,157 @@ restore while a batch is processing; two workers (`UVICORN_WORKERS=2`) for dupli
 - A local model that takes one image per request fails two-sided cards (the eval shows which models do).
 - Reloading the capture page drops photos not yet uploaded. Ingredient parsing is English-only.
 - Total concurrency is `(AI_INGEST_CONCURRENCY + 1 re-read slot) × UVICORN_WORKERS`, with no per-group share.
+
+## As built
+
+Built as designed above, with the changes below. They came from two review rounds, the integration seam tests and
+a live run of the production build. Section numbers point at the design text each one changes.
+
+### Changes from the design
+
+**Inputs and intake (§1, §2)**
+- An upload must carry `Authorization: Bearer <token>`. Any other scheme, or an empty token, is a 401 (§1.2 said
+  the header must be present).
+- Every inbox file operation goes through directory file descriptors opened with `O_NOFOLLOW`. A group, household
+  or reserved folder that is a link, or not a directory, is skipped and logged once. Error notes are created with
+  `O_EXCL|O_NOFOLLOW`. One bad entry or folder no longer stops the scan. The inbox is off on Windows.
+- A blank `AI_INGEST_INBOX_DIR` counts as unset (Unraid passes unused variables as empty strings).
+- The inbox and JSON-body decoding share the two intake slots with uploads, and JSON bodies are decoded to spooled
+  temporary files rather than `BytesIO`. Normalizing a 100-megapixel JPEG now peaks at about 250 MB instead of
+  1.4 GB.
+- Refusals: a malformed body is 400 `invalid_body`; a raw image over 30 MiB is a `too_large` rejection, not a 413;
+  the 400 `nothing_accepted` body carries a `summary` and no `message`.
+- The capture page holds chosen photos in a tray with an **Upload** button. The lock with "Stays on this server"
+  shows only under a local-only policy.
+- §1.1: the local-only switch applies to every card not sent yet, whatever batch it's in: each upload carries the
+  switch as it is when the card is sent. If cards of the open batch already went with the other setting, that batch
+  is finished and the next card starts a new one.
+- A card already scanned is reported as such ("1 card was already scanned."); the summary counts cards, not photos.
+  An unknown `batchId` is a 404 with a message. An upload the phone abandons mid-body logs no traceback. A link in
+  the inbox is logged once and never followed.
+
+**Runner (§3)**
+- §3.5: a task that goes back to the queue with a cancel request is never claimed again; the sweep ends it.
+- §3.7: orientation and its metadata are one fenced step. If the lease is lost, the page files are put back byte for
+  byte.
+- §3.8: shutdown waits for a claim in flight, within the same grace.
+- §3.9: one shared lock per process plus an in-process gate, instead of a lock per open file (NFS emulates `flock`
+  with per-process POSIX locks). Progress writes are skipped while a restore pauses ingestion. Usage rows are still
+  written (a restore that fails must not undercount the monthly limit); one that fails because the restore replaced
+  the tables logs a single INFO line.
+- §10: the worker applies the job's `local_only` **or** the group's current setting when each task starts, so
+  re-reads and retries of older cards obey a later switch-on. Intake does the same at insert.
+
+**Extraction and flags (§4, §5)**
+- §4.4: with a margin, the winning rotation must also score at least 500 (`MIN_TURN_SCORE`), so a blank page is
+  never turned. A failed Tesseract run leaves the page unsettled, to be tried again.
+- §4.5 cross-read: each draft ingredient takes its best transcript line by `token_set_ratio` on letters only (at
+  least 60), preferring a line shaped like it (starting with an amount as it does, or saying nothing it doesn't);
+  lines that read alike but for their amounts go in order. Each step is compared with windows of up to 4 lines
+  (`partial_ratio` at least 70), or longer ones grown while still shorter than the step (`ratio` at least 70), with
+  windows that can't win pruned first (a long step used to cost a minute per save). Units are compared by meaning
+  (C/c, t/tsp, Tbs/Tbsp agree; T and t don't).
+- §4.6 flags:
+  - `check_parse` also fires when the parsed fields lose an amount on the card's line (a range's end, a second
+    amount, a second ingredient run into the food, "dozen"), with `params.value`. Numbers kept in a food's name
+    ("2% milk", "V8") don't count.
+  - `unit_unclear` isn't raised for a short food word or a linked food the token starts.
+  - `implausible_temperature` takes 2 to 4 digits and applies the oven range unless the nearest word before the
+    temperature in its clause is about rising, cooling, warm liquids or a thermometer (then only the upper bound).
+  - `not_on_card` ignores list numbers ("2. Microwave").
+  - Note flag ids are `<kind>:notes:<position>#<digest>`, so a resolution doesn't move to another note after a
+    reorder; editing a flagged note's text means keeping it again.
+- §5: size words after the quantity (heaping, scant, level, med, lg, …) go into the note before parsing, and a
+  mixed number written with a dash ("2-1/4") is joined first (`join_mixed_numbers`).
+- Draft numbers must be finite: NaN or infinity in a save is a 422.
+
+**Review and commit (§6, §7)**
+- Every save recomputes flags with the stored transcription and flags, as finalize does; accepting a whole-card
+  proposal brings its flags with it. A save that edits the draft and accepts a proposal another device already
+  settled is a 409 `version_conflict`.
+- §6.6: on save, a line with no amount, unit or food whose text changed (a filled blank, an edited or new line) is
+  parsed like a freshly read line; fields the reviewer set are never overwritten.
+- An attribution starting with "From" doesn't repeat it in the note titled "From".
+- `draftVersion` changes only when the draft does; resolving a flag or settling a proposal leaves it.
+- The commit lease is fenced on the `commit_started_at` its caller set; a committer whose lease was taken over gets
+  409 `invalid_status`. `recipe_created` is sent after the write lock is released.
+- A re-read can target a new ingredient or step (a target with no `ref`).
+- There is no end-of-batch summary toast; the queue's own summary line stays. "Added …" after Commit & next shows at
+  the bottom of the next card's page, above the review bar, so it doesn't cover the header on a phone.
+- Upload retries, batch creation and sealing don't toast; each card's row shows why it's retrying or failed.
+- Pressing Enter in an organizer picker no longer creates a tag, category or tool.
+
+**Events (§8)**
+- The ready notification's fields are percent-encoded in the Apprise URL, and the notifier's own query is left as
+  written. Upstream's `urlencode` writes spaces as `+`, which Apprise doesn't decode, so Home Assistant's
+  `from_json` couldn't parse `document_data`. Upstream's own events still have that problem.
+- **Send test notification** uses the same event type, titled "Recipe cards ready (test)", and is sent whatever the
+  box says, so it also fires the Home Assistant automation.
+
+**API and settings (§12, §14, §15)**
+- `GET /ingest/settings` answers 200 when ingestion is off, with `enabled: false` (not 503). It also reports
+  `limitReached` when every provider the group's reading would use is over its monthly limit; uploads are still
+  accepted, and the capture page and settings card warn.
+- Job summaries carry `canDiscard`; `canExportEval` is true only for a card that can still be exported. The review
+  badge shows the effective local-only policy for a card that can still be read again.
+- `GET /jobs` keeps snake_case pagination keys, like upstream's pagination.
+- Every server-side message falls back to en-US (`ingest/i18n.py`).
+- The voice tool speaks digits ("7 recipe cards are ready…"); its result keys are snake_case.
+- `OCR_ENABLED=false` turns off orientation as well as the OCR fallback.
+- Worker processes are `WORKER_PER_CORE × UVICORN_WORKERS`, so total concurrency is that times
+  `(AI_INGEST_CONCURRENCY + 1)`.
+- §11.6: libjpeg-turbo's `jpegtran` takes one input file; write `jpegtran -copy none [-rotate 90] -perfect -outfile
+  OUT IN`.
+- For OpenAI-compatible providers the eval reports the configured model, not the model the provider says answered.
+- AI clients are closed on the event loop that used them. Task threads have their own loops, and the garbage
+  collector would otherwise close a client on another loop and log "Event loop is closed".
+
+### Verified
+
+- **Checks:** ruff, mypy, the full backend suite on SQLite and on PostgreSQL 16 (server time zone
+  America/New_York; only upstream's three `test_config.py` URL tests fail there, because the private cluster isn't
+  on port 5432), and frontend lint and tests (891). Tesseract runs in backend CI, so the orientation and OCR tests
+  run there.
+- **Two review rounds.** Round 1 raised 75 findings across eight dimensions; its high and medium ones were checked by
+  separate verifiers, and the fix round handled 68. Round 2 reviewed those fixes and confirmed 17 more. Each fix has
+  a regression test that fails without it (layout fixes were measured in Chromium instead).
+- **Seam tests**, each passing 10 times in a row on SQLite and once on PostgreSQL:
+  - `test_card_flow_e2e.py`: a two-sided card from a Bearer upload to a committed recipe, with one ready
+    notification that Home Assistant can parse, and one batch and one notification when Done is tapped while the
+    last card uploads;
+  - `test_two_dispatchers.py`: no card read twice, one notification per batch;
+  - `test_restore_while_processing.py`: the restore waits, completes and leaves files matching rows, and the
+    dispatcher carries on with nothing logged as an error;
+  - `test_banana_replay.py`: the banana card through the real eval, golden scores, the invented "2" caught only
+    with cross-read on, and no database rows written.
+- **Live, outside CI** (a production build, a stub provider answering the card schemas, Chromium):
+  - **Exit criterion 2:** a 10-card two-sided batch captured, reviewed and committed at 375 px in 71 s (75 s on
+    the final re-run), at machine speed with the stub answering in about 2.5 s. One "Recipe cards ready"
+    notification arrived, and its link opens the first card. Clean cards took one tap, flagged ones two to four.
+  - The local-only switch under a slow network: every card went with the switch as it was when the card was sent,
+    across ON, OFF, ON and after Done.
+  - Every review action at 375 px and 1366 px: filling a blank, Keep as written, a region re-read, Commit & next,
+    Already scanned, logout with uploads in flight, the restore pause and retry.
+  - A restore while cards are read (SQLite and PostgreSQL), including the busy 503 after 2 minutes.
+  - Two workers on SQLite and PostgreSQL: every card read once, one notification, a double commit making one
+    recipe.
+  - The inbox (cards, card folders, rejects, links); Home Assistant's REST counts and the `recipe_card_queue` tool
+    through HA's own MCP client code; iOS Shortcut-style raw and JSON uploads.
+- **Not verified here:** a real iPhone, a real Home Assistant, and real AI providers (no keys in this
+  environment).
+
+### Still open
+
+- **Exit criterion 1** (a 20-card eval set scored per provider) needs your cards and provider keys:
+  [`EVAL.md`](EVAL.md) has the commands. The harness, the banana replay and the release check are in place.
+- With local-only on, a local provider over its monthly limit and a cloud fallback still within it, a card fails
+  `local_only_unavailable` rather than `limit_reached` (the router applies limits before the policy).
+- With two whole-card proposals pending, accepting the older one computes its flags against the newer reading.
+- Editing a flagged note's text means keeping its flag again.
+- A size word after the food ("1 c. sugar (scant)") is still read as the unit "cup scant".
+- A crash in the milliseconds between turning a page's files and saving its metadata can leave the page turned with
+  its old metadata.
+- The re-read selection starts across the middle of the card, not at the flagged line (no bounding boxes).
+- The voice tool's result keys are snake_case; REST's are camelCase.
+- Upstream, unchanged: its own events' Apprise URLs still turn spaces into `+`; the restore page shows its generic
+  failure toast next to the busy message; a fresh install started with two workers fails its first start.

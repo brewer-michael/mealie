@@ -123,7 +123,7 @@ Shortcuts send cards to `POST /api/ai/ingest` ([section 5](#5-the-upload-api)). 
 - **The header** `Authorization` with the value `Bearer <token>`. Mealie refuses uploads without it.
 
 The answer holds `summary`, such as "1 recipe card queued. You'll be notified when it's ready.", in the phone's
-language. When nothing was queued, the reason is in `detail.summary` (photos that couldn't be used) or
+language. When nothing was queued, the reason is in `detail.summary` (cards already scanned or that couldn't be used) or
 `detail.message` (anything else).
 
 **Scan a card** (one side):
@@ -241,12 +241,13 @@ entirely.
    isn't used.
 2. **Cover the slots a card uses:** a local **image provider** (or OCR) and a local **default provider**. If the
    **fast** slot has providers of its own, give it a local one too, or tag suggestions are skipped for these cards.
-3. **Turn it on**, for the whole group or for one batch:
+3. **Turn it on**, for the whole group or for the cards you're sending:
    - **Group Settings > Recipe cards > Keep recipe card photos and text on this server** (group managers). The card
      lists the local providers for *Reading photos*, *Building recipes* and *Quick tasks*, and warns when cards can't
      be read locally.
    - Or tap the privacy chip on the Recipe cards page and choose **Keep these cards on this server**. It applies to
-     the cards you send from then on. A batch can opt in when the group doesn't, never out.
+     every card not sent yet; cards already sent keep the setting they went with. Cards can opt in when the group
+     doesn't, never out.
 
 Every AI call a local-only card causes is checked: the read, the OCR fallback, building the recipe, suggestions,
 re-reads and re-extracts. If no local provider can do a step, the card fails with *local only unavailable* rather

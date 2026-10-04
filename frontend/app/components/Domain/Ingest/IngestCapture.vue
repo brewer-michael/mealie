@@ -17,16 +17,6 @@
       </v-btn>
     </v-btn-toggle>
 
-    <div v-if="pendingFront" class="pending-front d-flex align-center mb-3">
-      <img
-        :src="previewUrl(pendingFront)"
-        class="capture-thumb"
-        :alt="$t('recipe-ingest.capture.front')"
-        decoding="async"
-      >
-      <span class="ml-3 text-body-2">{{ $t("recipe-ingest.capture.front") }}</span>
-    </div>
-
     <div class="capture-actions d-flex flex-wrap align-center ga-2">
       <v-btn
         class="take-photo"
@@ -64,6 +54,16 @@
       >
         {{ $t("recipe-ingest.capture.done") }}
       </v-btn>
+    </div>
+    <!-- below the buttons, so the Back side shutter stays where Take photo was (the top half of a phone screen) -->
+    <div v-if="pendingFront" class="pending-front d-flex align-center mt-3">
+      <img
+        :src="previewUrl(pendingFront)"
+        class="capture-thumb"
+        :alt="$t('recipe-ingest.capture.front')"
+        decoding="async"
+      >
+      <span class="ml-3 text-body-2">{{ $t("recipe-ingest.capture.front") }}</span>
     </div>
     <p v-if="openBatchCardCount" class="cards-queued text-caption mt-2 mb-0">
       {{ $t("recipe-ingest.capture.cards-queued", openBatchCardCount) }}
