@@ -29,6 +29,7 @@ TOOL_NAMES = {
     "suggest_from_ingredients": False,
     "whats_planned": False,
     "get_shopping_list": False,
+    "recipe_card_queue": False,
     "add_to_shopping_list": True,
     "plan_meal": True,
 }

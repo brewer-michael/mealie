@@ -151,6 +151,8 @@
                 :label="opt.text"
               />
             </section>
+            <!-- fork: "recipe cards ready" (docs/ai/PHASE2.md §8) -->
+            <HouseholdNotifierAIEvents :notifier-id="notifier.id" />
           </div>
           <v-card-actions class="py-0">
             <v-spacer />

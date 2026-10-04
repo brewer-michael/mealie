@@ -23,6 +23,7 @@ from mealie.services.ai.errors import (
     AIProviderRefusedError,
     AIProviderUnsupportedError,
 )
+from mealie.services.ai.ingest.pipeline import llm_schemas as card_schemas
 from mealie.services.ai.usage import AITokenUsage
 from mealie.services.openai import OpenAIImageExternal, OpenAILocalImage, OpenAIService
 from mealie.services.openai.openai import OpenAILocalAudio
@@ -319,8 +320,17 @@ RESPONSE_SCHEMAS = [
     schema
     for name in response_schemas.__all__
     if isinstance(schema := getattr(response_schemas, name), type) and issubclass(schema, OpenAIBase)
+] + [
+    # the recipe card pipeline's own (docs/ai/PHASE2.md §4.2)
+    card_schemas.OpenAIRecipeCardTranscription,
+    card_schemas.OpenAIRecipeCardUnsure,
+    card_schemas.OpenAIRecipeCardTranscript,
+    card_schemas.OpenAIRecipeCardRegion,
 ]
-"""Every response schema upstream asks providers for (`mealie/schema/openai`), and the models they nest"""
+"""
+Every response schema upstream asks providers for (`mealie/schema/openai`), and the models they nest; and the recipe
+card pipeline's
+"""
 
 MAX_UNION_PARAMETERS = 16
 MAX_OPTIONAL_PARAMETERS = 24

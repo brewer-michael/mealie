@@ -94,7 +94,9 @@
 </template>
 
 <script setup lang="ts">
+import { mdiCardTextOutline } from "@mdi/js";
 import { useLoggedInState } from "~/composables/use-logged-in-state";
+import { useRecipeIngestCounts, useRecipeIngestSettings } from "~/composables/use-recipe-ingest";
 import type { SideBarLink } from "~/types/application-types";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useCookbookPreferences } from "~/composables/use-users/preferences";
@@ -134,6 +136,20 @@ const cookbooks = computed(() => {
 });
 
 const showAIImport = computed(() => group.value?.aiProviderSettings?.aiEnabled);
+
+// Fork: recipe cards (docs/ai/PHASE2.md §1.1): a sidebar entry with the ready count and a Create-menu item, shown
+// when the group can read cards. The count is fetched once here; the cards pages update the shared ref.
+const { settings: cardSettings, load: loadCardSettings } = useRecipeIngestSettings();
+const { ready: cardsReady, refresh: refreshCardCounts } = useRecipeIngestCounts();
+const canReadCards = computed(() => isOwnGroup.value && !!cardSettings.value?.canReadCards);
+const cardsTitle = computed(() => cardsReady.value
+  ? i18n.t("recipe-ingest.nav.recipe-cards-count", { count: cardsReady.value })
+  : i18n.t("recipe-ingest.nav.recipe-cards"));
+watch(() => isOwnGroup.value && !!showAIImport.value, async (aiOn) => {
+  if (aiOn && !cardSettings.value && (await loadCardSettings())?.canReadCards) {
+    await refreshCardCounts();
+  }
+}, { immediate: true });
 
 const sidebar = ref<boolean>(false);
 onMounted(() => {
@@ -213,6 +229,15 @@ const createLinks = computed(() => [
     hide: !showAIImport.value,
   },
   {
+    insertDivider: false,
+    icon: mdiCardTextOutline,
+    title: i18n.t("recipe-ingest.nav.scan-recipe-cards"),
+    subtitle: i18n.t("recipe-ingest.nav.scan-recipe-cards-subtitle"),
+    to: `/g/${groupSlug.value}/recipes/cards`,
+    restricted: true,
+    hide: !canReadCards.value, // fork: recipe cards
+  },
+  {
     insertDivider: true,
     icon: $globals.icons.edit,
     title: i18n.t("general.create"),
@@ -236,6 +261,9 @@ const topLinks = computed<SideBarLink[]>(() => [
     title: i18n.t("recipe-finder.recipe-finder"),
     restricted: false,
   },
+  ...(canReadCards.value // fork: recipe cards
+    ? [{ icon: mdiCardTextOutline, to: `/g/${groupSlug.value}/recipes/cards`, title: cardsTitle.value, restricted: true }]
+    : []),
   {
     icon: $globals.icons.calendarMultiselect,
     title: i18n.t("meal-plan.meal-planner"),

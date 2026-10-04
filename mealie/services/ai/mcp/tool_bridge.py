@@ -52,6 +52,7 @@ TITLES = {
     "suggest_from_ingredients": "Suggest recipes from ingredients",
     "whats_planned": "What's planned",
     "get_shopping_list": "Read the shopping list",
+    "recipe_card_queue": "Recipe card queue",
     "add_to_shopping_list": "Add to the shopping list",
     "plan_meal": "Plan a meal",
 }

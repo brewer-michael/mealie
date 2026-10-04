@@ -79,6 +79,18 @@
           variant="outlined"
           class="mb-4"
         />
+        <!-- Fork: local-only recipe cards use only providers marked so, at a private address (docs/ai/PHASE2.md §10) -->
+        <v-switch
+          :model-value="hasBaseUrl && formData.runsLocally"
+          :label="$t('recipe-ingest.provider.runs-locally')"
+          :hint="$t(hasBaseUrl ? 'recipe-ingest.provider.runs-locally-hint' : 'recipe-ingest.provider.runs-locally-needs-base-url')"
+          :disabled="!hasBaseUrl"
+          persistent-hint
+          color="primary"
+          density="compact"
+          class="mb-4 runs-locally"
+          @update:model-value="value => formData.runsLocally = !!value"
+        />
         <v-number-input
           v-model.number="formData.timeout"
           :label="$t('group.ai-provider-settings.request-timeout-seconds')"
@@ -191,11 +203,14 @@ const defaultForm = () => ({
   timeout: 300,
   protocol: "openai" as NonNullable<AIProviderCreate["protocol"]>,
   monthlyTokenLimit: null as number | null,
+  runsLocally: false,
   requestHeaders: {} as Record<string, string>,
   requestParams: {} as Record<string, string>,
 });
 
 const formData = reactive(defaultForm());
+// Fork: a provider with no base URL uses its cloud API, so it can't run locally
+const hasBaseUrl = computed(() => !!formData.baseUrl?.trim());
 
 const protocolOptions = computed(() => [
   { title: i18n.t("group.ai-provider-settings.api-type-openai"), value: "openai" },
@@ -275,6 +290,7 @@ watch(
       formData.timeout = data.timeout ?? 300;
       formData.protocol = data.protocol ?? "openai";
       formData.monthlyTokenLimit = data.monthlyTokenLimit ?? null;
+      formData.runsLocally = data.runsLocally ?? false;
       apiKeyUnreadable.value = data.apiKeySet === false;
       savedApiKeyDestination.value = apiKeyDestination(data);
       formData.requestHeaders = { ...(data.requestHeaders ?? {}) };
@@ -297,6 +313,7 @@ function handleSubmit() {
       timeout: formData.timeout,
       protocol: formData.protocol,
       monthlyTokenLimit: formData.monthlyTokenLimit || null,
+      runsLocally: hasBaseUrl.value && formData.runsLocally,
       requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
       requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
     };
@@ -314,6 +331,7 @@ function handleSubmit() {
       timeout: formData.timeout,
       protocol: formData.protocol,
       monthlyTokenLimit: formData.monthlyTokenLimit || null,
+      runsLocally: hasBaseUrl.value && formData.runsLocally,
       requestHeaders: Object.keys(formData.requestHeaders).length ? formData.requestHeaders : undefined,
       requestParams: Object.keys(formData.requestParams).length ? formData.requestParams : undefined,
     };

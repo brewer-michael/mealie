@@ -46,6 +46,7 @@ READ_TOOLS = [
     "suggest_from_ingredients",
     "whats_planned",
     "get_shopping_list",
+    "recipe_card_queue",
 ]
 """In the registry's order"""
 ALL_TOOLS = [*READ_TOOLS, "add_to_shopping_list", "plan_meal"]

@@ -65,6 +65,9 @@
       </v-card>
     </div>
 
+    <!-- fork: recipe card settings (docs/ai/PHASE2.md §10) -->
+    <GroupRecipeCardSettings v-if="group.aiProviderSettings" class="mt-6" />
+
     <div class="mt-6">
       <v-card variant="outlined" style="border-color: lightgray;">
         <v-card-text>
@@ -80,6 +83,7 @@ import GroupPreferencesEditor from "~/components/Domain/Group/GroupPreferencesEd
 import GroupAIProviderSettingsEditor from "~/components/Domain/Group/GroupAIProviderSettingsEditor.vue";
 import GroupAIProviderUsage from "~/components/Domain/Group/GroupAIProviderUsage.vue";
 import GroupMcpSettings from "~/components/Domain/Group/GroupMcpSettings.vue";
+import GroupRecipeCardSettings from "~/components/Domain/Group/GroupRecipeCardSettings.vue";
 import { useGroupSelf } from "~/composables/use-groups";
 import { useAIProviders } from "~/composables/use-ai-providers";
 import { useAIProviderKeyStatus, useAIProviderRoutes } from "~/composables/use-ai-provider-routing";

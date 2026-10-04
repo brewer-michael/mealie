@@ -53,6 +53,7 @@ vi.mock("~/components/Domain/Group/GroupPreferencesEditor.vue", () => ({ default
 vi.mock("~/components/Domain/Group/GroupAIProviderSettingsEditor.vue", () => ({ default: { render: () => null } }));
 vi.mock("~/components/Domain/Group/GroupAIProviderUsage.vue", () => ({ default: { render: () => null } }));
 vi.mock("~/components/Domain/Group/GroupMcpSettings.vue", () => ({ default: { render: () => null } }));
+vi.mock("~/components/Domain/Group/GroupRecipeCardSettings.vue", () => ({ default: { render: () => null } }));
 
 type PageVM = {
   refGroupAISettingsForm: { validate: () => boolean } | null;

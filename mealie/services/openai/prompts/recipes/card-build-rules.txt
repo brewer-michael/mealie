@@ -1,0 +1,6 @@
+This source is the transcription of a handwritten or printed recipe card. Rules for recipe cards, which override the rules above where they differ:
+- The markers [illegible] and [blank] mark writing that couldn't be read and gaps the writer left on purpose. Keep every marker exactly where it is, written exactly that way, in the field it belongs to. Never replace a marker with a value, never remove one, and never guess what it stands for.
+- Keep each ingredient line exactly as transcribed, abbreviations and capitals included ("1 T. coconut oil (melted)", "1/4 t. salt"). Don't expand, convert or correct quantities or units.
+- Keep each step's wording as transcribed. Never add quantities, times or temperatures that aren't in the transcription.
+- Don't put who the recipe is from (e.g. "From Grandma Jo") in the description.
+- Leave the description empty unless the card itself has one.

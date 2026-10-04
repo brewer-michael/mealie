@@ -3,6 +3,7 @@
 from typing import Any
 
 from .base import AITool
+from .ingest import recipe_card_queue
 from .mealplans import plan_meal, whats_planned
 from .recipes import get_cooking_step, get_recipe, search_recipes, suggest_from_ingredients
 from .shopping import add_to_shopping_list, get_shopping_list
@@ -16,6 +17,7 @@ _TOOLS: dict[str, AITool[Any, Any]] = {
         suggest_from_ingredients,
         whats_planned,
         get_shopping_list,
+        recipe_card_queue,
         add_to_shopping_list,
         plan_meal,
     ]

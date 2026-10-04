@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -62,6 +62,12 @@ class OCRResult:
 
     rotation: int = 0
     """Degrees the image was turned clockwise to read it"""
+
+    rotation_scores: dict[int, float] = field(default_factory=dict)
+    """
+    Fork: how well the image read at each rotation it was probed at (see `_orientation_score`), so a caller can see
+    how sure the chosen rotation was. Empty when nothing was probed.
+    """
 
 
 @dataclass(frozen=True)
@@ -171,12 +177,23 @@ def _orientation_score(words: list[_Word]) -> float:
     return sum(word.confidence * word.characters for word in words if word.characters > 1 and word.width >= word.height)
 
 
-def _find_rotation(image: Image.Image, read: Callable[[Image.Image], list[_Word]]) -> int:
+def _probe_rotations(image: Image.Image, read: Callable[[Image.Image], list[_Word]]) -> dict[int, float]:
     # Tesseract's own orientation detection (--psm 0) gives up on handwriting, so read
-    # a small copy every way up and keep whichever reads best
+    # a small copy every way up and score each reading
     probe = _fit(image, PROBE_DIMENSION)
-    scores = {rotation: _orientation_score(read(_rotate(probe, rotation))) for rotation in ROTATIONS}
-    return max(scores, key=scores.__getitem__)
+    return {rotation: _orientation_score(read(_rotate(probe, rotation))) for rotation in ROTATIONS}
+
+
+def _choose_rotation(scores: dict[int, float], min_ratio: float = 1.0) -> int:
+    """
+    The best-scoring rotation, but only when it scores at least `min_ratio` times the upright one; otherwise 0.
+    Handwriting scores low every way up, so a caller that turns the image for good (rather than just reading it)
+    asks for a margin. Fork: the margin (docs/ai/PHASE2.md §4.4); with the default of 1 the best rotation wins.
+    """
+    best = max(scores, key=scores.__getitem__)
+    if best and scores[best] >= min_ratio * scores.get(0, 0.0):
+        return best
+    return 0
 
 
 def _to_text(words: list[_Word]) -> str:
@@ -197,10 +214,14 @@ def _to_text(words: list[_Word]) -> str:
     return "\n".join(lines)
 
 
-def extract_text(path: Path) -> OCRResult:
+def extract_text(path: Path, *, min_ratio: float = 1.0) -> OCRResult:
     """
     Reads the text in an image, whichever way up it was photographed. This blocks, so run it off
     the event loop. Returns an empty result if OCR is unavailable or the image can't be read.
+
+    Fork: the image is turned only when the best rotation scores at least `min_ratio` times the upright
+    one (docs/ai/PHASE2.md §4.4), and the text is read at the rotation chosen. The default of 1 keeps
+    upstream's behaviour: the best rotation wins.
     """
 
     if not is_available():
@@ -211,7 +232,8 @@ def extract_text(path: Path) -> OCRResult:
         image = _prepare(path)
         with tempfile.TemporaryDirectory(prefix="mealie-ocr-") as work_dir:
             read = functools.partial(_read_words, work_dir=Path(work_dir), deadline=deadline)
-            rotation = _find_rotation(image, read)
+            scores = _probe_rotations(image, read)
+            rotation = _choose_rotation(scores, min_ratio)
             long_side = min(max(max(image.size), MIN_DIMENSION), MAX_DIMENSION)
             words = read(_fit(_rotate(image, rotation), long_side))
     except subprocess.TimeoutExpired:
@@ -225,8 +247,8 @@ def extract_text(path: Path) -> OCRResult:
         return OCRResult()
 
     if not words:
-        return OCRResult(rotation=rotation)
+        return OCRResult(rotation=rotation, rotation_scores=scores)
 
     confidence = sum(word.confidence for word in words) / len(words)
     logger.debug(f"OCR read {len(words)} words from {path.name} (rotation {rotation}, confidence {confidence:.0f})")
-    return OCRResult(text=_to_text(words), confidence=confidence, rotation=rotation)
+    return OCRResult(text=_to_text(words), confidence=confidence, rotation=rotation, rotation_scores=scores)

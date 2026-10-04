@@ -81,6 +81,21 @@ function mountDialog(providerId?: string) {
             </div>
           `,
         },
+        VSwitch: {
+          props: ["modelValue", "label", "hint", "disabled"],
+          emits: ["update:modelValue"],
+          template: `
+            <label class="switch">
+              <input
+                type="checkbox"
+                :checked="modelValue"
+                :disabled="disabled"
+                @change="$emit('update:modelValue', $event.target.checked)"
+              >
+              <small class="hint">{{ hint }}</small>
+            </label>
+          `,
+        },
         VNumberInput: {
           props: ["modelValue", "label", "max"],
           template: `
@@ -335,5 +350,93 @@ describe("GroupAIProviderDialog", () => {
     await flushPromises();
 
     expect(wrapper.findAll(".model-option")).toHaveLength(0);
+  });
+
+  // "Runs on my network": its texts come from the fork's recipe-ingest strings, so it's found by its class
+  function runsLocally(wrapper: VueWrapper) {
+    return wrapper.get(".runs-locally input").element as HTMLInputElement;
+  }
+
+  test("a provider with no base URL can't run locally", async () => {
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    expect(runsLocally(wrapper).disabled).toBe(true);
+    expect(runsLocally(wrapper).checked).toBe(false);
+    // the hint explains why it's off
+    const explanation = wrapper.get(".runs-locally .hint").text();
+
+    await field(wrapper, "Base URL").setValue("http://ollama.local:11434/v1");
+    expect(runsLocally(wrapper).disabled).toBe(false);
+    expect(wrapper.get(".runs-locally .hint").text()).not.toBe(explanation);
+    expect(explanation).not.toBe("");
+  });
+
+  test("creates a provider that runs on the network", async () => {
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    await field(wrapper, "Provider Name").setValue("Qwen VL");
+    await field(wrapper, "Model").setValue("qwen3-vl");
+    await field(wrapper, "API Key").setValue("ollama");
+    await field(wrapper, "Base URL").setValue("http://192.168.1.20:11434/v1");
+    await wrapper.get(".runs-locally input").setValue(true);
+    await wrapper.get(".dialog-submit").trigger("click");
+
+    expect(wrapper.emitted("create")?.[0]?.[0]).toMatchObject({
+      baseUrl: "http://192.168.1.20:11434/v1",
+      runsLocally: true,
+    });
+  });
+
+  test("clearing the base URL turns it off", async () => {
+    api.getOne.mockResolvedValue({
+      data: {
+        id: "provider-id",
+        name: "Ollama",
+        model: "qwen3-vl",
+        protocol: "openai",
+        baseUrl: "http://localhost:11434/v1",
+        runsLocally: true,
+        apiKeySet: true,
+      },
+    });
+    const wrapper = mountDialog("provider-id");
+    await flushPromises();
+    expect(runsLocally(wrapper).checked).toBe(true);
+
+    await field(wrapper, "Base URL").setValue("");
+    expect(runsLocally(wrapper).checked).toBe(false);
+    expect(runsLocally(wrapper).disabled).toBe(true);
+    await wrapper.get(".dialog-submit").trigger("click");
+
+    expect(wrapper.emitted("update")?.[0]).toEqual([
+      "provider-id",
+      expect.objectContaining({ baseUrl: null, runsLocally: false }),
+    ]);
+  });
+
+  test("an edit keeps the saved setting", async () => {
+    api.getOne.mockResolvedValue({
+      data: {
+        id: "provider-id",
+        name: "Ollama",
+        model: "qwen3-vl",
+        protocol: "openai",
+        baseUrl: "http://localhost:11434/v1",
+        runsLocally: true,
+        apiKeySet: true,
+      },
+    });
+    const wrapper = mountDialog("provider-id");
+    await flushPromises();
+
+    await field(wrapper, "Model").setValue("qwen3-vl:32b");
+    await wrapper.get(".dialog-submit").trigger("click");
+
+    expect(wrapper.emitted("update")?.[0]).toEqual([
+      "provider-id",
+      expect.objectContaining({ model: "qwen3-vl:32b", runsLocally: true }),
+    ]);
   });
 });

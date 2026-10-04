@@ -79,6 +79,10 @@
             {{ $t('recipe.import-with-ai-images-ocr-hint') }}
           </v-alert>
           <RecipeImportImages v-model="uploadedImages" :disabled="state.loading" />
+          <!-- fork: recipe card batches (docs/ai/PHASE2.md §1.1) -->
+          <router-link :to="`/g/${groupSlug}/recipes/cards`" class="d-inline-block mt-3 text-primary">
+            {{ $t('recipe-ingest.nav.scan-a-stack') }}
+          </router-link>
         </div>
         <v-alert
           v-else
