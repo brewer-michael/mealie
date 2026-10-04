@@ -10,7 +10,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -896,8 +896,8 @@ def short_renders(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     The real renderer with 2 s of CPU time (a hostile PDF runs out of it, a small one renders in a fraction), and the
     names of the PDFs it was started on, in order
     """
-    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
-    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 30)
+    monkeypatch.setattr(images, "pdf_render_cpu_seconds", lambda: 2)
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 30)
     monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 200)
     started: list[str] = []
     real_expand = images.expand_document
@@ -985,8 +985,7 @@ def test_a_groups_pdfs_hold_up_another_groups_for_one_card_at_most(
             with anyio.fail_after(30):
                 while not short_renders:  # the first one renders
                     await anyio.sleep(0.05)
-                group_lock = intake._group_render_locks[UUID(g2_user.group_id)]
-                while group_lock.statistics().tasks_waiting < 2:  # the others wait for their group's turn
+                while intake._render_turn(UUID(g2_user.group_id)).waiting < 2:  # the others wait for their group's turn
                     await anyio.sleep(0.05)
             card = IntakeCard(pages=[IntakePage(_named(_small_pdf(), "b.pdf"), "b.pdf")])
             group.start_soon(send, _service(db, user), card, _options(user), "b.pdf")
@@ -997,6 +996,132 @@ def test_a_groups_pdfs_hold_up_another_groups_for_one_card_at_most(
     assert [outcomes[name].reason for name in ("a1.pdf", "a2.pdf", "a3.pdf")] == [
         IngestRejectReason.pdf_not_supported
     ] * 3
+
+
+@pytest.fixture()
+def gated_renders(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[list[str], threading.Event]]:
+    """
+    PDF renders in the order they start (by file name), each refused once the gate opens: the first holds the render
+    slot until then
+    """
+    order: list[str] = []
+    gate = threading.Event()
+
+    def pdf_pages(raw: Any, raw_sha256: str, raw_bytes: int) -> list[images.DocumentPage]:
+        order.append(getattr(raw, "name", "?"))
+        gate.wait(60)
+        raise images.PageRejected(IngestRejectReason.pdf_not_supported)
+
+    monkeypatch.setattr(images, "_pdf_pages", pdf_pages)
+    yield order, gate
+    gate.set()
+
+
+def test_the_inboxs_pdfs_take_their_groups_turn_too(
+    db: Session,
+    unique_user_fn_scoped: TestUser,
+    g2_user: TestUser,
+    gated_renders: tuple[list[str], threading.Event],
+):
+    # an inbox scan's PDF and an upload's of the same group share the group's one place in the render queue: another
+    # group's upload waits for one card of that group, not for the inbox's card too
+    user = unique_user_fn_scoped
+    order, gate = gated_renders
+    group_id = UUID(g2_user.group_id)
+    outcomes: dict[str, Any] = {}
+
+    def scan() -> None:
+        with session_context() as session:
+            card = IntakeCard(pages=[IntakePage(_named(PDF, "inbox.pdf"), "inbox.pdf")])
+            service = IntakeService(session, group_id, UUID(g2_user.household_id), intake.RenderBudget())
+            outcomes["inbox.pdf"] = service.ingest(card, _options(g2_user))
+
+    async def send(service: IntakeService, name: str, options: IntakeOptions) -> None:
+        outcomes[name] = await service.ingest_async(IntakeCard(pages=[IntakePage(_named(PDF, name), name)]), options)
+
+    async def wait_for(condition: Callable[[], bool]) -> None:
+        with anyio.fail_after(30):
+            while not condition():
+                await anyio.sleep(0.02)
+
+    async def main() -> threading.Thread:
+        async with anyio.create_task_group() as group:
+            group.start_soon(send, _service(db, g2_user), "upload.pdf", _options(g2_user))
+            await wait_for(lambda: order == ["upload.pdf"])  # it holds its group's turn and the slot
+            inbox_scan = threading.Thread(target=scan)
+            inbox_scan.start()
+            await wait_for(lambda: intake._render_turn(group_id).waiting == 1)  # the inbox's card waits for its turn
+            group.start_soon(send, _service(db, user), "other-group.pdf", _options(user))
+            await wait_for(lambda: intake._render_slot.waiting == 1)  # the other group's card waits for the slot
+            gate.set()
+        return inbox_scan
+
+    inbox_scan = anyio.run(main)
+    inbox_scan.join(30)
+    assert not inbox_scan.is_alive()
+    assert order == ["upload.pdf", "other-group.pdf", "inbox.pdf"]
+    assert {name: outcome.reason for name, outcome in outcomes.items()} == dict.fromkeys(
+        ("upload.pdf", "other-group.pdf", "inbox.pdf"), IngestRejectReason.pdf_not_supported
+    )
+    assert (intake._render_slot.waiting, intake._render_turn(group_id).waiting) == (0, 0)
+
+
+def test_the_render_queue_is_first_come_first_served_and_survives_cancelled_waiters():
+    lock = intake._FairLock()
+    order: list[str] = []
+    done = anyio.Event()
+    scopes: dict[str, anyio.CancelScope] = {}
+
+    async def take(name: str, hold: anyio.Event | None = None) -> None:
+        with anyio.CancelScope() as scopes[name]:
+            async with lock.held():
+                order.append(name)
+                if hold is not None:
+                    await hold.wait()
+
+    def take_blocking(name: str) -> None:
+        with lock.held_blocking():
+            order.append(name)
+
+    async def wait_for(waiting: int) -> None:
+        with anyio.fail_after(10):
+            while lock.waiting != waiting:
+                await anyio.sleep(0.01)
+
+    async def main() -> None:
+        release = anyio.Event()
+        async with anyio.create_task_group() as group:
+            group.start_soon(take, "first", release)
+            await wait_for(0)
+            group.start_soon(take, "gives up")
+            await wait_for(1)
+            group.start_soon(take, "second")
+            await wait_for(2)
+            thread = threading.Thread(target=take_blocking, args=("thread",))
+            thread.start()
+            await wait_for(3)
+            scopes["gives up"].cancel()  # cancelled while it waits: out of the queue
+            await wait_for(2)
+            release.set()
+        await anyio.to_thread.run_sync(thread.join, 10)
+
+        # cancelled just as the lock is handed to it: it passes the lock on
+        hold = anyio.Event()
+        async with anyio.create_task_group() as group:
+            group.start_soon(take, "holder", hold)
+            await wait_for(0)
+            group.start_soon(take, "handed then cancelled")
+            await wait_for(1)
+            hold.set()
+            await anyio.sleep(0)  # the holder releases: the lock is handed over, its waiter not yet running
+            scopes["handed then cancelled"].cancel()
+        with anyio.fail_after(10):
+            async with lock.held():
+                done.set()
+
+    anyio.run(main)
+    assert order[:4] == ["first", "second", "thread", "holder"]
+    assert done.is_set() and lock.waiting == 0
 
 
 # ==========================================

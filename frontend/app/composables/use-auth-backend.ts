@@ -42,6 +42,32 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let refreshInFlight: Promise<void> | null = null;
 let refreshRetries = 0;
 
+/** fork: how long a session check waits out a backup restore before it gives up as before */
+const RESTORE_WAIT_MS = 5 * 60_000;
+/** fork: how often it asks again meanwhile, at most (a restore takes seconds; its Retry-After is a minute) */
+const RESTORE_POLL_MS = 5000;
+
+/**
+ * fork: a backup restore answers every request with 503 paused_for_restore for a moment (docs/ai/PHASE2.md §3.9).
+ * That isn't a signed-out user, so `request` is sent again until the restore is over (for up to `RESTORE_WAIT_MS`)
+ * rather than its failure ending the session; any other failure is thrown as it is.
+ */
+async function whilePausedForRestore<T>(request: () => Promise<T>): Promise<T> {
+  const since = Date.now();
+  for (;;) {
+    try {
+      return await request();
+    }
+    catch (error: any) {
+      if (error?.response?.status !== 503 || Date.now() - since >= RESTORE_WAIT_MS) {
+        throw error;
+      }
+      const asked = Number(error.response.headers?.["retry-after"]) * 1000;
+      await new Promise(resolve => setTimeout(resolve, asked > 0 ? Math.min(asked, RESTORE_POLL_MS) : RESTORE_POLL_MS));
+    }
+  }
+}
+
 export function resetAuth() {
   authUser.value = null;
   authStatus.value = "unauthenticated";
@@ -124,7 +150,7 @@ export const useAuthBackend = function (): AuthState {
 
     authStatus.value = "loading";
     try {
-      const { data } = await $axios.get<UserOut>("/api/users/self");
+      const { data } = await whilePausedForRestore(() => $axios.get<UserOut>("/api/users/self")); // fork
       authUser.value = data;
       authStatus.value = "authenticated";
     }

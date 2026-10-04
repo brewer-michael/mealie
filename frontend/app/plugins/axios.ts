@@ -75,7 +75,13 @@ export default defineNuxtPlugin((nuxtApp) => {
         try {
           await nuxtApp.runWithContext(() => useAuthBackend().refresh());
         }
-        catch {
+        catch (refreshError: any) {
+          // fork: a backup restore answers every request, the refresh too, with 503 paused_for_restore for a moment
+          // (docs/ai/PHASE2.md §3.9). The session isn't over: the request fails with that 503, which its caller retries
+          // after Retry-After (recipe card uploads do), and the next request refreshes again.
+          if (refreshError?.response?.status === 503) {
+            return Promise.reject(refreshError);
+          }
           // Refresh failed, so the session really is over. Fall through to the logout path.
           refreshed = false;
         }

@@ -206,10 +206,12 @@ def test_a_provider_over_its_monthly_limit_still_counts_as_able_to_read(
         raise AIProviderLimitReachedError("over the limit")
 
     monkeypatch.setattr(AIRuntime, "candidates", over_the_limit)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)  # nothing stands in for the image slot
     settings = get_settings(api_client, unique_user_fn_scoped)
     assert settings["canReadCards"] is True
     assert settings["limitReached"] is True  # the capture page warns before anything is uploaded
-    assert settings["reader"] is None
+    # the reader is still named (LO4): the limit is reported on its own, not as "AI isn't set up"
+    assert settings["reader"] == {"name": "Gemini Flash", "local": False, "viaOcr": False}
 
 
 @pytest.mark.parametrize(

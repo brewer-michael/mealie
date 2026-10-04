@@ -702,6 +702,32 @@ describe("drafts and proposals", () => {
     expect(rereadTargetValue(rereadTargets(normalizeDraft({ name: "Banana Mug Cake" })), "ingredients", "gone")).toBe("ingredients:new");
   });
 
+  test("each ingredient target is named by its line as on the card, parsed or not (LU8)", () => {
+    const options = rereadTargets(normalizeDraft(bananaDraft({
+      ingredients: [
+        // parsed: its row shows the parsed reading, the card says what was written
+        {
+          referenceId: "i1",
+          originalText: "1/3 C. almond flour",
+          quantity: 1 / 3,
+          unit: { id: "u-cup", name: "cup" },
+          food: { id: "f-flour", name: "almond flour" },
+          note: "",
+          display: "¹/₃ cup almond flour",
+        },
+        // a marker line, kept as text
+        { referenceId: "i2", originalText: "1 C. [illegible]", quantity: null, unit: null, food: null, note: "1 C. [illegible]", display: "1 C. [illegible]" },
+        // added here: nothing on the card, so as its row shows it
+        { referenceId: "i3", originalText: "", quantity: 2, unit: { id: null, name: "cup" }, food: { id: null, name: "pecans" }, note: "", display: "" },
+      ],
+    })));
+    expect(options.filter(option => option.kind === "ingredient").map(option => option.text)).toEqual([
+      "1/3 C. almond flour",
+      "1 C. [illegible]",
+      "2 cup pecans",
+    ]);
+  });
+
   test("each note is a re-read target by its id, named by its title or its first words", () => {
     const options = rereadTargets(normalizeDraft(bananaDraft({
       notes: [{ id: "n1", title: "From", text: "Grandma Jo" }, { id: "n2", title: "", text: "Doubles well in a 9x13 pan, baked a little longer" }],
@@ -883,6 +909,8 @@ describe("useRecipeIngestReview", () => {
       flagResolutions: {},
       resolvedProposalIds: [],
       clearError: false,
+      // the draft schema this page is built for, so the server doesn't take its cover choice for an old page's
+      clientDraftSchema: 3,
     });
     expect(review.saveState.value).toBe("saved");
     expect(review.draftVersion.value).toBe(4);
@@ -1184,6 +1212,108 @@ describe("useRecipeIngestReview", () => {
     // with Undo for the card just added
     expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake", detail: null, undoJobId: "j1" });
     expect(takeCarriedReviewNotice("j2")).toBeNull();
+  });
+
+  test("Added names the recipe the card became, not the draft, when the draft's name is taken (LB3)", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({
+      flags: [],
+      duplicateOf: { id: "r0", slug: "banana-mug-cake", name: "Banana Mug Cake" },
+      duplicateName: "Banana Mug Cake (2)",
+    })));
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake-2", nextJobId: "j2", warnings: [] }));
+    const { review } = await loaded();
+
+    expect(await review.commit()).toBe("committed");
+
+    expect(takeCarriedReviewNotice("j2")).toEqual({ kind: "success", text: "Added Banana Mug Cake (2)", detail: null, undoJobId: "j1" });
+  });
+
+  test("Added names the recipe as the commit answer names it", async () => {
+    // another card took "Banana Mug Cake (2)" between this page's last save and its commit
+    api.getJob.mockResolvedValueOnce(ok(job({
+      flags: [],
+      duplicateOf: { id: "r0", slug: "banana-mug-cake", name: "Banana Mug Cake" },
+      duplicateName: "Banana Mug Cake (2)",
+    })));
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake-3", name: "Banana Mug Cake (3)", nextJobId: "j2", warnings: [] }));
+    const { review } = await loaded();
+
+    expect(await review.commit()).toBe("committed");
+
+    expect(takeCarriedReviewNotice("j2")).toMatchObject({ text: "Added Banana Mug Cake (3)" });
+  });
+
+  test("Added follows the name as the save just before the commit left it", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({
+      flags: [],
+      duplicateOf: { id: "r0", slug: "banana-mug-cake", name: "Banana Mug Cake" },
+      duplicateName: "Banana Mug Cake (2)",
+    })));
+    api.updateJob.mockResolvedValueOnce(ok({ draftVersion: 4, flags: [], duplicateOf: null, duplicateJob: null, duplicateName: null }));
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "scones", nextJobId: "j2", warnings: [] }));
+    const { review } = await loaded();
+
+    review.draft.value.name = "Scones";
+    await nextTick();
+    expect(await review.commit()).toBe("committed");
+
+    expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 4 });
+    expect(takeCarriedReviewNotice("j2")).toMatchObject({ text: "Added Scones" });
+  });
+
+  test("a commit with the version from before a merge reloads the card and says so in one notice (LO2)", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    api.commit.mockResolvedValueOnce(conflictError);
+    const { review, navigate } = await loaded();
+
+    // another device added a page to this card: it's read again, at a new draft version
+    api.getJob.mockResolvedValueOnce(ok(job({
+      flags: [],
+      draftVersion: 4,
+      pageCount: 2,
+      task: { kind: "extract", state: "queued" },
+    })));
+    expect(await review.commit()).toBe("conflict");
+    await flushPromises();
+
+    expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 3 });
+    expect(api.getJob).toHaveBeenCalledTimes(2);
+    // shown as it is now, with no dialog to click through: nothing was unsaved
+    expect(review.conflict.value).toBe(false);
+    expect(review.draftVersion.value).toBe(4);
+    expect(review.job.value?.pageCount).toBe(2);
+    expect(review.job.value?.task).toEqual({ kind: "extract", state: "queued" });
+    expect(review.notice.value).toMatchObject({
+      kind: "warning",
+      text: "This card changed somewhere else, so it was reloaded. Check it, then commit again.",
+    });
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.warning).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(review.committing.value).toBe(false);
+  });
+
+  test("a commit refused as stale while an edit waits to be saved opens the reload dialog instead", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    let answer: (value: unknown) => void = () => {};
+    api.commit.mockReturnValueOnce(new Promise((resolve) => {
+      answer = resolve;
+    }));
+    const { review } = await loaded();
+
+    const committed = review.commit();
+    await flushPromises();
+    // typed while the commit was on its way: a reload would drop it
+    review.draft.value.description = "Typed meanwhile";
+    await nextTick();
+    answer(conflictError);
+    expect(await committed).toBe("conflict");
+    await flushPromises();
+
+    expect(review.conflict.value).toBe(true);
+    expect(api.getJob).toHaveBeenCalledOnce();
+    expect(review.draft.value.description).toBe("Typed meanwhile");
+    expect(review.notice.value).toBeNull();
   });
 
   test("after the batch's last card, the queue opens on the batch, which sums it up and says what was added", async () => {

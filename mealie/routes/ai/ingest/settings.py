@@ -6,7 +6,8 @@ every member's capture page needs to know.
   `reader` for the privacy chip, whether a card can be kept local (`localOnlyAvailable`), OCR, the upload limits and
   the household's inbox folder. Group managers also get `localReadiness`, the local providers per slot.
 - **Group managers** (`checks.can_manage()`) change `localOnly` and `crossRead`; the row is upserted (no row means
-  the defaults).
+  the defaults), in the ingest write section: a backup restore waits for it, and while one pauses ingestion the `PUT`
+  answers 503 `paused_for_restore` (§3.9).
 
 `canReadCards` and `localOnlyAvailable` follow exactly the rule the upload applies (`intake.reading_readiness`), so
 the app never offers what an upload would refuse: a provider over its monthly token limit still counts as able to
@@ -51,7 +52,7 @@ from mealie.services.ai.ingest.intake import ReadingReadiness, reading_readiness
 from mealie.services.ai.ingest.settings import get_ingest_settings, inbox_root
 from mealie.services.ai.local import card_reader, local_readiness
 
-from ._deps import IngestController, require_enabled
+from ._deps import IngestController, require_enabled, require_not_paused, write_section
 from .about import reader_running
 
 router = APIRouter(prefix="/ai/ingest", tags=["AI: Recipe Cards"])
@@ -167,6 +168,8 @@ class RecipeIngestSettingsController(IngestController):
         """Keep cards on this server, and read every card twice (group managers)"""
         self.checks.can_manage()
         require_enabled(self.translator)
+        require_not_paused(self.translator)
 
-        self.ingest_repos.settings.upsert(data)
+        with write_section(self.translator):
+            self.ingest_repos.settings.upsert(data)
         return settings_out(self.session, self.group_id, self.household_id, manager=True)

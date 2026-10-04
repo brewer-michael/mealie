@@ -8,6 +8,8 @@ import type { RecipeIngestionSettingsOut } from "~/lib/api/types/recipe-ingest";
 const api = vi.hoisted(() => ({ getSettings: vi.fn() }));
 const uploads = vi.hoisted(() => ({ closeCardsPage: vi.fn(), openCardsPage: vi.fn(), takeOverQueue: vi.fn() }));
 const queueElsewhere = ref(false);
+const queueKeptInMemoryElsewhere = ref(false);
+const uploadingLeftovers = ref(false);
 
 vi.mock("~/composables/api", () => ({
   useUserApi: () => ({ recipeIngest: api }),
@@ -20,6 +22,8 @@ vi.mock("~/composables/use-recipe-ingest-uploads", async importOriginal => ({
     localOnlyFinishedBatch: ref(false),
     openCardsPage: uploads.openCardsPage,
     queueElsewhere,
+    queueKeptInMemoryElsewhere,
+    uploadingLeftovers,
     takeOverQueue: uploads.takeOverQueue,
   }),
 }));
@@ -97,6 +101,8 @@ describe("the recipe cards page", () => {
     uploads.openCardsPage.mockReturnValue(uploads.closeCardsPage);
     uploads.takeOverQueue.mockResolvedValue(undefined);
     queueElsewhere.value = false;
+    queueKeptInMemoryElsewhere.value = false;
+    uploadingLeftovers.value = false;
     vi.stubGlobal("definePageMeta", vi.fn());
     vi.stubGlobal("useSeoMeta", vi.fn());
     vi.stubGlobal("useRoute", () => route);
@@ -138,7 +144,8 @@ describe("the recipe cards page", () => {
       .format(new Date("2026-11-01T00:00:00Z"));
     expect(wrapper.get(".limit-reached").text()).toBe(
       "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. "
-      + `They're read again automatically when the limit resets on ${reset}, or sooner if a manager raises it.`,
+      + `They're read automatically when the limit resets on ${reset}, or within about 10 minutes after a group manager `
+      + "raises it.",
     );
   });
 
@@ -345,6 +352,30 @@ describe("the recipe cards page", () => {
     await flushPromises();
     expect(wrapper.find(".queue-elsewhere").exists()).toBe(false);
     expect(wrapper.find(".capture-buttons").exists()).toBe(true);
+  });
+
+  test("Use this tab refused by a tab that couldn't save its photos: the page says why they stay there", async () => {
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    queueElsewhere.value = true;
+    const wrapper = await mountPage();
+    expect(wrapper.find(".queue-kept-in-memory").exists()).toBe(false);
+
+    queueKeptInMemoryElsewhere.value = true;
+    await flushPromises();
+    expect(wrapper.get(".queue-kept-in-memory").text()).toBe(
+      "That tab couldn't save its photos on this device, so they can't move here. Let them upload there first.",
+    );
+  });
+
+  test("a tab still uploading photos it couldn't save, after the queue left it, says to keep it open", async () => {
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    queueElsewhere.value = true;
+    uploadingLeftovers.value = true;
+    const wrapper = await mountPage();
+    expect(wrapper.get(".uploading-leftovers").text()).toBe(
+      "This tab is still uploading photos it couldn't save on this device. Keep it open until they're uploaded.",
+    );
+    expect(wrapper.find(".upload-queue").exists()).toBe(true);
   });
 
   test("the queue shows once: under the capture buttons when they're there, not before the settings answer", async () => {

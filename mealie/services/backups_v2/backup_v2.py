@@ -1,19 +1,56 @@
+import contextlib
 import datetime
+import functools
 import json
 import re
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from zipfile import ZipFile
 
 from mealie.core.config import get_app_settings
 from mealie.core.settings.static import APP_VERSION
+from mealie.db.migration_lock import MigrationLockTimeout, migration_lock  # fork: docs/ai/PHASE2.md §17
 from mealie.services._base_service import BaseService
+from mealie.services.ai.errors import IngestBusyError  # fork
 from mealie.services.ai.ingest.storage import pauses_ingest  # fork: docs/ai/PHASE2.md §3.9
 from mealie.services.backups_v2.alchemy_exporter import AlchemyExporter
 from mealie.services.backups_v2.backup_file import BackupFile
 
 
 class BackupSchemaMismatch(Exception): ...
+
+
+MIGRATION_LOCK_WAIT = 10
+"""Fork: how long a restore waits for another process's migration before it gives up, having changed nothing"""
+
+
+class MigrationBusyError(IngestBusyError):
+    """Fork: another Mealie process kept migrating the database, so the restore gave up before it changed anything"""
+
+    def __init__(self) -> None:
+        super().__init__("Another Mealie process is migrating the database. Try the restore again.")
+
+
+def holds_migrations[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """
+    Fork: `func` (a restore) holds the database's migration lock, from before it drops the tables until the restored
+    database is migrated and seeded (the exporter's `init_db.main`, which takes it again without waiting). A process
+    starting meanwhile waits for the restore, then finds the database at head and seeded, rather than migrating and
+    seeding the dropped one while the restore rebuilds it. A restore asked for while another process migrates waits
+    `MIGRATION_LOCK_WAIT`, then raises `MigrationBusyError` (the restore route's "try again") before anything changed.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(migration_lock(timeout=MIGRATION_LOCK_WAIT))
+            except MigrationLockTimeout as e:
+                raise MigrationBusyError() from e
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 class BackupV2(BaseService):
@@ -157,6 +194,7 @@ class BackupV2(BaseService):
         get_app_settings.cache_clear()
         self.settings = get_app_settings()
 
+    @holds_migrations  # fork: a process starting during the restore waits for it, not migrating a dropped database
     @pauses_ingest  # fork: recipe card ingestion pauses, and in-flight writes finish, before anything is replaced
     def restore(self, backup_path: Path) -> None:
         self.logger.info("initializing backup restore")

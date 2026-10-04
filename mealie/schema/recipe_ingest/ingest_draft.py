@@ -20,6 +20,12 @@ The current `CardDraft.schema_version`. Version 2 gave notes an `id`; version 3 
 is the household's default), which versions 1 and 2 set on every draft.
 """
 
+COVER_CHOICE_SCHEMA_VERSION = 3
+"""
+The first `schema_version` whose `use_card_as_cover: true` is the reviewer's choice: earlier versions, and pages built
+for them, set it on every draft
+"""
+
 NOTE_ID_NAMESPACE = UUID("6f1d2b8e-4c3a-4e57-9a0d-2b5c7e9f1a34")
 """The `uuid5` namespace of the ids a note sent or stored without one is given (`note_id_for`)"""
 
@@ -132,7 +138,7 @@ class CardDraft(MealieModel):
         if not isinstance(version, int) or version < CARD_DRAFT_SCHEMA_VERSION:
             data = {**data, "schema_version": CARD_DRAFT_SCHEMA_VERSION}
             data.pop("schemaVersion", None)
-        if not isinstance(version, int) or version < 3:
+        if not isinstance(version, int) or version < COVER_CHOICE_SCHEMA_VERSION:
             for key in ("use_card_as_cover", "useCardAsCover"):
                 if data.get(key) is True:
                     data[key] = None

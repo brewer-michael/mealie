@@ -100,11 +100,11 @@
         {{ $t("recipe-ingest.capture.limit-reached", { date: dateText(nextLimitReset(), true) }) }}
       </v-alert>
       <!-- cards are read, but an optional part of the read is skipped this month: a soft note, not a warning -->
-      <p v-if="limitedFeatures.length" class="limited-features text-body-small text-medium-emphasis mb-3">
+      <div v-if="limitedFeatures.length" class="limited-features text-body-small text-medium-emphasis mb-3">
         <span v-for="feature in limitedFeatures" :key="feature" class="limited-feature d-block">
           {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
         </span>
-      </p>
+      </div>
       <!-- another tab of this browser keeps the user's queue (it uploads it): this one only says so, and can take it -->
       <v-alert
         v-if="queueElsewhere"
@@ -113,6 +113,14 @@
         variant="tonal"
       >
         {{ $t("recipe-ingest.capture.queue-elsewhere") }}
+        <!-- "Use this tab" was refused: that tab couldn't save some photos on this device, so they can't move here -->
+        <div v-if="queueKeptInMemoryElsewhere" class="queue-kept-in-memory mt-2">
+          {{ $t("recipe-ingest.capture.queue-kept-in-memory") }}
+        </div>
+        <!-- this tab lost the queue with photos it couldn't save: they upload from here, so it must stay open -->
+        <div v-if="uploadingLeftovers" class="uploading-leftovers mt-2">
+          {{ $t("recipe-ingest.capture.uploading-leftovers") }}
+        </div>
         <template #append>
           <v-btn
             class="use-this-tab"
@@ -143,9 +151,9 @@
     -->
     <IngestUploadQueue v-if="queueWithoutCapture" class="upload-queue-alone mb-6" :group-slug="groupSlug" />
 
-    <p v-if="inboxFolder" class="inbox-hint text-body-medium text-medium-emphasis mb-6">
+    <div v-if="inboxFolder" class="inbox-hint text-body-medium text-medium-emphasis mb-6">
       {{ $t("recipe-ingest.settings.inbox-hint", { folder: inboxFolder }) }}
-    </p>
+    </div>
     <!-- photos waiting in the household's inbox folder and why, and the ones it refused lately -->
     <IngestInboxStatus class="mb-6" :settings="settings" />
 
@@ -172,7 +180,7 @@ import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads"
  * limit skips, and shows the household's inbox: photos waiting there and why, and the ones it refused. Those change
  * by themselves, so while the page is visible the settings are asked again every minute, and on coming back to it.
  * When another tab of this browser keeps the user's upload queue, the page says so instead of capturing, with "Use this
- * tab". Fork-owned.
+ * tab" (and why, when that tab can't hand it over). Fork-owned.
  */
 definePageMeta({
   middleware: ["group-only"],
@@ -203,6 +211,8 @@ const {
   localOnlyFinishedBatch,
   openCardsPage,
   queueElsewhere,
+  queueKeptInMemoryElsewhere,
+  uploadingLeftovers,
   takeOverQueue,
 } = useRecipeIngestUploads();
 const { dateText } = useRecipeIngestText();

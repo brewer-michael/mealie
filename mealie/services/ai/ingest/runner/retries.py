@@ -13,6 +13,9 @@ A lift that doesn't help a card at all (OCR stands in for an image slot over its
 so the card fails `limit_reached` again while the check keeps saying "lifted") queues it again only after
 `LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT` (`_lift_waits`), until its reset.
 
+Queueing a card also arms its batch's notification again (`events.arm_limit_wave`, in the same transaction), so the
+household hears once the cards that waited are read: one notification per batch for the cards queued together.
+
 Everything here is a conditional update on the card still waiting, so every worker process running it is harmless.
 """
 
@@ -32,7 +35,7 @@ from mealie.services.ai.errors import AIProviderLimitReachedError
 from mealie.services.ai.policy import ai_call_policy
 from mealie.services.openai import OpenAIService
 
-from .. import limits, storage
+from .. import events, limits, storage
 from .classify import safe_trace
 
 logger = get_logger(__name__)
@@ -187,6 +190,9 @@ def retry_waiting(now: datetime) -> int:
                 if not _lift_may_queue(wait.job_id, time.monotonic()):
                     continue  # the last lift didn't help it: it waits a while before the next one reads it
             with session_context() as session:
+                # the batch notifies again once the card is read (its notification went out when it failed), armed
+                # in the transaction the queueing commits
+                events.arm_limit_wave(session, wait.job_id)
                 if IngestQueue(session).retry_after_limit(wait.job_id, wait.household_id):
                     retried += 1
                     if not due:

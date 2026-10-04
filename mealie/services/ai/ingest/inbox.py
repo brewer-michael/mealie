@@ -52,10 +52,11 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   writes the photos as a member of Mealie's group can write there), set on the open folder so the umask can't strip
   it. Folders that already exist are never changed.
 - **`processed/` is purged** when `AI_INGEST_INBOX_PROCESSED_DAYS` is set: once a day per process (first 10 minutes
-  after the first scan), each household's `processed/YYYY-MM/` loses the regular files processed longer ago than
-  that, through the same descriptors and never through a link, at most `PURGE_ENTRIES` a run; a month folder left
-  empty is removed. A file's processing time is the later of its mtime and its ctime (the move into `processed/` sets
-  it; a photo copied with its old date keeps its mtime), and never before its month folder's first day.
+  after the first scan), each household's `processed/YYYY-MM/` loses the regular files and card folders processed
+  longer ago than that, through the same descriptors and never through a link, about `PURGE_ENTRIES` entries a run
+  (a card folder is looked at whole); a card or month folder left empty is removed. An entry's processing time is the
+  later of its mtime and its ctime (the move into `processed/` sets it; a photo copied with its old date keeps its
+  mtime), and never before its month folder's first day; a card folder's files go with it, unless one is newer.
 - **Refusals are told:** each refused file logs one INFO line (its folder and the reason code, nothing of the file),
   and a burst of them sends the household one "Recipe cards not added" notification
   (`events.notify_inbox_rejections`): once a scan of the folder took everything it found, or two minutes after the
@@ -142,7 +143,10 @@ _CLAIM_NAME = re.compile(r"^(?P<ms>\d+)__(?P<token>[0-9a-f]{32})__(?P<name>.+)$"
 _MONTH_NAME = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})$")
 
 PURGE_ENTRIES = 5000
-"""At most this many entries of `processed/` are looked at in one purge; a purge that stops there resumes next scan"""
+"""
+About this many entries of `processed/` are looked at in one purge (a card folder begun is finished); a purge that
+stops there resumes next scan
+"""
 
 _monotonic = time.monotonic
 _wall_clock = time.time
@@ -842,7 +846,10 @@ def _month_start(name: str) -> float | None:
 
 
 def _purge_month(processed: int, month_name: str, start: float, purge: _Purge, label: str) -> None:
-    """Removes the month folder's regular files processed before the cutoff, then the folder if that emptied it"""
+    """
+    Removes the month folder's regular files and card folders (`_purge_card`) processed before the cutoff, then the
+    folder if that emptied it
+    """
     month = _open_dir(month_name, processed, label)
     try:
         with os.scandir(month) as entries:
@@ -854,11 +861,14 @@ def _purge_month(processed: int, month_name: str, start: float, purge: _Purge, l
                     st = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue  # a link, a folder: never followed or removed
                 processed_at = max(st.st_mtime, st.st_ctime, start)
                 if processed_at >= purge.cutoff:
                     continue
+                if stat.S_ISDIR(st.st_mode):
+                    _purge_card(month, entry.name, purge, f"{label}/{_display_name(entry.name)}")
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue  # a link: never followed or removed
                 try:
                     os.unlink(entry.name, dir_fd=month)
                 except FileNotFoundError:
@@ -872,6 +882,47 @@ def _purge_month(processed: int, month_name: str, start: float, purge: _Purge, l
                 pass  # something arrived meanwhile, or another process removed it
     finally:
         os.close(month)
+
+
+def _purge_card(month: int, name: str, purge: _Purge, label: str) -> None:
+    """
+    A card folder (a multi-page card, moved into the month whole) processed before the cutoff, by the folder's own
+    times: the move into `processed/` sets its ctime, never its files'. Its entries old by their own times too are
+    removed (a file, or a link itself: never followed; a folder inside, whole, by `shutil.rmtree`, which follows no
+    link either), then the card folder if that emptied it. Looked at whole, whatever is left of the budget: removing
+    entries touches the folder's times, so what a purge left in it would look newly processed to the next one.
+    """
+    try:
+        card = _open_dir(name, month, label)
+    except _UnsafeFolder, FileNotFoundError:
+        return  # swapped for a link since, or gone
+    try:
+        with os.scandir(card) as entries:
+            for entry in entries:
+                purge.budget -= 1
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if max(st.st_mtime, st.st_ctime) >= purge.cutoff:
+                        continue  # put there since
+                    if stat.S_ISDIR(st.st_mode):
+                        shutil.rmtree(entry.name, dir_fd=card)
+                    else:
+                        os.unlink(entry.name, dir_fd=card)
+                except FileNotFoundError:
+                    continue  # another process's purge
+                except OSError as e:
+                    _state.log_once(f"purge:{label}", f"Couldn't clean up {label} in the recipe card inbox: {e}")
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    purge.files += 1
+        if not os.listdir(card):
+            try:
+                os.rmdir(name, dir_fd=month)
+                purge.folders += 1
+            except OSError:
+                pass  # something arrived meanwhile, or another process removed it
+    finally:
+        os.close(card)
 
 
 def _purge_folder(root_fd: int, folder: HouseholdFolder, purge: _Purge) -> None:
@@ -921,8 +972,8 @@ def purge_processed(root_fd: int, folders: list[HouseholdFolder], days: int, now
             _state.log_once(f"purge:{folder.key}", f"Couldn't clean up the recipe card inbox of {folder.key}: {e}")
     if purge.files or purge.folders:
         logger.info(
-            f"Removed {purge.files} files processed more than {days} days ago (and {purge.folders} empty month "
-            "folders) from the recipe card inbox"
+            f"Removed {purge.files} files processed more than {days} days ago (and {purge.folders} card and month "
+            "folders they emptied) from the recipe card inbox"
         )
     return purge
 

@@ -5,10 +5,10 @@
  * card's record once the card has uploaded.
  *
  * One tab of the browser keeps a user's queue at a time (`openQueueLock`: a Web Lock, or where there is none, as on a
- * server reached over plain http, a BroadcastChannel with a heartbeat). The tab that takes the queue claims the
- * database (`claim`), and a write names its tab, so a tab that lost the queue without noticing yet (frozen in the
- * background, a lock taken over) writes nothing. A database deleted by a logout in another tab isn't created again by
- * this one. Fork-owned.
+ * server reached over plain http, a lease in this database that the tab keeping the queue renews). The tab that takes
+ * the queue claims the database (`claim`), and a write names its tab, so a tab that lost the queue without noticing yet
+ * (frozen in the background, a lock taken over) writes nothing. A database deleted by a logout in another tab isn't
+ * created again by this one. Fork-owned.
  */
 
 /** A stored photo: the bytes, and what a `File` needs to be made again */
@@ -45,6 +45,15 @@ export interface UploadStorage {
   claim(tab: string): Promise<void>;
   /** The tab whose queue it is; null while no tab has claimed it */
   claimedBy(): Promise<string | null>;
+  /**
+   * The queue's lease, where the browser has no Web Locks (`leaseQueueLock`), in one transaction: `tab` takes it, or
+   * keeps it, until `until` (ms since the epoch) when no tab holds it, its holder's time ran out or it's `tab`'s
+   * already; `over` takes it over, from any tab (`true`) or from the tab named (it said it let go). Answers whether
+   * `tab` holds it now.
+   */
+  lease(tab: string, until: number, over?: true | string): Promise<boolean>;
+  /** Lets the lease go, when it's `tab`'s */
+  releaseLease(tab: string): Promise<void>;
   /** Forgets everything (logout) */
   clear(): Promise<void>;
 }
@@ -66,6 +75,19 @@ const RECORDS = "records";
 const PHOTOS = "photos";
 /** The record naming the tab that keeps the queue; `load` leaves it out */
 const OWNER_KEY = "owner";
+/** The record of the queue's lease (`QueueLease`); `load` leaves it out */
+const LEASE_KEY = "lease";
+
+/** Which tab holds the queue's lease, and until when unless it's renewed (ms since the epoch) */
+interface QueueLease {
+  tab: string;
+  until: number;
+}
+
+/** Whether `tab` may take or keep `lease` now (`over`: as `UploadStorage.lease`) */
+function mayLease(lease: QueueLease | undefined, tab: string, over?: true | string): boolean {
+  return over === true || !lease || lease.tab === tab || lease.tab === over || lease.until <= Date.now();
+}
 
 /** The database of a user's queue */
 export function uploadStorageName(userId: string): string {
@@ -182,6 +204,7 @@ export function indexedDbUploadStorage(name: string, factory: IDBFactory = index
         readAll(transaction.objectStore(PHOTOS)),
       ]);
       records.delete(OWNER_KEY);
+      records.delete(LEASE_KEY);
       return {
         records,
         photos: new Map([...photos].map(([id, stored]) => [id, fromStoredPhoto(stored as StoredPhoto | Blob)])),
@@ -248,6 +271,41 @@ export function indexedDbUploadStorage(name: string, factory: IDBFactory = index
       return typeof keeper === "string" ? keeper : null;
     },
 
+    async lease(tab, until, over) {
+      // a read and a write in one transaction: of two tabs asking at once, one takes it and the other is told
+      const db = await open();
+      const transaction = db.transaction([RECORDS], "readwrite");
+      const done = transactionDone(transaction);
+      const records = transaction.objectStore(RECORDS);
+      let held = false;
+      const request = records.get(LEASE_KEY);
+      request.onsuccess = () => {
+        if (mayLease(request.result as QueueLease | undefined, tab, over)) {
+          held = true;
+          records.put({ tab, until } satisfies QueueLease, LEASE_KEY);
+        }
+      };
+      await done;
+      return held;
+    },
+
+    async releaseLease(tab) {
+      if (closed) {
+        return;
+      }
+      const db = await open();
+      const transaction = db.transaction([RECORDS], "readwrite");
+      const done = transactionDone(transaction);
+      const records = transaction.objectStore(RECORDS);
+      const request = records.get(LEASE_KEY);
+      request.onsuccess = () => {
+        if ((request.result as QueueLease | undefined)?.tab === tab) {
+          records.delete(LEASE_KEY);
+        }
+      };
+      await done;
+    },
+
     async clear() {
       try {
         // emptied first: deleting waits for other tabs to let go of the database
@@ -261,6 +319,8 @@ export function indexedDbUploadStorage(name: string, factory: IDBFactory = index
       }
       finally {
         opening = null;
+        // forgotten for good: nothing from this tab opens it again (a lease renewed, a late write) and creates it anew
+        closed = true;
         await new Promise<void>((resolve) => {
           const request = factory.deleteDatabase(name);
           request.onsuccess = () => resolve();
@@ -278,11 +338,14 @@ export function memoryUploadStorage(): UploadStorage & {
   photos: Map<string, Blob>;
   /** The tab that keeps the queue */
   owner: string | undefined;
+  /** The queue's lease */
+  leased: QueueLease | undefined;
 } {
   const store = {
     records: new Map<string, unknown>(),
     photos: new Map<string, Blob>(),
     owner: undefined as string | undefined,
+    leased: undefined as QueueLease | undefined,
     load(): Promise<StoredUploads> {
       return Promise.resolve({ records: new Map(store.records), photos: new Map(store.photos) });
     },
@@ -309,10 +372,24 @@ export function memoryUploadStorage(): UploadStorage & {
     claimedBy(): Promise<string | null> {
       return Promise.resolve(store.owner ?? null);
     },
+    lease(tab: string, until: number, over?: true | string): Promise<boolean> {
+      if (!mayLease(store.leased, tab, over)) {
+        return Promise.resolve(false);
+      }
+      store.leased = { tab, until };
+      return Promise.resolve(true);
+    },
+    releaseLease(tab: string): Promise<void> {
+      if (store.leased?.tab === tab) {
+        store.leased = undefined;
+      }
+      return Promise.resolve();
+    },
     clear(): Promise<void> {
       store.records.clear();
       store.photos.clear();
       store.owner = undefined;
+      store.leased = undefined;
       return Promise.resolve();
     },
   };
@@ -347,11 +424,15 @@ export interface QueueLock {
   steal: () => void;
   /** Lets the queue go, or stops waiting for it, for good (a sign-out) */
   release: () => void;
+  /** Whether this tab still keeps the queue, as far as the lock can tell now (asked before each upload) */
+  stillHeld: () => Promise<boolean>;
 }
 
 /** The queue as a Web Lock: the browser hands it to the next tab in line when the tab keeping it lets go or closes */
 export function webLocksQueueLock(locks: LockManager, name: string, events: QueueLockEvents): QueueLock {
   let stopped = false;
+  /** This tab keeps the queue (the browser holds the lock for it, or refused Web Locks) */
+  let holding = false;
   /** Ends this tab's hold of the lock; null while it doesn't hold it */
   let letGo: (() => void) | null = null;
   /** Gives up this tab's place in the line; null while it isn't in it */
@@ -373,12 +454,14 @@ export function webLocksQueueLock(locks: LockManager, name: string, events: Queu
       return new Promise<void>((resolve) => {
         mine = resolve;
         letGo = resolve;
+        holding = true;
         events.granted();
       });
     }).catch(() => {
       // the queue was taken over while this tab kept it (a wait given up changes nothing)
       if (mine && letGo === mine && !stopped) {
         letGo = null;
+        holding = false;
         mine();
         events.lost();
         wait();
@@ -402,13 +485,17 @@ export function webLocksQueueLock(locks: LockManager, name: string, events: Queu
       events.waiting();
       wait();
     }
-  }, () => events.granted());
+  }, () => {
+    holding = true;
+    events.granted();
+  });
 
   return {
     yield() {
       const go = letGo;
       if (go && !stopped) {
         letGo = null;
+        holding = false;
         wait();
         go();
       }
@@ -423,209 +510,218 @@ export function webLocksQueueLock(locks: LockManager, name: string, events: Queu
     },
     release() {
       stopped = true;
+      holding = false;
       cancelWait?.();
       cancelWait = null;
       const go = letGo;
       letGo = null;
       go?.();
     },
+    // the browser says when the lock is taken over (`lost`); a tab frozen meanwhile finds out from the stored claim
+    stillHeld: () => Promise.resolve(holding),
   };
 }
 
-/** How long a tab asking for the queue waits for the tab keeping it to answer */
-export const QUEUE_ASK_MS = 400;
-/** How often the tab keeping the queue says so */
-export const QUEUE_BEAT_MS = 5000;
-/**
- * A tab waiting for the queue asks again when it hasn't heard from the tab keeping it for this long (a background tab's
- * timers may run once a minute; its answers to a question don't wait for them)
- */
-export const QUEUE_STALE_MS = 20_000;
+/** How long the queue's lease lasts unless it's renewed: longer than a background tab's timers wait (once a minute) */
+export const QUEUE_LEASE_MS = 90_000;
+/** How often the tab keeping the queue renews its lease, and a tab waiting for it asks for it again */
+export const QUEUE_RENEW_MS = 5000;
+/** A tab that let the queue go to the tab that asked for it doesn't take it back for this long */
+export const QUEUE_YIELD_MS = 3000;
 
-interface QueueLockMessage {
-  type: "ask" | "held" | "free" | "steal";
+interface QueueLeaseMessage {
+  /** "free": the lease was let go; "taken": a tab took it over */
+  type: "free" | "taken";
   tab: string;
-  /** When the tab saying "held" took the queue */
-  since?: number;
 }
 
 /**
- * The queue without Web Locks (a server reached over plain http has none): the tabs ask over a BroadcastChannel. The
- * tab keeping the queue answers and says so every 5 s; a tab that hears nothing within `QUEUE_ASK_MS` takes it. When
- * two tabs took it at once, the one that took it last keeps it: its claim on the database is the one that counts.
+ * The queue without Web Locks (a server reached over plain http has none): a lease in the queue's database
+ * (`UploadStorage.lease`), which a tab takes in one transaction, so of two tabs asking at once only one gets it. The
+ * tab keeping the queue renews it every `QUEUE_RENEW_MS`; the others ask as often, and get it once it's let go or has
+ * run out (a tab closed, or frozen in the background, for `QUEUE_LEASE_MS`). The tabs say "free" and "taken" over a
+ * BroadcastChannel, so a waiting tab asks at once and a tab whose lease was taken over stops at once.
  */
-export function channelQueueLock(
+export function leaseQueueLock(
+  storage: Pick<UploadStorage, "lease" | "releaseLease">,
   name: string,
   events: QueueLockEvents,
   tab: string,
-  makeChannel: (name: string) => BroadcastChannel = channelName => new BroadcastChannel(channelName),
+  makeChannel: ((name: string) => BroadcastChannel) | null = typeof BroadcastChannel === "function"
+    ? channelName => new BroadcastChannel(channelName)
+    : null,
 ): QueueLock {
-  const channel = makeChannel(`${name}-lock`);
   let state: "asking" | "waiting" | "holding" | "stopped" = "asking";
-  /** When this tab took the queue */
-  let since = 0;
-  /** When the tab keeping the queue was last heard from */
-  let heard = Date.now();
-  let askTimer: ReturnType<typeof setTimeout> | null = null;
+  /** After letting the queue go, this tab doesn't ask for it again on its own before this time */
+  let yieldedUntil = 0;
+  /** Lease requests run one after another */
+  let chain: Promise<unknown> = Promise.resolve();
+  let channel: BroadcastChannel | null = null;
+  try {
+    channel = makeChannel?.(`${name}-lease`) ?? null;
+  }
+  catch {
+    channel = null;
+  }
 
-  const post = (type: QueueLockMessage["type"]) => {
+  /** Read again after an await: `release` may have run meanwhile */
+  const stopped = () => state === "stopped";
+
+  const post = (type: QueueLeaseMessage["type"]) => {
     try {
-      channel.postMessage({ type, tab, ...(type === "held" ? { since } : {}) } satisfies QueueLockMessage);
+      channel?.postMessage({ type, tab } satisfies QueueLeaseMessage);
     }
     catch {
       // closed
     }
   };
 
-  function hold() {
-    state = "holding";
-    since = Date.now();
-    post("held");
-    events.granted();
+  function letGo() {
+    return storage.releaseLease(tab).catch(() => undefined).then(() => post("free"));
   }
 
-  function ask() {
-    state = "asking";
-    post("ask");
-    if (askTimer !== null) {
-      clearTimeout(askTimer);
-    }
-    askTimer = setTimeout(() => {
-      askTimer = null;
-      if (state === "asking") {
-        hold();
+  /**
+   * Takes or renews the lease (`over`: takes it over, from any tab, or from the tab that said it let go), and tells the
+   * tab what changed
+   */
+  function attempt(over?: true | string): Promise<void> {
+    const run = chain.then(async () => {
+      if (state === "stopped") {
+        return;
       }
-    }, QUEUE_ASK_MS);
+      let held: boolean;
+      try {
+        held = await storage.lease(tab, Date.now() + QUEUE_LEASE_MS, over);
+      }
+      catch {
+        // the database can't say (it's full, or a logout elsewhere deleted it): a tab keeping the queue keeps it, and a
+        // tab just asking keeps it too, as before there were tabs (its writes fail the same way)
+        held = state !== "waiting";
+      }
+      if (stopped()) {
+        // released meanwhile
+        if (held) {
+          await letGo();
+        }
+        return;
+      }
+      if (held && state !== "holding") {
+        state = "holding";
+        if (over === true) {
+          post("taken");
+        }
+        events.granted();
+      }
+      else if (!held && state === "holding") {
+        state = "waiting";
+        events.lost();
+      }
+      else if (!held && state === "asking") {
+        state = "waiting";
+        events.waiting();
+      }
+    });
+    chain = run.catch(() => undefined);
+    return run;
   }
 
-  function lose() {
-    state = "waiting";
-    heard = Date.now();
-    events.lost();
+  if (channel) {
+    channel.onmessage = (event: MessageEvent<QueueLeaseMessage>) => {
+      const message = event.data;
+      if (!message || message.tab === tab) {
+        return;
+      }
+      if (message.type === "free" && state === "waiting") {
+        // a tab closing can't be relied on to let its lease go in time (an IndexedDB write while the page unloads), so
+        // its word is enough: its lease is taken from it
+        void attempt(message.tab);
+      }
+      else if (message.type === "taken" && state === "holding") {
+        void attempt();
+      }
+    };
   }
 
-  channel.onmessage = (event: MessageEvent<QueueLockMessage>) => {
-    const message = event.data;
-    if (!message || message.tab === tab || state === "stopped") {
-      return;
+  const renew = setInterval(() => {
+    // a tab that just let the queue go leaves it to the tab that asked for it a moment
+    if (state === "holding" || (state === "waiting" && Date.now() >= yieldedUntil)) {
+      void attempt();
     }
-    switch (message.type) {
-      case "ask":
-        if (state === "holding") {
-          post("held");
-        }
-        break;
-      case "held":
-        heard = Date.now();
-        if (state === "asking") {
-          if (askTimer !== null) {
-            clearTimeout(askTimer);
-            askTimer = null;
-          }
-          state = "waiting";
-          events.waiting();
-        }
-        else if (state === "holding") {
-          // two tabs keep it: the one that took it last keeps it, the other is told
-          const theirs = message.since ?? 0;
-          if (theirs > since || (theirs === since && message.tab > tab)) {
-            lose();
-          }
-          else {
-            post("held");
-          }
-        }
-        break;
-      case "free":
-        if (state === "waiting") {
-          // a moment apart, so that of several waiting tabs one asks first and the others hear it took the queue
-          state = "asking";
-          askTimer = setTimeout(ask, Math.random() * QUEUE_ASK_MS / 2);
-        }
-        break;
-      case "steal":
-        if (state === "holding") {
-          lose();
-        }
-        else {
-          heard = Date.now();
-        }
-        break;
-    }
-  };
+  }, QUEUE_RENEW_MS);
 
-  const beat = setInterval(() => {
-    if (state === "holding") {
-      post("held");
-    }
-    else if (state === "waiting" && Date.now() - heard > QUEUE_STALE_MS) {
-      ask();
-    }
-  }, QUEUE_BEAT_MS);
-
-  // a tab that closes lets the queue go at once, rather than after `QUEUE_STALE_MS`
+  // a tab that closes lets the queue go at once, rather than when its lease runs out: it says so (a message goes out
+  // even as the page unloads) and lets the lease go if it can. One kept in the back-forward cache finds out at its next
+  // renewal whether another tab took it meanwhile.
   const onPageHide = () => {
     if (state === "holding") {
       post("free");
+      chain = chain.then(letGo);
     }
   };
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", onPageHide);
   }
 
-  ask();
+  void attempt();
 
   return {
     yield() {
       if (state === "holding") {
         state = "waiting";
-        heard = Date.now();
-        post("free");
+        // the tab that asked for it takes it before this one asks again
+        yieldedUntil = Date.now() + QUEUE_YIELD_MS;
+        chain = chain.then(letGo);
       }
     },
     steal() {
       if (state === "holding" || state === "stopped") {
         return;
       }
-      if (askTimer !== null) {
-        clearTimeout(askTimer);
-        askTimer = null;
-      }
-      post("steal");
-      hold();
+      void attempt(true);
     },
     release() {
-      if (state === "holding") {
-        post("free");
-      }
+      const holding = state === "holding";
       state = "stopped";
-      if (askTimer !== null) {
-        clearTimeout(askTimer);
-        askTimer = null;
-      }
-      clearInterval(beat);
+      clearInterval(renew);
       if (typeof window !== "undefined") {
         window.removeEventListener("pagehide", onPageHide);
       }
-      channel.close();
+      const closing = holding ? chain.then(letGo) : chain;
+      void closing.finally(() => channel?.close());
+    },
+    stillHeld() {
+      if (state !== "holding") {
+        return Promise.resolve(false);
+      }
+      // renewed in the same transaction that checks it: a tab whose lease was taken over (it was frozen while its lease
+      // ran out) finds out here, before it sends anything
+      return attempt().then(() => state === "holding");
     },
   };
 }
 
-/** A browser with neither Web Locks nor BroadcastChannel: the tab keeps the queue (as before there were two) */
+/** Nothing to agree on (no Web Locks, no storage to hold a lease): the tab keeps the queue (as before there were two) */
 function soleQueueLock(events: QueueLockEvents): QueueLock {
   events.granted();
-  return { yield() {}, steal() {}, release() {} };
+  return { yield() {}, steal() {}, release() {}, stillHeld: () => Promise.resolve(true) };
 }
 
-/** The user's queue among this browser's tabs: a Web Lock where there is one, else a BroadcastChannel, else this tab */
-export function openQueueLock(name: string, events: QueueLockEvents, tab: string): QueueLock {
+/**
+ * The user's queue among this browser's tabs: a Web Lock where there is one, else a lease in the queue's storage, else
+ * this tab
+ */
+export function openQueueLock(
+  name: string,
+  events: QueueLockEvents,
+  tab: string,
+  storage: Pick<UploadStorage, "lease" | "releaseLease"> | null = null,
+): QueueLock {
   const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
   if (locks && typeof locks.request === "function") {
     return webLocksQueueLock(locks, name, events);
   }
-  if (typeof BroadcastChannel === "function") {
-    return channelQueueLock(name, events, tab);
+  if (storage) {
+    return leaseQueueLock(storage, name, events, tab);
   }
   return soleQueueLock(events);
 }

@@ -61,9 +61,10 @@
         {{ $t("recipe-ingest.capture.retake") }}
       </v-btn>
     </div>
-    <p v-if="openBatchCardCount" class="cards-queued text-body-small mt-2 mb-0">
-      {{ $t("recipe-ingest.capture.cards-queued", openBatchCardCount) }}
-    </p>
+    <!-- the open batch so far: cards waiting to try again (offline, a restore) and cards that didn't upload apart -->
+    <div v-if="queueSummary" class="cards-queued text-body-small mt-2">
+      {{ queueSummary }}
+    </div>
     <!-- chosen or dropped files the server can't use; under the buttons, so they don't move -->
     <v-alert
       v-if="skipped"
@@ -257,6 +258,7 @@ const {
   mode,
   dataSaver,
   storageFailed,
+  cards,
   drafts,
   pendingFront,
   openBatch,
@@ -301,6 +303,24 @@ const cameraLabel = computed(() => {
 });
 
 const canFinish = computed(() => !!openBatch.value || !!pendingFront.value || drafts.value.length > 0);
+
+/**
+ * "3 cards queued · 1 retrying · 1 didn't upload": the open batch's cards the server took or may still take, with the
+ * ones waiting to try again on their own and the ones waiting for Retry counted apart
+ */
+const queueSummary = computed(() => {
+  const open = cards.value.filter(card => card.batchKey === openBatch.value?.key);
+  const retrying = open.filter(card => card.status === "retrying").length;
+  const notUploaded = open.filter(card => card.status === "failed" && card.retryable).length;
+  return [
+    { key: "recipe-ingest.capture.cards-queued", count: openBatchCardCount.value - retrying - notUploaded },
+    { key: "recipe-ingest.capture.cards-retrying", count: retrying },
+    { key: "recipe-ingest.capture.cards-not-uploaded", count: notUploaded },
+  ]
+    .filter(part => part.count > 0)
+    .map(part => i18n.t(part.key, part.count))
+    .join(" · ");
+});
 
 function sideLabel(count: number, side: number): string {
   if (side === 0) {
@@ -388,6 +408,11 @@ const { isOverDropZone } = useDropZone(dropZone, {
     height: 44px;
     padding-inline: 12px;
   }
+}
+
+/* Data saver's hint wraps to two lines on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+.data-saver :deep(.v-messages__message) {
+  line-height: 1rem;
 }
 
 .drop-zone {

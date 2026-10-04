@@ -1,4 +1,6 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import ReviewPage from "./[jobId].vue";
 import BaseDialog from "~/components/global/BaseDialog.vue";
@@ -550,6 +552,29 @@ describe("the recipe card review page", () => {
     expect(api.getJob).toHaveBeenCalledTimes(2);
     expect(wrapper.find(".dialog[data-title=\"This card changed\"]").exists()).toBe(false);
     expect(primary(wrapper).text()).toBe("Commit & next");
+  });
+
+  test("a commit refused because the card changed elsewhere (a page merged into it) reloads it, with one notice", async () => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    api.commit.mockResolvedValueOnce({ data: null, response: null, error: { response: { status: 409, data: { detail: { code: "version_conflict", current: 4 } } } } });
+    const wrapper = await mountPage();
+
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [], draftVersion: 4, task: { kind: "extract", state: "queued" } })));
+    await primary(wrapper).trigger("click");
+    await flushPromises();
+
+    expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 3 });
+    expect(api.getJob).toHaveBeenCalledTimes(2);
+    expect(router.replace).not.toHaveBeenCalled();
+    // no dialog to click through, nor a banner: nothing was left unsaved
+    expect(wrapper.find(".dialog[data-title=\"This card changed\"]").exists()).toBe(false);
+    expect(wrapper.find(".ingest-review__conflict").exists()).toBe(false);
+    const notices = wrapper.findAll(".ingest-review-bar__notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.classes()).toContain("ingest-review-bar__notice--warning");
+    expect(notices[0]!.text()).toContain("This card changed somewhere else, so it was reloaded. Check it, then commit again.");
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.warning).not.toHaveBeenCalled();
   });
 
   test("Re-read on a flag opens the region dialog aimed at its line", async () => {
@@ -1354,7 +1379,7 @@ describe("the recipe card review page", () => {
     const wrapper = await mountPage();
 
     expect(wrapper.findAll(".ingest-review__failed-when").map(line => line.text())).toEqual([
-      `Tries again on ${date("2099-11-01T00:00:00", true)}`,
+      `Tries again on ${date("2099-11-01T00:00:00")}, or sooner if the limit is raised`,
       `Removed on ${date("2099-11-15T00:00:00")} unless it's read again before then.`,
     ]);
 
@@ -1389,5 +1414,35 @@ describe("the recipe card review page", () => {
     await vi.advanceTimersByTimeAsync(1500);
     await flushPromises();
     expect(api.updateJob.mock.calls[0]![1].draft.ingredients[1].food).toEqual({ id: null, name: "rd onions" });
+  });
+});
+
+describe("the review page's spacing and hint lines (read from the sources: jsdom lays nothing out)", () => {
+  const app = resolve(__dirname, "../../../../..");
+  // the review page and the components it's built from
+  const REVIEW_COMPONENT
+    = /^Ingest(Ingredient|Step|RecipeFields|Flag|Region|CardViewer|ReviewBar|OrganizerSelector|EvalCaseDialog|NoteList|ProposalBanner|Transcription|NeedsALook)\w*\.vue$/;
+  const files = [
+    "pages/g/[groupSlug]/recipes/cards/[jobId].vue",
+    "pages/g/[groupSlug]/recipes/cards/review.vue",
+    ...readdirSync(join(app, "components/Domain/Ingest"))
+      .filter(name => REVIEW_COMPONENT.test(name))
+      .map(name => `components/Domain/Ingest/${name}`),
+  ];
+  const source = (file: string) => readFileSync(join(app, file), "utf8");
+
+  test("no <p> carries a margin helper, which upstream's unlayered `p { margin: 0 }` would cancel (LB2)", () => {
+    expect(files.length).toBeGreaterThan(15);
+    const spaced = files.flatMap(file => [...source(file).matchAll(/<p\b([^>]*)>/g)]
+      .filter(([, attributes]) => /class="[^"]*\bm[tbsexy]?-n?\d+\b/.test(attributes!))
+      .map(([tag]) => `${file}: ${tag!.replace(/\s+/g, " ")}`));
+    expect(spaced).toEqual([]);
+  });
+
+  test("a field's hint or message gets 16 px lines, not Vuetify's 12 px for 12 px text (LU2)", () => {
+    const hinted = files.filter(file => /\s:?(hint|error-messages)="/.test(source(file)));
+    expect(hinted.length).toBeGreaterThan(3);
+    const cramped = hinted.filter(file => !/:deep\(\.v-messages__message\) \{\s*line-height: 1rem;/.test(source(file)));
+    expect(cramped).toEqual([]);
   });
 });

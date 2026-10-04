@@ -187,4 +187,9 @@ const servingsError = computed(() =>
 .ingest-field--warning :deep(.v-field__append-inner .v-icon) {
   color: rgb(var(--v-theme-warning));
 }
+
+/* a field's hint or message may wrap on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+.ingest-field :deep(.v-messages__message) {
+  line-height: 1rem;
+}
 </style>

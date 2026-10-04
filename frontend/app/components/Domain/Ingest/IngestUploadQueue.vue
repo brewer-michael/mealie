@@ -1,6 +1,6 @@
 <template>
   <div v-if="visibleCards.length || sealingCount" class="ingest-upload-queue">
-    <p v-if="sealingCount" class="sealing d-flex align-center text-body-medium mb-2">
+    <div v-if="sealingCount" class="sealing d-flex align-center text-body-medium mb-2">
       <v-progress-circular
         indeterminate
         size="16"
@@ -8,7 +8,7 @@
         class="mr-2"
       />
       {{ $t("recipe-ingest.capture.sealing") }}
-    </p>
+    </div>
     <v-list v-if="visibleCards.length" class="upload-cards py-0" density="compact">
       <v-list-item
         v-for="card in visibleCards"

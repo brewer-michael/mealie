@@ -291,12 +291,25 @@ describe("GroupRecipeCardSettings", () => {
     expect(toggle(wrapper, "cross-read").attributes("disabled")).toBeDefined();
   });
 
-  test("warns a manager when this month's token limit stops cards being read", async () => {
-    api.getSettings.mockResolvedValue({ data: settings({ limitReached: true }), error: null });
-    const wrapper = await mountSettings();
+  test("warns a manager when this month's token limit stops cards being read, and says the cards are read later", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T15:00:00Z"));
+    try {
+      api.getSettings.mockResolvedValue({ data: settings({ limitReached: true }), error: null });
+      const wrapper = await mountSettings();
 
-    expect(wrapper.get(".limit-reached").text()).toContain("monthly token limit");
-    expect(wrapper.find(".disabled").exists()).toBe(false);
+      // as the cards page and the failed cards say: read by themselves, at the reset or soon after a raise
+      const reset = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(new Date("2026-11-01T00:00:00Z"));
+      expect(wrapper.get(".limit-reached").text()).toBe(
+        "Every AI provider that reads cards has used its monthly token limit, so new cards can't be read yet. "
+        + `They're read automatically when the limit resets on ${reset}, or within about 10 minutes after a provider's `
+        + "limit is raised in the AI provider settings.",
+      );
+      expect(wrapper.find(".disabled").exists()).toBe(false);
+    }
+    finally {
+      vi.useRealTimers();
+    }
   });
 
   test("says when the group can't read cards, and when OCR is available", async () => {

@@ -253,15 +253,15 @@
 
             <!-- the review itself -->
             <template v-else>
-              <p v-if="checksLine" class="text-body-medium text-medium-emphasis mb-2 ingest-review__checks">
+              <div v-if="checksLine" class="text-body-medium text-medium-emphasis mb-2 ingest-review__checks">
                 <v-icon
                   size="small"
                   class="mr-1"
                   :icon="job.read?.readPath === 'ocr' ? $globals.icons.alert : mdiTextRecognition"
                 />
                 {{ checksLine }}
-              </p>
-              <p
+              </div>
+              <div
                 v-for="info in cardInfos"
                 :key="info.id"
                 class="text-body-small text-medium-emphasis mb-2 ingest-review__info"
@@ -280,7 +280,7 @@
                 >
                   {{ $t("recipe-ingest.review.parse-with-ai") }}
                 </v-btn>
-              </p>
+              </div>
 
               <v-alert
                 v-if="review.conflict.value"
@@ -908,7 +908,7 @@ const failedWhen = computed(() => {
   if (retryAt) {
     // the dispatcher reads a card that's due within a minute
     lines.push(retryAt.getTime() > Date.now()
-      ? i18n.t("recipe-ingest.queue.retries-on", { date: dateText(retryAt, true) })
+      ? i18n.t("recipe-ingest.queue.retries-on-limit", { date: dateText(retryAt) })
       : i18n.t("recipe-ingest.queue.retries-soon"));
   }
   const expiresAt = serverDate(job.value.expiresAt);

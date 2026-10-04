@@ -9,12 +9,24 @@ still processing and one was written in the last 24 hours. `maybe_notify_batch` 
 `UPDATE` that takes a 5-minute lease (`notify_claimed_at`) and counts the attempt (`notify_attempts`), so two
 processes finishing the last two cards at the same moment can't both send it. It then sends to each notifier on its
 own, checks Apprise's answer, and records each notifier that got it (a hash in `notify_delivered`) before the next
-send; `notified_at` is set once every notifier has it. A notifier that failed, or a process that died part way, is
-tried again by housekeeping once the lease has passed, skipping the notifiers that already have it; after 5 attempts
-the batch is given up on (`notified_at` set, an error logged). A notifier gets it twice only if the process dies
-between sending to it and recording that. The 24 hours count from the cards' last activity, not the batch's creation:
-a batch read over days still notifies, while a batch whose cards were last written over 24 hours ago (a restored
-backup's) never does, and housekeeping settles it so a later edit doesn't either.
+send; `notified_at` is set once every notifier has it. The lease is renewed every third of it while the sends run
+(`Heartbeat`), so a slow notifier never lets another process start the same attempt over. A notifier that failed, or
+a process that died part way, is tried again by housekeeping once the lease has passed, skipping the notifiers that
+already have it; after 5 attempts the batch is given up on (`notified_at` set, an error logged). A notifier gets it
+twice only if the process dies between sending to it and recording that. The 24 hours count from the cards' last
+activity, not the batch's creation: a batch read over days still notifies, while a batch whose cards were last written
+over 24 hours ago (a restored backup's) never does, and housekeeping settles it so a later edit doesn't either.
+
+**Its title follows what it says:** "Recipe cards ready" when a card is ready to review, else "Recipe cards not read".
+The event type is `recipe_ingestion_ready` either way, so a Home Assistant automation matches both.
+
+**Cards that waited for a monthly limit.** A card that failed `limit_reached` is read again automatically later
+(`runner/retries.py`), after its batch's notification went out. Queueing it arms the batch's notification again for a
+"wave" (`arm_limit_wave`, in the queueing's transaction): `notified_at` and the attempt are cleared and the card's id is
+kept in `notify_delivered` (`limit-wave:<job id>`, beside the delivery hashes). Once none of the batch's cards is still
+being read, the notification goes out as above, at least once per notifier, counting only the wave's cards ("2 cards
+that waited for the monthly limit were read. 1 card is ready to review (1 failed)."), one per batch for the cards
+queued together. When none of them was read (each failed `limit_reached` again, and waits on), nothing is sent.
 
 **Counts and a link only:** no card names or text, since notifications leave the server. Logs name a notifier by its
 id and name, never by its URL, which holds its secrets.
@@ -24,12 +36,14 @@ route's threadpool), never on the event loop, and no database transaction stays 
 """
 
 import hashlib
+import threading
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from functools import partial
 from typing import Any, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
@@ -46,8 +60,8 @@ from mealie.db.models.group import Group
 from mealie.db.models.household.events import GroupEventNotifierModel
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.lang.providers import Translator
-from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
-from mealie.schema.recipe_ingest import IngestRejectReason, IngestStatus, RecipeIngestionJobCounts
+from mealie.repos.repository_recipe_ingest import IngestRepos, naive_utc, utcnow
+from mealie.schema.recipe_ingest import IngestErrorCode, IngestRejectReason, IngestStatus, RecipeIngestionJobCounts
 from mealie.services.event_bus_service.event_bus_listeners import AppriseEventListener
 from mealie.services.event_bus_service.event_types import (
     INTERNAL_INTEGRATION_ID,
@@ -62,6 +76,7 @@ from mealie.services.event_bus_service.publisher import ApprisePublisher
 from . import limits
 from .batches import seal_idle_batches
 from .i18n import translator_for
+from .intake import lock_household_intake
 
 logger = get_logger(__name__)
 
@@ -238,12 +253,49 @@ def notifier_urls(session: Session, group_id: UUID, household_id: UUID, notifier
     return [NotifierURL(row.id, row.name, row.apprise_url) for row in session.execute(stmt) if row.apprise_url]
 
 
+class Heartbeat:
+    """
+    Keeps a send's claim on an event while the send runs: `renew()` every `interval` seconds, on a daemon thread of its
+    own (it opens its own sessions), from entering the block until it ends, or until `renew` answers False (the claim
+    is no longer the sender's). A process that stops renews nothing, so the claim's lease runs out and housekeeping
+    sends the event; one that is still sending keeps it, however long its notifiers take. A renewal that fails is
+    logged and tried again at the next beat.
+    """
+
+    def __init__(self, renew: Callable[[], bool], interval: float, what: str) -> None:
+        self._renew = renew
+        self._interval = interval
+        self._what = what
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ai-ingest-claim", daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                if not self._renew():
+                    return
+            except Exception as e:
+                logger.warning(f"{self._what}: couldn't renew its claim ({type(e).__name__}); tried again shortly")
+
+    def __enter__(self) -> Heartbeat:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
 # ==================================================================================================================
 # The message
 
 
-def ready_message(counts: RecipeIngestionJobCounts, translator: Translator) -> EventBusMessage:
-    """'Recipe cards ready' / '10 cards are ready to review (2 need a look, 1 failed).'"""
+def ready_message(counts: RecipeIngestionJobCounts, translator: Translator, *, waited: int = 0) -> EventBusMessage:
+    """
+    'Recipe cards ready' / '10 cards are ready to review (2 need a look, 1 failed).', titled 'Recipe cards not read'
+    when none is ready. `waited`: the cards read after waiting for a monthly limit (a wave), which the body says first:
+    '2 cards that waited for the monthly limit were read. 1 card is ready to review (1 failed).'
+    """
     ready = translator.t("recipe-ingest.notification-ready", count=counts.ready)
     details: list[str] = []
     if counts.needs_attention:
@@ -258,7 +310,11 @@ def ready_message(counts: RecipeIngestionJobCounts, translator: Translator) -> E
         )
     else:
         body = translator.t("recipe-ingest.notification-body", ready=ready)
-    return EventBusMessage(title=translator.t("recipe-ingest.notification-title"), body=body)
+    if waited:
+        read = translator.t("recipe-ingest.notification-limit-wave", count=waited)
+        body = translator.t("recipe-ingest.notification-limit-wave-body", waited=read, summary=body)
+    title = "recipe-ingest.notification-title" if counts.ready else "recipe-ingest.notification-title-none-ready"
+    return EventBusMessage(title=translator.t(title), body=body)
 
 
 def rejected_message(reasons: Mapping[str, int], translator: Translator) -> EventBusMessage:
@@ -337,12 +393,62 @@ def _claimable(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bo
     return [*_due(batch_id, now), _lease_free(now), Batch.notify_attempts < limits.NOTIFY_ATTEMPTS]
 
 
+LIMIT_WAVE_PREFIX = "limit-wave:"
+"""
+A `notify_delivered` entry naming a card read again after waiting for a monthly limit, whose batch notifies again for
+it (`arm_limit_wave`); the other entries are delivery hashes (`NotifierURL.delivery_key`), which never start so
+"""
+
+
+def _wave_entry(job_id: UUID) -> str:
+    return f"{LIMIT_WAVE_PREFIX}{job_id}"
+
+
+def _wave_ids(entries: Iterable[str]) -> set[UUID]:
+    """The cards of a batch's pending wave, from its `notify_delivered`"""
+    ids: set[UUID] = set()
+    for entry in entries:
+        if entry.startswith(LIMIT_WAVE_PREFIX):
+            try:
+                ids.add(UUID(entry.removeprefix(LIMIT_WAVE_PREFIX)))
+            except ValueError:
+                continue
+    return ids
+
+
+@dataclass
+class _Lease:
+    """
+    One attempt's hold on a batch's notification: its number, and the lease's current start (`notify_claimed_at`),
+    which the `Heartbeat` moves on. Every write of the attempt is fenced on both, so once the batch is armed again
+    (`arm_limit_wave`, which clears them) the attempt writes nothing, even if a later one has its number.
+    """
+
+    batch_id: UUID
+    attempt: int
+    claimed_at: datetime
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    """Held for each fenced write, so a renewal and a record never use the start the other is replacing"""
+
+    def fence(self) -> list[sa.ColumnElement[bool]]:
+        return [
+            Batch.id == self.batch_id,
+            Batch.notified_at.is_(None),
+            Batch.notify_attempts == self.attempt,
+            Batch.notify_claimed_at == self.claimed_at,
+        ]
+
+
 @dataclass(frozen=True)
 class _Claim:
-    attempt: int
-    """The batch's `notify_attempts` after this claim: only this attempt's writes match it"""
+    lease: _Lease
     delivered: frozenset[str]
-    """The notifiers earlier attempts reached (`NotifierURL.delivery_key`)"""
+    """The notifiers earlier attempts reached (`NotifierURL.delivery_key`), and a pending wave's cards"""
+
+    @property
+    def attempt(self) -> int:
+        """The batch's `notify_attempts` after this claim"""
+        return self.lease.attempt
 
 
 def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
@@ -360,10 +466,12 @@ def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
         claim = None
         if isinstance(result, CursorResult) and result.rowcount == 1:
             # read before the commit: until then the row is this transaction's
-            attempt, delivered = session.execute(
-                sa.select(Batch.notify_attempts, Batch.notify_delivered).where(Batch.id == batch_id)
+            attempt, claimed_at, delivered = session.execute(
+                sa.select(Batch.notify_attempts, Batch.notify_claimed_at, Batch.notify_delivered).where(
+                    Batch.id == batch_id
+                )
             ).one()
-            claim = _Claim(attempt, frozenset(delivered or ()))
+            claim = _Claim(_Lease(batch_id, attempt, claimed_at), frozenset(delivered or ()))
         session.commit()
     except BaseException:
         session.rollback()
@@ -371,29 +479,118 @@ def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
     return claim
 
 
-def _record(
-    session: Session, batch_id: UUID, attempt: int, delivered: Iterable[str], *, notified_at: datetime | None = None
-) -> bool:
-    """
-    Records the notifiers that have the batch's notification and, with `notified_at`, that it's done, if `attempt`
-    still holds it (no later attempt took it over, nothing settled it); whether it did
-    """
-    values: dict[str, Any] = {"notify_delivered": sorted(delivered)}
-    if notified_at is not None:
-        values["notified_at"] = notified_at
-    stmt = (
-        sa.update(Batch)
-        .where(Batch.id == batch_id, Batch.notified_at.is_(None), Batch.notify_attempts == attempt)
-        .values(**values)
-    )
+def _fenced_update(session: Session, lease: _Lease, values: Mapping[str, Any]) -> bool:
+    """One write of the attempt holding `lease`, if it still holds it; whether it did. Commits."""
+    stmt = sa.update(Batch).where(*lease.fence()).values(**values)
     try:
         result = session.execute(stmt, execution_options={"synchronize_session": False})
-        recorded = isinstance(result, CursorResult) and result.rowcount == 1
+        updated = isinstance(result, CursorResult) and result.rowcount == 1
         session.commit()
     except BaseException:
         session.rollback()
         raise
-    return recorded
+    return updated
+
+
+def _renew_claim(lease: _Lease) -> bool:
+    """
+    Moves the lease of the batch's notification on to now while the attempt still holds it (`Heartbeat`, from its own
+    thread, with a session of its own); whether it did
+    """
+    with lease.lock, session_context() as session:
+        renewed = max(utcnow(), naive_utc(lease.claimed_at) + timedelta(microseconds=1))
+        if not _fenced_update(session, lease, {"notify_claimed_at": renewed}):
+            return False
+        lease.claimed_at = renewed
+        return True
+
+
+def _record(session: Session, lease: _Lease, delivered: Iterable[str], *, notified_at: datetime | None = None) -> bool:
+    """
+    Records the notifiers that have the batch's notification (and keeps a wave's cards) and, with `notified_at`, that
+    it's done, if the attempt still holds `lease` (no later attempt took it over, nothing settled or armed it again);
+    whether it did
+    """
+    values: dict[str, Any] = {"notify_delivered": sorted(delivered)}
+    if notified_at is not None:
+        values["notified_at"] = notified_at
+    with lease.lock:
+        return _fenced_update(session, lease, values)
+
+
+ARM_TRIES = 10
+"""How often `arm_limit_wave` reads the notification's state again when another process changed it meanwhile"""
+
+
+def arm_limit_wave(session: Session, job_id: UUID) -> None:
+    """
+    Arms the notification of the batch of a card the automatic retry queues after it waited for a monthly limit
+    (`runner/retries.py`), in the caller's transaction, which the queueing then commits, so the card is never queued
+    without it. Under the household's intake lock (`intake.lock_household_intake`), so two processes arming one batch
+    keep both cards, and fenced on the notification's state as read, so it never lands between another process's
+    claim and its record:
+    - the batch's notification went out: it's due again once the card is read, for a wave of the cards that waited
+      (`notified_at`, the claim and the attempts cleared, the card's id kept in `notify_delivered`);
+    - a wave is pending: the card joins it, and one being sent starts over (its counts didn't have the card);
+    - the batch's own notification is pending: it counts the card as it is once read, and one being sent (or waiting
+      to be tried again) starts over, for the same reason.
+    """
+    job = session.execute(sa.select(Job.batch_id, Job.household_id).where(Job.id == job_id)).one_or_none()
+    if job is None:
+        return
+    lock_household_intake(session, job.household_id)
+    for _ in range(ARM_TRIES):
+        state = session.execute(
+            sa.select(Batch.notified_at, Batch.notify_claimed_at, Batch.notify_attempts, Batch.notify_delivered).where(
+                Batch.id == job.batch_id
+            )
+        ).one_or_none()
+        if state is None:
+            return
+        entries = set(state.notify_delivered or ())
+        wave = {entry for entry in entries if entry.startswith(LIMIT_WAVE_PREFIX)}
+        start_over = {"notified_at": None, "notify_claimed_at": None, "notify_attempts": 0}
+        if state.notified_at is not None:
+            values: dict[str, Any] = {**start_over, "notify_delivered": [_wave_entry(job_id)]}
+        elif wave and state.notify_claimed_at is None:
+            values = {"notify_delivered": sorted(entries | {_wave_entry(job_id)})}
+        elif wave:
+            values = {**start_over, "notify_delivered": sorted(wave | {_wave_entry(job_id)})}
+        elif state.notify_claimed_at is not None:
+            values = {**start_over, "notify_delivered": []}
+        else:
+            return  # its own notification is still to come
+        fence = [
+            Batch.id == job.batch_id,
+            Batch.notify_attempts == state.notify_attempts,
+            Batch.notified_at.is_(None) if state.notified_at is None else Batch.notified_at == state.notified_at,
+            Batch.notify_claimed_at.is_(None)
+            if state.notify_claimed_at is None
+            else Batch.notify_claimed_at == state.notify_claimed_at,
+        ]
+        stmt = sa.update(Batch).where(*fence).values(**values)
+        result = session.execute(stmt, execution_options={"synchronize_session": False})
+        if isinstance(result, CursorResult) and result.rowcount == 1:
+            return
+    raise RuntimeError(f"Recipe card batch {job.batch_id}: its notification kept changing; not armed")
+
+
+def _event(
+    session: Session, batch: Batch, counts: RecipeIngestionJobCounts, job_ids: list[UUID], waited: int = 0
+) -> AIEvent:
+    return AIEvent(
+        message=ready_message(counts, translator_for(batch.locale), waited=waited),
+        event_type=AIEventTypes.recipe_ingestion_ready,
+        integration_id=INTERNAL_INTEGRATION_ID,
+        document_data=EventIngestionReadyData(
+            batch_id=batch.id,
+            job_ids=job_ids,
+            ready_count=counts.ready,
+            needs_attention_count=counts.needs_attention,
+            failed_count=counts.failed,
+            review_url=cards_url(group_slug(session, batch.group_id), batch.id),
+        ),
+    )
 
 
 def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
@@ -408,19 +605,37 @@ def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
         .where(Job.batch_id == batch.id, *repos.jobs.scope)
         .order_by(Job.position, Job.created_at, Job.id)
     ).scalars()
-    return AIEvent(
-        message=ready_message(counts, translator_for(batch.locale)),
-        event_type=AIEventTypes.recipe_ingestion_ready,
-        integration_id=INTERNAL_INTEGRATION_ID,
-        document_data=EventIngestionReadyData(
-            batch_id=batch.id,
-            job_ids=list(job_ids),
-            ready_count=counts.ready,
-            needs_attention_count=counts.needs_attention,
-            failed_count=counts.failed,
-            review_url=cards_url(group_slug(session, batch.group_id), batch.id),
-        ),
+    return _event(session, batch, counts, list(job_ids))
+
+
+def _wave_event(session: Session, batch: Batch, wave: set[UUID]) -> AIEvent | None:
+    """
+    The notification of a wave of the batch's cards that waited for a monthly limit, counting only those (`job_ids`
+    too); None when none of them was read: each failed `limit_reached` again and waits on, or is gone
+    """
+    repos = IngestRepos(session, batch.group_id, batch.household_id)
+    rows = session.execute(
+        sa.select(Job.id, Job.status, Job.error_count, Job.warning_count, Job.error_code, Job.auto_retry_at)
+        .where(Job.batch_id == batch.id, Job.id.in_(wave), *repos.jobs.scope)
+        .order_by(Job.position, Job.created_at, Job.id)
+    ).all()
+    ready = [row for row in rows if row.status == IngestStatus.ready.value]
+    waiting = IngestErrorCode.limit_reached.value
+    failed = [
+        row
+        for row in rows
+        if row.status == IngestStatus.failed.value and not (row.error_code == waiting and row.auto_retry_at)
+    ]
+    if not ready and not failed:
+        return None
+    counts = RecipeIngestionJobCounts(
+        ready=len(ready),
+        needs_attention=sum(1 for row in ready if row.error_count or row.warning_count),
+        failed=len(failed),
     )
+    read = {row.id for row in [*ready, *failed]}
+    job_ids = [row.id for row in rows if row.id in read]
+    return _event(session, batch, counts, job_ids, waited=len(read))
 
 
 def maybe_notify_batch(batch_id: UUID) -> bool:
@@ -429,7 +644,7 @@ def maybe_notify_batch(batch_id: UUID) -> bool:
     written in the last 24 hours) and no other process is sending it. Whether this call finished it: every notifier
     that opted in has it (or there's none). False when it wasn't due or was being sent elsewhere, when a notifier
     didn't get it (housekeeping tries again), and when the finished batch has nothing to look at (every card
-    committed or discarded already). Blocking (Apprise).
+    committed or discarded already, or a wave's cards are all still waiting). Blocking (Apprise).
     """
     return _notify_batch(batch_id, utcnow())
 
@@ -440,41 +655,43 @@ def _notify_batch(batch_id: UUID, now: datetime) -> bool:
         claim = _claim(session, batch_id, now)
         if claim is None:
             return False
+        lease = claim.lease
 
         # anything raised from here leaves the claim: housekeeping tries again once its lease has passed
         batch = session.get(Batch, batch_id)
         if batch is None:
             return False
-        event = _ready_event(session, batch)
+        wave = _wave_ids(claim.delivered)
+        event = _wave_event(session, batch, wave) if wave else _ready_event(session, batch)
         if event is None:
-            _record(session, batch_id, claim.attempt, claim.delivered, notified_at=utcnow())
+            _record(session, lease, claim.delivered, notified_at=utcnow())
             return False
 
         listener = AIEventAppriseListener(batch.group_id, batch.household_id, session)
         targets = listener.targets(event)  # ends the session's transaction before anything is sent
         delivered = set(claim.delivered)
         missed: list[NotifierURL] = []
-        for target in targets:
-            if target.delivery_key in delivered:
-                continue  # an earlier attempt reached it
-            if (reason := listener.send(event, target)) is not None:
-                last = claim.attempt >= limits.NOTIFY_ATTEMPTS
-                again = "" if last else f", tried again in {limits.NOTIFY_LEASE // 60} minutes"
-                logger.warning(
-                    f"Recipe card batch {batch_id}: notifier {target.label} didn't get the ready notification "
-                    f"({reason}; attempt {claim.attempt} of {limits.NOTIFY_ATTEMPTS}{again})"
-                )
-                missed.append(target)
-                continue
-            delivered.add(target.delivery_key)
-            if not _record(session, batch_id, claim.attempt, delivered):
-                return False  # this attempt outlived its lease and another took over, or the batch was settled
+        renew = partial(_renew_claim, lease)
+        with Heartbeat(renew, limits.NOTIFY_LEASE / 3, f"Recipe card batch {batch_id}'s ready notification"):
+            for target in targets:
+                if target.delivery_key in delivered:
+                    continue  # an earlier attempt reached it
+                if (reason := listener.send(event, target)) is not None:
+                    last = claim.attempt >= limits.NOTIFY_ATTEMPTS
+                    again = "" if last else f", tried again in {limits.NOTIFY_LEASE // 60} minutes"
+                    logger.warning(
+                        f"Recipe card batch {batch_id}: notifier {target.label} didn't get the ready notification "
+                        f"({reason}; attempt {claim.attempt} of {limits.NOTIFY_ATTEMPTS}{again})"
+                    )
+                    missed.append(target)
+                    continue
+                delivered.add(target.delivery_key)
+                if not _record(session, lease, delivered):
+                    return False  # taken over (this attempt stalled past its lease), armed again, or settled
 
         if not missed:
-            return _record(session, batch_id, claim.attempt, delivered, notified_at=utcnow())
-        if claim.attempt >= limits.NOTIFY_ATTEMPTS and _record(
-            session, batch_id, claim.attempt, delivered, notified_at=utcnow()
-        ):
+            return _record(session, lease, delivered, notified_at=utcnow())
+        if claim.attempt >= limits.NOTIFY_ATTEMPTS and _record(session, lease, delivered, notified_at=utcnow()):
             logger.error(
                 f"Recipe card batch {batch_id}: gave up on the ready notification after {claim.attempt} attempts; "
                 f"never delivered to {', '.join(target.label for target in missed)}"

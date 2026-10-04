@@ -360,9 +360,18 @@ def test_an_image_is_served_uncached_while_a_restore_pauses_ingestion(
     marker = storage.pause_marker_path()
     marker.write_text(f"{time.time():.3f}")
     try:
+        # a request waits for the restore: the restore guard answers every request then
         view = api_client.get(job_url(job_id, "pages", 0, "view"), headers=user.token)
-        assert view.status_code == 200
-        assert view.headers["cache-control"] == "no-store"
+        assert view.status_code == 503
+        assert view.json()["detail"]["code"] == "paused_for_restore"
+        # one already past the guard when the restore began gets the file as it is, never cached
+        with session_context() as session:
+            repos = IngestRepos(session, UUID(user.group_id), UUID(user.household_id))
+            users = get_repositories(session, group_id=UUID(user.group_id), household_id=None).users
+            private = users.get_one(user.user_id)
+            assert private is not None
+            image = ReviewService(repos, private).page_image(job_id, 0, "view")
+        assert image.settled is False  # the route serves it with `no-store`
         assert len(staged_files(user, job_id)) == 3  # nothing is written while paused
     finally:
         marker.unlink(missing_ok=True)

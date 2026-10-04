@@ -105,7 +105,7 @@ class AdminBackupController(BaseAdminController):
     def import_one(self, file_name: str):
         from mealie.services.ai.errors import IngestBusyError  # fork: docs/ai/PHASE2.md §3.9
         from mealie.services.ai.ingest.i18n import with_fallback  # fork
-        from mealie.services.backups_v2.backup_v2 import BackupSchemaMismatch, BackupV2
+        from mealie.services.backups_v2.backup_v2 import BackupSchemaMismatch, BackupV2, MigrationBusyError
 
         backup = BackupV2()
 
@@ -119,8 +119,10 @@ class AdminBackupController(BaseAdminController):
                 ErrorResponse.respond("database backup schema version does not match current database"),
             ) from e
         except IngestBusyError as e:
-            # fork: recipe card ingestion kept writing files, so nothing was restored; retrying works (PHASE2.md §3.9)
-            message = with_fallback(self.translator).t("recipe-ingest.errors.busy-restore")
+            # fork: recipe card ingestion kept writing files, or another process is migrating the database, so nothing
+            # was restored; retrying works (PHASE2.md §3.9, §17)
+            key = "busy-migrating" if isinstance(e, MigrationBusyError) else "busy-restore"
+            message = with_fallback(self.translator).t(f"recipe-ingest.errors.{key}")
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, ErrorResponse.respond(message)) from e
         except Exception as e:
             logger.exception(e)

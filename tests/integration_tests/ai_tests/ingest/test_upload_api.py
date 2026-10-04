@@ -671,7 +671,9 @@ def test_split_makes_each_image_a_card_and_partial_success_is_202(api_client: Te
     body = response.json()
     assert len(body["jobs"]) == 2
     assert body["rejected"] == [{"index": 1, "filename": "b.pdf", "reason": "pdf_not_supported", "duplicateOf": None}]
-    assert body["summary"] == "2 recipe cards queued for review in Mealie. 1 card couldn't be used."
+    assert body["summary"] == (
+        "2 recipe cards queued for review in Mealie. 1 card couldn't be used: the PDF couldn't be rendered."
+    )
     jobs = [job_row(item["id"]) for item in body["jobs"]]
     assert {str(job.batch_id) for job in jobs} == {body["batchId"]}
     assert [job.position for job in jobs] == [0, 1]
@@ -699,8 +701,8 @@ def test_a_pdfs_pages_are_one_card(api_client: TestClient, reader: TestUser, mon
     row = job_row(job["id"])
     pages = [PageMeta.model_validate(page) for page in row.pages]
     assert [(page.width, page.height, page.format, page.original_filename) for page in pages] == [
-        (600, 400, "pdf", "scan.pdf (page 1)"),
-        (400, 600, "pdf", "scan.pdf (page 2)"),
+        (300, 200, "pdf", "scan.pdf (page 1)"),  # at their scans' own size, never enlarged
+        (200, 300, "pdf", "scan.pdf (page 2)"),
     ]
     assert row.source_name == "upload/scan.pdf"
 
@@ -726,7 +728,8 @@ def test_once_a_pdf_runs_out_of_time_the_requests_other_pdfs_arent_rendered(
     api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch
 ):
     # the render slot is everyone's: a request's PDF that takes all its time leaves the request's other PDFs unrendered
-    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
+    monkeypatch.setattr(images, "pdf_render_cpu_seconds", lambda: 2)
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 30)
     monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 300)
     rendered: list[Path] = []
     real_run = images._run_renderer
@@ -787,7 +790,7 @@ def test_nothing_accepted_is_400_with_the_same_body(api_client: TestClient, read
     assert detail["rejected"] == [
         {"index": 0, "filename": "photo-0.jpg", "reason": "unreadable_image", "duplicateOf": None}
     ]
-    assert detail["summary"] == "No recipe cards were queued. 1 card couldn't be used."
+    assert detail["summary"] == "No recipe cards were queued. 1 card couldn't be used: the image couldn't be read."
     assert job_dirs(reader) == before  # nothing left in DATA_DIR
 
 
@@ -876,7 +879,8 @@ def test_the_summary_counts_cards_and_says_which_were_already_scanned(api_client
         "unsupported_format",
     ]
     assert response.json()["summary"] == (
-        "2 recipe cards queued for review in Mealie. 1 card was already scanned. 2 cards couldn't be used."
+        "2 recipe cards queued for review in Mealie. 1 card was already scanned. 2 cards couldn't be used: "
+        "1 not a supported image, 1 unusable PDF."
     )
 
 
@@ -900,6 +904,72 @@ def test_the_summary_promises_a_notification_only_when_one_will_come(
     )
     response = api_client.post(INGEST, files=files(jpeg(), jpeg()), data={"split": "true"}, headers=user.token)
     assert response.json()["summary"] == "2 recipe cards queued. You'll be notified when they're ready."
+
+
+def test_the_summary_says_why_cards_couldnt_be_used(api_client: TestClient, reader: TestUser):
+    # a Shortcut's notification shows only the summary: one reason is said as it is, several as counts (LU13)
+    response = api_client.post(
+        INGEST, files=files(b"not an image", b"also not one"), data={"split": "true"}, headers=reader.token
+    )
+    assert response.json()["detail"]["summary"] == (
+        "No recipe cards were queued. 2 cards couldn't be used: they aren't supported images (JPEG, PNG, WebP, HEIC, "
+        "AVIF, TIFF or PDF)."
+    )
+
+    body = {"images": [{"url": "http://example.com/card.jpg"}]}
+    response = api_client.post(INGEST, json=body, headers=reader.token)
+    assert response.json()["detail"]["rejected"][0]["reason"] == "url_not_allowed"  # URL fetching is off
+    assert assert_summary(response, 400)["summary"] == (
+        "No recipe cards were queued. 1 card couldn't be used: the image URL isn't allowed."
+    )
+
+    response = api_client.post(
+        INGEST,
+        files=files(b"not an image", b"%PDF-1.7\n...", b"%PDF-1.7\n..", jpeg()),
+        data={"split": "true"},
+        headers=reader.token,
+    )
+    assert response.json()["summary"] == (
+        "1 recipe card queued for review in Mealie. 3 cards couldn't be used: 2 unusable PDFs, 1 not a supported image."
+    )
+
+
+def test_a_card_over_a_cap_says_so(api_client: TestClient, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    # the request's first card got in; the next would pass the group's cap (counted in its insert)
+    with session_context() as session:
+        processing = IngestRepos(session, UUID(reader.group_id), None).processing_jobs_in_group()
+    monkeypatch.setattr(limits, "MAX_PROCESSING_JOBS_PER_GROUP", processing + 1)
+    response = api_client.post(INGEST, files=files(jpeg(), jpeg()), data={"split": "true"}, headers=reader.token)
+    assert response.status_code == 202, response.text
+    assert response.json()["summary"] == (
+        "1 recipe card queued for review in Mealie. 1 card couldn't be used: too many recipe cards are being read; "
+        "send it again when some are done."
+    )
+
+
+def test_over_the_monthly_limit_the_summary_says_when_cards_are_read(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    # the cards are taken and read once the limit allows: no "when it's ready" promise for now (LU11, LU12)
+    user = unique_user_fn_scoped
+    configure_card_reading(user)
+    real = upload_service.reading_readiness
+    monkeypatch.setattr(
+        upload_service,
+        "reading_readiness",
+        lambda *args: replace(real(*args), limit_reached=True),
+    )
+    assert post_card(api_client, user, jpeg()).json()["summary"] == (
+        "1 recipe card queued for review in Mealie. The AI's monthly limit is reached, so it will be read when the "
+        "limit resets, or within about 10 minutes after the limit is raised."
+    )
+
+    make_notifier(api_client, user, cards_ready=True)
+    response = api_client.post(INGEST, files=files(jpeg(), jpeg()), data={"split": "true"}, headers=user.token)
+    assert response.json()["summary"] == (
+        "2 recipe cards queued. The AI's monthly limit is reached, so they will be read when the limit resets, or "
+        "within about 10 minutes after the limit is raised. You'll be notified then."
+    )
 
 
 # ==================================================================================================================
@@ -1105,10 +1175,16 @@ def assert_summary(response: Any, status: int, summary: str | None = None) -> di
 
 
 def test_no_token_at_all_is_401_with_a_summary(api_client: TestClient):
+    # told what's missing, as a cookie alone is (LU14): there's no token to reject
     response = api_client.post(INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg"})
-    detail = assert_summary(response, 401, "Mealie didn't accept the API token. Check it and try again.")
+    detail = assert_summary(response, 401, "Send your API token in the Authorization header to upload recipe cards.")
     assert detail == "Could not validate credentials"  # the auth dependency's own detail, unchanged
     assert response.headers["WWW-Authenticate"] == "Bearer"
+
+    response = api_client.post(
+        INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg", "Authorization": "Basic dXNlcjpwYXNz"}
+    )
+    assert_summary(response, 401, "Send your API token in the Authorization header to upload recipe cards.")
 
 
 def test_a_bad_token_is_401_with_a_summary(api_client: TestClient):
@@ -1172,7 +1248,12 @@ def test_refusals_after_the_body_have_a_summary(api_client: TestClient, reader: 
     assert assert_summary(post_card(api_client, reader, jpeg(), batchId=theirs), 404)["code"] == "not_found"
 
     response = post_card(api_client, reader, b"not an image")
-    detail = assert_summary(response, 400, "No recipe cards were queued. 1 card couldn't be used.")
+    detail = assert_summary(
+        response,
+        400,
+        "No recipe cards were queued. 1 card couldn't be used: it isn't a supported image (JPEG, PNG, WebP, HEIC, "
+        "AVIF, TIFF or PDF).",
+    )
     assert detail["code"] == "nothing_accepted"
     assert "message" not in detail
 
@@ -1180,7 +1261,9 @@ def test_refusals_after_the_body_have_a_summary(api_client: TestClient, reader: 
 def test_the_fallback_summary_is_in_the_requests_language(api_client: TestClient):
     # only en-US has the fork's texts so far: any other language falls back to it rather than showing a key
     response = api_client.post(
-        INGEST, content=jpeg(), headers={"Content-Type": "image/jpeg", "Accept-Language": "de-DE"}
+        INGEST,
+        content=jpeg(),
+        headers={"Content-Type": "image/jpeg", "Accept-Language": "de-DE", "Authorization": "Bearer not-a-token"},
     )
     assert_summary(response, 401, "Mealie didn't accept the API token. Check it and try again.")
 

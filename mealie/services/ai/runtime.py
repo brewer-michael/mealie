@@ -145,13 +145,24 @@ class AIRuntime:
         The policy filters before the limits do: a local-only card whose local provider is over its limit fails
         `limit_reached`, not "no local provider", whatever cloud fallback still has tokens left.
         """
+        router = self._router()
+        return router.within_limits(apply_policy(slot, router.resolve(slot)), slot)
+
+    def allowed(self, slot: AIProviderSlot) -> list[AIProviderOut]:
+        """
+        `candidates` whatever the providers' monthly token limits: the providers the current call policy allows for
+        `slot`, in order, for saying which providers a task uses (a limit is reported on its own). Raises as
+        `candidates` does, but never `AIProviderLimitReachedError`.
+        """
+        return apply_policy(slot, self._router().resolve(slot))
+
+    def _router(self) -> AIProviderRouter:
         primaries = {
             AIProviderSlot.default: self.service.default_provider,
             AIProviderSlot.image: self.service.image_provider,
             AIProviderSlot.audio: self.service.audio_provider,
         }
-        router = AIProviderRouter(self.service.repos, primaries)
-        return router.within_limits(apply_policy(slot, router.resolve(slot)), slot)
+        return AIProviderRouter(self.service.repos, primaries)
 
     def record_attempt(
         self,

@@ -46,7 +46,15 @@ function mountChip(props: {
           props: ["prependIcon", "color"],
           template: "<button type=\"button\" class=\"chip\" :data-icon=\"prependIcon\" :data-color=\"color\"><slot /></button>",
         },
-        VExpandTransition: slot(),
+        // a menu: the chip opens it, and the panel shows over the page (`.menu`)
+        VMenu: {
+          props: ["modelValue"],
+          emits: ["update:modelValue"],
+          template: `<div>
+            <slot name="activator" :props="{ onClick: () => $emit('update:modelValue', !modelValue) }" />
+            <div v-if="modelValue" class="menu"><slot /></div>
+          </div>`,
+        },
         VCard: slot("div", "card"),
         VCardTitle: slot("h4"),
         VCardText: slot(),
@@ -183,6 +191,22 @@ describe("IngestPrivacyChip", () => {
     await wrapper.get(".chip").trigger("click");
     expect(wrapper.find(".switch").exists()).toBe(false);
     expect(wrapper.get(".local-unavailable").text()).toBe("No AI provider on your network can read cards.");
+  });
+
+  test("a panel over the page: the capture buttons under the chip don't move", async () => {
+    const wrapper = mountChip({ settings: settings({ localOnlyAvailable: true }) });
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.find(".menu .card").exists()).toBe(true);
+    await wrapper.get(".chip").trigger("click");
+    expect(wrapper.find(".menu").exists()).toBe(false);
+  });
+
+  test("over the monthly limit with no reader named: read once the limit allows, not that AI isn't set up", () => {
+    const chip = mountChip({ settings: settings({ reader: null, limitReached: true }) }).get(".chip");
+    expect(chip.text()).toBe("Read once the monthly limit allows");
+    expect(chip.classes()).toContain("privacy-limit");
+    // the reader the server still names (its limit filter left out) shows as it is
+    expect(mountChip({ settings: settings({ limitReached: true }) }).get(".chip").text()).toBe("Read by Claude Sonnet (cloud)");
   });
 
   test("no reader: says AI isn't set up", () => {

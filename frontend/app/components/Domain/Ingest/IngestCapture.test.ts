@@ -174,6 +174,23 @@ describe("IngestCapture", () => {
     expect(wrapper.get(".cards-queued").text()).toBe("1 card queued");
   });
 
+  test("cards waiting to try again (a restore, offline) and cards that didn't upload are counted apart", async () => {
+    // a restore: the first card is told to come back in a minute; the second is refused for a reason Retry may fix
+    api.upload
+      .mockResolvedValueOnce({ data: null, error: { response: { status: 503, headers: { "retry-after": "60" }, data: { detail: { code: "paused_for_restore" } } } } })
+      .mockResolvedValueOnce({ data: null, error: { response: { status: 403, headers: {}, data: { detail: { code: "forbidden" } } } } });
+    const wrapper = mountCapture();
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+    expect(wrapper.get(".cards-queued").text()).toBe("1 card retrying");
+
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+    await pick(wrapper.get<HTMLInputElement>(".camera-input"), [photo()]);
+    await flushPromises();
+    expect(wrapper.get(".cards-queued").text()).toBe("1 card queued · 1 card retrying · 1 card didn't upload");
+  });
+
   test("front & back: Take photo, then Back side, then Next card", async () => {
     useRecipeIngestUploads().mode.value = "front-and-back";
     const wrapper = mountCapture();

@@ -2,7 +2,11 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ref } from "vue";
 import AppHeader from "./AppHeader.vue";
-import { resetRecipeIngestUploads, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
+import {
+  countRecipeIngestPhotosNotUploaded,
+  resetRecipeIngestUploads,
+  useRecipeIngestUploads,
+} from "~/composables/use-recipe-ingest-uploads";
 
 /** The logout button's fork hook (docs/ai/PHASE2.md §1.1): photos not uploaded yet aren't dropped without asking */
 const api = vi.hoisted(() => ({ upload: vi.fn(), createBatch: vi.fn(), sealBatch: vi.fn(), getCounts: vi.fn() }));
@@ -11,6 +15,11 @@ const signOut = vi.hoisted(() => vi.fn());
 vi.mock("~/composables/api", () => ({
   useUserApi: () => ({ recipeIngest: api }),
 }));
+// the real count, which a test can replace (a tab keeping the queue that doesn't answer)
+vi.mock("~/composables/use-recipe-ingest-uploads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("~/composables/use-recipe-ingest-uploads")>();
+  return { ...actual, countRecipeIngestPhotosNotUploaded: vi.fn(actual.countRecipeIngestPhotosNotUploaded) };
+});
 vi.mock("~/composables/use-logged-in-state", () => ({
   useLoggedInState: () => ({ loggedIn: ref(true), isOwnGroup: ref(true) }),
 }));
@@ -102,7 +111,18 @@ describe("logging out from the header", () => {
     await useRecipeIngestUploads().addPhotos([new File([JPEG_HEAD, "b"], "IMG_2.jpg", { type: "image/jpeg" })]);
     const wrapper = mountHeader();
     await logoutButton(wrapper).trigger("click");
+    await flushPromises();
     expect(wrapper.get(".confirm-dialog").text()).toBe("1 photo hasn't been uploaded. Log out anyway?");
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  test("the tab keeping the queue doesn't answer (suspended): its stored photos are counted, so it asks first", async () => {
+    vi.mocked(countRecipeIngestPhotosNotUploaded).mockResolvedValueOnce(3);
+    const wrapper = mountHeader();
+    await logoutButton(wrapper).trigger("click");
+    await flushPromises();
+    expect(countRecipeIngestPhotosNotUploaded).toHaveBeenCalledOnce();
+    expect(wrapper.get(".confirm-dialog").text()).toBe("3 photos haven't been uploaded. Log out anyway?");
     expect(signOut).not.toHaveBeenCalled();
   });
 });

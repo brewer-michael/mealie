@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from mealie.db.db_setup import session_context
 from mealie.repos.all_repositories import get_repositories
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderOut, AIProviderSettingsUpdate, AIProviderSlot
+from mealie.schema.group.ai_routing import AIUsageLogCreate
 from mealie.schema.openai.general import OpenAIText
 from mealie.services import ocr
 from mealie.services.ai import local
@@ -59,9 +60,39 @@ def _provider(name: str = "p", *, base_url: str | None = None, runs_locally: boo
     return AIProviderOut(id=uuid4(), name=name, model="m", api_key="k", base_url=base_url, runs_locally=runs_locally)
 
 
-def _create(user: TestUser, name: str, *, base_url: str | None = None, runs_locally: bool = False) -> AIProviderOut:
+def _create(
+    user: TestUser,
+    name: str,
+    *,
+    base_url: str | None = None,
+    runs_locally: bool = False,
+    monthly_token_limit: int | None = None,
+) -> AIProviderOut:
     return user.repos.group_ai_providers.create(
-        AIProviderCreate(name=name, model="m", api_key="k", base_url=base_url, runs_locally=runs_locally)
+        AIProviderCreate(
+            name=name,
+            model="m",
+            api_key="k",
+            base_url=base_url,
+            runs_locally=runs_locally,
+            monthly_token_limit=monthly_token_limit,
+        )
+    )
+
+
+def _spend(user: TestUser, provider: AIProviderOut, tokens: int) -> None:
+    """This month's usage of `provider`"""
+    user.repos.group_ai_usage.create(
+        AIUsageLogCreate(
+            provider_id=provider.id,
+            provider_name=provider.name,
+            model="m",
+            protocol=provider.protocol,
+            slot=AIProviderSlot.default,
+            prompt_tokens=tokens,
+            completion_tokens=0,
+            success=True,
+        )
     )
 
 
@@ -313,3 +344,47 @@ def test_readiness_lists_local_providers_per_slot_and_those_that_wont_be_used(un
     assert readiness.not_private == ["LAN proxy", "No URL"]
     # it doesn't leave a policy behind
     assert current_policy() == AICallPolicy()
+
+
+# ==========================================
+# Over the monthly limit, the reader and the providers are still named (LO4): `limitReached` reports the limit
+
+
+def test_over_the_monthly_limit_the_reader_is_still_named(
+    unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    user = unique_user_fn_scoped
+    lan = _create(user, "Ollama", base_url="http://ollama.lan/v1", runs_locally=True, monthly_token_limit=100)
+    vision = _create(user, "qwen3-vl", base_url="http://127.0.0.1:11434/v1", runs_locally=True, monthly_token_limit=100)
+    _configure(user, default=lan, image=vision)
+    _spend(user, lan, 500)
+    _spend(user, vision, 500)
+    service = OpenAIService(user.repos)
+    monkeypatch.setattr(ocr, "is_available", lambda: False)
+
+    for local_only in (False, True):
+        reader = card_reader(service, local_only=local_only)
+        assert reader is not None
+        assert (reader.name, reader.local, reader.via_ocr) == ("qwen3-vl", True, False)
+
+    readiness = local_readiness(service)
+    assert (readiness.image, readiness.default, readiness.fast) == (["qwen3-vl"], ["Ollama"], ["Ollama"])
+
+    # with OCR, an image slot over its limit is stood in for: the card is read from Tesseract's text
+    monkeypatch.setattr(ocr, "is_available", lambda: True)
+    reader = card_reader(service, local_only=True)
+    assert reader is not None
+    assert (reader.name, reader.via_ocr) == ("Ollama", True)
+
+
+def test_the_reader_is_the_first_provider_within_its_limit(unique_user_fn_scoped: TestUser):
+    # the one that reads: a primary over its limit hands over to the next route
+    user = unique_user_fn_scoped
+    capped = _create(user, "Capped", monthly_token_limit=100)
+    fallback = _create(user, "Fallback")
+    _configure(user, default=_create(user, "Text"), image=capped, routes={AIProviderSlot.image: [fallback]})
+    _spend(user, capped, 500)
+
+    reader = card_reader(OpenAIService(user.repos), local_only=False)
+    assert reader is not None and reader.name == "Fallback"
+    assert OpenAIService(user.repos).runtime.allowed(AIProviderSlot.image) == [capped, fallback]

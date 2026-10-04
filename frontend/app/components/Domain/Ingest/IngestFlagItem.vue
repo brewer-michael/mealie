@@ -307,4 +307,9 @@ function fill() {
 .ingest-flag-item--error .ingest-flag-item__mark {
   background-color: rgba(var(--v-theme-error), 0.25);
 }
+
+/* a field's hint or message may wrap on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+.ingest-flag-item__fill :deep(.v-messages__message) {
+  line-height: 1rem;
+}
 </style>

@@ -64,6 +64,32 @@ def test_save_bumps_the_version_and_recomputes_flags(api_client: TestClient, uni
     assert job["title"] == "Banana Mug Cake for One"
 
 
+def test_a_cover_from_a_page_running_an_older_build_is_the_households_default(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    A review page loaded before the upgrade and kept open sets `useCardAsCover: true` on every draft it saves: a save
+    without `clientDraftSchema` (or from before version 3) stores it unset, the household's default; the current page
+    says it's version 3, and its choice is kept
+    """
+    user = unique_user_fn_scoped
+    job_id = seed_job(user)
+    draft = api_client.get(job_url(job_id), headers=user.token).json()["draft"]
+    assert draft["schemaVersion"] == 3 and draft["useCardAsCover"] is None
+
+    old_page = {**draft, "useCardAsCover": True, "description": "Saved by an older page"}
+    assert _put(api_client, user, job_id, 1, draft=old_page).status_code == 200
+    row = job_row(job_id)
+    assert row["draft"]["description"] == "Saved by an older page"
+    assert row["draft"]["use_card_as_cover"] is None
+    version = row["draft_version"]
+
+    current_page = {**draft, "useCardAsCover": True, "description": "Saved by this page"}
+    response = _put(api_client, user, job_id, version, draft=current_page, clientDraftSchema=3)
+    assert response.status_code == 200, response.text
+    assert job_row(job_id)["draft"]["use_card_as_cover"] is True
+
+
 def test_a_stale_version_is_a_409_with_the_current_one(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
     job_id = seed_job(user)

@@ -332,9 +332,9 @@ def _pdf(*sizes: tuple[int, int]) -> bytes:
 
 
 def test_a_scanners_pdf_is_one_card_with_its_pages(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 500)  # rendered small: quicker
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 250)  # rendered small: quicker
     folder = _folder(root, reader)
-    _drop(folder, "scan.pdf", _pdf((300, 200), (200, 300)))
+    _drop(folder, "scan.pdf", _pdf((300, 200), (100, 150)))
     before = len(_jobs(reader))
 
     assert _scan_twice() == 1
@@ -342,8 +342,8 @@ def test_a_scanners_pdf_is_one_card_with_its_pages(root: Path, reader: TestUser,
     [job] = _jobs(reader)[before:]
     pages = [PageMeta.model_validate(page) for page in job.pages]
     assert [(page.original_filename, page.width, page.height, page.format) for page in pages] == [
-        ("scan.pdf (page 1)", 500, 334, "pdf"),
-        ("scan.pdf (page 2)", 334, 500, "pdf"),
+        ("scan.pdf (page 1)", 250, 167, "pdf"),  # within the long side
+        ("scan.pdf (page 2)", 100, 150, "pdf"),  # at its scan's own size, never enlarged
     ]
     assert job.source_name.endswith("/scan.pdf")
     assert (folder / "processed" / _month() / "scan.pdf").is_file()
@@ -513,8 +513,8 @@ def test_two_processes_scanning_at_once_never_pass_the_quota(
 def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_of_the_scan_arent_rendered(
     root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 2)
-    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 30)
+    monkeypatch.setattr(images, "pdf_render_cpu_seconds", lambda: 2)
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 30)
     monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 200)
     rendered: list[int] = []
     real_run = images._run_renderer
@@ -1042,15 +1042,83 @@ def test_files_processed_before_the_cutoff_are_removed(root: Path, reader: TestU
     outside.write_bytes(b"not the inbox's")
     os.utime(outside, (0, 0))
     (month / "link.jpg").symlink_to(outside)
-    (month / "nested").mkdir()
-    _drop(month / "nested", "deep.jpg")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _drop(elsewhere, "deep.jpg")
+    (month / "linked-card").symlink_to(elsewhere)
 
     purged = _purge(root, reader, 30, later)
     assert purged.files == 1
     assert not old.exists()
     assert recent.exists()
     assert (month / "link.jpg").is_symlink() and outside.read_bytes() == b"not the inbox's"
-    assert (month / "nested" / "deep.jpg").exists()
+    assert (month / "linked-card").is_symlink() and (elsewhere / "deep.jpg").exists()
+
+
+def test_card_folders_are_purged_with_their_pages(root: Path, reader: TestUser, tmp_path: Path):
+    # a multi-page card moves into processed/ as a folder: once the folder was processed before the cutoff, its pages
+    # go (whatever their own dates), then the folder, and the month folder it emptied (LO3)
+    later = time.time() + 40 * DAY
+    month = _processed(root, reader, "2007-08")
+    card = month / "card-a"
+    card.mkdir()
+    for name in ("front.jpg", "back.jpg"):
+        _drop(card, name)
+    _drop(card, ".DS_Store", b"finder")
+    (card / "originals").mkdir()  # a folder inside, which the scan never read as a page
+    _drop(card / "originals", "raw.jpg")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = _drop(outside, "keep.jpg")
+    (card / "link").symlink_to(outside)  # moved in with the card: removed, never followed
+    (card / "link.jpg").symlink_to(keep)
+
+    other = _processed(root, reader, "2007-09")
+    newer = other / "card-b"
+    newer.mkdir()
+    _drop(newer, "front.jpg")
+    rewritten = _drop(newer, "back.jpg")
+    os.utime(rewritten, (later - DAY, later - DAY))  # changed since: kept by its own time, and its folder with it
+
+    purged = _purge(root, reader, 30, later)
+    assert not month.exists()
+    assert keep.exists() and sorted(os.listdir(outside)) == ["keep.jpg"]
+    assert sorted(os.listdir(newer)) == ["back.jpg"]
+    assert (purged.files, purged.folders) == (4, 2)  # card-a's two pages and .DS_Store, card-b's front; card-a, 2007-08
+
+
+def test_a_card_folder_processed_after_the_cutoff_is_kept(root: Path, reader: TestUser):
+    # a card folder of an old month moved in today, its photos taken long ago: kept
+    month = _processed(root, reader, "2008-01")
+    card = month / "card"
+    card.mkdir()
+    front = _drop(card, "front.jpg")
+    os.utime(front, (1_199_145_600, 1_199_145_600))
+    assert _purge(root, reader, 30, time.time()).files == 0
+    assert front.exists()
+
+
+def test_a_purge_finishes_the_card_folder_it_began(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):
+    # removing pages touches the folder's times: a card folder left half purged would look newly processed
+    monkeypatch.setattr(inbox, "PURGE_ENTRIES", 2)
+    later = time.time() + 40 * DAY
+    month = _processed(root, reader, "2009-02")
+    pages = {"card-1": 4, "card-2": 3}
+    for name, count in pages.items():
+        (month / name).mkdir()
+        for n in range(count):
+            _drop(month / name, f"{n}.jpg")
+
+    first = _purge(root, reader, 30, later)
+    assert first.exhausted
+    [waiting] = os.listdir(month)  # the card it began is gone whole; the other one waits, untouched
+    assert len(os.listdir(month / waiting)) == pages[waiting]
+    begun = next(name for name in pages if name != waiting)
+    assert (first.files, first.folders) == (pages[begun], 1)
+
+    second = _purge(root, reader, 30, later)
+    assert (second.files, second.folders) == (pages[waiting], 2)
+    assert not month.exists()
 
 
 def test_an_old_photo_moved_in_today_is_kept(root: Path, reader: TestUser):
@@ -1150,7 +1218,8 @@ def test_a_purge_logs_one_summary(root: Path, reader: TestUser, monkeypatch: pyt
     _drop(month, "b.jpg")
     _purge(root, reader, 30, time.time() + 40 * DAY)
     assert logged == [
-        "Removed 2 files processed more than 30 days ago (and 1 empty month folders) from the recipe card inbox"
+        "Removed 2 files processed more than 30 days ago (and 1 card and month folders they emptied) from the recipe "
+        "card inbox"
     ]
 
 

@@ -2,9 +2,9 @@
   <div class="ingest-transcription">
     <!-- "Rebuild from this text": the reviewer corrects what was read, and the recipe is built again from it -->
     <template v-if="editing">
-      <p class="text-body-medium text-medium-emphasis mb-2 ingest-transcription__hint">
+      <div class="text-body-medium text-medium-emphasis mb-2 ingest-transcription__hint">
         {{ $t("recipe-ingest.review.rebuild-hint") }}
-      </p>
+      </div>
       <v-textarea
         v-model="edited"
         class="ingest-transcription__editor"
@@ -132,5 +132,10 @@ const segments = computed<TextSegment[]>(() =>
   background-color: rgba(var(--v-theme-warning), 0.35);
   border-radius: 2px;
   font-weight: 600;
+}
+
+/* a field's hint or message may wrap on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+.ingest-transcription__editor :deep(.v-messages__message) {
+  line-height: 1rem;
 }
 </style>

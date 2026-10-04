@@ -23,11 +23,17 @@ written, so a worker that waited finds the database at head and seeded, and does
 A process waiting for another's migration waits for as long as that process holds the lock, and logs every minute
 that it's still waiting: a migration can take a long time (a large database on a small computer), and the lock goes
 when its holder dies. Giving up would fail the worker's startup, and uvicorn then stops every worker.
+
+A backup restore holds the lock too, from before it drops the tables until the restored database is migrated and
+seeded (`BackupV2.restore`), so a process starting meanwhile waits and finds the restored database ready rather than
+migrating and seeding a dropped one. The lock is re-entrant in the thread that holds it: the restore's own
+`init_db.main` doesn't wait for itself.
 """
 
 import contextlib
 import errno
 import os
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -62,6 +68,9 @@ _NO_TIMEOUTS = sa.text(
 )
 
 _UNSUPPORTED_LOCK_ERRORS = {errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS}
+
+_holding = threading.local()
+"""How deep in `migration_lock` blocks this thread is: inside one, it holds the lock already"""
 
 
 class MigrationLockTimeout(TimeoutError):
@@ -179,14 +188,28 @@ def _advisory_lock(url: str, timeout: float | None) -> Iterator[None]:
 @contextmanager
 def migration_lock(timeout: float | None = None) -> Iterator[None]:
     """
-    Holds the database's migration lock, waiting for as long as another process holds it; with a `timeout`, for up
-    to that many seconds (then `MigrationLockTimeout`)
+    Holds the database's migration lock, waiting for as long as another process (or thread) holds it; with a
+    `timeout`, for up to that many seconds (then `MigrationLockTimeout`). In a thread that holds it already, it holds
+    on without waiting.
     """
+    depth: int = getattr(_holding, "depth", 0)
+    if depth:
+        _holding.depth = depth + 1
+        try:
+            yield
+        finally:
+            _holding.depth = depth
+        return
+
     # by the database alembic migrates (`DB_URL`), which needn't be `DB_ENGINE`'s: a provider set in code wins
     url = get_app_settings().DB_URL
     if url and sa.make_url(url).get_backend_name() == "postgresql":
-        with _advisory_lock(url, timeout):
-            yield
+        lock = _advisory_lock(url, timeout)
     else:
-        with _file_lock(timeout):
+        lock = _file_lock(timeout)
+    with lock:
+        _holding.depth = 1
+        try:
             yield
+        finally:
+            _holding.depth = 0

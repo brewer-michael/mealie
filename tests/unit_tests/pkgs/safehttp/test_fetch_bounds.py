@@ -1,19 +1,23 @@
 """
 Fork: safehttp reads a body as the server sent it and never past a cap (fetch.py, DEFAULT_MAX_BYTES). curl used to
 inflate gzip into memory faster than `_read_capped` counted it, and closing a response it stopped reading waited for
-the rest of the body. These go over a real connection, through curl, to a server on 127.0.0.1 (allowed).
+the rest of the body. Requests keep the impersonated browser's Accept-Encoding, and every coding it offers is decoded
+here within the cap. These go over a real connection, through curl, to a server on 127.0.0.1 (allowed).
 """
 
+import functools
 import gzip
 import http.server
 import threading
 import time
 import tracemalloc
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from compression import zstd
 from types import SimpleNamespace
 from typing import Any
 
+import brotli
 import pytest
 
 from mealie.pkgs.safehttp import fetch
@@ -123,7 +127,12 @@ def sent_after_hang_up(server: LocalServer) -> int:
 
 
 @pytest.mark.asyncio
-async def test_a_page_is_asked_for_uncompressed_and_read(server: LocalServer):
+@pytest.mark.parametrize("impersonation", fetch.BROWSER_IMPERSONATIONS)
+async def test_a_page_is_asked_for_with_the_browsers_own_accept_encoding(
+    server: LocalServer, impersonation: str, monkeypatch: pytest.MonkeyPatch
+):
+    """Any other value would contradict the browser fingerprint (bot managers score that); each coding is decoded"""
+    monkeypatch.setattr(fetch, "BROWSER_IMPERSONATIONS", [impersonation])
     server.headers = {"Content-Type": "text/html; charset=utf-8"}
     server.body = b"<html>pancakes</html>"
 
@@ -133,19 +142,61 @@ async def test_a_page_is_asked_for_uncompressed_and_read(server: LocalServer):
     assert result.content == b"<html>pancakes</html>"
     [(method, headers)] = server.requests
     assert method == "GET"
-    assert headers["accept-encoding"] == "identity"
+    offered = {coding.strip() for coding in headers["accept-encoding"].split(",")}
+    assert {"gzip", "deflate", "br"} <= offered
+    assert offered <= set(fetch._DECODERS), f"{impersonation} offers a coding that isn't decoded: {offered}"
+
+
+PAGE = b"<html>" + b"waffles " * 10_000 + b"</html>"
+
+
+def raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
 
 
 @pytest.mark.asyncio
-async def test_a_page_compressed_anyway_is_inflated(server: LocalServer):
-    page = b"<html>" + b"waffles " * 10_000 + b"</html>"
-    server.headers = {"Content-Type": "text/html", "Content-Encoding": "gzip"}
-    server.body = gzip.compress(page)
+@pytest.mark.parametrize(
+    ("coding", "body"),
+    [
+        ("gzip", gzip.compress(PAGE)),
+        ("x-gzip", gzip.compress(PAGE)),
+        ("deflate", zlib.compress(PAGE)),
+        ("deflate", raw_deflate(PAGE)),  # without a zlib header, as old IIS and PHP servers send it
+        ("deflate", gzip.compress(PAGE)),  # a gzip header under deflate, which curl reads too
+        ("gzip", gzip.compress(PAGE[:9000]) + gzip.compress(PAGE[9000:])),  # two members
+        ("gzip", gzip.compress(PAGE) + b"\0" * 512),  # zero padding
+        ("zstd", zstd.compress(PAGE)),
+        ("zstd", zstd.compress(PAGE[:9000]) + zstd.compress(PAGE[9000:])),  # two frames
+        ("br", brotli.compress(PAGE)),
+        ("gzip, br", brotli.compress(gzip.compress(PAGE))),  # gzip applied first, then br
+        ("none", PAGE),  # curl's name for no coding
+        ("identity", PAGE),
+    ],
+    ids=[
+        "gzip",
+        "x-gzip",
+        "zlib deflate",
+        "raw deflate",
+        "gzip as deflate",
+        "gzip members",
+        "gzip padding",
+        "zstd",
+        "zstd frames",
+        "br",
+        "gzip then br",
+        "none",
+        "identity",
+    ],
+)
+async def test_a_compressed_page_is_decoded(server: LocalServer, coding: str, body: bytes):
+    server.headers = {"Content-Type": "text/html", "Content-Encoding": coding}
+    server.body = body
 
     result = await fetch.resilient_fetch(server.url)
 
     assert result is not None
-    assert result.content == page
+    assert result.content == PAGE
 
 
 @pytest.mark.asyncio
@@ -158,6 +209,50 @@ async def test_a_gzip_bomb_is_never_inflated_past_the_cap(server: LocalServer):
 
     assert isinstance(result, fetch.ResponseTooLargeError)
     assert peak < 8 * MIB, f"{peak / MIB:.0f} MiB held while refusing a gzip body"
+
+
+@functools.cache
+def bomb(coding: str, inflated: int = 128 * MIB) -> bytes:
+    """`inflated` zero bytes in `coding`, a few hundred KiB at most"""
+    if coding == "gzip":
+        return gzip_bomb(inflated)
+    if coding == "deflate":  # raw
+        compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        return b"".join(compressor.compress(b"\0" * MIB) for _ in range(inflated // MIB)) + compressor.flush()
+    if coding == "zstd":  # streamed, so within a browser's window, as a server streaming it would send it
+        compressor = zstd.ZstdCompressor(options={zstd.CompressionParameter.window_log: 20})
+        return b"".join(compressor.compress(b"\0" * MIB) for _ in range(inflated // MIB)) + compressor.flush()
+    if coding == "br":
+        compressor = brotli.Compressor(quality=5)
+        return b"".join(compressor.process(b"\0" * MIB) for _ in range(inflated // MIB)) + compressor.finish()
+    raise ValueError(coding)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coding", ["gzip", "deflate", "zstd", "br"])
+async def test_a_bomb_in_any_coding_is_never_decoded_past_the_cap(server: LocalServer, coding: str):
+    # a few hundred KiB that decode to 128 MiB, against a 1 MiB cap
+    server.headers = {"Content-Type": "image/jpeg", "Content-Encoding": coding}
+    server.body = bomb(coding)
+
+    started = time.monotonic()
+    result, peak = await fetch_measured(server.url, max_bytes=MIB)
+
+    assert isinstance(result, fetch.ResponseTooLargeError)
+    assert peak < 8 * MIB, f"{peak / MIB:.0f} MiB held while refusing a {coding} body"
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.asyncio
+async def test_a_zstd_frame_wanting_a_larger_window_than_a_browser_allows_is_refused(server: LocalServer):
+    """A 16 MiB window: browsers refuse it (8 MiB at most), and it isn't allocated here"""
+    server.headers = {"Content-Type": "text/html", "Content-Encoding": "zstd"}
+    server.body = zstd.compress(b"\0" * (16 * MIB), options={zstd.CompressionParameter.window_log: 24})
+
+    result, peak = await fetch_measured(server.url)
+
+    assert result is None
+    assert peak < 16 * MIB, f"{peak / MIB:.0f} MiB held"
 
 
 @pytest.mark.asyncio
@@ -204,7 +299,7 @@ async def test_an_error_page_isnt_received(server: LocalServer):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("encoding", ["br", "zstd", "compress"])
+@pytest.mark.parametrize("encoding", ["br", "zstd", "compress", "gzip, compress"])
 async def test_a_body_in_another_coding_fails_like_an_error(server: LocalServer, encoding: str):
     server.headers = {"Content-Type": "text/html", "Content-Encoding": encoding}
     server.body = b"\x8b\x00not really compressed"
@@ -213,12 +308,58 @@ async def test_a_body_in_another_coding_fails_like_an_error(server: LocalServer,
     assert len(server.requests) == 1  # a different fingerprint gets the same body
 
 
+def _cut(data: bytes) -> bytes:
+    return data[: len(data) - 12]
+
+
 @pytest.mark.asyncio
-async def test_a_corrupt_gzip_body_fails_like_an_error(server: LocalServer):
-    server.headers = {"Content-Type": "text/html", "Content-Encoding": "gzip"}
-    server.body = b"\x1f\x8b\x08\x00 this isn't gzip"
+@pytest.mark.parametrize(
+    ("coding", "body"),
+    [
+        ("gzip", b"\x1f\x8b\x08\x00 this isn't gzip"),
+        ("gzip", gzip.compress(PAGE) + b"garbage"),  # read as the first member alone, before
+        ("gzip", _cut(gzip.compress(PAGE))),
+        ("deflate", zlib.compress(PAGE) + b"garbage"),
+        ("deflate", _cut(raw_deflate(PAGE))),
+        ("zstd", _cut(zstd.compress(PAGE))),
+        ("zstd", zstd.compress(PAGE) + b"garbage"),
+        ("br", _cut(brotli.compress(PAGE))),
+        ("br", brotli.compress(PAGE) + b"garbage"),
+    ],
+    ids=[
+        "corrupt gzip",
+        "gzip then garbage",
+        "truncated gzip",
+        "deflate then garbage",
+        "truncated deflate",
+        "truncated zstd",
+        "zstd then garbage",
+        "truncated br",
+        "br then garbage",
+    ],
+)
+async def test_a_body_that_doesnt_decode_fails_like_an_error(
+    server: LocalServer, coding: str, body: bytes, monkeypatch: pytest.MonkeyPatch
+):
+    """Never a shorter page or image than was sent"""
+    server.headers = {"Content-Type": "text/html", "Content-Encoding": coding}
+    server.body = body
+    read: list[Any] = []
+    read_capped: Callable[..., Any] = fetch._read_capped
+
+    async def recorded(*args: Any, **kwargs: Any) -> bytes:
+        try:
+            content = await read_capped(*args, **kwargs)
+        except Exception as e:
+            read.append(e)
+            raise
+        read.append(content)
+        return content
+
+    monkeypatch.setattr(fetch, "_read_capped", recorded)
 
     assert await fetch.resilient_fetch(server.url) is None
+    assert [type(outcome) for outcome in read] == [fetch.UnreadableEncodingError]
 
 
 @pytest.mark.asyncio

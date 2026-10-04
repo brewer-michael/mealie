@@ -45,8 +45,28 @@ def is_postgres() -> bool:
     return get_app_settings().DB_ENGINE == "postgres"
 
 
+@contextmanager
+def held_elsewhere() -> Iterator[None]:
+    """The lock held by another thread, as another process would hold it: the holding thread itself takes it freely"""
+    acquired, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with migration_lock():
+            acquired.set()
+            release.wait(60)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert acquired.wait(30)
+        yield
+    finally:
+        release.set()
+        holder.join(30)
+
+
 def test_a_second_holder_waits_and_gives_up_at_the_timeout():
-    with migration_lock():
+    with held_elsewhere():
         started = time.monotonic()
         with pytest.raises(MigrationLockTimeout):
             with migration_lock(timeout=0.6):
@@ -101,7 +121,7 @@ def test_a_waiting_process_never_gives_up_while_the_holder_migrates(
         if clock.polls == 240:  # two hours on
             raise _StopWaiting
 
-    with migration_lock():
+    with held_elsewhere():
         monkeypatch.setattr(lock_module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
         with caplog.at_level("INFO"), pytest.raises(_StopWaiting), migration_lock():
             pytest.fail("took a lock another holder has")
@@ -112,6 +132,32 @@ def test_a_waiting_process_never_gives_up_while_the_holder_migrates(
     assert len(progress) == 119  # every minute after the first
     assert "(1 min" in progress[0]
     assert "(119 min" in progress[-1]
+
+
+def test_the_holding_thread_takes_it_again_without_waiting():
+    """A backup restore holds it around its own `init_db.main`, which would otherwise wait for the restore forever"""
+    others: list[str] = []
+
+    def another_thread_tries() -> None:
+        try:
+            with migration_lock(timeout=0.3):
+                others.append("took it")
+        except MigrationLockTimeout:
+            others.append("waited")
+
+    with migration_lock():
+        with migration_lock(timeout=0.1), migration_lock(timeout=0.1):  # waiting would time out
+            pass
+        # still held once the nested blocks end: another thread (or process) still waits
+        trying = threading.Thread(target=another_thread_tries)
+        trying.start()
+        trying.join(10)
+    assert others == ["waited"]
+
+    trying = threading.Thread(target=another_thread_tries)
+    trying.start()
+    trying.join(10)
+    assert others == ["waited", "took it"]
 
 
 def test_the_lock_is_released_when_the_holder_raises():
@@ -187,7 +233,7 @@ def test_a_server_timeout_for_idle_transactions_doesnt_release_it(monkeypatch: p
     monkeypatch.setattr(
         lock_module, "get_app_settings", lambda: SimpleNamespace(DB_URL=url.render_as_string(hide_password=False))
     )
-    with migration_lock():
+    with held_elsewhere():
         [(holder, _)] = _holders()
         time.sleep(0.8)
         assert _holders() == [(holder, "idle in transaction")]

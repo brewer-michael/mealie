@@ -70,6 +70,15 @@ class IngestSettings(BaseSettings):
     private network (Home Assistant's, say); on top of `HTTP_ALLOW_LIST`. `HTTP_DISALLOW_LIST` still wins."""
     URL_TIMEOUT: int = Field(20, ge=1, le=300)
     """Seconds one image URL's download may take in all, redirects included"""
+    PDF_CPU_SECONDS: int = Field(20, ge=1, le=600)
+    """
+    The CPU time one PDF's pages may take to render (the renderer's `RLIMIT_CPU`); its rendering may take 1.5 times
+    this in all, waiting for a CPU included. A scanned card of 4 pages takes about 4 s on a current x86-64 core. A PDF
+    that runs out of it is refused `pdf_not_supported`, and so are the later PDFs of its upload (or of its group's
+    inbox scan), unrendered; the log says "A PDF wasn't rendered within ...". Raise it on a slow NAS or ARM board whose
+    card PDFs are refused that way. One process renders one PDF at a time, so a larger value also lets a hostile PDF
+    hold up other uploads' PDFs longer.
+    """
     PDF_UNCONFINED: bool = False
     """
     Render PDFs even where the system can't confine the renderer (neither Landlock nor its seccomp filter applies: a

@@ -69,7 +69,7 @@
         </div>
         <v-spacer />
         <v-btn
-          v-if="batch.failed"
+          v-if="batch.retryable"
           class="batch-retry-failed"
           size="small"
           variant="text"
@@ -90,12 +90,14 @@
         >
           {{ $t("recipe-ingest.queue.add-clean", batch.clean.length) }}
         </v-btn>
+        <!-- not while its clean cards are being added: the review would open cards on their way to becoming recipes -->
         <v-btn
           v-if="batch.ready"
           class="batch-review"
           size="small"
           color="primary"
           variant="flat"
+          :disabled="cleanBusy === batch.id"
           :to="`/g/${groupSlug}/recipes/cards/review?batch=${batch.id}`"
         >
           {{ $t("recipe-ingest.queue.review-batch") }}
@@ -117,9 +119,12 @@
           :job="job"
           :group-slug="groupSlug"
           :busy="busyJobs.has(job.id)"
+          :can-retry="canRetry(job)"
+          :can-read-with-cloud="cloudReadable.get(job.id) === true"
           @retry="retryJob"
           @cancel="cancelJob"
           @discard="askDiscard"
+          @read-with-cloud="askReadWithCloud"
         />
       </v-list>
     </section>
@@ -182,6 +187,27 @@
       </v-card-text>
     </BaseDialog>
 
+    <!-- the card was set to stay on this server: its photos leave the network only once the user agrees (as on its page) -->
+    <BaseDialog
+      v-model="cloudDialog"
+      :title="$t('recipe-ingest.review.read-with-cloud')"
+      :icon="mdiCloudUploadOutline"
+      color="warning"
+    >
+      <v-card-text>
+        {{ $t("recipe-ingest.review.read-with-cloud-text") }}
+      </v-card-text>
+      <template #card-actions>
+        <v-btn variant="text" class="cloud-cancel" @click="cloudDialog = false">
+          {{ $t("general.cancel") }}
+        </v-btn>
+        <v-spacer />
+        <v-btn color="warning" variant="flat" class="cloud-confirm" @click="readWithCloud">
+          {{ $t("recipe-ingest.review.read-with-cloud") }}
+        </v-btn>
+      </template>
+    </BaseDialog>
+
     <BaseDialog
       v-model="cleanDialog"
       bottom-sheet
@@ -203,9 +229,9 @@
         >
           {{ $t("recipe-ingest.queue.add-clean-public") }}
         </v-alert>
-        <p class="mb-2">
+        <div class="mb-2">
           {{ $t("recipe-ingest.queue.add-clean-confirm") }}
-        </p>
+        </div>
         <ul class="clean-cards ps-4">
           <li v-for="card in cleanCards" :key="card.id" class="clean-card">
             {{ cardTitle(card) }}
@@ -217,6 +243,7 @@
 </template>
 
 <script setup lang="ts">
+import { mdiCloudUploadOutline } from "@mdi/js";
 import { useDocumentVisibility } from "@vueuse/core";
 import IngestBatchListNotice from "./IngestBatchListNotice.vue";
 import IngestJobListItem from "./IngestJobListItem.vue";
@@ -228,6 +255,7 @@ import {
   serverDate,
   takeRecipeIngestCommitNotice,
   useRecipeIngestCounts,
+  useRecipeIngestSettings,
   useRecipeIngestText,
 } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
@@ -269,6 +297,8 @@ interface BatchView {
   source: IngestSource;
   ready: number;
   failed: number;
+  /** Failed cards Retry can read now: "Retry failed" retries them */
+  retryable: number;
   /** Ready cards with nothing to check and nothing reading them: "Add N clean cards" adds them */
   clean: Job[];
 }
@@ -301,6 +331,8 @@ const router = useRouter();
 const { cardTitle, ingestErrorText } = useRecipeIngestText();
 const counts = useRecipeIngestCounts();
 const uploads = useRecipeIngestUploads();
+/** What can read cards now (the page loads it): whether Retry can read a card that must stay local */
+const { settings } = useRecipeIngestSettings();
 const visibility = useDocumentVisibility();
 
 /** Cards not added yet (all of the batch's when filtered) */
@@ -348,6 +380,19 @@ function isClean(job: Job): boolean {
   return job.status === "ready" && !job.task && !job.errorCount && !job.warningCount;
 }
 
+/** Failed because it must stay on this server and nothing local could read it */
+function failedLocalOnly(job: Job): boolean {
+  return job.status === "failed" && job.error?.code === "local_only_unavailable";
+}
+
+/**
+ * Whether Retry can read the failed card now: not one that must stay local while nothing on the network reads cards
+ * (it would fail the same way; its reason says a manager can add a provider, and Retry is back once one is)
+ */
+function canRetry(job: Job): boolean {
+  return !failedLocalOnly(job) || settings.value?.localOnlyAvailable !== false;
+}
+
 /** The time a card was added as a recipe, or uploaded; 0 for none (a server time without an offset is UTC) */
 function time(value: string | null | undefined): number {
   return serverDate(value)?.getTime() ?? 0;
@@ -376,6 +421,7 @@ const batches = computed<BatchView[]>(() => {
       source: first?.source ?? "app",
       ready: sorted.filter(job => job.status === "ready").length,
       failed: sorted.filter(job => job.status === "failed").length,
+      retryable: sorted.filter(job => job.status === "failed" && canRetry(job)).length,
       clean: sorted.filter(isClean),
     };
   });
@@ -824,10 +870,67 @@ async function cancelJob(job: Job) {
 async function retryFailed(batch: BatchView) {
   retryingBatch.value = batch.id;
   try {
-    await Promise.all(batch.jobs.filter(job => job.status === "failed").map(job => retryOne(job)));
+    await Promise.all(batch.jobs.filter(job => job.status === "failed" && canRetry(job)).map(job => retryOne(job)));
   }
   finally {
     retryingBatch.value = null;
+  }
+  void refreshCounts();
+  void pollNow();
+}
+
+// ==========================================
+// Reading a card kept on this server with cloud providers
+
+/**
+ * Failed cards set to stay on this server that nothing local could read, and whether this user may have them read by
+ * the group's other providers: the card page's permission (`canReadWithCloud`: its uploader or a household manager,
+ * while the group doesn't keep cards local), read once from the card
+ */
+const cloudReadable = ref(new Map<string, boolean>());
+const cloudChecks = new Set<string>();
+const cloudDialog = ref(false);
+const cloudTarget = ref<Job | null>(null);
+
+watch(() => jobs.value.filter(job => failedLocalOnly(job) && job.localOnly).map(job => job.id), (ids) => {
+  ids.filter(id => !cloudReadable.value.has(id) && !cloudChecks.has(id)).forEach((id) => {
+    cloudChecks.add(id);
+    void api.recipeIngest.getJob(id).then(({ data }) => {
+      cloudChecks.delete(id);
+      if (data && !disposed) {
+        cloudReadable.value = new Map(cloudReadable.value).set(id, !!data.permissions?.canReadWithCloud);
+      }
+    });
+  });
+}, { immediate: true });
+
+function askReadWithCloud(job: Job) {
+  cloudTarget.value = job;
+  cloudDialog.value = true;
+}
+
+/** The card is read again by any of the group's providers; the server answers with its new state (being read) */
+async function readWithCloud() {
+  const job = cloudTarget.value;
+  cloudDialog.value = false;
+  cloudTarget.value = null;
+  if (!job) {
+    return;
+  }
+  markBusy(job.id, true);
+  try {
+    const { data, error } = await api.recipeIngest.readWithCloud(job.id);
+    if (data) {
+      applyState(job.id, data);
+      jobs.value = jobs.value.map(j => (j.id === job.id ? { ...j, localOnly: false } : j));
+    }
+    else {
+      notifyRefusal(error);
+    }
+    extraBatchIds.add(job.batchId);
+  }
+  finally {
+    markBusy(job.id, false);
   }
   void refreshCounts();
   void pollNow();

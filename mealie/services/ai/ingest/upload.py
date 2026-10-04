@@ -29,8 +29,9 @@ its place, when `AI_INGEST_URL_FETCH` allows it (`fetch_url`), else refused `url
 through `IntakeService.ingest_async`.
 
 The answer is `202 IngestResponse`, whose `summary` is in the request's language for a Shortcut's notification (it
-promises a notification only when a household notifier sends "recipe cards ready") and which has nothing named
-`message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
+promises a notification only when a household notifier sends "recipe cards ready"; while the group's reading is over
+its monthly limit, it says the cards are read when the limit resets or is raised; it says why cards were refused) and
+which has nothing named `message` (the frontend toasts any). `400 nothing_accepted` carries the same body in `detail`.
 Refusals are `UploadRefused`, which the route turns into `{"detail": {"code", "message"?}}`.
 """
 
@@ -38,7 +39,7 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from tempfile import SpooledTemporaryFile
 from typing import Any, BinaryIO, Literal
@@ -502,14 +503,26 @@ async def _fetch_urls(body: UploadBody) -> None:
 # The handler
 
 
-def _summary(translator: Translator, accepted: int, rejected: list[IngestRejected], *, notifies: bool = False) -> str:
+def _summary(
+    translator: Translator,
+    accepted: int,
+    rejected: list[IngestRejected],
+    *,
+    notifies: bool = False,
+    limit_reached: bool = False,
+) -> str:
     """
     For a Shortcut's notification: the cards queued, then those already scanned, then those refused for another
-    reason (each counted once, however many photos it had). "You'll be notified when it's ready" only when the
-    household `notifies` (a notifier sends "recipe cards ready"); otherwise the cards wait for review in Mealie.
+    reason, and why (each counted once, however many photos it had: `_why`). "You'll be notified when it's ready" only
+    when the household `notifies` (a notifier sends "recipe cards ready"); otherwise the cards wait for review in
+    Mealie. While the group's reading is over its monthly limit (`limit_reached`), the cards are read when the limit
+    resets or is raised, and notified then.
     """
     if not accepted:
         queued = translator.t("recipe-ingest.upload-summary-none")
+    elif limit_reached:
+        key = "upload-summary-limit" if notifies else "upload-summary-limit-in-app"
+        queued = translator.t(f"recipe-ingest.{key}", count=accepted)
     elif notifies:
         queued = translator.t("recipe-ingest.upload-summary", count=accepted)
     else:
@@ -518,9 +531,43 @@ def _summary(translator: Translator, accepted: int, rejected: list[IngestRejecte
     duplicates = sum(1 for item in rejected if item.reason == IngestRejectReason.duplicate)
     if duplicates:
         parts.append(translator.t("recipe-ingest.upload-summary-duplicate", count=duplicates))
-    if others := len(rejected) - duplicates:
-        parts.append(translator.t("recipe-ingest.upload-summary-rejected", count=others))
+    others = [item.reason for item in rejected if item.reason != IngestRejectReason.duplicate]
+    if others:
+        why = _why(translator, others)
+        if why:
+            parts.append(translator.t("recipe-ingest.upload-summary-rejected-because", count=len(others), why=why))
+        else:
+            parts.append(translator.t("recipe-ingest.upload-summary-rejected", count=len(others)))
     return " ".join(parts)
+
+
+_WHY_PARAMS = {"mib": limits.MAX_FILE_BYTES // limits.MIB, "pages": limits.MAX_PAGES_PER_CARD}
+
+
+def _why(translator: Translator, reasons: Sequence[IngestRejectReason]) -> str | None:
+    """
+    Why cards were refused, for the summary: one reason as a phrase (`upload-summary-why`: "the image URL isn't
+    allowed"), several as counts, the commonest first ("2 too large, 1 unusable PDF", the inbox notification's
+    `notification-rejected.reasons`); None when a reason has no text (the summary then only counts them)
+    """
+    counts: dict[IngestRejectReason, int] = {}
+    for reason in reasons:
+        counts[reason] = counts.get(reason, 0) + 1
+    if len(counts) == 1:
+        ((reason, count),) = counts.items()
+        key = f"recipe-ingest.upload-summary-why.{reason.value}"
+        text = translator.t(key, count=count, **_WHY_PARAMS)
+        return None if text == key else text
+
+    order = list(IngestRejectReason)
+    details = []
+    for reason, count in sorted(counts.items(), key=lambda item: (-item[1], order.index(item[0]))):
+        key = f"recipe-ingest.notification-rejected.reasons.{reason.value}"
+        text = translator.t(key, count=count)
+        if text == key:
+            return None
+        details.append(text)
+    return translator.t("recipe-ingest.notification-details-separator").join(details)
 
 
 @dataclass
@@ -685,12 +732,17 @@ class UploadHandler:
             await anyio.to_thread.run_sync(self._check_batch, options.batch_id)
             await _fetch_urls(body)
             return await self._ingest(
-                body, local_only=readiness.group_local_only or options.local_only, user_cap=user_cap
+                body,
+                local_only=readiness.group_local_only or options.local_only,
+                user_cap=user_cap,
+                limit_reached=readiness.limit_reached,
             )
         finally:
             body.close()
 
-    async def _ingest(self, body: UploadBody, *, local_only: bool, user_cap: int = 0) -> IngestResponse:
+    async def _ingest(
+        self, body: UploadBody, *, local_only: bool, user_cap: int = 0, limit_reached: bool = False
+    ) -> IngestResponse:
         options = body.options
         cards = [[image] for image in body.images] if options.split else ([body.images] if body.images else [])
 
@@ -774,7 +826,7 @@ class UploadHandler:
             batch_id=batch_id if jobs and isinstance(batch_id, UUID) else None,
             jobs=jobs,
             rejected=rejected,
-            summary=_summary(self.translator, len(jobs), rejected, notifies=notifies),
+            summary=_summary(self.translator, len(jobs), rejected, notifies=notifies, limit_reached=limit_reached),
         )
         if not jobs:
             raise UploadRefused(400, NOTHING_ACCEPTED, **response.model_dump(mode="json", by_alias=True))

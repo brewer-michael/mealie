@@ -239,11 +239,26 @@ def _recover_pages(pages: list[CardPage]) -> None:
                 logger.info(f"Recipe card page {page.dir}: the staged files of a turn cut short were {outcome}")
 
 
-def _card_pages(ctx: TaskContext, job: RecipeIngestionJob) -> list[CardPage]:
+def _settle_merges(ctx: TaskContext, session: Session, job: RecipeIngestionJob) -> RecipeIngestionJob:
     """
-    The job's pages, a turn cut short by a crash settled first (`_recover_pages`); `FileNotFoundError` when a page's
-    files are gone
+    The job once a merge a stop left half done is settled (`review.settle_merges_to_read`): a page of this card a
+    stopped merge left in another card's folder comes back, so it's read rather than failing `files_missing`.
+    `TaskFailed(interrupted)` when the card is gone (its merge happened meanwhile).
     """
+    from .review import JobActionError, settle_merges_to_read  # here: the review service imports the runner
+
+    try:
+        return settle_merges_to_read(IngestRepos(session, ctx.group_id, ctx.household_id), job)
+    except JobActionError as e:
+        raise TaskFailed(IngestErrorCode.interrupted) from e
+
+
+def _card_pages(ctx: TaskContext, session: Session, job: RecipeIngestionJob) -> list[CardPage]:
+    """
+    The job's pages, a merge (`_settle_merges`) or a turn (`_recover_pages`) cut short by a stop settled first;
+    `FileNotFoundError` when a page's files are gone
+    """
+    job = _settle_merges(ctx, session, job)
     pages = [
         CardPage(dir=storage.page_dir(ctx.group_id, ctx.job_id, meta.index), meta=meta)
         for meta in (PageMeta.model_validate(page) for page in job.pages or [])
@@ -441,7 +456,7 @@ async def handle_extract(ctx: TaskContext) -> ExtractResult | ParseLinesResult:
 
     with session_context() as session:
         job = _load_job(session, ctx)
-        pages = _card_pages(ctx, job)
+        pages = _card_pages(ctx, session, job)
         end_transaction(session)
 
         await _orient(ctx, pages)
@@ -521,7 +536,7 @@ async def _rebuild(ctx: TaskContext) -> ExtractResult:
     transcription = _transcription(ctx.payload)
     with session_context() as session:
         job = _load_job(session, ctx)
-        pages = _card_pages(ctx, job)
+        pages = _card_pages(ctx, session, job)
         previous = ExtractionMeta.model_validate(job.extraction) if job.extraction else None
         end_transaction(session)
 
@@ -694,7 +709,7 @@ async def handle_reread(ctx: TaskContext) -> RereadResult:
 
     with session_context() as session:
         job = _load_job(session, ctx)
-        pages = _card_pages(ctx, job)
+        pages = _card_pages(ctx, session, job)
         draft = CardDraft.model_validate(job.draft) if job.draft else None
         extraction = ExtractionMeta.model_validate(job.extraction) if job.extraction else None
         end_transaction(session)

@@ -18,7 +18,9 @@ descriptors are closed first. **Unconfined, it renders nothing:** where neither 
 (a kernel or container without Landlock, on another architecture or without seccomp), it answers `{"error":
 "unconfined"}` without parsing the document, unless `unconfined` is 1 (`AI_INGEST_PDF_UNCONFINED`).
 
-Each page is rendered upright on white, its long side `page max side` pixels (fewer when `max pixels` needs it). The
+Each page is rendered upright on white at the resolution it holds: a scan or a photo (an image covering at least half
+the page) at its image's own, so a PDF of 1200 x 1600 photos gives 1200 x 1600 pages as a TIFF of them would; any other
+page at `VECTOR_DPI`. Never more than `page max side` pixels on the long side, nor `max pixels` in all. The
 result goes to stdout, the only thing it writes, as frames of a kind byte and an 8-byte big-endian length: a `P` frame
 holding each page's PNG, in order, then one `R` frame holding JSON: `{"pages": n}`, or `{"error": "pdf_not_supported"}`
 (encrypted, empty, damaged or unrenderable), `{"error": "too_many_pages"}` or `{"error": "unconfined"}`, each with
@@ -43,6 +45,16 @@ OPEN_FILES = 32
 """File descriptors once confined: what Python and PDFium have open, and a font file or two"""
 FONT_DIRS = ("/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/X11/fonts", "/usr/X11R6/lib/X11/fonts")
 """What PDFium may read once confined: the fonts a PDF names without embedding them"""
+
+VECTOR_DPI = 300
+"""The resolution of a page that isn't a scan or a photo (text and drawings, which have none of their own)"""
+SCAN_SHARE = 0.5
+"""A page whose largest image covers at least this share of it is a scan or a photo"""
+MAX_PAGE_OBJECTS = 1000
+"""Objects looked at on a page for its images; a page with more is a drawing"""
+MAX_FORM_DEPTH = 2
+"""How deep into a page's forms (form XObjects) its images are looked for: a scanner's PDF has them at most one deep"""
+POINTS_PER_INCH = 72
 
 PAGE_FRAME = b"P"
 RESULT_FRAME = b"R"
@@ -307,6 +319,42 @@ def render_scale(width: float, height: float, max_side: int, max_pixels: int) ->
     return scale
 
 
+def native_scale(page: object, width: float, height: float) -> float:
+    """
+    The scale (pixels per PDF unit) that renders a page of `width` x `height` units at the resolution it holds: a
+    scan's or a photo's (its largest image, by the area it covers, covering at least `SCAN_SHARE` of the page) is that
+    image's own, along its finer axis, whatever it's scaled or turned by; any other page's is `VECTOR_DPI`. Images in
+    forms count, `MAX_FORM_DEPTH` deep, and at most `MAX_PAGE_OBJECTS` objects are looked at.
+    """
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
+    largest_area, scale = 0.0, 0.0
+    objects = page.get_objects(max_depth=MAX_FORM_DEPTH + 1)  # type: ignore[attr-defined]
+    for _ in range(MAX_PAGE_OBJECTS):
+        try:
+            item = next(objects)
+            if item.type != pdfium_c.FPDF_PAGEOBJ_IMAGE or not isinstance(item, pdfium.PdfImage):
+                continue
+            columns, rows = item.get_px_size()
+            matrix = item.get_matrix()  # the unit square onto the form it's in, or the page
+            container = item.container
+            while container is not None:
+                matrix = matrix.multiply(container.get_matrix())
+                container = container.container
+        except StopIteration:
+            break
+        except pdfium.PdfiumError:
+            break  # the objects PDFium can't list: the page is rendered with what was found
+        across, down = math.hypot(matrix.a, matrix.b), math.hypot(matrix.c, matrix.d)
+        area = abs(matrix.a * matrix.d - matrix.b * matrix.c)
+        if columns > 0 and rows > 0 and across > 0 and down > 0 and math.isfinite(area) and area > largest_area:
+            largest_area, scale = area, max(columns / across, rows / down)
+    if largest_area >= SCAN_SHARE * width * height and math.isfinite(scale):
+        return scale
+    return VECTOR_DPI / POINTS_PER_INCH
+
+
 def write_frame(kind: bytes, data: bytes) -> None:
     out = sys.stdout.buffer
     out.write(kind + len(data).to_bytes(8, "big"))
@@ -336,9 +384,8 @@ def render(data: bytes, max_side: int, max_pixels: int, max_pages: int) -> dict:
                 width, height = page.get_size()  # in PDF units, with the page's rotation applied
                 if not (width > 0 and height > 0 and math.isfinite(width * height)):
                     return {"error": "pdf_not_supported"}
-                bitmap = page.render(
-                    scale=render_scale(width, height, max_side, max_pixels), fill_color=(255, 255, 255, 255)
-                )
+                scale = min(native_scale(page, width, height), render_scale(width, height, max_side, max_pixels))
+                bitmap = page.render(scale=scale, fill_color=(255, 255, 255, 255))
                 image = bitmap.to_pil().convert("RGB")
                 png = io.BytesIO()
                 image.save(png, format="PNG", compress_level=1)

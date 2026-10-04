@@ -8,6 +8,7 @@ import fcntl
 import io
 import os
 import threading
+import time
 from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -579,6 +580,22 @@ def test_a_double_commit_answers_with_the_same_recipe(
     assert [recipe["slug"] for recipe in recipes] == ["banana-mug-cake"]
 
 
+def test_the_commit_answer_names_the_recipe_as_made(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """A card whose name is taken becomes "Name (2)": the answer says so, for the page's "Added …" notice"""
+    user = unique_user_fn_scoped
+    first = commit(api_client, user, ready_to_commit(user))
+    assert first.status_code == 201
+    assert first.json()["name"] == "Banana Mug Cake"
+
+    second_job = ready_to_commit(user)
+    second = commit(api_client, user, second_job)
+    assert second.status_code == 201
+    assert second.json()["name"] == recipe_of(api_client, user, second.json()["slug"])["name"]
+    assert second.json()["name"] != "Banana Mug Cake"
+    # a commit answered again (a double tap) names it too
+    assert commit(api_client, user, second_job).json()["name"] == second.json()["name"]
+
+
 def test_a_commit_in_progress_is_a_409(api_client: TestClient, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
     job_id = ready_to_commit(user, status=IngestStatus.committing, commit_started_at=utcnow(), commit_recipe_id=uuid4())
@@ -1055,6 +1072,48 @@ def test_a_send_that_starts_late_keeps_housekeeping_away_while_it_runs(
     assert [event["slug"] for event in published if str(event["household_id"]) == user.household_id] == [
         "banana-mug-cake"
     ]
+
+
+@pytest.mark.parametrize("sender", ["commit", "housekeeping"])
+def test_a_send_longer_than_the_lease_isnt_repeated_by_housekeeping(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, sender: str
+):
+    """
+    The notifiers take longer than the claim's lease: the claim is renewed while they run, so housekeeping running
+    meanwhile (here, twice, past the lease) doesn't send the event again, whoever sends it
+    """
+    user = unique_user_fn_scoped
+    monkeypatch.setattr(card_commit, "RECIPE_EVENT_LEASE", timedelta(seconds=0.6))
+    monkeypatch.setattr(card_commit, "RECIPE_EVENT_GRACE", timedelta(0))
+    sent: list[str] = []
+
+    def dispatch(self: EventBusService, *args: Any, **kwargs: Any) -> None:
+        if kwargs["event_type"] != EventTypes.recipe_created or str(kwargs["household_id"]) != user.household_id:
+            return  # another test's late event
+        sent.append(kwargs["document_data"].recipe_slug)
+        if len(sent) == 1:
+            for _ in range(2):  # the notifiers are slow
+                time.sleep(0.5)
+                card_commit.resend_recipe_events(utcnow())
+
+    job_id = ready_to_commit(user)
+    if sender == "commit":
+        monkeypatch.setattr(EventBusService, "dispatch", dispatch)
+        assert commit(api_client, user, job_id).status_code == 201
+    else:
+        assert commit(api_client, user, job_id).status_code == 201
+        # as if the process had stopped between the finish and the send, six minutes ago
+        set_columns(
+            job_id,
+            recipe_event_sent_at=None,
+            recipe_event_claimed_at=utcnow() - timedelta(minutes=6),
+            committed_at=utcnow() - timedelta(minutes=6),
+        )
+        monkeypatch.setattr(EventBusService, "dispatch", dispatch)
+        card_commit.resend_recipe_events(utcnow())
+
+    assert sent == ["banana-mug-cake"]
+    assert job_row(job_id)["recipe_event_sent_at"] is not None
 
 
 def test_late_events_skip_old_commits_and_deleted_recipes(

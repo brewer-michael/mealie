@@ -29,6 +29,9 @@ The whole commit, from the claim to the finish, runs inside the ingest write loc
    once, even when the process stops between the finish and the send. The winner's send renews the claim the finish
    took as it starts, and sends nothing when that claim is no longer there (`_claim_event`): a send that only starts
    once housekeeping has taken over (a bulk commit's sends queued behind slow notifiers) doesn't repeat the event.
+   While a send runs (the winner's or housekeeping's), its claim is renewed every third of `RECIPE_EVENT_LEASE`
+   (`events.Heartbeat`), so however long the notifiers take, housekeeping doesn't send it again; only a process that
+   stops mid-send lets the lease run out.
 
 A validation error before `create_one` returns the job to `ready` with `commit_invalid` (and removes `recipes/<id>`
 when no recipe has that id), and so does a `create_one` that fails without making the recipe (`commit_interrupted`).
@@ -50,6 +53,7 @@ import re
 import secrets
 import shutil
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -111,10 +115,12 @@ from mealie.schema.recipe_ingest import (
     UncommitRequest,
     UnresolvedFlagsDetail,
 )
+from mealie.schema.recipe_ingest.ingest_draft import CARD_DRAFT_SCHEMA_VERSION
 from mealie.schema.user.user import DEFAULT_INTEGRATION_ID, PrivateUser
 from mealie.services import urls
 from mealie.services.ai.errors import IngestPaused
 from mealie.services.ai.ingest import images, limits, storage
+from mealie.services.ai.ingest.events import Heartbeat
 from mealie.services.ai.ingest.i18n import translator_for, with_fallback
 from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline.cardtext import strip_from_prefix
@@ -938,16 +944,35 @@ def _publish_recipe_created(
     return True
 
 
-def _claim_event(session: Session, job_id: UUID, claim: datetime) -> bool:
+def _claim_event(session: Session, job_id: UUID, claim: datetime) -> datetime | None:
     """
-    Renews the claim on `recipe_created` that this caller's finish took (`claim`), right before it sends the event;
-    whether it still had it. Housekeeping takes over an event whose claim is older than `RECIPE_EVENT_LEASE`
-    (`resend_recipe_events`), so a send that starts after that, or after the event went out, sends nothing; the renewed
-    claim keeps housekeeping away while this send runs.
+    Renews the claim on `recipe_created` that this caller took (`claim`: its finish's, or housekeeping's), as it starts
+    sending the event and every third of `RECIPE_EVENT_LEASE` while it sends (`_send_recipe_created`): the renewed
+    claim, always later than `claim`, or None when the caller no longer has it. Housekeeping takes over an event whose
+    claim is older than `RECIPE_EVENT_LEASE` (`resend_recipe_events`), so a send that starts after that, or after the
+    event went out, sends nothing; the renewed claim keeps housekeeping away while this send runs.
     """
     unsent = [Job.id == job_id, Job.recipe_event_sent_at.is_(None), Job.recipe_event_claimed_at == claim]
-    renewed = max(utcnow(), naive_utc(claim))
-    return _update(session, sa.update(Job).where(*unsent).values(recipe_event_claimed_at=renewed))
+    renewed = max(utcnow(), naive_utc(claim) + timedelta(microseconds=1))
+    if not _update(session, sa.update(Job).where(*unsent).values(recipe_event_claimed_at=renewed)):
+        return None
+    return renewed
+
+
+class _EventClaim:
+    """The claim on one card's `recipe_created` while it's sent, renewed on the `Heartbeat`'s thread"""
+
+    def __init__(self, job_id: UUID, claim: datetime) -> None:
+        self.job_id = job_id
+        self.claim = claim
+
+    def renew(self) -> bool:
+        with session_context() as session:
+            renewed = _claim_event(session, self.job_id, self.claim)
+        if renewed is None:
+            return False
+        self.claim = renewed
+        return True
 
 
 def _mark_event_sent(session: Session, job_id: UUID) -> None:
@@ -970,8 +995,8 @@ def _send_recipe_created(
 ) -> None:
     """
     Publishes `recipe_created` and records it as sent, with `session` or (from a request's background task, after the
-    response) a session of its own. `claim` is the event's claim the caller's finish took: the event is sent only while
-    the caller still holds it (`_claim_event`). Housekeeping, which sends right after its own claim, passes none.
+    response) a session of its own. `claim` is the event's claim the caller took (its finish's, or housekeeping's): the
+    event is sent only while the caller still holds it (`_claim_event`), and the claim is renewed while it's sent.
     """
     if session is None:
         with session_context() as own:
@@ -987,17 +1012,22 @@ def _send_recipe_created(
                 claim=claim,
             )
         return
-    if claim is not None and not _claim_event(session, job_id, claim):
-        return  # housekeeping took it over, or it went out meanwhile
-    published = _publish_recipe_created(
-        session,
-        group_id=group_id,
-        household_id=household_id,
-        slug=slug,
-        name=name,
-        translator=translator,
-        integration_id=integration_id,
-    )
+    held: _EventClaim | None = None
+    if claim is not None:
+        if (renewed := _claim_event(session, job_id, claim)) is None:
+            return  # housekeeping took it over, or it went out meanwhile
+        held = _EventClaim(job_id, renewed)
+    interval = RECIPE_EVENT_LEASE.total_seconds() / 3
+    with Heartbeat(held.renew, interval, f"Recipe card job {job_id}'s recipe_created") if held else nullcontext():
+        published = _publish_recipe_created(
+            session,
+            group_id=group_id,
+            household_id=household_id,
+            slug=slug,
+            name=name,
+            translator=translator,
+            integration_id=integration_id,
+        )
     if published:
         _mark_event_sent(session, job_id)
 
@@ -1192,6 +1222,7 @@ def _done(review: ReviewService, job: RecipeIngestionJob) -> CommitResult:
         out=CommitOut(
             recipe_id=recipe_id,
             slug=recipe.slug if recipe else "",
+            name=recipe.name if recipe else None,
             next_job_id=review.next_ready_job_id(job.batch_id, job.id),
         ),
         created=False,
@@ -1244,6 +1275,7 @@ def _take_over(
         out=CommitOut(
             recipe_id=outcome.recipe_id,
             slug=outcome.slug,
+            name=outcome.name,
             next_job_id=review.next_ready_job_id(job.batch_id, job.id),
             warnings=outcome.warnings,
         ),
@@ -1286,7 +1318,10 @@ def commit_job(
     version = request.draft_version
     if request.draft is not None:
         try:
-            update = CardDraftUpdate(draft_version=version, draft=request.draft)
+            # the review page never sends a draft with its commit, so no older build of it does either
+            update = CardDraftUpdate(
+                draft_version=version, draft=request.draft, client_draft_schema=CARD_DRAFT_SCHEMA_VERSION
+            )
         except ValidationError as e:
             # the limits of a saved draft (which a PUT checks as it reads its body): nothing is saved or claimed
             fields = DraftInvalid.of(e).fields
@@ -1317,6 +1352,7 @@ def commit_job(
         out=CommitOut(
             recipe_id=outcome.recipe_id,
             slug=outcome.slug,
+            name=outcome.name,
             next_job_id=review.next_ready_job_id(job.batch_id, job_id),
             warnings=outcome.warnings,
         ),
@@ -1595,6 +1631,7 @@ def resend_recipe_events(now: datetime) -> int:
                     name=recipe.name or "",
                     translator=_job_translator(job),
                     integration_id=DEFAULT_INTEGRATION_ID,
+                    claim=claimed_at,
                 )
                 sent += 1
             except Exception as e:

@@ -3,9 +3,9 @@
     <v-card variant="outlined" style="border-color: lightgray;">
       <v-card-text>
         <BaseCardSectionTitle :title="$t('recipe-ingest.settings.title')" />
-        <p class="text-body-medium mb-4">
+        <div class="text-body-medium mb-4">
           {{ $t("recipe-ingest.settings.description") }}
-        </p>
+        </div>
 
         <!-- A failed refresh keeps showing the settings loaded before it -->
         <v-alert
@@ -51,7 +51,7 @@
             variant="tonal"
             class="mb-4 limit-reached"
           >
-            {{ $t("recipe-ingest.settings.limit-reached") }}
+            {{ $t("recipe-ingest.settings.limit-reached", { date: dateText(nextLimitReset()) }) }}
           </v-alert>
           <!-- no card reader has run lately (AI_INGEST_WORKER off, or it stopped): cards and inbox photos wait -->
           <v-alert
@@ -75,9 +75,9 @@
               {{ $t(`recipe-ingest.settings.limited.${feature}`, { date: dateText(nextLimitReset()) }) }}
             </div>
           </v-alert>
-          <p v-if="settings.ocrAvailable" class="text-body-small text-medium-emphasis mb-2 ocr-available">
+          <div v-if="settings.ocrAvailable" class="text-body-small text-medium-emphasis mb-2 ocr-available">
             {{ $t("recipe-ingest.settings.ocr-available") }}
-          </p>
+          </div>
 
           <v-switch
             :model-value="localOnly"
@@ -132,26 +132,26 @@
           <div class="text-title-small">
             {{ $t("recipe-ingest.settings.inbox-title") }}
           </div>
-          <p class="text-body-medium mb-4 inbox">
+          <div class="text-body-medium mb-4 inbox">
             <template v-if="settings.inbox?.enabled && settings.inbox.folder">
               {{ $t("recipe-ingest.settings.inbox-hint", { folder: settings.inbox.folder }) }}
             </template>
             <template v-else>
               {{ $t("recipe-ingest.settings.inbox-off") }}
             </template>
-          </p>
+          </div>
           <!-- photos waiting in the household's folder and why, and the ones it refused lately -->
           <IngestInboxStatus class="mb-4" :settings="settings" />
 
           <!-- The notifiers page is behind the profile's "Show advanced features" -->
-          <p class="text-body-medium mb-4 notifications">
+          <div class="text-body-medium mb-4 notifications">
             <nuxt-link v-if="advanced" to="/household/notifiers">
               {{ $t("recipe-ingest.settings.notifications") }}
             </nuxt-link>
             <template v-else>
               {{ $t("recipe-ingest.settings.notifications-advanced") }}
             </template>
-          </p>
+          </div>
           <!-- notification links are built from BASE_URL: at its default (or another local address) a phone can't open them -->
           <v-alert
             v-if="!disabled && settings.baseUrlSet === false"
@@ -540,5 +540,10 @@ watch(() => group.value?.aiProviderSettings, (now, before) => {
 <style scoped>
 .eval-case + .eval-case {
   border-top: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
+/* the switches' hints wrap to two lines on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+:deep(.v-messages__message) {
+  line-height: 1rem;
 }
 </style>

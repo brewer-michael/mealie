@@ -767,8 +767,12 @@ def test_file_writing_routes_answer_503_while_paused(api_client: TestClient, uni
             assert response.headers["Retry-After"] == str(limits.PAUSED_RETRY_AFTER)
             assert response.json()["detail"]["code"] == "paused_for_restore"
             assert response.json()["detail"]["message"]
-        # reading isn't writing
-        assert api_client.get(job_url(job_id), headers=user.token).status_code == 200
+        # a read waits too (the restore guard answers every request then), without a message to show on each poll
+        read = api_client.get(job_url(job_id), headers=user.token)
+        assert read.status_code == 503
+        assert read.json()["detail"]["code"] == "paused_for_restore"
+        assert "message" not in read.json()["detail"]
     finally:
         marker.unlink(missing_ok=True)
     assert job_row(job_id)["status"] == "ready"
+    assert api_client.get(job_url(job_id), headers=user.token).status_code == 200

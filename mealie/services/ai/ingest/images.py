@@ -141,7 +141,7 @@ class PageRejected(Exception):
 
 
 class RenderTimedOut(PageRejected):
-    """A PDF that ran out of render time (`PDF_RENDER_TIMEOUT`, or its CPU time): `pdf_not_supported`"""
+    """A PDF that ran out of render time (`pdf_render_timeout()`, or its CPU time): `pdf_not_supported`"""
 
     def __init__(self) -> None:
         super().__init__(IngestRejectReason.pdf_not_supported)
@@ -650,13 +650,23 @@ def _tiff_page_frames(raw: BinaryIO) -> list[int]:
     return frames
 
 
-PDF_RENDER_CPU_SECONDS = 20
-"""
-The CPU time a PDF's pages may take to render (the renderer's `RLIMIT_CPU`): a scanned card of 4 pages at 300 dpi
-takes about 4 s on a current x86-64 core, so this leaves a slow NAS or ARM board room to spare
-"""
-PDF_RENDER_TIMEOUT = 30
-"""How long a PDF's pages may take to render in all, waiting for a CPU included"""
+PDF_RENDER_WALL_FACTOR = 1.5
+"""How long a PDF's pages may take to render in all, waiting for a CPU included, as a multiple of their CPU time"""
+
+
+def pdf_render_cpu_seconds() -> int:
+    """
+    The CPU time a PDF's pages may take to render (the renderer's `RLIMIT_CPU`): `AI_INGEST_PDF_CPU_SECONDS`, 20 by
+    default (a scanned card of 4 pages takes about 4 s on a current x86-64 core)
+    """
+    return get_ingest_settings().PDF_CPU_SECONDS
+
+
+def pdf_render_timeout() -> float:
+    """How long a PDF's pages may take to render in all, waiting for a CPU included"""
+    return pdf_render_cpu_seconds() * PDF_RENDER_WALL_FACTOR
+
+
 _PDF_RENDERER = Path(__file__).with_name("pdf_render.py")
 _CHILD_ENVIRONMENT = ("SYSTEMROOT", "TMPDIR", "TEMP", "TMP")
 """What the renderer's process gets of the server's environment: nothing secret"""
@@ -803,10 +813,11 @@ def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentP
 
 def _run_renderer(document: Path) -> _RenderedFrames:
     """
-    The renderer's run on `document` within `PDF_RENDER_TIMEOUT` and `PDF_RENDER_CPU_SECONDS`; `RenderTimedOut` when it
-    ran out of either, `PageRejected` when it failed
+    The renderer's run on `document` within `pdf_render_timeout()` and `pdf_render_cpu_seconds()`; `RenderTimedOut`
+    when it ran out of either, `PageRejected` when it failed
     """
-    deadline = time.monotonic() + PDF_RENDER_TIMEOUT
+    cpu_seconds, timeout = pdf_render_cpu_seconds(), pdf_render_timeout()
+    deadline = time.monotonic() + timeout
     try:
         process = subprocess.Popen(  # the renderer's path and our own numbers: no shell, no user input
             [
@@ -817,7 +828,7 @@ def _run_renderer(document: Path) -> _RenderedFrames:
                 str(limits.PAGE_MAX_SIDE),
                 str(limits.MAX_PIXELS),
                 str(limits.MAX_PAGES_PER_CARD),
-                str(PDF_RENDER_CPU_SECONDS),
+                str(cpu_seconds),
                 "1" if get_ingest_settings().PDF_UNCONFINED else "0",
             ],
             stdin=subprocess.DEVNULL,
@@ -857,7 +868,8 @@ def _run_renderer(document: Path) -> _RenderedFrames:
     if timed_out or (not frames.broken and returncode in _TIME_LIMIT_SIGNALS):
         frames.close()
         logger.info(
-            f"A PDF wasn't rendered within {PDF_RENDER_TIMEOUT} seconds or {PDF_RENDER_CPU_SECONDS} seconds of CPU time"
+            f"A PDF wasn't rendered within {timeout:g} seconds or {cpu_seconds} seconds of CPU time "
+            "(AI_INGEST_PDF_CPU_SECONDS)"
         )
         raise RenderTimedOut()
     if frames.result is None or frames.broken or returncode != 0:

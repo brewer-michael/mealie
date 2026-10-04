@@ -6,11 +6,11 @@ directory, then one transaction checks for a duplicate, touches the batch (unsea
 extraction queued; the dispatcher is woken. The uploaded bytes never reach `DATA_DIR`. Used by the upload route and the
 inbox.
 
-**PDF rendering is shared fairly.** The process renders one PDF at a time, its uploads in the order they asked, and
-each group has at most one card waiting for that slot or holding it (`ingest_async`), so another group's PDF waits for
-one card per group rendering at most. Once a PDF of one sender (a request's cards, or one inbox scan's cards of a group:
-`RenderBudget`) runs out of render time, the sender's later PDFs are refused `pdf_not_supported` without being
-rendered.
+**PDF rendering is shared fairly.** The process renders one card's PDFs at a time, in the order they asked, and each
+group has at most one card waiting for that slot or holding it, an upload's (`ingest_async`) or the inbox scan's
+(`ingest`) alike, so another group's PDF waits for one card per group rendering at most. Once a PDF of one sender (a
+request's cards, or one inbox scan's cards of a group: `RenderBudget`) runs out of render time, the sender's later PDFs
+are refused `pdf_not_supported` without being rendered.
 
 **One household's intakes take turns.** The transaction starts with the household's intake lock
 (`lock_household_intake`): a transaction-level advisory lock on PostgreSQL, the database's write lock on SQLite (plus
@@ -44,9 +44,12 @@ Public interface:
   which optional parts of the read they skip (`limited_features`).
 """
 
+import asyncio
 import hashlib
 import threading
-from collections.abc import Callable, Sequence
+from collections import deque
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, BinaryIO, Literal
@@ -91,20 +94,115 @@ _intake_limiter = anyio.CapacityLimiter(limits.INTAKE_CONCURRENCY)
 _intake_slots = threading.BoundedSemaphore(limits.INTAKE_CONCURRENCY)
 """The same bound for every caller of `ingest`, the inbox's scan included: one large photo takes hundreds of MB"""
 
-RENDER_CONCURRENCY = 1
-"""PDFs rendered at once per process"""
-_render_limiter = anyio.CapacityLimiter(RENDER_CONCURRENCY)
-"""Uploads whose PDFs wait to be rendered wait on the event loop, first come, first served"""
-_group_render_locks: dict[UUID, anyio.Lock] = {}
+
+class _FairLock:
+    """
+    A lock taken first come, first served by code on an event loop (`held`: waiting there holds no thread) and in
+    threads (`held_blocking`) alike, so uploads and the inbox's scan queue for it together
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._held = False
+        self._waiters: deque[Callable[[], bool]] = deque()
+
+    @property
+    def waiting(self) -> int:
+        """How many wait for it"""
+        with self._guard:
+            return len(self._waiters)
+
+    def _take_or_queue(self, wake: Callable[[], bool]) -> bool:
+        """Takes the lock when it's free and nobody waits (True); else queues `wake`, which hands the lock over"""
+        with self._guard:
+            if not self._held and not self._waiters:
+                self._held = True
+                return True
+            self._waiters.append(wake)
+            return False
+
+    def _release(self) -> None:
+        """Hands the lock to the first waiter still waiting (a `wake` that answers True), else frees it"""
+        while True:
+            with self._guard:
+                if not self._waiters:
+                    self._held = False
+                    return
+                wake = self._waiters.popleft()
+            if wake():
+                return
+
+    def _withdraw(self, wake: Callable[[], bool]) -> None:
+        """A waiter that stopped waiting: out of the queue, or, when the lock was handed to it meanwhile, passed on"""
+        with self._guard:
+            if wake in self._waiters:
+                self._waiters.remove(wake)
+                return
+        self._release()
+
+    @contextmanager
+    def held_blocking(self) -> Iterator[None]:
+        handed = threading.Event()
+
+        def wake() -> bool:
+            handed.set()
+            return True
+
+        if not self._take_or_queue(wake):
+            handed.wait()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @asynccontextmanager
+    async def held(self) -> AsyncIterator[None]:
+        loop = asyncio.get_running_loop()
+        handed: asyncio.Future[None] = loop.create_future()
+
+        def wake() -> bool:
+            try:
+                loop.call_soon_threadsafe(_resolve, handed)
+            except RuntimeError:
+                return False  # its event loop is closed: nobody waits there any more
+            return True
+
+        if not self._take_or_queue(wake):
+            try:
+                await handed
+            except BaseException:
+                self._withdraw(wake)  # cancelled
+                raise
+        try:
+            yield
+        finally:
+            self._release()
+
+
+def _resolve(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+_render_slot = _FairLock()
 """
-One card of each group at a time waits for `_render_limiter` or holds it (`ingest_async`): a group's backlog of PDFs
-holds up another group's for one card at most
+The process's PDF render slot, held while one card's PDFs render (one card at a time), apart from the intake slots: a
+PDF can take `images.pdf_render_timeout()` to render (in a process of its own, with its own memory limit), and holds up
+other PDFs meanwhile, never photos. Uploads wait for it on the event loop, the inbox's scan in its thread, in one queue.
 """
-_render_slots = threading.BoundedSemaphore(RENDER_CONCURRENCY)
+_render_threads = anyio.CapacityLimiter(1)
+"""The worker thread an upload's card renders in, once it holds the slot: never waited for"""
+_render_turns: dict[UUID, _FairLock] = {}
 """
-The same bound for every caller of `ingest`, apart from the intake slots: a PDF can take `images.PDF_RENDER_TIMEOUT`
-to render (in a process of its own, with its own memory limit), and holds up other PDFs meanwhile, never photos
+Each group's turn at the render slot (`_render_turn`): one card of each group at a time waits for the slot or holds it,
+an upload's or the inbox scan's, so a group's backlog of PDFs holds up another group's for one card at most
 """
+_render_turns_guard = threading.Lock()
+
+
+def _render_turn(group_id: UUID) -> _FairLock:
+    with _render_turns_guard:
+        return _render_turns.setdefault(group_id, _FairLock())
 
 
 _household_locks: dict[UUID, threading.Lock] = {}
@@ -315,11 +413,11 @@ class IntakeService:
         self, card: IntakeCard, options: IntakeOptions, *, confirm: Callable[[], bool] | None = None
     ) -> IntakeOutcome:
         """
-        `ingest` from async code: a card's PDFs are rendered once one of the process's render slots is free (behind
-        at most one card of each other group: the group's other cards wait for its turn first), then it waits for one
-        of its intake slots; it waits on the event loop each time, so waiting uploads hold no worker thread, and runs
-        in worker threads. Once one of the service's PDFs ran out of render time, a card's PDF is refused without
-        waiting.
+        `ingest` from async code: a card's PDFs are rendered once the process's render slot is free (behind at most
+        one card of each other group: the group's other cards, the inbox's included, wait for its turn first), then it
+        waits for one of its intake slots; it waits on the event loop each time, so waiting uploads hold no worker
+        thread, and runs in worker threads. Once one of the service's PDFs ran out of render time, a card's PDF is
+        refused without waiting.
         """
         rejected = self._check_card(card)
         if rejected is not None:
@@ -329,8 +427,8 @@ class IntakeService:
             if self.renders.timed_out:
                 rendering = await anyio.to_thread.run_sync(self._render, card)  # refused, unrendered
             else:
-                async with _group_render_locks.setdefault(self.group_id, anyio.Lock()):
-                    rendering = await anyio.to_thread.run_sync(self._render, card, limiter=_render_limiter)
+                async with _render_turn(self.group_id).held(), _render_slot.held():
+                    rendering = await anyio.to_thread.run_sync(self._render, card, limiter=_render_threads)
             if isinstance(rendering, IntakeRejected):
                 return rendering
             rendered = rendering
@@ -353,7 +451,8 @@ class IntakeService:
         Turns one card into a job, holding one of the process's `INTAKE_CONCURRENCY` intake slots (waiting for one),
         and the ingest write lock from its directory's creation through the insert. Each file gives its pages first
         (`images.expand_document`: a multi-page TIFF or a PDF fills several, at most `MAX_PAGES_PER_CARD` in all; a
-        PDF is rendered before the intake slot, in one of the process's render slots); then each page is normalized
+        card's PDFs are rendered before the intake slot, in the process's render slot, once the group's turn and the
+        slot come, as for `ingest_async`); then each page is normalized
         into `pages/<n>/`, and one transaction takes the household's intake lock, chooses and touches the batch
         (choosing again if it was sealed meanwhile), checks for a duplicate (unless allowed), calls `confirm` (the
         inbox checks that its claimed file is still there) and inserts the job, `processing` with its extraction
@@ -368,7 +467,11 @@ class IntakeService:
         rejected = self._check_card(card)
         if rejected is not None:
             return rejected
-        rendered = self._render(card)
+        if self.renders.timed_out or not _has_pdf(card):
+            rendered = self._render(card)  # nothing to render: no PDF, or the service's PDFs are refused unrendered
+        else:
+            with _render_turn(self.group_id).held_blocking(), _render_slot.held_blocking():
+                rendered = self._render(card)
         if isinstance(rendered, IntakeRejected):
             return rendered
         return self._ingest(card, options, confirm, rendered)
@@ -416,10 +519,11 @@ class IntakeService:
 
     def _render(self, card: IntakeCard) -> _Rendered | IntakeRejected:
         """
-        The card's PDFs' pages (`images.expand_document`), each PDF rendered in one of the process's render slots
-        (waiting for one) and before the write lock, which a restore may be waiting for; or the rejection of the
-        first that can't be rendered, or that takes the card over `MAX_PAGES_PER_CARD` pages, or comes after a PDF of
-        the service's that ran out of render time (`renders`). Empty without a PDF.
+        The card's PDFs' pages (`images.expand_document`), rendered before the write lock, which a restore may be
+        waiting for, by a caller holding the render slot (`ingest`, `ingest_async`); or the rejection of the first that
+        can't be rendered, or that takes the card over `MAX_PAGES_PER_CARD` pages, or comes after a PDF of the
+        service's that ran out of render time (`renders`: refused without rendering, so needing no slot). Empty
+        without a PDF.
         """
         rendered: _Rendered = {}
         try:
@@ -428,12 +532,11 @@ class IntakeService:
                     continue
                 if self.renders.timed_out:
                     raise images.PageRejected(IngestRejectReason.pdf_not_supported)
-                with _render_slots:
-                    try:
-                        rendered[position] = images.expand_document(upload.file)
-                    except images.RenderTimedOut:
-                        self.renders.timed_out = True
-                        raise
+                try:
+                    rendered[position] = images.expand_document(upload.file)
+                except images.RenderTimedOut:
+                    self.renders.timed_out = True
+                    raise
                 if sum(len(pages) for pages in rendered.values()) > limits.MAX_PAGES_PER_CARD:
                     raise images.PageRejected(IngestRejectReason.too_many_pages)
         except images.PageRejected as e:

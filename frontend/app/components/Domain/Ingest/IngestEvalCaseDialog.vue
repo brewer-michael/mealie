@@ -13,9 +13,9 @@
     @submit="save"
   >
     <v-card-text class="ingest-eval-dialog">
-      <p class="text-body-medium mb-4">
+      <div class="text-body-medium mb-4">
         {{ $t("recipe-ingest.eval.description") }}
-      </p>
+      </div>
       <v-text-field
         v-model="slug"
         variant="outlined"
@@ -33,9 +33,9 @@
         :label="$t('recipe-ingest.eval.verified')"
       />
       <!-- what the card is like, which the eval report groups scores by -->
-      <p id="ingest-eval-tags-label" class="text-body-medium mt-2 mb-1">
+      <div id="ingest-eval-tags-label" class="text-body-medium mt-2 mb-1">
         {{ $t("recipe-ingest.review.eval-tags") }}
-      </p>
+      </div>
       <v-chip-group
         v-model="tags"
         multiple
@@ -145,3 +145,10 @@ function save() {
   }
 }
 </script>
+
+<style scoped>
+/* a field's hint or message may wrap on a phone: Vuetify sets 12 px lines for 12 px text, which run together */
+.ingest-eval-dialog :deep(.v-messages__message) {
+  line-height: 1rem;
+}
+</style>

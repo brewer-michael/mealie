@@ -246,7 +246,8 @@ def test_paused_for_a_restore(
         assert response.json()["detail"]["code"] == "paused_for_restore"
         assert response.json()["detail"]["message"]
 
-    # reading the list writes nothing, so it still works
+    # nothing was written; once the restore is over the list reads as before
+    monkeypatch.setattr(storage, "is_paused", lambda: False)
     assert [case["slug"] for case in api_client.get(EVAL_CASES, headers=unique_user.token).json()] == ["kept"]
     assert sorted(path.name for path in storage.eval_cards_dir(UUID(unique_user.group_id)).iterdir()) == [
         "kept-1.jpg",

@@ -7,6 +7,7 @@ claim's lease: at least once per notifier, given up on after `NOTIFY_ATTEMPTS`.
 
 import json
 import threading
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -265,23 +266,32 @@ def test_only_the_households_enabled_notifiers_that_opted_in(
 
 
 @pytest.mark.parametrize(
-    ("cards", "body"),
+    ("cards", "title", "body"),
     [
-        (["ready"], "1 card is ready to review."),
-        (["ready", "ready", "ready!"], "3 cards are ready to review (1 needs a look)."),
-        (["ready!", "ready!", "failed", "failed"], "2 cards are ready to review (2 need a look, 2 failed)."),
-        # a batch whose every card failed still says so
-        (["failed", "failed"], "No cards are ready to review (2 failed)."),
+        (["ready"], "Recipe cards ready", "1 card is ready to review."),
+        (["ready", "ready", "ready!"], "Recipe cards ready", "3 cards are ready to review (1 needs a look)."),
+        (
+            ["ready!", "ready!", "failed", "failed"],
+            "Recipe cards ready",
+            "2 cards are ready to review (2 need a look, 2 failed).",
+        ),
+        # a batch whose every card failed still says so, and its title doesn't say they're ready
+        (["failed", "failed"], "Recipe cards not read", "No cards are ready to review (2 failed)."),
+        (["failed"], "Recipe cards not read", "No cards are ready to review (1 failed)."),
     ],
 )
-def test_the_message_counts(unique_user_fn_scoped: TestUser, published: list[Published], cards: list[str], body: str):
+def test_the_message_counts(
+    unique_user_fn_scoped: TestUser, published: list[Published], cards: list[str], title: str, body: str
+):
     notifier(unique_user_fn_scoped, "json://ha.local/hook")
     batch_id = make_batch(unique_user_fn_scoped, *cards)
 
     assert events.maybe_notify_batch(batch_id) is True
     [sent] = published
-    assert sent.event.message.body == body
+    assert (sent.event.message.title, sent.event.message.body) == (title, body)
     assert sent.data.failed_count == cards.count("failed")
+    # the same event type either way, so a Home Assistant automation matches it
+    assert sent.event.event_type == events.AIEventTypes.recipe_ingestion_ready
 
 
 def test_a_language_without_the_texts_falls_back_to_english(
@@ -706,6 +716,123 @@ def test_an_attempt_that_outlives_its_lease_stops_when_another_takes_over(
     # the stuck attempt finished its one send (which a crash at that moment would also double), then stopped
     tried = [published.tried(batch_id, host) for host in ("first.local", "second.local")]
     assert sorted(tried) == [1, 2]
+
+
+def test_a_send_that_takes_longer_than_the_lease_keeps_its_claim(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A live process whose notifier takes longer than the lease renews its claim while it sends, so housekeeping running
+    meanwhile doesn't start the same notification over: each notifier gets it once
+    """
+    monkeypatch.setattr(limits, "NOTIFY_LEASE", 0.6)
+    user = unique_user_fn_scoped
+    notifier(user, "json://first.local/hook")
+    notifier(user, "json://second.local/hook")
+    batch_id = make_batch(user, "ready")
+
+    sending = threading.Event()
+    go_on = threading.Event()
+    deliver = published.deliver
+
+    def deliver_slowly(event: events.AIEvent, url: str) -> bool:
+        if threading.current_thread() is not threading.main_thread() and not sending.is_set():
+            sending.set()
+            assert go_on.wait(10)
+        return deliver(event, url)
+
+    results: list[bool] = []
+    slow = threading.Thread(target=lambda: results.append(events.maybe_notify_batch(batch_id)))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(events, "deliver", deliver_slowly)
+        slow.start()
+        assert sending.wait(10)
+        for _ in range(3):  # well past the lease, with the first notifier still busy
+            time.sleep(0.5)
+            events.housekeeping(utcnow())
+        go_on.set()
+        slow.join(10)
+
+    assert results == [True]
+    assert notify_state(batch_id)["notify_attempts"] == 1
+    assert [published.tried(batch_id, host) for host in ("first.local", "second.local")] == [1, 1]
+
+
+def _job_ids(batch_id: UUID) -> list[UUID]:
+    with session_context() as session:
+        stmt = sa.select(RecipeIngestionJob.id).where(RecipeIngestionJob.batch_id == batch_id)
+        return list(session.execute(stmt.order_by(RecipeIngestionJob.position)).scalars())
+
+
+def _arm(job_id: UUID) -> None:
+    """What the automatic retry does as it queues a card that waited for a monthly limit (the queueing commits)"""
+    with session_context() as session:
+        events.arm_limit_wave(session, job_id)
+        session.commit()
+
+
+def _set_notify(batch_id: UUID, **values: Any) -> None:
+    with session_context() as session:
+        session.execute(sa.update(RecipeIngestionBatch).where(RecipeIngestionBatch.id == batch_id).values(**values))
+        session.commit()
+
+
+def test_queueing_a_card_that_waited_arms_its_batch_again(unique_user_fn_scoped: TestUser, published: Outbox):
+    user = unique_user_fn_scoped
+    notifier(user, "json://first.local/hook")
+    batch_id = make_batch(user, "ready", "failed", "failed")
+    _, first, second = _job_ids(batch_id)
+    assert events.maybe_notify_batch(batch_id) is True
+    hashes = notify_state(batch_id)["notify_delivered"]
+
+    # the batch's notification went out: it's due again for the card, once it's read
+    _arm(first)
+    state = notify_state(batch_id)
+    assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"]) == (None, None, 0)
+    assert state["notify_delivered"] == [f"limit-wave:{first}"]
+
+    # another card joins the wave still to come
+    _arm(second)
+    assert notify_state(batch_id)["notify_delivered"] == sorted([f"limit-wave:{first}", f"limit-wave:{second}"])
+
+    # a wave being sent starts over with the card that joined it, and the attempt in flight writes nothing more
+    with session_context() as session:
+        stale = events._claim(session, batch_id, utcnow())
+    assert stale is not None and stale.attempt == 1
+    _arm(second)
+    state = notify_state(batch_id)
+    assert (state["notify_claimed_at"], state["notify_attempts"]) == (None, 0)
+    assert state["notify_delivered"] == sorted([f"limit-wave:{first}", f"limit-wave:{second}"])
+    # the next attempt has the same number, but not the same lease: the stale one can't renew or record over it
+    with session_context() as session:
+        again = events._claim(session, batch_id, utcnow() + timedelta(seconds=1))
+        assert again is not None and again.attempt == stale.attempt
+        assert events._renew_claim(stale.lease) is False
+        assert events._record(session, stale.lease, hashes, notified_at=utcnow()) is False
+        assert events._renew_claim(again.lease) is True
+    assert notify_state(batch_id)["notified_at"] is None
+
+    # a batch whose own notification is still to come counts the card as it is once read: nothing changes
+    other = make_batch(user, "failed")
+    [card] = _job_ids(other)
+    before = notify_state(other)
+    _arm(card)
+    assert notify_state(other) == before
+
+    # one being sent (or waiting to be tried again) starts over, so it counts the card once read
+    with session_context() as session:
+        stale = events._claim(session, other, utcnow())
+    assert stale is not None
+    _arm(card)
+    state = notify_state(other)
+    assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"], state["notify_delivered"]) == (
+        None,
+        None,
+        0,
+        [],
+    )
+    with session_context() as session:
+        assert events._record(session, stale.lease, [], notified_at=utcnow()) is False
 
 
 def test_given_up_after_the_last_attempt(

@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import pytest
 from PIL import Image, ImageCms, ImageFile
@@ -32,6 +32,7 @@ from mealie.services.ai.ingest.images import (
     sniff,
     stage_rotation,
 )
+from mealie.services.ai.ingest.settings import IngestSettings
 
 RED = (255, 0, 0)
 WHITE = (255, 255, 255)
@@ -933,7 +934,7 @@ def test_a_two_page_pdf_gives_two_rendered_pages(tmp_path: Path, monkeypatch: py
     assert [meta.original_filename for meta, _ in normalized] == ["scan.pdf (page 1)", "scan.pdf (page 2)"]
     for meta, page_dir in normalized:
         assert meta.format == "pdf" and meta.raw_bytes == len(raw)
-        assert (meta.width, meta.height) == (800, 534)  # rendered at the page's long side (PDFium rounds up)
+        assert (meta.width, meta.height) == (300, 200)  # rendered at its image's own resolution
         _assert_no_metadata(page_dir)
     assert _close(_center(normalized[0][1]), RED) and _close(_center(normalized[1][1]), BLUE)
 
@@ -951,13 +952,91 @@ def test_a_one_page_pdf_is_identified_by_its_bytes(monkeypatch: pytest.MonkeyPat
 def test_a_pdf_page_is_rendered_within_the_pixel_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 1000)
     monkeypatch.setattr(limits, "MAX_PIXELS", 100_000)
-    pages = images.expand_document(io.BytesIO(_pdf_of(RED, size=(300, 300))))
+    pages = images.expand_document(io.BytesIO(_pdf_of(RED, size=(1000, 1000))))
     try:
         ((meta, _),) = _normalized(pages, tmp_path, "square.pdf")
     finally:
         images.close_pages(pages)
     assert meta.width * meta.height <= 100_000
     assert meta.width >= 310  # as large as the cap allows
+
+
+def _rendered_sizes(raw: bytes) -> list[tuple[int, int]]:
+    pages = images.expand_document(io.BytesIO(raw))
+    try:
+        sizes = []
+        for page in pages:
+            with Image.open(page.file) as rendered:
+                sizes.append(rendered.size)
+        return sizes
+    finally:
+        images.close_pages(pages)
+
+
+def _pdf_page(content: bytes, xobjects: list[bytes], page_size: tuple[int, int] = (600, 800)) -> bytes:
+    """
+    A one-page PDF drawing `content`, whose resources name `xobjects` (each an object's dictionary and stream, `%d` in
+    it for the number of the object before it) /X1, /X2, ...
+    """
+    objects = list(xobjects)
+    names = b" ".join(b"/X%d %d 0 R" % (number, number) for number in range(1, len(objects) + 1))
+    objects.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+    objects.append(
+        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] /Contents %d 0 R /Resources << /XObject << %s >> >> >>"
+        % (len(objects) + 2, *page_size, len(objects), names)
+    )
+    objects.append(b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % len(objects))
+    objects.append(b"<< /Type /Catalog /Pages %d 0 R >>" % len(objects))
+    data = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    data += b"trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, len(objects), xref)
+    return bytes(data)
+
+
+def _image_xobject(width: int, height: int) -> bytes:
+    data = zlib.compress(bytes(RED) * (width * height))
+    return (
+        b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        b"/Filter /FlateDecode /Length %d >>\nstream\n" % (width, height, len(data)) + data + b"\nendstream"
+    )
+
+
+@pytest.mark.parametrize("resolution", [72, 300])
+def test_a_pdf_of_photos_keeps_their_size(resolution: int):
+    # a PDF made of 1200 x 1600 photos gives 1200 x 1600 pages, as a TIFF of them does, whatever size its pages say
+    # they are: never enlarged to the long side the server allows (LU9)
+    photos = [Image.new("RGB", (1200, 1600), color) for color in (RED, BLUE)]
+    raw = _encoded(photos[0], "PDF", save_all=True, append_images=photos[1:], resolution=resolution)
+    assert _rendered_sizes(raw) == [(1200, 1600), (1200, 1600)]
+
+
+def test_a_large_photos_page_is_rendered_within_the_long_side():
+    assert _rendered_sizes(_encoded(Image.new("RGB", (6000, 8000), RED), "PDF", resolution=72)) == [(3072, 4096)]
+
+
+def test_a_scan_in_a_scaled_turned_form_is_rendered_at_its_own_resolution():
+    # a 150 x 200 scan drawn through a form whose matrix doubles and turns it fills the 800 x 600 page: 200 x 150
+    form = (
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 300 400] /Matrix [0 2 -2 0 800 0] "
+        b"/Resources << /XObject << /I 1 0 R >> >> /Length 25 >>\nstream\nq 300 0 0 400 0 0 cm /I Do Q\nendstream"
+    )
+    raw = _pdf_page(b"q /X2 Do Q", [_image_xobject(150, 200), form], page_size=(800, 600))
+    assert _rendered_sizes(raw) == [(200, 150)]
+
+
+def test_a_page_without_a_scan_is_rendered_at_300_dpi():
+    # text and drawings have no resolution of their own; a small image (a logo) doesn't make the page a scan
+    drawing = _pdf_page(b"0 0 0 rg 100 100 200 300 re f", [], page_size=(288, 432))  # 4 x 6 inches
+    logo = _pdf_page(b"q 72 0 0 72 36 36 cm /X1 Do Q", [_image_xobject(20, 20)], page_size=(288, 432))
+    for raw in (drawing, logo):
+        ((width, height),) = _rendered_sizes(raw)
+        assert abs(width - 1200) <= 1 and abs(height - 1800) <= 1  # PDFium rounds each side up
 
 
 @pytest.mark.parametrize("pixels", [100_000, 99_999, 2_000_000])
@@ -1074,7 +1153,7 @@ def fake_renderer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def test_a_renderer_that_hangs_is_stopped(fake_renderer, monkeypatch: pytest.MonkeyPatch):
     fake_renderer("import time\ntime.sleep(30)\n")
-    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 0.5)
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 0.5)
     started = time.monotonic()
     with pytest.raises(images.RenderTimedOut) as e:
         images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
@@ -1085,8 +1164,8 @@ def test_a_renderer_that_hangs_is_stopped(fake_renderer, monkeypatch: pytest.Mon
 def test_a_pdf_that_takes_too_much_cpu_time_is_stopped_by_its_limit(monkeypatch: pytest.MonkeyPatch):
     # the real renderer on a 4 KB PDF PDFium would render for minutes: the CPU limit it's given stops it long before
     # the wall-clock limit, and that's running out of time too
-    monkeypatch.setattr(images, "PDF_RENDER_CPU_SECONDS", 1)
-    monkeypatch.setattr(images, "PDF_RENDER_TIMEOUT", 60)
+    monkeypatch.setattr(images, "pdf_render_cpu_seconds", lambda: 1)
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 60)
     started = time.monotonic()
     with pytest.raises(images.RenderTimedOut) as e:
         images.expand_document(io.BytesIO(nested_pdf()))
@@ -1097,8 +1176,31 @@ def test_a_pdf_that_takes_too_much_cpu_time_is_stopped_by_its_limit(monkeypatch:
 def test_the_render_budget_leaves_a_scanned_card_room():
     # a scanned card of 4 pages at 300 dpi takes about 4 s of CPU on a current x86-64 core (measured when the budget
     # was set): the budget leaves a 5x slower machine room, and the wall clock some more for a busy one
-    assert images.PDF_RENDER_CPU_SECONDS >= 20
-    assert images.PDF_RENDER_TIMEOUT > images.PDF_RENDER_CPU_SECONDS
+    assert images.pdf_render_cpu_seconds() >= 20
+    assert images.pdf_render_timeout() > images.pdf_render_cpu_seconds()
+
+
+def test_a_slow_machine_can_raise_the_render_budget(monkeypatch: pytest.MonkeyPatch):
+    # AI_INGEST_PDF_CPU_SECONDS: the renderer's CPU limit, and the wall clock 1.5 times it
+    monkeypatch.setenv("AI_INGEST_PDF_CPU_SECONDS", "90")
+    monkeypatch.setattr(images, "get_ingest_settings", IngestSettings)
+    assert (images.pdf_render_cpu_seconds(), images.pdf_render_timeout()) == (90, 135)
+
+    commands: list[list[str]] = []
+
+    class Popen:
+        def __init__(self, command: list[str], **kwargs: Any) -> None:
+            commands.append(command)
+            raise OSError("not started")
+
+    monkeypatch.setattr(images.subprocess, "Popen", Popen)
+    with pytest.raises(PageRejected):
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert commands[0][-2] == "90"  # `cpu seconds`, then `unconfined`
+
+    monkeypatch.setenv("AI_INGEST_PDF_CPU_SECONDS", "0")
+    with pytest.raises(ValueError):
+        IngestSettings()
 
 
 def test_a_renderer_that_crashes_is_a_refusal_not_an_error(fake_renderer):

@@ -993,11 +993,16 @@ class _MergeMarker:
 def _merge_markers(job: RecipeIngestionJob) -> list[Path]:
     """
     The merge notes `job` is in: as the target, the notes in its folder; as the source, while one of its pages is
-    missing (a card that can be merged: ready or failed, or being committed since), a note naming it in another card's
-    folder
+    missing (a card that can be merged: ready or failed, or being read again or committed since), a note naming it in
+    another card's folder
     """
     paths = sorted(storage.job_dir(job.group_id, job.id).glob(f"{MERGE_MARKER_PREFIX}*.json"))
-    statuses = (IngestStatus.ready.value, IngestStatus.failed.value, IngestStatus.committing.value)
+    statuses = (
+        IngestStatus.ready.value,
+        IngestStatus.failed.value,
+        IngestStatus.processing.value,
+        IngestStatus.committing.value,
+    )
     if job.status in statuses and any(
         not storage.page_dir(job.group_id, job.id, page.index).is_dir() for page in parse_pages(job.pages)
     ):
@@ -1062,6 +1067,18 @@ def settle_merges(repos: IngestRepos, job: RecipeIngestionJob) -> RecipeIngestio
     if current is None:
         raise not_found()
     return current
+
+
+def settle_merges_to_read(repos: IngestRepos, job: RecipeIngestionJob) -> RecipeIngestionJob:
+    """
+    `settle_merges` for a card a task is about to read, in a write section of its own taken only when a merge a stop
+    left involves the card: a failed card retried, or a card read again, before anything looked at its photos still
+    has a page in the other card's folder. `IngestPaused` while a backup restore pauses ingestion.
+    """
+    if not _merge_markers(job):
+        return job
+    with storage.ingest_write():
+        return settle_merges(repos, job)
 
 
 def settle_merges_into(session: Session, group_id: UUID, job_id: UUID, *, locked: UUID | None = None) -> None:
@@ -2003,6 +2020,10 @@ class ReviewService:
         one goes back to `processing`), and the source is deleted, each only if its `row_version`, status and idle
         task are as read. Whether both happened.
 
+        The target's `draft_version` and `extracted_version` both go up, so a save or commit made with the version
+        seen before the merge is a 409 `version_conflict` (the page reloads) rather than landing on the card being read
+        again, or cancelling that reading; a draft nobody edited still counts as unedited, and the reading replaces it.
+
         The target keeps to this server when either card was sent so: photos uploaded to stay here never reach a cloud
         provider through the card they join (§10); only "Read with cloud" lifts that, with the user's consent.
         """
@@ -2011,6 +2032,8 @@ class ReviewService:
         values: dict[str, Any] = {
             "pages": [page.model_dump(mode="json") for page in pages],
             "source_sha256": source_sha256(pages),
+            "draft_version": Job.draft_version + 1,
+            "extracted_version": Job.extracted_version + 1,
         }
         if source.local_only and not target.local_only:
             values["local_only"] = True

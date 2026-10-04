@@ -151,7 +151,9 @@ def test_a_two_sided_card_from_the_phone_to_a_recipe(
     assert draft["attachCardPhoto"] is draft["useCardAsCover"] is None
     draft["steps"][-1]["text"] = FILLED_STEP
     draft["attachCardPhoto"] = draft["useCardAsCover"] = True
-    saved = api_client.put(job_url(job_id), json={"draftVersion": 1, "draft": draft}, headers=user.token)
+    # (the review page says which draft schema it was built for: an older build's `true` would read as unset)
+    body = {"draftVersion": 1, "draft": draft, "clientDraftSchema": 3}
+    saved = api_client.put(job_url(job_id), json=body, headers=user.token)
     assert saved.status_code == 200, saved.text
     assert saved.json()["draftVersion"] == 2
     assert saved.json()["errorCount"] == 0

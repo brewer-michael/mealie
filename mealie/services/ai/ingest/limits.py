@@ -119,9 +119,7 @@ allow a request, so the browser sees the answer.
 """
 RESTORE_LOCK_POLL = 0.25
 GUARD_THREADS = 4
-"""Threads per process on which upstream writes enter their write section (`restore_guard`)"""
-GUARD_BODY_IN_MEMORY = MIB
-"""An upstream write's body, read before its write section starts, is kept in memory up to this, the rest in a file"""
+"""Threads per process on which requests check for a pause, and writes enter their section (`restore_guard`)"""
 PAUSED_TASK_POLL = 5
 """How often a task that hit the pause checks whether it's over"""
 PAUSED_RELEASE_DELAY = 60

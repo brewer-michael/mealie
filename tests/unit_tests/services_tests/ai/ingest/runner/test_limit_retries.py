@@ -4,29 +4,36 @@ automatically, at the next reset (the first of next month, UTC) or once the limi
 every 10 minutes per group, under the card's own policy), as a manual retry would; any other failure clears the retry.
 """
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from ingest_runner_testing import FakeHandlers, Jobs, run, settle
 
 from mealie.db.db_setup import session_context
-from mealie.repos.repository_recipe_ingest import IngestQueue, LimitWait, naive_utc, utcnow
+from mealie.db.models.recipe_ingest import RecipeIngestionBatch
+from mealie.repos.repository_recipe_ingest import IngestQueue, IngestRepos, LimitWait, naive_utc, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
+from mealie.schema.household.group_events import GroupEventNotifierSave
 from mealie.schema.recipe_ingest import IngestErrorCode, IngestStatus, IngestTaskState, RecipeIngestionSettingsUpdate
 from mealie.services import ocr
 from mealie.services.ai.errors import AIProviderLimitReachedError
-from mealie.services.ai.ingest import limits
+from mealie.services.ai.ingest import events, limits
 from mealie.services.ai.ingest.runner import retries
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
 from mealie.services.ai.ingest.runner.finalize import finalize_failure, next_limit_reset
 from mealie.services.ai.ingest.runner.retries import retry_waiting
-from mealie.services.ai.ingest.runner.types import TaskContext
+from mealie.services.ai.ingest.runner.types import TaskContext, TaskFailed
 from tests.utils.fixture_schemas import TestUser
 
 LIMIT = IngestErrorCode.limit_reached.value
+
+MAYBE_NOTIFY_BATCH = events.maybe_notify_batch
+"""The real one: the runner's fixtures put a recorder in its place"""
 
 
 @pytest.fixture(autouse=True)
@@ -364,3 +371,141 @@ def test_a_card_retried_by_hand_and_read_no_longer_waits(
     run(scenario())
     row = jobs.row(job_id)
     assert (row["status"], row["auto_retry_at"]) == (IngestStatus.ready, None)
+
+
+# ==========================================
+# The household hears once the cards that waited are read
+
+
+def _notified_batch(jobs: Jobs) -> None:
+    """The batch was sealed and its notification went out (saying its waiting cards failed)"""
+    with session_context() as session:
+        session.execute(
+            sa.update(RecipeIngestionBatch)
+            .where(RecipeIngestionBatch.id == jobs.batch_id)
+            .values(sealed_at=utcnow(), notified_at=utcnow(), notify_attempts=1, notify_delivered=["0" * 64])
+        )
+        session.commit()
+
+
+@pytest.fixture()
+def notifications(monkeypatch: pytest.MonkeyPatch, unique_user: TestUser) -> Iterator[list[events.AIEvent]]:
+    """The ready notifications sent to a notifier of the test household (nothing leaves the server)"""
+    sent: list[events.AIEvent] = []
+    notifier = unique_user.repos.group_event_notifier.create(
+        GroupEventNotifierSave(
+            name="Kitchen HA",
+            apprise_url="json://ha.local/hook",
+            group_id=unique_user.group_id,
+            household_id=unique_user.household_id,
+        )
+    )
+    with session_context() as session:
+        repos = IngestRepos(session, UUID(unique_user.group_id), UUID(unique_user.household_id))
+        repos.notifier_options.set(notifier.id, recipe_ingestion_ready=True)
+
+    def deliver(event: events.AIEvent, url: str) -> bool:
+        sent.append(event)
+        return True
+
+    monkeypatch.setattr(events, "maybe_notify_batch", MAYBE_NOTIFY_BATCH)  # the real one, not the phases' recorder
+    monkeypatch.setattr(events, "deliver", deliver)
+    monkeypatch.setattr(retries, "retry_waiting", retry_waiting)  # the real phase
+    yield sent
+    unique_user.repos.group_event_notifier.delete(notifier.id)
+
+
+def test_cards_read_after_waiting_for_the_limit_notify_their_batch_once(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+):
+    jobs.ready()  # read the first time round: the batch's own notification counted it
+    first = _waiting(jobs, retry_in=-timedelta(seconds=1))  # their reset has come
+    second = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    _waiting(jobs)  # its limit still applies: it waits on, and isn't counted
+    _notified_batch(jobs)
+
+    async def scenario() -> None:
+        await dispatcher.run_once()  # queues both again
+        await dispatcher.run_once()  # and reads them
+        await settle(dispatcher)
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    run(scenario())
+    assert jobs.row(first)["status"] == jobs.row(second)["status"] == IngestStatus.ready
+
+    [sent] = notifications  # one for the two cards read together
+    assert sent.event_type == events.AIEventTypes.recipe_ingestion_ready
+    assert sent.message.title == "Recipe cards ready"
+    assert sent.message.body == ("2 cards that waited for the monthly limit were read. 2 cards are ready to review.")
+    data = sent.document_data
+    assert isinstance(data, events.EventIngestionReadyData)
+    assert (data.batch_id, data.job_ids, data.ready_count, data.failed_count) == (jobs.batch_id, [first, second], 2, 0)
+
+    # and only once
+    assert events.maybe_notify_batch(jobs.batch_id) is False
+    assert len(notifications) == 1
+
+
+def test_a_card_that_fails_the_limit_again_sends_nothing(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+):
+    job_id = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    _notified_batch(jobs)
+
+    async def limit_reached(ctx: TaskContext) -> Any:
+        raise AIProviderLimitReachedError("every provider is still over its monthly limit")
+
+    handlers.default = limit_reached
+
+    async def scenario() -> None:
+        await dispatcher.run_once()
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    run(scenario())
+    row = jobs.row(job_id)
+    assert (row["status"], row["error_code"]) == (IngestStatus.failed, IngestErrorCode.limit_reached)
+    assert notifications == []
+    with session_context() as session:
+        notified_at = session.execute(
+            sa.select(RecipeIngestionBatch.notified_at).where(RecipeIngestionBatch.id == jobs.batch_id)
+        ).scalar_one()
+    assert notified_at is not None  # settled: nothing left to send for it
+
+
+def test_a_card_that_fails_for_good_after_the_wait_is_told(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+):
+    job_id = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    _notified_batch(jobs)
+
+    async def no_recipe(ctx: TaskContext) -> Any:
+        raise TaskFailed(IngestErrorCode.no_recipe_found)
+
+    handlers.default = no_recipe
+
+    async def scenario() -> None:
+        await dispatcher.run_once()
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    run(scenario())
+    assert jobs.row(job_id)["error_code"] == IngestErrorCode.no_recipe_found
+    [sent] = notifications
+    assert sent.message.title == "Recipe cards not read"
+    assert sent.message.body == (
+        "1 card that waited for the monthly limit was read. No cards are ready to review (1 failed)."
+    )

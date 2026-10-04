@@ -1429,7 +1429,7 @@
       "rejected": "Not used: {reason}",
       "cards-queued": "No cards queued | {count} card queued | {count} cards queued",
       "cannot-read": "AI isn't set up to read recipe cards. A group manager can set it up in the group settings.",
-      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. They're read again automatically when the limit resets on {date}, or sooner if a manager raises it.",
+      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so cards you add now can't be read yet. They're read automatically when the limit resets on {date}, or within about 10 minutes after a group manager raises it.",
       "choose-photos-short": "Choose",
       "data-saver": "Data saver",
       "data-saver-hint": "Sends smaller photos, no larger than the server keeps them.",
@@ -1438,7 +1438,11 @@
       "logout-pending": "{count} photo hasn't been uploaded. Log out anyway? | {count} photos haven't been uploaded. Log out anyway?",
       "local-only-blocked": "Your group keeps cards on this server, but no AI provider on your network can read them. Ask a group manager to add one.",
       "queue-elsewhere": "Your recipe cards are being added in another tab of this browser. Carry on there, or use this tab instead.",
-      "use-this-tab": "Use this tab"
+      "use-this-tab": "Use this tab",
+      "cards-retrying": "{count} card retrying | {count} cards retrying",
+      "cards-not-uploaded": "{count} card didn't upload | {count} cards didn't upload",
+      "queue-kept-in-memory": "That tab couldn't save its photos on this device, so they can't move here. Let them upload there first.",
+      "uploading-leftovers": "This tab is still uploading photos it couldn't save on this device. Keep it open until they're uploaded."
     },
     "queue": {
       "title": "Cards",
@@ -1494,7 +1498,6 @@
       "clean-check-failed": "Couldn't check the cards. Try again.",
       "load-failed": "Couldn't load the cards",
       "status-failed": "Failed",
-      "retries-on": "Tries again on {date}",
       "retries-soon": "Tries again shortly",
       "removed-on": "Removed on {date}",
       "cancel": "Cancel",
@@ -1503,7 +1506,8 @@
       "load-older": "Load older cards",
       "adding-clean": "Adding {done} of {total} card… | Adding {done} of {total} cards…",
       "clean-not-sent": "{count} other card wasn't added. Try again. | The other {count} cards weren't added. Try again.",
-      "add-clean-public": "Recipes in this household can be seen without logging in. A card's photo is used as the recipe's picture, or attached, only where that was turned on for the card, and anyone can then see it. Open a card to check."
+      "add-clean-public": "Recipes in this household can be seen without logging in. A card's photo is used as the recipe's picture, or attached, only where that was turned on for the card, and anyone can then see it. Open a card to check.",
+      "retries-on-limit": "Tries again on {date}, or sooner if the limit is raised"
     },
     "review": {
       "card-of": "Card {number} of {total}",
@@ -1582,6 +1586,7 @@
       "reload-title": "This card changed",
       "reload-text": "This card was changed somewhere else. Reload it to see the latest version; your last few seconds of typing may be lost.",
       "reload": "Reload this card",
+      "commit-reloaded": "This card changed somewhere else, so it was reloaded. Check it, then commit again.",
       "busy": "This card is being read. Your re-read starts when it's done.",
       "reading-again": "Reading the card again",
       "read-only-while-reading": "The card is being read again; you can edit it when that's done.",
@@ -1866,7 +1871,8 @@
       "no-reader": "AI isn't set up to read recipe cards.",
       "local-blocked": "Kept on this server, but nothing here can read it",
       "keep-local-unavailable": "No AI provider on your network can read cards now, so cards sent with this on fail.",
-      "finished-batch": "The cards already sent finish as their own batch; the next photo starts a new one."
+      "finished-batch": "The cards already sent finish as their own batch; the next photo starts a new one.",
+      "limit-reached": "Read once the monthly limit allows"
     },
     "notifier": {
       "recipe-cards-ready": "Recipe cards ready to review",
@@ -1885,7 +1891,7 @@
       "description": "Scan stacks of handwritten or printed recipe cards, and review each one before it becomes a recipe.",
       "cannot-read": "Cards can't be read yet: add a text provider, plus an image provider or OCR.",
       "disabled": "Recipe card scanning is turned off on this server. A server administrator can turn it on with AI_INGEST_ENABLED.",
-      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so new cards fail until the limit resets. Raise a provider's limit in the AI provider settings to read them now.",
+      "limit-reached": "Every AI provider that reads cards has used its monthly token limit, so new cards can't be read yet. They're read automatically when the limit resets on {date}, or within about 10 minutes after a provider's limit is raised in the AI provider settings.",
       "ocr-available": "OCR is available on this server",
       "local-only": "Keep recipe card photos and text on this server",
       "local-only-hint": "Only AI providers marked \"Runs on my network\" at a private address read cards.",

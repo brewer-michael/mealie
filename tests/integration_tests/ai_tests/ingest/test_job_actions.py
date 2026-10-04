@@ -201,6 +201,41 @@ def test_a_failed_card_with_its_back_is_read_again(api_client: TestClient, uniqu
     assert (row["status"], row["error_code"], row["task_state"]) == ("processing", None, "queued")
 
 
+@pytest.mark.parametrize("edited", [False, True])
+def test_a_save_or_commit_from_before_a_merge_is_a_version_conflict(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, edited: bool
+):
+    """
+    The page the reviewer had open before the card's back was added: its commit doesn't cancel the reading of the
+    back's page, and its save doesn't land on the card being read again; both get 409 and the page reloads
+    """
+    user = unique_user_fn_scoped
+    front = ready_to_commit(user, created_by=user.user_id)
+    back = seed_job(user, created_by=user.user_id, position=1)
+    if edited:
+        set_columns(front, draft_version=3, extracted_version=1)
+    before = job_row(front)["draft_version"]
+
+    merged = api_client.post(job_url(back, "merge"), json={"intoJobId": str(front)}, headers=user.token)
+    assert merged.status_code == 202, merged.text
+    after = merged.json()["draftVersion"]
+    assert after > before
+    row = job_row(front)
+    # an unedited draft stays unedited (the reading replaces it), an edited one stays edited (it gets a proposal)
+    assert (row["draft_version"] == row["extracted_version"]) is not edited
+
+    detail = assert_code(commit(api_client, user, front, before), 409, "version_conflict")
+    assert detail["current"] == after
+    draft = banana_draft(name="Saved before the merge").model_dump(mode="json", by_alias=True)
+    saved = api_client.put(job_url(front), json={"draftVersion": before, "draft": draft}, headers=user.token)
+    assert_code(saved, 409, "version_conflict")
+
+    row = job_row(front)
+    assert (row["status"], row["task_kind"], row["task_state"]) == ("ready", "extract", "queued")
+    assert row["title"] == "Banana Mug Cake"
+    assert len(parse_pages(row["pages"])) == 2
+
+
 def test_merges_that_cant_happen(api_client: TestClient, admin_token: dict, unique_user_fn_scoped: TestUser):
     user = unique_user_fn_scoped
     three = seed_job(user, page_count=3, created_by=user.user_id)
@@ -385,6 +420,62 @@ def test_a_merge_a_stop_left_before_its_write_is_undone(api_client: TestClient, 
     assert _merge(api_client, user, back, front).status_code == 202
     assert _pages_on_disk(user, front) == ["0", "1"]
     _every_listed_page_on_disk(user, front)
+
+
+@pytest.mark.parametrize("action", ["retry", "reextract"])
+def test_a_task_reads_the_pages_a_stopped_merge_left_in_another_card(
+    api_client: TestClient, unique_user_fn_scoped: TestUser, monkeypatch: pytest.MonkeyPatch, action: str
+):
+    """
+    A card read again (its retry, or a re-extract) before anything looked at its photos, after a merge into another
+    card stopped half done: the task puts its page back first, rather than failing `files_missing`
+    """
+    import asyncio
+
+    from mealie.services.ai.ingest import tasks
+    from mealie.services.ai.ingest.runner.types import TaskContext
+
+    user = unique_user_fn_scoped
+    front = seed_job(user, created_by=user.user_id)
+    status = IngestStatus.failed if action == "retry" else IngestStatus.ready
+    back = seed_job(user, status=status, error_code="no_recipe_found" if action == "retry" else None, position=1)
+    _stopped_merge(user, back, front)
+    assert _pages_on_disk(user, back) == []
+
+    response = api_client.post(job_url(back, action), headers=user.token)
+    assert response.status_code == 202, response.text
+
+    class Read(Exception):
+        pass
+
+    read: list[list[bool]] = []
+
+    async def extract_card(pages: Any, **kwargs: Any) -> Any:
+        read.append([page.page_path.is_file() and page.view_path.is_file() for page in pages])
+        raise Read()
+
+    async def report_progress(key: str) -> None:
+        return None
+
+    monkeypatch.setattr(tasks, "orientation_available", lambda: False)
+    monkeypatch.setattr(tasks, "extract_card", extract_card)
+    ctx = TaskContext(
+        job_id=back,
+        group_id=UUID(user.group_id),
+        household_id=UUID(user.household_id),
+        kind=IngestTaskKind.extract,
+        payload=None,
+        token=uuid4(),
+        locale="en-US",
+        local_only=False,
+        report_progress=report_progress,
+    )
+    with pytest.raises(Read):
+        asyncio.run(tasks.handle_extract(ctx))
+
+    assert read == [[True]]
+    assert _pages_on_disk(user, back) == ["0"] and _pages_on_disk(user, front) == ["0"]
+    assert _merge_notes(user, front) == []
 
 
 def test_a_merge_into_a_card_settles_what_a_stop_left_there_first(

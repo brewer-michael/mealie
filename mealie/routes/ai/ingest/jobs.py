@@ -6,14 +6,16 @@ undoing a commit, and committing a batch's clean cards (`/batches/{id}/commit-cl
 `/jobs/{id}`.
 
 Every route is household-scoped (another household's job, images included, is a 404) and answers 503 while
-`AI_INGEST_ENABLED` is off. The routes that write files (rotate, commit, discard, merge, uncommit, the bulk commit)
-also answer 503 `paused_for_restore` while a backup restore pauses ingestion, both up front and when their write
-section can't start. The work is in `mealie.services.ai.ingest.review` and `.commit`; refusals come back as
+`AI_INGEST_ENABLED` is off. The routes that write, files or only the database (a draft save, queueing or cancelling a
+task, rotate, commit, discard, merge, uncommit), run in the ingest write section, so a backup restore waits for them,
+and answer 503 `paused_for_restore` while a restore pauses ingestion, both up front and when their section can't
+start. The bulk commit checks the pause up front and takes a section per card, so a restore can start between two
+cards and stops the rest. The work is in `mealie.services.ai.ingest.review` and `.commit`; refusals come back as
 `{"detail": {"code", ...}}`.
 """
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from functools import cached_property
 from typing import Literal
@@ -86,13 +88,19 @@ class RecipeIngestJobsController(IngestController):
         return ReviewService(self.ingest_repos, self.user)
 
     @contextmanager
-    def _answer(self, *, writes_files: bool = False) -> Iterator[None]:
-        """The checks every route makes first, and refusals turned into `{"detail": {"code": ...}}` bodies"""
+    def _answer(self, *, writes: bool = False, checks_pause: bool = False) -> Iterator[None]:
+        """
+        The checks every route makes first, and refusals turned into `{"detail": {"code": ...}}` bodies. A route that
+        `writes` (files, or only the database) runs in the ingest write section, so a backup restore waits for it, and
+        is refused while a restore pauses ingestion (§3.9); `checks_pause` only refuses it then (its own sections are
+        finer).
+        """
         require_enabled(self.translator)
-        if writes_files:
+        if writes or checks_pause:
             require_not_paused(self.translator)
         try:
-            yield
+            with write_section(self.translator) if writes else nullcontext():
+                yield
         except JobActionError as e:
             raise ingest_error(e.status_code, e.code, translator=self.translator, **e.params) from e
         except IngestPaused as e:
@@ -162,13 +170,13 @@ class RecipeIngestJobsController(IngestController):
         Saves the draft (§6.6). A stale `draftVersion` is `409 {detail: {code: "version_conflict", current}}`, with
         no `message`: the page shows its own Reload dialog.
         """
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.save_draft(job_id, data)
 
     @router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
     def discard_job(self, job_id: UUID4) -> Response:
         """Deletes the card and its photos: the uploader, anyone for inbox cards, otherwise household managers"""
-        with self._answer(writes_files=True), write_section(self.translator):
+        with self._answer(writes=True):
             self.review.discard(job_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -180,7 +188,7 @@ class RecipeIngestJobsController(IngestController):
     )
     def reextract_job(self, job_id: UUID4) -> RecipeIngestionJobState:
         """Reads the whole card again; `409 {detail: {code: "busy"}}` while a task is active"""
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.reextract(job_id)
 
     @router.post("/jobs/{job_id}/reread", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
@@ -189,7 +197,7 @@ class RecipeIngestJobsController(IngestController):
         Reads one region of an upright page again (fractions of its width and height) for one field; the result
         arrives as a proposal. `409 {detail: {code: "busy"}}` while a task is active.
         """
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.reread(job_id, data)
 
     @router.post("/jobs/{job_id}/rebuild", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
@@ -198,7 +206,7 @@ class RecipeIngestJobsController(IngestController):
         Builds the recipe again from the card's text as corrected (no photo is read): it replaces a draft nobody
         edited, else arrives as a whole-card proposal. `409 {detail: {code: "busy"}}` while a task is active.
         """
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.rebuild(job_id, data.transcription)
 
     @router.post(
@@ -210,13 +218,13 @@ class RecipeIngestJobsController(IngestController):
         lines nobody changed meanwhile. `409 busy` while a task is active, `422 unknown_target` for a line the draft
         hasn't.
         """
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.parse_lines(job_id, data.refs)
 
     @router.post("/jobs/{job_id}/retry", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
     def retry_job(self, job_id: UUID4) -> RecipeIngestionJobState:
         """A failed card is read again from the start"""
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.retry(job_id)
 
     @router.post(
@@ -228,12 +236,12 @@ class RecipeIngestJobsController(IngestController):
         uploader or a household manager, while the group doesn't keep cards local (`409 {detail: {code:
         "group_local_only"}}` otherwise)
         """
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.read_with_cloud(job_id)
 
     @router.post("/jobs/{job_id}/cancel", response_model=RecipeIngestionJobState)
     def cancel_job(self, job_id: UUID4) -> RecipeIngestionJobState:
-        with self._answer():
+        with self._answer(writes=True):
             return self.review.cancel(job_id)
 
     @router.post("/jobs/{job_id}/merge", status_code=status.HTTP_202_ACCEPTED, response_model=RecipeIngestionJobState)
@@ -243,7 +251,7 @@ class RecipeIngestJobsController(IngestController):
         reads the other again; answers the other card's state. `409 {detail: {code: "too_many_pages", max}}` when
         they wouldn't fit in one card, `409 busy` while either has a task.
         """
-        with self._answer(writes_files=True), write_section(self.translator):
+        with self._answer(writes=True):
             return self.review.merge(job_id, data.into_job_id)
 
     # ==================================================================================================================
@@ -252,7 +260,7 @@ class RecipeIngestJobsController(IngestController):
     @router.post("/jobs/{job_id}/pages/{index}/rotate", response_model=PageOut)
     def rotate_page(self, job_id: UUID4, index: int, data: RotateRequest) -> PageOut:
         """Turns a page clockwise; `409 {detail: {code: "busy"}}` while a task is active"""
-        with self._answer(writes_files=True), write_section(self.translator):
+        with self._answer(writes=True):
             return self.review.rotate(job_id, index, data.degrees)
 
     @router.get("/jobs/{job_id}/region-hint", response_model=RegionHintOut)
@@ -300,7 +308,7 @@ class RecipeIngestJobsController(IngestController):
         recipe if it was already committed, `422 {detail: {code: "unresolved_flags", flags}}` while errors remain,
         `409 {detail: {code}}` otherwise
         """
-        with self._answer(writes_files=True):
+        with self._answer(writes=True):
             result = commit_job(
                 self.ingest_repos,
                 self.user,
@@ -323,7 +331,7 @@ class RecipeIngestJobsController(IngestController):
         committer or a household manager allowed to delete the recipe). `409 {detail: {code: "recipe_edited"}}` when
         the recipe was edited since, unless `force`; `409 purged` once the card's photos are gone.
         """
-        with self._answer(writes_files=True), write_section(self.translator):
+        with self._answer(writes=True):
             return uncommit_job(
                 self.ingest_repos,
                 self.user,
@@ -342,7 +350,7 @@ class RecipeIngestJobsController(IngestController):
         Commits the listed cards of a batch that are ready at the version the page showed, with no unresolved error
         or warning, one by one as Commit does; the rest are listed in `skipped` with the reason
         """
-        with self._answer(writes_files=True):
+        with self._answer(checks_pause=True):
             return commit_clean(
                 self.ingest_repos,
                 self.user,

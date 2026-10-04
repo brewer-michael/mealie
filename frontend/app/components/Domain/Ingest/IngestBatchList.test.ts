@@ -6,7 +6,9 @@ import {
   leaveRecipeIngestCommitNotice,
   resetRecipeIngestCounts,
   resetRecipeIngestReviewState,
+  resetRecipeIngestSettings,
   takeRecipeIngestCommitNotice,
+  useRecipeIngestSettings,
 } from "~/composables/use-recipe-ingest";
 import { takeCarriedReviewNotice } from "~/composables/use-recipe-ingest-review";
 import { resetRecipeIngestUploads, useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads";
@@ -15,6 +17,9 @@ import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
 const api = vi.hoisted(() => ({
   getJobs: vi.fn(),
+  getJob: vi.fn(),
+  getSettings: vi.fn(),
+  readWithCloud: vi.fn(),
   getJobState: vi.fn(),
   commitClean: vi.fn(),
   getCounts: vi.fn(),
@@ -201,6 +206,7 @@ beforeEach(() => {
   resetRecipeIngestUploads();
   resetRecipeIngestCounts();
   resetRecipeIngestReviewState();
+  resetRecipeIngestSettings();
   setVisibility("visible");
   vi.stubGlobal("useRouter", () => router);
   serverJobs = [];
@@ -1140,5 +1146,95 @@ describe("adding a batch's clean cards", () => {
     await wrapper.get(".dialog-confirm").trigger("click");
     await flushPromises();
     expect(wrapper.find(".commit-notice").exists()).toBe(false);
+  });
+});
+
+describe("a failed card kept on this server that nothing local could read", () => {
+  const stuck = (id: string, position = 0) => job({
+    id,
+    position,
+    status: "failed",
+    title: null,
+    localOnly: true,
+    error: { code: "local_only_unavailable", params: {} },
+  });
+
+  /** What can read cards now, as the cards page loads it */
+  async function loadSettings(localOnlyAvailable: boolean) {
+    api.getSettings.mockResolvedValue({ data: { localOnly: false, localOnlyAvailable, limits: {} }, error: null });
+    await useRecipeIngestSettings().load();
+  }
+
+  test("offers Read with cloud providers on its row where its card page would, asking first; no Retry that fails the same way", async () => {
+    await loadSettings(false);
+    serverJobs = [stuck("mine"), stuck("theirs", 1), job({ id: "other", position: 2, status: "failed", error: { code: "timeout", params: {} } })];
+    api.getJob.mockImplementation(async (id: string) => ({
+      data: { id, permissions: { canReadWithCloud: id === "mine" } },
+      error: null,
+    }));
+    api.readWithCloud.mockImplementation(async (id: string) => {
+      const queued = { status: "processing" as const, task: { kind: "extract" as const, state: "queued" as const }, error: null };
+      serverJobs = serverJobs.map(j => (j.id === id ? { ...j, ...queued, localOnly: false } : j));
+      return { data: { draftVersion: 1, ...queued }, error: null };
+    });
+    api.retry.mockResolvedValue({ data: { draftVersion: 1, status: "processing", task: { kind: "extract", state: "queued" }, error: null }, error: null });
+    const wrapper = await mountList({}, {
+      BaseDialog: {
+        props: ["modelValue", "title"],
+        template: "<div v-if=\"modelValue\" class=\"confirm-dialog\" :data-title=\"title\"><slot /><slot name=\"card-actions\" /></div>",
+      },
+    });
+
+    const rows = wrapper.findAll(".ingest-job");
+    expect(rows.map(row => row.find(".job-read-with-cloud").exists())).toEqual([true, false, false]);
+    expect(rows.map(row => row.find(".job-retry").exists())).toEqual([false, false, true]);
+    // Retry failed leaves out the cards Retry can't read
+    await wrapper.get(".batch-retry-failed").trigger("click");
+    await flushPromises();
+    expect(api.retry).toHaveBeenCalledExactlyOnceWith("other");
+
+    await rows[0]!.get(".job-read-with-cloud").trigger("click");
+    await flushPromises();
+    expect(api.readWithCloud).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("Reading it with a cloud provider sends its photos to that provider, outside your network.");
+    await wrapper.get(".cloud-confirm").trigger("click");
+    await flushPromises();
+    expect(api.readWithCloud).toHaveBeenCalledExactlyOnceWith("mine");
+    expect(wrapper.findAll(".ingest-job")[0]!.get(".job-status").text()).toBe("Waiting to be read");
+  });
+
+  test("once something local can read cards, Retry is back", async () => {
+    await loadSettings(true);
+    serverJobs = [stuck("mine")];
+    api.getJob.mockResolvedValue({ data: { id: "mine", permissions: { canReadWithCloud: false } }, error: null });
+    const wrapper = await mountList();
+    expect(wrapper.find(".job-retry").exists()).toBe(true);
+    expect(wrapper.find(".job-read-with-cloud").exists()).toBe(false);
+  });
+});
+
+describe("Review batch while the batch's clean cards are added", () => {
+  test("is disabled until they're added", async () => {
+    serverJobs = [job({ id: "a", position: 0, title: "Scones" }), job({ id: "b", position: 1, title: "Fudge" }), job({ id: "c", position: 2, title: "Pie", warningCount: 1 })];
+    let answer!: () => void;
+    api.commitClean.mockImplementation(async (_batchId: string, payload: { jobIds: string[] }) => {
+      await new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+      serverJobs = serverJobs.map(j => (payload.jobIds.includes(j.id) ? { ...j, status: "committed", committedAt: ago(0) } : j));
+      return { data: { committed: payload.jobIds.map(id => ({ jobId: id, recipeId: `r-${id}`, slug: id })), skipped: [] }, error: null };
+    });
+    const wrapper = await mountList();
+    expect(wrapper.get(".batch-review").attributes("disabled")).toBe("false");
+
+    await wrapper.get(".batch-add-clean").trigger("click");
+    await flushPromises();
+    await wrapper.get(".dialog-confirm").trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".batch-review").attributes("disabled")).toBe("true");
+
+    answer();
+    await flushPromises();
+    expect(wrapper.get(".batch-review").attributes("disabled")).toBe("false");
   });
 });

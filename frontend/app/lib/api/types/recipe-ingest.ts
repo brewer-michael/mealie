@@ -181,6 +181,7 @@ export interface CardDraftUpdate {
   };
   resolvedProposalIds?: string[];
   clearError?: boolean;
+  clientDraftSchema?: number | null;
 }
 export interface CardProposal {
   id?: string;
@@ -209,6 +210,7 @@ export interface CardReadInfo {
 export interface CommitOut {
   recipeId: string;
   slug: string;
+  name?: string | null;
   nextJobId?: string | null;
   warnings?: string[];
 }

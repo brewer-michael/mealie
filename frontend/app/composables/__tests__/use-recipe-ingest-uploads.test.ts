@@ -1535,6 +1535,98 @@ describe("the queue kept on this device", () => {
   });
 });
 
+describe("choices this browser remembers, changed in another of its tabs", () => {
+  /** Another tab writes the choice: this one is told by a `storage` event */
+  function changedElsewhere(key: string, value: string | null) {
+    if (value === null) {
+      localStorage.removeItem(key);
+    }
+    else {
+      localStorage.setItem(key, value);
+    }
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue: value, storageArea: localStorage }));
+  }
+
+  test("this tab follows them, without writing them again, and a card not sent yet goes with the switch", async () => {
+    const created = deferred<unknown>();
+    api.createBatch.mockImplementation(() => created.promise);
+    const queue = useRecipeIngestUploads();
+    await queue.connect("u1", () => memoryUploadStorage());
+    queue.takePhoto(photo("waiting.jpg"));
+    await flushPromises();
+
+    changedElsewhere(`${LOCAL_ONLY_STORAGE_KEY}.u1`, "true");
+    changedElsewhere(CAPTURE_MODE_STORAGE_KEY, "front-and-back");
+    changedElsewhere(DATA_SAVER_STORAGE_KEY, "true");
+    expect([queue.localOnly.value, queue.mode.value, queue.dataSaver.value]).toEqual([true, "front-and-back", true]);
+    // turned off again elsewhere (removed, not written as "false")
+    changedElsewhere(DATA_SAVER_STORAGE_KEY, null);
+    expect(queue.dataSaver.value).toBe(false);
+
+    created.resolve({ data: { id: "b1", source: "app" }, error: null, response: null });
+    await flushPromises();
+    expect(uploadOptions(0)).toMatchObject({ localOnly: true });
+    // another user's switch isn't this one's
+    changedElsewhere(`${LOCAL_ONLY_STORAGE_KEY}.u2`, null);
+    expect(queue.localOnly.value).toBe(true);
+  });
+
+  test("a card read back from another tab's queue goes with that tab's switch, until the switch changes here", async () => {
+    const storage = memoryUploadStorage();
+    api.upload.mockImplementation(() => new Promise(() => {}));
+    const first = useRecipeIngestUploads();
+    await first.connect("u1", () => storage);
+    first.localOnly.value = true;
+    first.takePhoto(photo("private.jpg"));
+    first.takePhoto(photo("also-private.jpg"));
+    await flushPromises();
+    expect(uploadOptions(0)).toMatchObject({ localOnly: true });
+
+    // the next tab can't read what this browser remembers (a private window)
+    resetRecipeIngestUploads();
+    localStorage.clear();
+    api.upload.mockReset();
+    const sent = deferred<unknown>();
+    api.upload.mockImplementationOnce(() => ok(accepted("b1", "j1")))
+      .mockImplementationOnce(() => sent.promise);
+    const queue = useRecipeIngestUploads();
+    await queue.connect("u1", () => storage);
+    await flushPromises();
+    expect(queue.localOnly.value).toBe(false);
+    expect(uploadOptions(0)).toMatchObject({ localOnly: true });
+    expect(uploadOptions(1)).toMatchObject({ localOnly: true });
+
+    // the second card's attempt fails: when it goes again, it's with the switch as it is here once it's changed
+    sent.resolve({ data: null, error: { message: "Network Error" }, response: null });
+    await flushPromises();
+    queue.localOnly.value = true;
+    queue.localOnly.value = false;
+    expect(queue.cards.value.map(card => card.localOnlyChoice)).toEqual([null, null]);
+    await vi.waitFor(() => expect(api.upload).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(uploadOptions(2)).toMatchObject({ localOnly: false });
+  });
+
+  test("a front read back while this tab is in One side mode pairs with the next photo, as its \"Back side\" says", async () => {
+    const storage = memoryUploadStorage();
+    const queue = useRecipeIngestUploads();
+    await queue.connect("u1", () => storage);
+    queue.mode.value = "front-and-back";
+    queue.takePhoto(photo("front.jpg"));
+    await flushPromises();
+
+    resetRecipeIngestUploads();
+    localStorage.setItem(CAPTURE_MODE_STORAGE_KEY, "one-side");
+    const after = useRecipeIngestUploads();
+    await after.connect("u1", () => storage);
+    await flushPromises();
+    expect(after.mode.value).toBe("one-side");
+    expect((after.pendingFront.value as File).name).toBe("front.jpg");
+    after.takePhoto(photo("back.jpg"));
+    await flushPromises();
+    expect(uploadedPhotos().map(sent => sent.map(file => (file as File).name))).toEqual([["front.jpg", "back.jpg"]]);
+  });
+});
+
 // ==========================================
 // Failures elsewhere, logout, Scan again
 

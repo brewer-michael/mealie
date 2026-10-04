@@ -7,7 +7,7 @@ from pydantic import UUID4, ConfigDict, Field, model_validator
 
 from mealie.schema._mealie import MealieModel
 
-from .ingest_draft import CardDraft, CardDraftIngredient
+from .ingest_draft import COVER_CHOICE_SCHEMA_VERSION, CardDraft, CardDraftIngredient
 from .ingest_enums import CardFlagSeverity, EvalCaseTag, FlagResolution, RegionHintSource
 from .ingest_flags import CardFlag, ProposalTarget
 from .ingest_jobs import RecipeIngestionJobRef, RecipeIngestionRecipeRef
@@ -46,6 +46,13 @@ class CardDraftUpdate(MealieModel):
     """Proposals used or dismissed, which are removed"""
     clear_error: bool = False
     """Dismisses the banner of a failed re-read or re-extract"""
+    client_draft_schema: int | None = None
+    """
+    The draft `schemaVersion` the page that sent the save was built for (the review page sends the current one). A
+    page loaded before version 3 and kept open sends the drafts the server gives it, marked version 3, but its build
+    set `useCardAsCover: true` on every draft: from a save without this, or below 3, that `true` is stored unset (the
+    household's default), as a stored draft of version 1 or 2 is read.
+    """
 
     model_config = _STRICT
 
@@ -56,6 +63,13 @@ class CardDraftUpdate(MealieModel):
         for items in (draft.ingredients, draft.steps, draft.notes, draft.tags, draft.categories, draft.tools):
             if len(items) > MAX_DRAFT_ITEMS:
                 raise ValueError(f"A draft can hold at most {MAX_DRAFT_ITEMS} of each kind of item")
+        return self
+
+    @model_validator(mode="after")
+    def _older_page_cover(self) -> Self:
+        older = self.client_draft_schema is None or self.client_draft_schema < COVER_CHOICE_SCHEMA_VERSION
+        if older and self.draft.use_card_as_cover is True:
+            self.draft = self.draft.model_copy(update={"use_card_as_cover": None})
         return self
 
 
@@ -170,6 +184,8 @@ class RegionHintOut(MealieModel):
 class CommitOut(MealieModel):
     recipe_id: UUID4
     slug: str
+    name: str | None = None
+    """The name the recipe got (a taken name gets "Name (n)")"""
     next_job_id: UUID4 | None = None
     """The batch's next ready card, for Commit & next"""
     warnings: list[str] = Field(default_factory=list)

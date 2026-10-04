@@ -97,22 +97,27 @@ def is_local_provider(provider: AIProviderOut) -> bool:
     return host_is_private(host)
 
 
-def _candidates(service: OpenAIService, slot: AIProviderSlot) -> list[AIProviderOut]:
-    """The slot's providers under the current policy; none when the slot isn't set up or nothing is allowed"""
+def _candidates(service: OpenAIService, slot: AIProviderSlot, *, within_limits: bool = False) -> list[AIProviderOut]:
+    """
+    The slot's providers under the current policy, whatever their monthly token limits (the settings report a limit
+    reached on its own: `limitReached`), or with `within_limits` only those still within theirs; none when the slot
+    isn't set up or nothing is allowed
+    """
     from mealie.services.openai.openai import OpenAINotEnabledException
 
     from .errors import AIProviderLimitReachedError, AIProviderLocalOnlyError
 
     try:
-        return service.runtime.candidates(slot)
+        return service.runtime.candidates(slot) if within_limits else service.runtime.allowed(slot)
     except OpenAINotEnabledException, AIProviderLimitReachedError, AIProviderLocalOnlyError:
         return []
 
 
 def local_readiness(service: OpenAIService) -> LocalReadiness:
     """
-    For group managers setting up local-only cards: the local providers each slot a card uses would try, and the
-    providers marked as running locally whose address isn't private, which local-only cards won't use.
+    For group managers setting up local-only cards: the local providers each slot a card uses would try (whatever
+    their monthly token limits), and the providers marked as running locally whose address isn't private, which
+    local-only cards won't use.
     """
     from .policy import ai_call_policy
 
@@ -134,19 +139,27 @@ def local_readiness(service: OpenAIService) -> LocalReadiness:
 def card_reader(service: OpenAIService, *, local_only: bool) -> ReaderInfo | None:
     """
     The first provider reading a card would use under this policy, for the privacy chip: the image slot's first
-    provider, else (with OCR available) the default slot's, reading Tesseract's text. None when cards can't be read
-    that way, because the default slot has no allowed provider or there's neither an image provider nor OCR.
+    provider, else (with OCR available) the default slot's, reading Tesseract's text. A slot's first provider within
+    its monthly token limit; when they're all over theirs, its first all the same (the card then fails `limit_reached`
+    until the limit allows, which `limitReached` says), unless OCR stands in for the image slot, as the reading does.
+    None when cards can't be read that way, because the default slot has no allowed provider or there's neither an
+    image provider nor OCR.
     """
     from mealie.services import ocr
 
     from .policy import ai_call_policy
 
     with ai_call_policy(local_only=local_only):
-        default = _candidates(service, AIProviderSlot.default)
+        default = _candidates(service, AIProviderSlot.default, within_limits=True) or _candidates(
+            service, AIProviderSlot.default
+        )
         if not default:
             return None
 
-        if image := _candidates(service, AIProviderSlot.image):
+        image = _candidates(service, AIProviderSlot.image, within_limits=True)
+        if not image and not ocr.is_available():
+            image = _candidates(service, AIProviderSlot.image)
+        if image:
             return ReaderInfo(name=image[0].name, local=is_local_provider(image[0]), via_ocr=False)
 
     if ocr.is_available():

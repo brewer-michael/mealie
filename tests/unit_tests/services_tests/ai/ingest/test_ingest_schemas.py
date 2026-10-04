@@ -14,6 +14,7 @@ from mealie.schema.recipe_ingest import (
     BulkCommitRequest,
     CardDraft,
     CardDraftNote,
+    CardDraftUpdate,
     CardProposal,
     CardProposalKind,
     CardProposalOrigin,
@@ -101,6 +102,25 @@ def test_a_cover_stored_before_version_3_is_the_households_default():
     assert proposal.draft is not None and proposal.draft.use_card_as_cover is None
     assert _stored(proposal.draft)["schema_version"] == 3
     assert CardDraft.model_validate(_stored(proposal.draft)).use_card_as_cover is None
+
+
+def test_a_cover_saved_by_a_page_running_an_older_build_is_the_households_default():
+    """
+    A review page loaded before the upgrade and kept open sends drafts the server gave it, marked version 3, but its
+    build set `useCardAsCover: true` on every draft: only a save that says it comes from a version 3 page
+    (`clientDraftSchema`) keeps a `true` as a choice
+    """
+    draft = {"schemaVersion": 3, "name": "X", "useCardAsCover": True}
+    assert CardDraftUpdate.model_validate({"draftVersion": 1, "draft": draft}).draft.use_card_as_cover is None
+    for older in (1, 2):
+        update = CardDraftUpdate.model_validate({"draftVersion": 1, "draft": draft, "clientDraftSchema": older})
+        assert update.draft.use_card_as_cover is None
+    current = {"draftVersion": 1, "draft": draft, "clientDraftSchema": CARD_DRAFT_SCHEMA_VERSION}
+    assert CardDraftUpdate.model_validate(current).draft.use_card_as_cover is True
+    # turning it off was always a choice, and the card photo's switch was never forced
+    off = {**draft, "useCardAsCover": False, "attachCardPhoto": True}
+    update = CardDraftUpdate.model_validate({"draftVersion": 1, "draft": off})
+    assert (update.draft.use_card_as_cover, update.draft.attach_card_photo) == (False, True)
 
 
 def test_a_draft_from_a_newer_version_is_read_as_it_is():

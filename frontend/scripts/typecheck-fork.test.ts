@@ -43,6 +43,8 @@ describe("typecheck:fork", () => {
       "app/pages/g/[groupSlug]/recipes/cards/[jobId].vue",
       "app/components/Layout/DefaultLayout.test.ts",
       "app/pages/admin/backups.test.ts",
+      "app/plugins/__tests__/axios-restore-pause.test.ts",
+      "app/composables/__tests__/use-auth-backend-restore-pause.test.ts",
     ]) {
       expect(isForkFile(file), file).toBe(true);
     }
@@ -52,6 +54,8 @@ describe("typecheck:fork", () => {
       "app/pages/g/[groupSlug]/r/create/ai.vue",
       "app/pages/admin/backups.vue",
       "app/lib/api/user/recipes/recipe.ts",
+      "app/plugins/axios.ts",
+      "app/composables/use-auth-backend.ts",
     ]) {
       expect(isForkFile(file), file).toBe(false);
     }

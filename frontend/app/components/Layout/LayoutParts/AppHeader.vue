@@ -100,7 +100,7 @@
 
 <script setup lang="ts">
 import { useLoggedInState } from "~/composables/use-logged-in-state";
-import { prepareRecipeIngestLogout, recipeIngestPhotosNotUploaded } from "~/composables/use-recipe-ingest-uploads"; // fork
+import { countRecipeIngestPhotosNotUploaded, prepareRecipeIngestLogout } from "~/composables/use-recipe-ingest-uploads"; // fork
 import type RecipeDialogSearch from "~/components/Domain/Recipe/RecipeDialogSearch.vue";
 
 defineProps({
@@ -140,14 +140,17 @@ onBeforeUnmount(() => {
 
 // fork: recipe cards: asked before photos not uploaded yet are dropped
 const cardsLogoutDialog = ref(false);
-const cardPhotosNotUploaded = computed(() => recipeIngestPhotosNotUploaded.value);
+const cardPhotosNotUploaded = ref(0);
 
 async function logout(confirmed = false) {
-  // fork: recipe cards (docs/ai/PHASE2.md §1.1): ask first when photos haven't been uploaded, then seal the open
-  // batches, so none is left open and empty on the server
-  if (!confirmed && cardPhotosNotUploaded.value > 0) {
-    cardsLogoutDialog.value = true;
-    return;
+  // fork: recipe cards (docs/ai/PHASE2.md §1.1): ask first when photos haven't been uploaded (counted from the stored
+  // queue when the tab keeping it doesn't answer), then seal the open batches, so none is left open and empty
+  if (!confirmed) {
+    cardPhotosNotUploaded.value = await countRecipeIngestPhotosNotUploaded();
+    if (cardPhotosNotUploaded.value > 0) {
+      cardsLogoutDialog.value = true;
+      return;
+    }
   }
   await prepareRecipeIngestLogout();
   try {

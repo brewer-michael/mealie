@@ -157,9 +157,12 @@ class _SafeTransportMixin:
             raise InvalidDomainError(f"request blocked by disallow list: {request.url}")
 
         allow_hosts, allow_networks = self._allow
-        if not _matches(host, ips, allow_hosts, allow_networks):
+        # fork hook: an allowed network lets through only the addresses inside it, so one allowed address in a DNS
+        # answer can't carry a private one along (a rebinding name answering [127.0.0.1, <allowed LAN address>]);
+        # a listed host name still allows its whole answer
+        if host.lower() not in allow_hosts:
             for ip in ips:
-                if is_blocked_ip(ip):
+                if is_blocked_ip(ip) and not _matches("", [ip], set(), allow_networks):
                     self._warn(request, f"resolves to non-public address {ip}")
                     raise InvalidDomainError(f"invalid request on local resource: {request.url} -> {ip}")
 

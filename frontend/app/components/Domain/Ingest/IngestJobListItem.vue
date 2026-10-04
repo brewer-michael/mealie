@@ -76,8 +76,21 @@
         >
           {{ $t("recipe-ingest.queue.review") }}
         </v-btn>
+        <!-- a card kept on this server that nothing local could read: read by the group's other providers, if the user may -->
         <v-btn
-          v-if="job.status === 'failed'"
+          v-if="job.status === 'failed' && canReadWithCloud"
+          class="job-read-with-cloud"
+          size="small"
+          variant="tonal"
+          color="warning"
+          :prepend-icon="mdiCloudUploadOutline"
+          :loading="busy"
+          @click="emit('read-with-cloud', job)"
+        >
+          {{ $t("recipe-ingest.review.read-with-cloud") }}
+        </v-btn>
+        <v-btn
+          v-if="job.status === 'failed' && canRetry"
           class="job-retry"
           size="small"
           variant="tonal"
@@ -123,24 +136,34 @@
 </template>
 
 <script setup lang="ts">
-import { mdiCardTextOutline } from "@mdi/js";
+import { mdiCardTextOutline, mdiCloudUploadOutline } from "@mdi/js";
 import { serverDate, sourceFileName, useRecipeIngestText } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestionJobSummary } from "~/lib/api/types/recipe-ingest";
 
 /**
- * One card in the queue (docs/ai/PHASE2.md §6.7): thumbnail, name (two lines at most), a short status chip with the
- * reason or progress under it, and Review, Retry, Cancel or Discard. A failed card says when it's read again by
- * itself (it failed over the monthly token limit, §3.6) or else when it's removed with its photos (§16). Fork-owned.
+ * One card in the queue (docs/ai/PHASE2.md §6.7): thumbnail, name (two lines at most; an added card's is its recipe's),
+ * a short status chip with the reason or progress under it, and Review, Retry, Cancel or Discard. A failed card says
+ * when it's read again by itself (it failed over the monthly token limit, §3.6) or else when it's removed with its
+ * photos (§16); one kept on this server that nothing local could read offers Read with cloud providers instead of a
+ * Retry that would fail the same way, as its card page does (§10). Fork-owned.
  */
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   job: RecipeIngestionJobSummary;
   groupSlug: string;
-  /** A Retry or Cancel for this card is in flight */
+  /** A Retry, Cancel or Read with cloud for this card is in flight */
   busy?: boolean;
-}>();
+  /** Retry can read a failed card now (one that must stay local can't be read while nothing local reads cards) */
+  canRetry?: boolean;
+  /** The user may have this failed card read by the group's cloud providers (its card page's permission) */
+  canReadWithCloud?: boolean;
+}>(), {
+  busy: false,
+  canRetry: true,
+  canReadWithCloud: false,
+});
 
 const emit = defineEmits<{
-  (e: "retry" | "discard" | "cancel", job: RecipeIngestionJobSummary): void;
+  (e: "retry" | "discard" | "cancel" | "read-with-cloud", job: RecipeIngestionJobSummary): void;
 }>();
 
 const i18n = useI18n();
@@ -150,10 +173,10 @@ const { cardTitle, ingestErrorText, progressText, dateText } = useRecipeIngestTe
 const fileName = computed(() => sourceFileName(props.job.sourceName));
 
 /**
- * The card's name; before it's read (or when it couldn't be), its file for inbox and API cards, else its place in the
- * batch
+ * The card's name: once added, its recipe's ("Banana Mug Cake (2)" when the name was taken); before it's read (or when
+ * it couldn't be), its file for inbox and API cards, else its place in the batch
  */
-const title = computed(() => cardTitle(props.job));
+const title = computed(() => (props.job.status === "committed" && props.job.recipe?.name) || cardTitle(props.job));
 /** A failed card names its file, so it can be found and sent again */
 const subtitle = computed(() =>
   props.job.status === "failed" && fileName.value && fileName.value !== title.value ? fileName.value : null,
@@ -170,7 +193,10 @@ const canDiscard = computed(() =>
   props.job.canDiscard !== false && props.job.status !== "committing" && props.job.status !== "committed",
 );
 
-/** "Tries again on Nov 1, 2026, 1:00 AM" (`autoRetryAt`), else "Removed on Nov 15, 2026" (`expiresAt`) */
+/**
+ * "Tries again on Nov 1, 2026, or sooner if the limit is raised" (`autoRetryAt`: the server checks the limit again
+ * every few minutes), else "Removed on Nov 15, 2026" (`expiresAt`)
+ */
 const failedWhen = computed(() => {
   if (props.job.status !== "failed") {
     return null;
@@ -179,7 +205,7 @@ const failedWhen = computed(() => {
   if (retryAt) {
     // the dispatcher reads a card that's due within a minute
     return retryAt.getTime() > Date.now()
-      ? i18n.t("recipe-ingest.queue.retries-on", { date: dateText(retryAt, true) })
+      ? i18n.t("recipe-ingest.queue.retries-on-limit", { date: dateText(retryAt) })
       : i18n.t("recipe-ingest.queue.retries-soon");
   }
   const expiresAt = serverDate(props.job.expiresAt);

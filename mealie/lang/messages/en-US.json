@@ -160,6 +160,20 @@
         "upload-summary-none": "No recipe cards were queued.",
         "upload-summary-duplicate": "{count} card was already scanned. | {count} cards were already scanned.",
         "upload-summary-rejected": "{count} card couldn't be used. | {count} cards couldn't be used.",
+        "upload-summary-rejected-because": "{count} card couldn't be used: {why}. | {count} cards couldn't be used: {why}.",
+        "upload-summary-why": {
+            "too_large": "the file is larger than {mib} MB | the files are larger than {mib} MB",
+            "unsupported_format": "it isn't a supported image (JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF) | they aren't supported images (JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF)",
+            "pdf_not_supported": "the PDF couldn't be rendered | the PDFs couldn't be rendered",
+            "too_many_pixels": "the photo has too many pixels | the photos have too many pixels",
+            "unreadable_image": "the image couldn't be read | the images couldn't be read",
+            "too_many_pages": "a card can have at most {pages} pages",
+            "url_not_allowed": "the image URL isn't allowed | the image URLs aren't allowed",
+            "url_fetch_failed": "the image couldn't be downloaded | the images couldn't be downloaded",
+            "quota": "too many recipe cards are being read; send it again when some are done | too many recipe cards are being read; send them again when some are done"
+        },
+        "upload-summary-limit": "{count} recipe card queued. The AI's monthly limit is reached, so it will be read when the limit resets, or within about 10 minutes after the limit is raised. You'll be notified then. | {count} recipe cards queued. The AI's monthly limit is reached, so they will be read when the limit resets, or within about 10 minutes after the limit is raised. You'll be notified then.",
+        "upload-summary-limit-in-app": "{count} recipe card queued for review in Mealie. The AI's monthly limit is reached, so it will be read when the limit resets, or within about 10 minutes after the limit is raised. | {count} recipe cards queued for review in Mealie. The AI's monthly limit is reached, so they will be read when the limit resets, or within about 10 minutes after the limit is raised.",
         "upload-failed": {
             "bad-request": "Mealie couldn't use this upload. Send the card as a photo.",
             "unauthorized": "Mealie didn't accept the API token. Check it and try again.",
@@ -171,6 +185,9 @@
             "other": "The recipe card couldn't be uploaded (error {status})."
         },
         "notification-title": "Recipe cards ready",
+        "notification-title-none-ready": "Recipe cards not read",
+        "notification-limit-wave": "{count} card that waited for the monthly limit was read. | {count} cards that waited for the monthly limit were read.",
+        "notification-limit-wave-body": "{waited} {summary}",
         "notification-ready": "No cards are ready to review | {count} card is ready to review | {count} cards are ready to review",
         "notification-needs-attention": "{count} needs a look | {count} need a look",
         "notification-failed": "{count} failed | {count} failed",
@@ -218,7 +235,7 @@
             "prefix-other": "Not added:",
             "too_large": "The file is larger than {mib} MB.",
             "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF.",
-            "pdf_not_supported": "This PDF can't be opened. It may need a password or be damaged.",
+            "pdf_not_supported": "This PDF couldn't be rendered. It may need a password, be damaged or take too long to render (the upload's later PDFs aren't tried then).",
             "too_many_pixels": "The photo has too many pixels. The most is {megapixels} megapixels, or {jpeg_megapixels} megapixels for a JPEG (fewer for a progressive JPEG).",
             "unreadable_image": "The image couldn't be read. It may be damaged or incomplete.",
             "too_many_pages": "A card can have at most {pages} pages.",
@@ -248,6 +265,7 @@
             "ai-not-enabled": "AI isn't set up to read recipe cards. A group manager can add an AI provider in the group settings.",
             "local-only-unavailable": "These cards must stay on this server, but no AI provider on your network can read them.",
             "busy-restore": "Mealie is still saving changes. Try the restore again in a minute.",
+            "busy-migrating": "Mealie is updating its database. Try the restore again in a minute.",
             "invalid-body": "The upload couldn't be read. Check that it's a complete multipart form or JSON body and try again.",
             "unknown-batch": "That batch of recipe cards wasn't found. Send the card without a batchId to start a new one.",
             "notification-failed": "The test notification wasn't delivered. Check the notifier's URL and that the service it sends to is running."

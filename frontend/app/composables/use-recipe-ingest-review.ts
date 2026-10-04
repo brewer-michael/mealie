@@ -70,6 +70,11 @@ export const MARKERS = { illegible: "[illegible]", blank: "[blank]" } as const;
 export const MAX_PARSE_LINES = 50;
 /** The longest card text "Rebuild from this text" takes (the server's `MAX_TRANSCRIPTION`) */
 export const MAX_TRANSCRIPTION = 20_000;
+/**
+ * The draft schema this page is built for, sent with every save (`clientDraftSchema`): the server stores the
+ * `useCardAsCover: true` of a page built for an older one unset, as such a page set it on every draft
+ */
+export const CLIENT_DRAFT_SCHEMA = 3;
 
 // ==========================================
 // Drafts
@@ -1023,7 +1028,7 @@ export interface RereadTargetOption {
   target: ProposalTarget;
   /** "name", "ingredient", "step", "note", "new-ingredient", ...: which label the dialog shows */
   kind: TextField | "ingredient" | "step" | "note" | "new-ingredient" | "new-step" | "new-note";
-  /** The line's text, the step's number (from 1), or the note's title (else its first words) */
+  /** The ingredient's line as on the card, the step's number (from 1), or the note's title (else its first words) */
   text: string;
 }
 
@@ -1042,7 +1047,8 @@ function noteLabel(note: CardDraftNote): string {
 
 /**
  * Every line a re-read can be for: each field, each ingredient, step and note by its `ref`, and a new ingredient,
- * step or note (a target without a `ref`, for a line the reading missed), which `applyProposal` adds.
+ * step or note (a target without a `ref`, for a line the reading missed), which `applyProposal` adds. An ingredient
+ * is named by its line as on the card, whether it was parsed or not, else (a line added here) as its row shows it.
  */
 export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
   const options: RereadTargetOption[] = TEXT_FIELDS.filter(field => field !== "recipeServings").map(field => ({
@@ -1056,7 +1062,7 @@ export function rereadTargets(draft: ReviewDraft): RereadTargetOption[] {
       value: `ingredients:${ingredient.referenceId}`,
       target: { field: "ingredients", ref: ingredient.referenceId ?? null },
       kind: "ingredient",
-      text: ingredient.display || ingredient.originalText || ingredientDisplay(ingredient),
+      text: ingredient.originalText?.trim() || ingredientLineText(ingredient),
     });
   });
   options.push({ value: "ingredients:new", target: { field: "ingredients", ref: null }, kind: "new-ingredient", text: "" });
@@ -1775,6 +1781,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       flagResolutions: resolutions,
       resolvedProposalIds: proposalIds,
       clearError,
+      clientDraftSchema: CLIENT_DRAFT_SCHEMA,
     });
 
     if (data) {
@@ -2677,7 +2684,9 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
         notify("error", i18n.t("recipe-ingest.review.commit-unsaved"));
         return "failed";
       }
-      const name = draft.value.name;
+      // the name the recipe gets: when the draft's is taken, the one the possible-duplicate banner says ("Banana Mug
+      // Cake (2)") as of the save just made, else the draft's
+      const name = job.value?.duplicateName || draft.value.name;
       const { data, error } = await api.recipeIngest.commit(jobId, { draftVersion: draftVersion.value });
       if (!data) {
         const code = errorCodeOf(error);
@@ -2690,7 +2699,17 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
           return "fix";
         }
         if (code === "version_conflict") {
-          conflict.value = true;
+          if (hasPendingChanges()) {
+            // typed while committing: a reload would drop it, so the "Reload this card" dialog asks
+            conflict.value = true;
+            return "conflict";
+          }
+          // nothing unsaved: the card changed elsewhere since this page read it (a page merged into it is read
+          // again, or another device saved), so it's shown as it is now
+          await refresh();
+          if (loadState.value === "ready" && !conflict.value) {
+            notify("warning", i18n.t("recipe-ingest.review.commit-reloaded"));
+          }
           return "conflict";
         }
         // the card moved on (a double tap: it's committing or committed, which the page then shows), or the draft
@@ -2704,7 +2723,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
 
       job.value.status = "committed";
       void counts.refresh();
-      const added = i18n.t("recipe-ingest.review.added", { name: name || data.slug });
+      // the server names the recipe as made; the banner's name stands in for a server that doesn't say
+      const added = i18n.t("recipe-ingest.review.added", { name: data.name || name || data.slug });
       // what commit left out (an organizer deleted since it was chosen)
       const warnings = (data.warnings ?? [])
         .map(warning => text.commitWarningText(warning))

@@ -48,9 +48,9 @@ function job(overrides: Partial<RecipeIngestionJobSummary> = {}): RecipeIngestio
 
 const wrappers: VueWrapper[] = [];
 
-function mountItem(value: RecipeIngestionJobSummary) {
+function mountItem(value: RecipeIngestionJobSummary, props: { canRetry?: boolean; canReadWithCloud?: boolean } = {}) {
   const wrapper = mount(IngestJobListItem, {
-    props: { job: value, groupSlug: "home" },
+    props: { job: value, groupSlug: "home", ...props },
     global: {
       mocks: { $globals: { icons: { lock: "lock", delete: "delete" } } },
       stubs: listItemStubs,
@@ -135,6 +135,7 @@ describe("IngestJobListItem", () => {
       recipe: { id: "r1", slug: "banana-mug-cake", name: "Banana Mug Cake" },
     }));
     expect(status(wrapper)).toBe("Added");
+    expect(wrapper.get(".job-title").text()).toBe("Banana Mug Cake");
     expect(wrapper.get(".job-title a").attributes("href")).toBe("/g/home/r/banana-mug-cake");
     expect(wrapper.get(".job-view-recipe").attributes("href")).toBe("/g/home/r/banana-mug-cake");
     expect(wrapper.find(".job-discard").exists()).toBe(false);
@@ -155,8 +156,7 @@ describe("IngestJobListItem", () => {
 });
 
 describe("IngestJobListItem: when a failed card is read again or removed", () => {
-  const withTime = (iso: string) =>
-    new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
+  const day = (iso: string) => new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(new Date(iso));
 
   afterEach(() => {
     vi.useRealTimers();
@@ -171,7 +171,10 @@ describe("IngestJobListItem: when a failed card is read again or removed", () =>
       autoRetryAt: "2026-11-01T00:00:00+00:00",
       expiresAt: "2026-11-15T00:00:00+00:00",
     }));
-    expect(wrapper.get(".job-when").text()).toBe(`Tries again on ${withTime("2026-11-01T00:00:00Z")}`);
+    // the server checks the limit again every few minutes, so a raise reads it sooner
+    expect(wrapper.get(".job-when").text()).toBe(
+      `Tries again on ${day("2026-11-01T00:00:00Z")}, or sooner if the limit is raised`,
+    );
     // still Retry now, by hand
     expect(wrapper.find(".job-retry").exists()).toBe(true);
   });
@@ -250,5 +253,42 @@ describe("IngestJobListItem Cancel", () => {
     for (const other of ["ready", "failed", "committing", "committed"] as const) {
       expect(mountItem(job({ status: other })).find(".job-cancel").exists(), other).toBe(false);
     }
+  });
+});
+
+describe("IngestJobListItem: a card kept on this server that nothing local could read", () => {
+  const stuck = () => job({ status: "failed", error: { code: "local_only_unavailable", params: {} }, localOnly: true });
+
+  test("offers reading it with cloud providers where the user may, instead of a Retry that would fail the same way", async () => {
+    const wrapper = mountItem(stuck(), { canRetry: false, canReadWithCloud: true });
+    expect(wrapper.find(".job-retry").exists()).toBe(false);
+    const cloud = wrapper.get(".job-read-with-cloud");
+    expect(cloud.text()).toBe("Read with cloud providers");
+    await cloud.trigger("click");
+    expect(wrapper.emitted("read-with-cloud")?.[0]?.[0]).toMatchObject({ id: "j1" });
+  });
+
+  test("without the permission, neither; Retry is back once something local can read it", () => {
+    const blocked = mountItem(stuck(), { canRetry: false, canReadWithCloud: false });
+    expect(blocked.find(".job-read-with-cloud").exists()).toBe(false);
+    expect(blocked.find(".job-retry").exists()).toBe(false);
+    expect(blocked.get(".job-caption").text()).toContain("A group manager can add one");
+    expect(mountItem(stuck(), { canRetry: true }).find(".job-retry").exists()).toBe(true);
+  });
+});
+
+describe("IngestJobListItem: an added card's name", () => {
+  test("is its recipe's, which may differ from the card's title (a name already taken)", () => {
+    const wrapper = mountItem(job({
+      status: "committed",
+      title: "Banana Mug Cake",
+      recipe: { id: "r2", slug: "banana-mug-cake-2", name: "Banana Mug Cake (2)" },
+    }));
+    expect(wrapper.get(".job-title").text()).toBe("Banana Mug Cake (2)");
+  });
+
+  test("falls back to the card's title when the recipe's name isn't known", () => {
+    const wrapper = mountItem(job({ status: "committed", title: "Pecan Pie", recipe: { id: "r3" } }));
+    expect(wrapper.get(".job-title").text()).toBe("Pecan Pie");
   });
 });

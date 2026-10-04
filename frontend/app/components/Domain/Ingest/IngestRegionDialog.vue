@@ -13,9 +13,9 @@
     @submit="submit"
   >
     <v-card-text class="ingest-region-dialog">
-      <p class="text-body-medium mb-4">
+      <div class="text-body-medium mb-4">
         {{ $t("recipe-ingest.review.reread-hint") }}
-      </p>
+      </div>
       <div class="d-flex flex-wrap align-center ga-2 pt-1 mb-3">
         <v-btn-toggle
           v-if="pages.length > 1"
@@ -75,13 +75,13 @@
       <p class="d-sr-only ingest-region-dialog__position" aria-live="polite">
         {{ positionText }}
       </p>
-      <p
+      <div
         v-if="tooSmall"
-        class="text-error text-body-medium mt-2 mb-0 ingest-region-dialog__error"
+        class="text-error text-body-medium mt-2 ingest-region-dialog__error"
         role="alert"
       >
         {{ $t("recipe-ingest.review.region-too-small") }}
-      </p>
+      </div>
     </v-card-text>
   </BaseDialog>
 </template>

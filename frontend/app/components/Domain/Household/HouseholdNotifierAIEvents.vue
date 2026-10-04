@@ -193,3 +193,10 @@ onMounted(() => {
   }
 });
 </script>
+
+<style scoped>
+/* the switch's two hints, each a line or two: Vuetify sets 12 px lines for 12 px text, which run together */
+.recipe-cards-ready :deep(.v-messages__message) {
+  line-height: 1rem;
+}
+</style>

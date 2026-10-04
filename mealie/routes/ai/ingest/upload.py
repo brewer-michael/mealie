@@ -30,11 +30,12 @@ from mealie.schema.recipe_ingest import (
     RecipeIngestionBatchJob,
     RecipeIngestionBatchOut,
 )
-from mealie.services.ai.ingest import batches, events
+from mealie.services.ai.errors import IngestPaused
+from mealie.services.ai.ingest import batches, events, storage
 from mealie.services.ai.ingest.i18n import translator_for
 from mealie.services.ai.ingest.upload import NOT_FOUND, UploadHandler, UploadRefused, resolve_locale
 
-from ._deps import IngestController, ingest_error, require_enabled, require_not_paused
+from ._deps import IngestController, ingest_error, require_enabled, require_not_paused, write_section
 
 BATCH_SEALED = "batch_sealed"
 
@@ -52,10 +53,17 @@ _FALLBACK_SUMMARIES = {
 """`recipe-ingest.upload-failed.<key>` for a refusal whose detail has no text of its own (the auth dependency's)"""
 
 
+def _sends_a_token(request: Request) -> bool:
+    """Whether the `Authorization` header carries a Bearer token, as an upload's must (check 1)"""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and bool(token.strip())
+
+
 def error_summary(request: Request, error: HTTPException) -> str:
     """
     What a Shortcut shows for a refused upload: the detail's `summary` (400 `nothing_accepted`) or translated
-    `message`, else a short text for the status in the request's language
+    `message`, else a short text for the status in the request's language. A 401 without a token in the
+    `Authorization` header says to send one there, as a cookie alone is told; one with a token says it wasn't accepted.
     """
     detail = error.detail
     if isinstance(detail, dict):
@@ -63,6 +71,8 @@ def error_summary(request: Request, error: HTTPException) -> str:
             if isinstance(text := detail.get(key), str) and text:
                 return text
     translator = translator_for(resolve_locale(request.headers.get("accept-language")))
+    if error.status_code == status.HTTP_401_UNAUTHORIZED and not _sends_a_token(request):
+        return translator.t("recipe-ingest.errors.authorization-required")
     key = _FALLBACK_SUMMARIES.get(error.status_code, "other")
     return translator.t(f"recipe-ingest.upload-failed.{key}", status=error.status_code)
 
@@ -119,6 +129,18 @@ def _batch_out(repos: IngestRepos, batch_id: UUID) -> RecipeIngestionBatchOut:
             for job in repos.batches.jobs(batch_id)
         ],
     )
+
+
+def _seal_after_upload(repos: IngestRepos, batch_id: UUID) -> bool:
+    """
+    Seals the batch of an upload sent with `done=true`, in a write section; a restore that paused ingestion since the
+    card went in leaves it open (the card is in, and the batch seals itself once idle)
+    """
+    try:
+        with storage.ingest_write():
+            return batches.seal(repos, batch_id, utcnow())
+    except IngestPaused:
+        return False
 
 
 def _notify_if_due(batch_id: UUID) -> None:
@@ -179,7 +201,7 @@ class RecipeIngestUploadController(IngestController):
         if handler.options is not None and handler.options.done and response.batch_id is not None:
             # like the batch's seal route: the notification goes out once none of its cards is still being read
             batch_id = response.batch_id
-            if await anyio.to_thread.run_sync(batches.seal, self.ingest_repos, batch_id, utcnow()):
+            if await anyio.to_thread.run_sync(_seal_after_upload, self.ingest_repos, batch_id):
                 background_tasks.add_task(_notify_if_due, batch_id)
         return response
 
@@ -191,11 +213,12 @@ class RecipeIngestBatchController(IngestController):
         """Starts an app batch: the capture session's cards send its id, and Done seals it"""
         require_not_paused(self.translator)
         require_enabled(self.translator)
-        batch_id = self.ingest_repos.batches.create(
-            source=IngestSource.app,
-            created_by=self.user.id,
-            locale=resolve_locale(request.headers.get("accept-language")),
-        )
+        with write_section(self.translator):
+            batch_id = self.ingest_repos.batches.create(
+                source=IngestSource.app,
+                created_by=self.user.id,
+                locale=resolve_locale(request.headers.get("accept-language")),
+            )
         return _batch_out(self.ingest_repos, batch_id)
 
     @router.post("/batches/{batch_id}/seal", response_model=RecipeIngestionBatchOut)
@@ -209,7 +232,9 @@ class RecipeIngestBatchController(IngestController):
         repos = self.ingest_repos
         if repos.batches.get(batch_id) is None:
             raise ingest_error(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-        if batches.seal(repos, batch_id, utcnow()):
+        with write_section(self.translator):
+            sealed = batches.seal(repos, batch_id, utcnow())
+        if sealed:
             background_tasks.add_task(_notify_if_due, batch_id)
         return _batch_out(repos, batch_id)
 
@@ -223,7 +248,8 @@ class RecipeIngestBatchController(IngestController):
         require_not_paused(self.translator)
         require_enabled(self.translator)
         repos = self.ingest_repos
-        outcome = batches.heartbeat(repos, batch_id, self.user.id, utcnow())
+        with write_section(self.translator):
+            outcome = batches.heartbeat(repos, batch_id, self.user.id, utcnow())
         if outcome is None:
             raise ingest_error(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         if outcome == "sealed":
