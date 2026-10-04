@@ -162,6 +162,72 @@ def test_a_short_line_isn_t_found_inside_a_long_text():
     assert regions_module.MIN_MATCH_CHARACTERS == 8
 
 
+PECAN_PIE = """# Pecan Pie
+
+## Ingredients
+- 3 eggs
+- 1 C. sugar
+- 1 C. dark corn syrup
+- 2 T. butter
+- 1 t. vanilla
+- 1 C. [illegible]
+- 1 pie crust
+
+## Directions
+Beat eggs, sugar, syrup, butter and vanilla."""
+
+PECAN_PIE_LINES = [
+    line("Pecan Pie", 0.066, 0.0493),
+    line("_- 1 C. sugar. |", 0.189, 0.0343),
+    line("-1.C. dark cornsyrup", 0.223, 0.062),
+    line("- 2 T. butter", 0.2787, 0.0243),
+    line("- 7 t. vanilla", 0.3227, 0.025),
+    line("1G eae", 0.3663, 0.0254),  # Tesseract's reading of the scribble
+    line("- 1 pie crust", 0.411, 0.031),
+]
+"""A live run's printed Pecan Pie card as Tesseract read it: the line with the scribble is "1G eae" """
+
+
+def test_a_marker_line_is_found_between_the_lines_around_it():
+    """
+    "1 C. [illegible]" is "1 c." once its marker is out, which every "1 C. ..." line matches: the re-read started on
+    "1 C. sugar" (and a model then proposed "1 C. sugar" for it). It's the line between "1 t. vanilla" and "1 pie
+    crust", whatever Tesseract made of it.
+    """
+    hint = region_hint([page(lines=PECAN_PIE_LINES)], PECAN_PIE, "1 C. [illegible]")
+
+    assert hint is not None and (hint.page, hint.source) == (0, RegionHintSource.ocr)
+    assert (hint.y, hint.height) == pytest.approx((0.3536, 0.0508), abs=1e-4)  # around "1G eae" only
+
+    # Tesseract read nothing there: the gap between them
+    skipped = [line for line in PECAN_PIE_LINES if line.text != "1G eae"]
+    gap = region_hint([page(lines=skipped)], PECAN_PIE, "1 C. [illegible]")
+    assert gap is not None and gap.source == RegionHintSource.ocr
+    assert 0.3227 < gap.y + gap.height / 2 < 0.411  # centred between "1 t. vanilla" and "1 pie crust"
+
+
+def test_a_short_line_is_found_by_the_lines_around_it():
+    """ "1 onion" is in a step too ("Brown the beef with the onion"): its own line is between its neighbours"""
+    transcription = "# Chili\n- 1 lb. ground beef\n- 1 onion\n- 1 T. chili powder\nBrown the beef with the onion."
+    lines = [
+        line("Brown the beef with the onion.", 0.05),
+        line("- 1 lb. ground beef", 0.4),
+        line("- 7_onion", 0.46),
+        line("- 1 T. chill powder", 0.52),
+    ]
+    hint = region_hint([page(lines=lines)], transcription, "1 onion")
+    assert hint is not None and hint.y == pytest.approx(0.435, abs=1e-4)
+
+
+def test_a_marker_line_without_its_neighbours_is_placed_by_its_own_line():
+    """No Tesseract line reads like the lines around it: the transcription's line saying exactly that places it"""
+    lines = [line("_- 1 C. sugar. |", 0.189, 0.0343), line("-1.C. dark cornsyrup", 0.223, 0.062)]
+    hint = region_hint([page(lines=lines)], PECAN_PIE, "1 C. [illegible]")
+    assert hint is not None and hint.source == RegionHintSource.position
+    # the 8th of 11 lines (headings too), not the first "1 C." line
+    assert hint.y == pytest.approx((7 + 0.5) / 11 - 0.06, abs=1e-4)
+
+
 @pytest.fixture()
 def tesseract_on(monkeypatch: pytest.MonkeyPatch):
     for key, value in {"OCR_ENABLED": "true", "OCR_LANGUAGES": "eng", "OCR_TIMEOUT": "60"}.items():

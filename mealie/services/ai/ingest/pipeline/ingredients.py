@@ -13,7 +13,9 @@ thread. Nothing is written: `IngestMatcher` only reads, and commit links the nam
    routed service (`CardIngredientParser`), so the job's local-only policy and the eval's pinned providers apply; if
    it fails they stay as text (`not_parsed`). `parse_lines` parses chosen lines with it in any language.
 4. Nothing read is lost: an amount the parsed fields don't hold (a range's end, "(10 3/4 oz.)", "+ 2 T.") is kept in
-   the note (`flags.keep_lost_amounts`), and `check_parse` still asks the reviewer to look.
+   the note (`flags.keep_lost_amounts`), and so is an alternative or a second food the parser split off the line ("or
+   margarine", "and 1 t. baking powder": `flags.keep_alternatives`); `check_parse` still asks the reviewer to look,
+   but for a measure in parentheses right after the unit ("1 pkg. (8 oz.) cream cheese").
 5. `original_text` is the card's line again (the parser stores its own input there), and `display` is rebuilt, since
    it goes stale once the matcher swaps in the group's units and foods.
 """
@@ -46,7 +48,7 @@ from mealie.services.parser_services.openai.parser import OpenAIParser
 from ..matching import IngestMatcher
 from ..shorthand import PreparedLine, prepare_line, unit_spellings
 from .cardtext import canonical_markers, markers_in
-from .flags import ingredient_hash, is_english, keep_lost_amounts
+from .flags import ingredient_hash, is_english, keep_alternatives, keep_lost_amounts
 from .service import end_transaction
 
 logger = get_logger(__name__)
@@ -100,24 +102,51 @@ def _as_text(line: IngredientLine, text: str) -> CardDraftIngredient:
     return ingredient
 
 
+def _spelled_as(unit: IngredientUnit, spellings: tuple[str, ...]) -> bool:
+    """Whether one of a group unit's names (name, plural, abbreviations, aliases) is one of `spellings`"""
+    names = (unit.name, unit.plural_name, unit.abbreviation, unit.plural_abbreviation)
+    aliases = (alias.name for alias in unit.aliases or [])
+    return any(name and unit_spellings(name) == spellings for name in (*names, *aliases))
+
+
 def _written_out_unit(
     name: str, parsed: IngredientUnit | CreateIngredientUnit | None, matcher: IngestMatcher
 ) -> IngredientUnit | CreateIngredientUnit:
     """
     The unit for a shorthand the line had written out (`name`: "square" for "sq.", "package" for "pkg."), as the
-    group has it by any of its spellings (`shorthand.unit_spellings`: the group's "pack" for "package"), else a new one.
-    The parser's own reading stands when it is one of those, never a unit its matcher took for a near miss ("square"
-    read as the group's "quart").
+    group has it by any of its spellings or their plurals (`shorthand.unit_spellings`: the group's "pack" for
+    "package", its "Tablespoons" for "tbsp"), else a new one. The parser's own reading stands when it is one of those,
+    or a unit whose own names are ("cup(s)"), never a unit its matcher took for a near miss ("square" read as the
+    group's "quart").
     """
     spellings = unit_spellings(name)
-    found = [unit for spelling in spellings if (unit := matcher.exact_unit(spelling)) is not None]
+    found = [
+        unit
+        for spelling in spellings
+        for form in (spelling, f"{spelling}s")
+        if (unit := matcher.exact_unit(form)) is not None
+    ]
     if isinstance(parsed, IngredientUnit):
-        if any(unit.id == parsed.id for unit in found):
+        if any(unit.id == parsed.id for unit in found) or _spelled_as(parsed, spellings):
             return parsed
     elif parsed is not None and unit_spellings(parsed.name) == spellings:
         if not found:
             return parsed  # not the group's, as the parser spelled it ("squares")
     return found[0] if found else CreateIngredientUnit(name=name)
+
+
+def _alternatives(ingredient: RecipeIngredient, matcher: IngestMatcher) -> list[list[str]]:
+    """
+    What the parser split off a line as its substitutions ("margarine" of "butter or margarine", "baking powder" of
+    "flour and 1 t. baking powder"), each by its names: its text, or the name and plural of the group's food it linked
+    """
+    alternatives: list[list[str]] = []
+    for substitution in ingredient.substitutions or []:
+        if substitution.note and substitution.note.strip():
+            alternatives.append([substitution.note])
+        elif food := matcher.food_by_id(substitution.substitute_food_id) or substitution.substitute_food:
+            alternatives.append([name for name in (food.name, food.plural_name) if name])
+    return alternatives
 
 
 def _from_parsed(
@@ -136,9 +165,12 @@ def _from_parsed(
     # what was taken out before parsing leads the note
     note = ", ".join(part for part in (*prepared.notes, (result.note or "").strip()) if part)
     unit_ref, food_ref = _ref(unit), _ref(result.food)
-    note, _ = keep_lost_amounts(
-        text, quantity, unit_ref.name if unit_ref else None, food_ref.name if food_ref else None, note
-    )
+    unit_name, food_name = unit_ref.name if unit_ref else None, food_ref.name if food_ref else None
+    # an alternative or a second food the parser split off, as the line has it; judged against the note with the
+    # amounts the fields lost kept ("8 ounce yogurt" of "1 c. (8 oz.) sour cream or yogurt" adds only "or yogurt")
+    restored, _ = keep_lost_amounts(text, quantity, unit_name, food_name, note)
+    note, split = keep_alternatives(text, note, _alternatives(result, matcher), (food_name, unit_name, restored))
+    note, _ = keep_lost_amounts(text, quantity, unit_name, food_name, note)
     # rebuilt rather than kept: the parser's display was made before the matcher linked the unit and food
     display = RecipeIngredient(quantity=quantity, unit=unit, food=result.food, note=note).display
     ingredient = CardDraftIngredient(
@@ -152,7 +184,7 @@ def _from_parsed(
         display=display or text,
         parse_confidence=parsed.confidence.average,
     )
-    ingredient.extracted_hash = ingredient_hash(ingredient)
+    ingredient.extracted_hash = ingredient_hash(ingredient, split=split)
     return ingredient
 
 

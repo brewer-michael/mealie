@@ -67,6 +67,8 @@ from mealie.services.ai.ingest.shorthand import (
         ("2 tbs. sugar", "2 tbsp sugar"),
         ("1 teasp. salt", "1 tsp salt"),
         ("2 pkgs. yeast", "2 package yeast"),
+        ("2 pkts. yeast", "2 package yeast"),
+        ("1 pkt. gelatin", "1 package gelatin"),
         ("2 Pkgs. yeast", "2 package yeast"),
         ("3 envs. gelatin", "3 envelope gelatin"),
     ],
@@ -186,6 +188,16 @@ def test_the_pattern_finds_shorthand_once_size_words_are_out():
         ("1 8 oz. pkg. cream cheese", "1 package cream cheese", ("8 oz.",)),
         ("1 10 3/4 oz. can soup", "1 can soup", ("10 3/4 oz.",)),
         ("1 15.5-oz. can corn", "1 can corn", ("15.5-oz.",)),
+        # or after a dash (the parser read "1 - 8" as a range of ounces, and "pkg. cream cheese" as the food)
+        ("1 - 8 oz. pkg. cream cheese", "1 package cream cheese", ("8 oz.",)),
+        ("1-8 oz. pkg. cream cheese", "1 package cream cheese", ("8 oz.",)),
+        ("1 – 8 oz. pkg. cream cheese", "1 package cream cheese", ("8 oz.",)),
+        ("2-15 oz. cans black beans", "2 cans black beans", ("15 oz.",)),
+        ("2 - 10 3/4 oz. cans soup", "2 cans soup", ("10 3/4 oz.",)),
+        ("1 - 3 oz. box Jello", "1 box Jello", ("3 oz.",)),
+        # a range before a unit that isn't a container stays a range
+        ("1-2 lb. ground beef", "1-2 lb. ground beef", ()),
+        ("2 - 3 oz. cheese", "2 - 3 oz. cheese", ()),
         # one amount: a mixed number and its unit, or a unit and the food
         ("2 1/2 oz. pkg. yeast", "2 1/2 oz. pkg. yeast", ()),
         ("1 lb. ground beef", "1 lb. ground beef", ()),
@@ -298,9 +310,10 @@ def test_a_units_spellings():
     """A group's unit may have only a name, and a card writes its abbreviation: the same unit"""
     assert unit_spellings("Teaspoons") == unit_spellings("tsp.") == ("teaspoon", "tsp", "ts", "teasp")
     assert unit_spellings("lbs") == unit_spellings("pound") == ("pound", "lb")
-    assert unit_spellings("Pack") == unit_spellings("pkg") == ("package", "pkg", "pack", "packet", "pk")
+    assert unit_spellings("Pack") == unit_spellings("pkg") == ("package", "pkg", "pack", "packet", "pk", "pkt")
     assert unit_spellings("fl. oz.") == ("fluid ounce", "fl oz")
     assert unit_spellings("Splash") == ("splash",)
+    assert unit_spellings("cup(s)") == unit_spellings("Cups") == ("cup", "c")  # an optional plural
     names = ("teaspoon", "Tablespoons", "pounds", "fluid ounce", "package", "pack", "tsp", "splash")
     assert [standard_abbreviation(name) for name in names] == ["tsp", "tbsp", "lb", "fl oz", "pkg", "", "", ""]
 
@@ -345,6 +358,8 @@ def test_long_runs_of_digits_or_spaces_are_prepared_in_linear_time():
         f"1 ({space}8",
         f"1 ({space}#2",
         f"1 8{space}-",
+        f"1{space}-{space}8{space}oz.",  # a package size after a dash
+        "1" * 5000 + " - 8",
         f"1 c. +{space}2",
         f"-{space}1 T.",
         f"1 lg.{space}egg",  # the spaces left where a size word was taken out

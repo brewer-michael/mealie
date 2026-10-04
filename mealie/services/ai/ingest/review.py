@@ -454,7 +454,7 @@ class KeptLine:
         ).display
         ingredient.display = display or self.text
         # as read: its flags are a parsed line's, against the line as written (`flags.ingredient_line`)
-        ingredient.extracted_hash = card_flags.ingredient_hash(ingredient)
+        ingredient.extracted_hash = card_flags.ingredient_hash(ingredient, split=card_flags.split_off(parsed))
         return ingredient
 
 

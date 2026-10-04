@@ -10,7 +10,7 @@ the fixture format, how to run this, and how to read the scores.
 
 `--check` validates the fixtures with no settings or database (it runs before they're imported), and `--dry-run`
 checks everything a run needs without calling a provider. Secrets given as `NAME_FILE` (Docker secrets) are read
-first, as `docker/entry.sh` does for the server, since `docker exec` skips it.
+first, and win over `NAME`, as `docker/entry.sh` does for the server, since `docker exec` skips it.
 """
 
 import argparse
@@ -115,15 +115,16 @@ SECRET_FILE_VARS = (
 
 def load_secret_files(environ: dict[str, str] | None = None) -> list[str]:
     """
-    For each of `SECRET_FILE_VARS` whose `NAME` isn't set but `NAME_FILE` is, reads that file into `NAME`, without its
-    trailing newlines, as `docker/entry.sh` does for the server. Returns the names set. A variable already set wins:
-    `docker exec -e NAME=…` overrides a secret. Raises `EvalSetupError` for a file that can't be read.
+    For each of `SECRET_FILE_VARS` whose `NAME_FILE` is set, reads that file into `NAME`, without its trailing
+    newlines, as `docker/entry.sh` does for the server: the secret wins over a `NAME` also set, so the eval reaches the
+    database the server does. Returns the names set. To override a secret, clear its file variable too:
+    `docker exec -e NAME_FILE= -e NAME=…`. Raises `EvalSetupError` for a file that can't be read.
     """
     env: Any = os.environ if environ is None else environ
     loaded: list[str] = []
     for name in SECRET_FILE_VARS:
         path = env.get(f"{name}_FILE")
-        if not path or env.get(name):
+        if not path:
             continue
         try:
             env[name] = Path(path).read_text().rstrip("\n")

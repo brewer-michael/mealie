@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from mealie.lang.providers import get_locale_provider
-from mealie.repos.seed.seeders import IngredientUnitsSeeder
+from mealie.repos.seed.seeders import IngredientFoodsSeeder, IngredientUnitsSeeder
 from mealie.schema.recipe.recipe import Recipe
 from mealie.schema.recipe.recipe_ingredient import (
     CreateIngredientFoodAlias,
@@ -15,7 +15,7 @@ from mealie.schema.recipe.recipe_ingredient import (
 )
 from mealie.schema.recipe_ingest import CardDraft, CardDraftIngredient, CardFlagKind, CardFlagSeverity, ExtractionMeta
 from mealie.services.ai.ingest.matching import IngestMatcher
-from mealie.services.ai.ingest.pipeline.flags import compute_flags, ingredient_hash
+from mealie.services.ai.ingest.pipeline.flags import compute_flags, is_unedited, split_off
 from mealie.services.ai.ingest.pipeline.ingredients import (
     IngredientLine,
     normalize_ingredients,
@@ -80,7 +80,7 @@ async def test_the_banana_lines_are_parsed_and_linked(unique_user_fn_scoped: Tes
     assert oil.display == "1 tablespoon coconut oil melted"
     assert salt.display == "¹/₄ teaspoon salt"  # Mealie's own fraction display
     assert all(line.parse_confidence and line.parse_confidence > 0.85 for line in (oil, salt, vanilla, flour, egg))
-    assert all(line.extracted_hash == ingredient_hash(line) for line in (oil, salt, vanilla, flour, egg))
+    assert all(is_unedited(line) and not split_off(line) for line in (oil, salt, vanilla, flour, egg))
 
 
 @pytest.mark.asyncio
@@ -173,6 +173,13 @@ async def test_a_size_word_anywhere_on_the_line_goes_to_the_note(
         ("1 3-oz. pkg. Jello", 1, "package", "Jello", "3-oz."),
         ("2 8-oz. cans tomato sauce", 2, "cans", "tomato sauce", "8-oz."),
         ("1 8 oz. pkg. cream cheese", 1, "package", "cream cheese", "8 oz."),
+        # or after a dash (read as 1 to 8 ounces of "pkg. cream cheese", or 1 can with the line in the note)
+        ("1 - 8 oz. pkg. cream cheese", 1, "package", "cream cheese", "8 oz."),
+        ("1-8 oz. pkg. cream cheese", 1, "package", "cream cheese", "8 oz."),
+        ("2-15 oz. cans black beans", 2, "cans", "black beans", "15 oz."),
+        ("2 - 15 oz. cans tomatoes", 2, "cans", "tomatoes", "15 oz."),
+        ("1 - 3 oz. box Jello", 1, "box", "Jello", "3 oz."),
+        ("2 - 10 oz. pkgs. frozen spinach", 2, "package", "frozen spinach", "10 oz."),
         # a can's number with a fraction (the food was "#2#1$2", the parser's own fraction code) or "No."
         ("1 #2 1/2 can peaches", 1, "can", "peaches", "#2 1/2"),
         ("1 #2½ can peaches", 1, "can", "peaches", "#2½"),
@@ -230,7 +237,8 @@ async def test_more_card_shorthand_is_read(
 @pytest.mark.parametrize(
     ("line", "quantity", "note", "value", "start"),
     [
-        ("1 can (10 3/4 oz.) soup", 1, "(10 3/4 oz.)", "10 3/4", 7),
+        ("1 can (8-10 oz.) beans", 1, "(8-10 oz.)", "8-10", 7),
+        ("1 c. (or 2) eggs", 1, "(or 2)", "2", 9),
         ("2-3 c. flour", 2, "to 3", "2-3", 0),
         ("1 c. sugar + 2 T.", 1, "+ 2 T.", "2", 13),
         ("1 c. sugar, 1 c. brown sugar", 1, "1 c. brown sugar", "1", 12),
@@ -283,10 +291,11 @@ async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(uni
     fine += ["1 heaping T. flour", "1 1/2 c. flour", "2 eggs, beaten", "1 9-inch pie shell"]
     # a dozen, an envelope and a package's size are read whole now
     fine += ["1 dozen eggs", "1 doz. eggs", "1 env. yeast", "1 (16 oz.) can tomatoes"]
+    fine += ["1 - 8 oz. pkg. cream cheese", "2-15 oz. cans black beans"]
     # short food words aren't lost units
     fine += ["2 TV dinners", "2 new potatoes", "2 dry figs", "1 wax bean", "1 big onion"]
     lost = ["2-3 T. milk", "1 to 2 c. water", "2 or 3 eggs"]
-    unclear = ["2 pk yeast"]
+    unclear = ["2 pk yeast", "2 btls. ketchup"]
 
     parsed, linked = await _normalize_and_link(user, banana + fine + lost + unclear)
     assert linked  # the group's foods and units these lines link: none by a near miss
@@ -302,6 +311,8 @@ async def test_realistic_card_lines_raise_what_needs_a_look_and_nothing_else(uni
     notes = {line.original_text: line.note for line in parsed}
     assert [notes[line] for line in lost] == ["to 3", "to 2", "or 3 eggs"]
     assert flags["2 pk yeast"] == [(CardFlagKind.unit_unclear, {"token": "pk", "start": 2, "end": 4})]
+    # a container's abbreviation the parser ran into the food ("btls. ketchup", a new food at commit)
+    assert flags["2 btls. ketchup"] == [(CardFlagKind.unit_unclear, {"token": "btls.", "start": 2, "end": 7})]
 
 
 @pytest.mark.asyncio
@@ -545,6 +556,79 @@ async def test_units_with_only_a_name_are_linked_exactly(unique_user_fn_scoped: 
 
 
 @pytest.mark.asyncio
+async def test_a_measure_after_the_unit_is_kept_and_not_checked(unique_user_fn_scoped: TestUser):
+    """
+    The parser drops "(8 oz.)" of "1 pkg. (8 oz.) cream cheese" (it reads it as a substitution): the note keeps it as
+    written and, the fields being right, it needs no tap, as the same size before the unit doesn't
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    measures = {
+        "1 pkg. (8 oz.) cream cheese": "(8 oz.)",
+        "1 can (10 3/4 oz.) soup": "(10 3/4 oz.)",
+        "1/2 c. (1 stick) butter": "(1 stick)",
+        "1 c. (8 oz.) sour cream": "(8 oz.)",
+        "2 c. (16 oz.) cottage cheese": "(16 oz.)",
+        "1 pkg. (1/4 oz.) yeast": "(1/4 oz.)",
+        "1 (8 oz.) pkg. cream cheese": "(8 oz.)",
+    }
+    checked = {"2 c. (3 c.) flour": "3", "1 c. (or 2) eggs": "2"}
+
+    parsed = await _normalize(user, [*measures, *checked])
+
+    assert {line.original_text: line.note for line in parsed[: len(measures)]} == measures
+    flags = _highlighted(parsed)
+    assert {line: flags[line] for line in measures} == {line: [] for line in measures}
+    assert {line: [params["value"] for _, params in flags[line]] for line in checked} == {
+        line: [value] for line, value in checked.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_alternatives_and_second_ingredients_are_kept_and_checked(unique_user_fn_scoped: TestUser):
+    """
+    The parser split "or margarine" off a line (its substitutions, which nothing kept: the card was clean and committed
+    without it), or kept "and 1 t. soda" only in its note: the note keeps each as the line has it, and the line is
+    checked. An alternative with its own amount, which the parser keeps whole in its note, reads as written.
+    """
+    user = unique_user_fn_scoped
+    IngredientUnitsSeeder(user.repos).seed("en-US")
+    IngredientFoodsSeeder(user.repos).seed("en-US")  # a linked food, "walnut", is split off by its id
+    split = {
+        "1/2 c. butter or margarine, softened": ("softened, or margarine", "margarine"),
+        "1 c. chopped pecans or walnuts": ("chopped, or walnuts", "walnuts"),
+        "2 c. flour and 1 t. baking powder": ("and 1 t. baking powder", "baking powder"),
+        "1 c. (8 oz.) sour cream or yogurt": ("or yogurt, (8 oz.)", "yogurt"),
+    }
+    second = {
+        "2 c. flour and 1 t. soda": "1",
+        "1 t. salt and 1/2 t. pepper": "1/2",
+        "2 cups flour and 1 teaspoon soda": "1",
+    }
+    kept = ["1 c. butter (or 1 c. margarine)", "2 c. flour (or 1 1/2 c. bread flour)", "1 c. sugar plus 2 T. more"]
+
+    parsed, linked = await _normalize_and_link(user, [*split, *second, *kept])
+
+    read = {line.original_text: line for line in parsed}
+    assert {line: read[line].note for line in split} == {line: note for line, (note, _) in split.items()}
+    assert all(split_off(read[line]) for line in split)
+    assert all(note in read[line].display for line, (note, _) in split.items())
+    flags = _highlighted(parsed, linked)
+    for line, (_, alternative) in split.items():
+        (params,) = [params for kind, params in flags[line] if kind == CardFlagKind.check_parse]
+        assert params["alternative"] == alternative
+        assert line[params["start"] : params["end"]] in (alternative, params.get("value"))
+    assert {line: [params.get("value") for _, params in flags[line]] for line in second} == {
+        line: [value] for line, value in second.items()
+    }
+    assert all(
+        not split_off(read[line]) and second_line in read[line].note
+        for line, second_line in [("2 c. flour and 1 t. soda", "soda"), ("1 t. salt and 1/2 t. pepper", "pepper")]
+    )
+    assert {line: flags[line] for line in kept} == {line: [] for line in kept}
+
+
+@pytest.mark.asyncio
 async def test_a_written_out_unit_links_the_groups_own_never_a_near_miss(unique_user_fn_scoped: TestUser):
     """
     Mealie's own units have no "square" or "package", but "quart" and "pack": "sq." is a new unit, never 2 quarts of
@@ -572,6 +656,43 @@ async def test_a_written_out_unit_links_the_groups_own_never_a_near_miss(unique_
     ]
     flags = _highlighted(parsed, linked)
     assert [line for line in flags if any(kind == CardFlagKind.linked_fuzzy for kind, _ in flags[line])] == []
+
+
+@pytest.mark.asyncio
+async def test_a_written_out_unit_links_the_groups_unit_named_in_the_plural(unique_user_fn_scoped: TestUser):
+    """
+    A group whose units are named only in the plural ("Tablespoons", "Packages", as typed by hand or imported) or
+    with an optional plural ("cup(s)"): card shorthand links them, as lines written in full do, rather than becoming
+    new units "tbsp", "package" or "square" beside them, which "Add all clean cards" would create
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)  # its foods; its units are replaced
+    with job_session(user) as (_, repos):
+        for unit in IngestMatcher(repos).units_by_id.values():
+            repos.ingredient_units.delete(unit.id)
+    names = ("Tablespoons", "Teaspoons", "cup(s)", "Packages", "Squares", "Dozens")
+    for name in names:
+        user.repos.ingredient_units.create(SaveIngredientUnit(name=name, group_id=user.repos.group_id))
+    lines = ["1 T. coconut oil (melted)", "1/4 t. salt", "1/3 C. almond flour", "1 pkg. yeast", "2 pkgs. yeast"]
+    lines += ["2 sq. chocolate", "1 doz. eggs", "1 tablespoon sugar", "1 cup milk"]
+
+    parsed, linked = await _normalize_and_link(user, lines)
+
+    units = [(line.unit and line.unit.name, line.unit is not None and line.unit.id is not None) for line in parsed]
+    assert units == [
+        ("Tablespoons", True),
+        ("Teaspoons", True),
+        ("cup(s)", True),
+        ("Packages", True),
+        ("Packages", True),
+        ("Squares", True),
+        ("Dozens", True),
+        ("Tablespoons", True),
+        ("cup(s)", True),
+    ]
+    card = CardDraft(name="Card", ingredients=parsed)
+    flags = compute_flags(card, ExtractionMeta(language="English"), {}, linked=linked)
+    assert [flag.kind for flag in flags if flag.kind in (CardFlagKind.new_unit, CardFlagKind.linked_fuzzy)] == []
 
 
 @pytest.mark.asyncio

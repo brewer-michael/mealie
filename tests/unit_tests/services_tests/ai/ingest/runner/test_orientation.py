@@ -470,14 +470,29 @@ def test_a_page_tesseract_or_the_reviewer_oriented_ignores_the_image_reader(
     assert [_files(jobs, job_id, 0), _files(jobs, job_id, 1)] == files_before
 
 
+@pytest.mark.parametrize(
+    ("scores", "turn"),
+    [
+        # a handwritten card: Tesseract kept it upright but read nothing there (its best score was turned a quarter,
+        # too low to turn it)
+        ({0: 0, 90: 135, 180: 83, 270: 0}, 90),
+        # the sideways banana card blurred: upright won on noise, far under what a turn needs
+        ({0: 116, 90: 68, 180: 0, 270: 112}, 270),
+    ],
+)
 def test_a_turn_tesseract_couldnt_decide_is_left_to_the_image_reader(
-    db: Session, jobs: Jobs, reader: SlowOCR, card_job: Any, monkeypatch: pytest.MonkeyPatch
+    db: Session,
+    jobs: Jobs,
+    reader: SlowOCR,
+    card_job: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    scores: dict[int, float],
+    turn: int,
 ):
-    # a handwritten card: Tesseract kept it upright but read nothing there (its best score was turned a quarter, too
-    # low to turn it), so its text is kept and the page isn't settled; the image reader's quarter turn applies
-    _reader_says(monkeypatch, {0: 90})
+    # its text is kept and the page isn't settled; the image reader's turn applies
+    _reader_says(monkeypatch, {0: turn})
     reader.readings[0] = 0
-    reader.scores[0] = {0: 0, 90: 135, 180: 83, 270: 0}
+    reader.scores[0] = scores
     reader.release.set()
     job_id = card_job(pages=1)
     token = _claim(db, job_id)
@@ -485,7 +500,7 @@ def test_a_turn_tesseract_couldnt_decide_is_left_to_the_image_reader(
     run(tasks.handle_extract(_context(jobs, job_id, token)))
 
     front = _stored_matches_disk(jobs, job_id, 0)
-    assert (front.rotation, front.rotation_source, front.oriented) == (90, PageRotationSource.model, True)
+    assert (front.rotation, front.rotation_source, front.oriented) == (turn, PageRotationSource.model, True)
     assert (front.width, front.height) == (SIDEWAYS[1], SIDEWAYS[0])
 
 

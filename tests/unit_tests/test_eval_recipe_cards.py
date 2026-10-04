@@ -1987,7 +1987,11 @@ def test_check_needs_no_production_setting(tmp_path: Path):
 
 
 def test_secrets_are_read_from_their_files_before_the_settings(tmp_path: Path):
-    """`docker exec` skips entry.sh: the eval reads `NAME_FILE` itself, unless `NAME` is set"""
+    """
+    `docker exec` skips entry.sh: the eval reads `NAME_FILE` itself, and as entry.sh does, the secret wins over a
+    `NAME` also set (a stale one would send the eval to another database than the server's); an empty `NAME_FILE`
+    leaves `NAME` as it is, the way to override a secret
+    """
     password = tmp_path / "postgres_password"
     password.write_text("s3cret\n")
     user = tmp_path / "postgres_user"
@@ -1995,12 +1999,14 @@ def test_secrets_are_read_from_their_files_before_the_settings(tmp_path: Path):
     env = {
         "POSTGRES_PASSWORD_FILE": str(password),
         "POSTGRES_USER_FILE": str(user),
-        "POSTGRES_USER": "given",
+        "POSTGRES_USER": "stale",
+        "POSTGRES_DB_FILE": "",
+        "POSTGRES_DB": "given",
         "UNRELATED_FILE": str(user),
     }
 
-    assert ev.load_secret_files(env) == ["POSTGRES_PASSWORD"]
-    assert (env["POSTGRES_PASSWORD"], env["POSTGRES_USER"]) == ("s3cret", "given")
+    assert ev.load_secret_files(env) == ["POSTGRES_USER", "POSTGRES_PASSWORD"]
+    assert (env["POSTGRES_PASSWORD"], env["POSTGRES_USER"], env["POSTGRES_DB"]) == ("s3cret", "mealie", "given")
     assert "UNRELATED" not in env
 
     with pytest.raises(ev.EvalSetupError, match="POSTGRES_DB_FILE"):

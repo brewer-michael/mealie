@@ -263,7 +263,7 @@ UNIT_ALIASES: dict[str, tuple[str, ...]] = {
     "dash": ("dashes",),
     "stick": ("sticks",),
     "can": ("cans",),
-    "pkg": ("package", "packages", "pkgs"),
+    "pkg": ("package", "packages", "pkgs", "pkt", "pkts", "packet", "packets"),
     "clove": ("cloves",),
     "slice": ("slices",),
     # the pipeline's other card abbreviations (`shorthand.ABBREVIATIONS`)

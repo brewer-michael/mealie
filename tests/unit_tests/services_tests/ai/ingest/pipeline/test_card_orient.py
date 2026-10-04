@@ -303,7 +303,14 @@ def test_the_orientation_is_decided_without_writing_a_file(
     ("scores", "sure"),
     [
         (UPRIGHT, True),
-        ({0: 300.0, 90: 100.0, 180: 80.0, 270: 60.0}, True),  # little, but best upright
+        ({0: 900.0, 90: 600.0, 180: 80.0, 270: 60.0}, True),  # 1.5 times the next way up: as a turn must
+        ({0: 300.0, 90: 100.0, 180: 80.0, 270: 60.0}, False),  # best upright, but too little to tell
+        # the sideways banana card blurred: upright wins on noise (it needs 270 or 90), so the reader's turn applies
+        ({0: 116.0, 90: 68.0, 180: 0.0, 270: 112.0}, False),
+        ({0: 115.0, 90: 0.0, 180: 0.0, 270: 70.0}, False),
+        ({0: 222.0, 270: 158.0}, False),
+        ({0: 600.0, 90: 0.0, 180: 0.0, 270: 800.0}, False),  # enough upright, but another way up as good
+        ({0: 800.0, 90: 600.0, 180: 0.0, 270: 0.0}, False),  # under 1.5 times the next way up
         ({0: 0.0, 90: 135.0, 180: 83.0, 270: 0.0}, False),  # the banana card blurred: too little read any way up
         ({0: 0.0, 90: 0.0, 180: 0.0, 270: 0.0}, False),  # no words at all
         (FAINT, False),  # handwriting that reads badly every way, upright no better than the rest

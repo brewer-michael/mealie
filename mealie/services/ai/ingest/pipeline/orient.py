@@ -92,16 +92,18 @@ def decide_orientation(page: CardPage) -> OrientDecision:
 
 def _decided(result: ocr.OCRResult) -> bool:
     """
-    Whether a Tesseract run told which way up the page is: it turned the page, or the upright reading scored
-    `MIN_TURN_SCORE` or more, or more than every other way up. One that read too little every way (zero words, all
-    scores under the floor with another as high) only fell back to upright. A result with no scores (nothing probed)
-    is taken at its word.
+    Whether a Tesseract run told which way up the page is: it turned the page, or the upright reading cleared the
+    same bar a turn must: `MIN_TURN_SCORE` or more, and `ORIENT_MIN_RATIO` times every other way up. One that read
+    too little every way (zero words, or a few hundred points upright against nearly as many sideways: a blurred
+    card's noise, which upright wins about as often as not) only fell back to upright. A result with no scores
+    (nothing probed) is taken at its word.
     """
     scores = result.rotation_scores
     if result.rotation % 360 or not scores:
         return True
     upright = scores.get(0, 0.0)
-    return upright >= MIN_TURN_SCORE or all(upright > score for turn, score in scores.items() if turn % 360)
+    others = [score for turn, score in scores.items() if turn % 360]
+    return upright >= MIN_TURN_SCORE and all(upright >= limits.ORIENT_MIN_RATIO * score for score in others)
 
 
 def oriented_meta(meta: PageMeta, decision: OrientDecision) -> PageMeta:

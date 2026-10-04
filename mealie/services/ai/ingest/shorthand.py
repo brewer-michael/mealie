@@ -12,9 +12,9 @@ line needs before the parser reads it:
   parser would join them to the unit ("cup scant") or the food ("heaping flour");
 - a size written in full right after the quantity ("1 large can", "1 small (3 oz.) pkg."): the parser reads "1
   large" as a second amount and drops it;
-- a package size between the quantity and the unit, in parentheses or not ("1 (8 oz.) pkg.", "1 8-oz. pkg."), and a
-  can number ("1 #2 can", "1 #2 1/2 can", "1 No. 2 can") are taken out (the parser reads them as a second amount, or
-  as the food);
+- a package size between the quantity and the unit, in parentheses, after a dash or neither ("1 (8 oz.) pkg.",
+  "1 - 8 oz. pkg.", "1 8-oz. pkg."), and a can number ("1 #2 can", "1 #2 1/2 can", "1 No. 2 can") are taken out (the
+  parser reads them as a second amount, a range, or the food);
 - the shorthand unit is written out (`normalize_shorthand`), and "doz.", "env." and "sq." as dozen, envelope and
   square (with their longer and plural spellings: "tbls.", "pkgs."), and so is a case-sensitive shorthand unit after
   a second, joined amount ("1 c. plus 2 T. flour"), which the parser would read as the food "T. flour".
@@ -79,6 +79,8 @@ ABBREVIATIONS = {
     "envs": "envelope",
     "sq": "square",
     "pkgs": "package",
+    "pkt": "package",
+    "pkts": "package",
     "tbs": "tbsp",
     "tbl": "tbsp",
     "tbls": "tbsp",
@@ -87,8 +89,8 @@ ABBREVIATIONS = {
 }
 """
 Other abbreviated units after a quantity, matched ignoring case ("1 doz. eggs", "1 env. Dream Whip", "2 sq. chocolate",
-and the longer or plural spellings of a spoon or a package: "2 tbls. sugar", "2 pkgs. yeast"). The parser doesn't
-know them: it reads "doz eggs" or "tbls. sugar" as the food.
+and the longer or plural spellings of a spoon or a package: "2 tbls. sugar", "2 pkgs. yeast", "2 pkts. yeast"). The
+parser doesn't know them: it reads "doz eggs" or "tbls. sugar" as the food.
 """
 
 UNIT_SPELLINGS: tuple[tuple[str, ...], ...] = (
@@ -106,7 +108,7 @@ UNIT_SPELLINGS: tuple[tuple[str, ...], ...] = (
     ("milligram", "mg"),
     ("milliliter", "ml", "millilitre"),
     ("liter", "l", "litre"),
-    ("package", "pkg", "pack", "packet", "pk"),
+    ("package", "pkg", "pack", "packet", "pk", "pkt"),
     ("dozen", "doz"),
     ("envelope", "env"),
     ("square", "sq"),
@@ -160,6 +162,15 @@ _PLAIN_PACKAGE_SIZE = re.compile(
 A package's size without parentheses between the quantity and a container: "1 8-oz. pkg. cream cheese", "2 15 oz. cans".
 A whole number after the quantity and a space, so "2 1/2 oz. pkg." stays one amount (and a run of digits is never
 split two ways, which would take quadratic time).
+"""
+_DASHED_PACKAGE_SIZE = re.compile(
+    rf"^(?P<lead>\s*+[-•*]?\s*+\d+)\s*+[-–]\s*+(?P<size>\d+(?:[.,]\d+)?(?:\s+\d+/\d+|\s*[½⅓⅔¼¾⅛⅜⅝⅞])?\s*+-?\s*+"
+    r"(?i:fl\.?\s*oz|oz|ounces?|lbs?|pounds?|g|grams?|kg|ml)\.?)\s+"
+    rf"(?={_CONTAINER})"
+)
+"""
+A package's size after a dash between the count and a container: "1 - 8 oz. pkg. cream cheese", "2-15 oz. cans" (two
+15-ounce cans, not 2 to 15 ounces: a range never runs into a size before a container, so "2-3 c. flour" stays a range)
 """
 _CAN_NUMBER = re.compile(
     rf"^{_LEAD}(?P<size>(?:#\s?|(?i:no)\.?\s*)\d+(?:\s+\d+/\d+|\s*[½⅓⅔¼¾⅛⅜⅝⅞])?)\s+(?=(?i:cans?)\b)"
@@ -271,7 +282,8 @@ def unit_name(token: str) -> str:
 
 
 def _spelling_key(name: str) -> str:
-    return " ".join(name.lower().replace(".", " ").split())
+    """A unit's name as spellings are looked up: lowercase, without dots or an optional plural ("cup(s)")"""
+    return " ".join(name.lower().replace("(s)", "").replace(".", " ").split())
 
 
 _SPELLINGS: dict[str, tuple[str, ...]] = {
@@ -351,10 +363,11 @@ def prepare_line(line: str) -> PreparedLine:
     if match := _LEAD_SIZE.match(text):
         notes.append(match.group("size"))
         text = match.group("lead") + text[match.end() :]
-    for pattern in (_PACKAGE_SIZE, _PLAIN_PACKAGE_SIZE, _CAN_NUMBER):
+    for pattern in (_PACKAGE_SIZE, _DASHED_PACKAGE_SIZE, _PLAIN_PACKAGE_SIZE, _CAN_NUMBER):
         if match := pattern.match(text):
             notes.append(match.group("size").strip())
-            text = match.group("lead") + text[match.end() :]
+            # the dashed size's lead has no space after it ("2-15 oz. cans": "2 cans", not "2cans")
+            text = match.group("lead").rstrip() + " " + text[match.end() :]
             break
 
     shorthand: tuple[str, str] | None = None
