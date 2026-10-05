@@ -324,8 +324,9 @@ Linux); it's off when Mealie runs directly on Windows.
   Mealie can't create the other households' folders there (the log says so once); mount each household that should
   have an inbox. This layout hasn't been tried on a real Docker host yet.
 - **`processed/`.** Read photos move to `processed/YYYY-MM/` and are kept, unless `AI_INGEST_INBOX_PROCESSED_DAYS` is
-  set: then a daily purge (first 10 minutes after the first scan) deletes the ones read longer ago than that, and
-  removes month folders it empties. `AI_INGEST_INBOX_KEEP_PROCESSED=false` deletes photos as soon as they're read.
+  set: then a daily purge (first 10 minutes after the first scan) deletes the photos and card folders read longer ago
+  than that, and removes month folders it empties. `AI_INGEST_INBOX_KEEP_PROCESSED=false` deletes photos as soon as
+  they're read.
 - **Backups.** The inbox isn't backed up.
 
 How files are picked up is in [`CARDS.md` section 6](CARDS.md#6-the-inbox-folder).
@@ -351,6 +352,8 @@ How files are picked up is in [`CARDS.md` section 6](CARDS.md#6-the-inbox-folder
 | `AI_INGEST_URL_FETCH` | `false` | Accept image URLs in the upload API ([Image URLs](#image-urls)) |
 | `AI_INGEST_URL_ALLOW_HOSTS` | empty | Private hosts, addresses or CIDR ranges, comma-separated, that image URLs may reach, such as Home Assistant's address |
 | `AI_INGEST_URL_TIMEOUT` | `20` | Seconds one image URL's download may take in all, redirects included (1 to 300) |
+| `AI_INGEST_PDF_CPU_SECONDS` | `20` | CPU seconds one PDF may take to render (it may take 1.5 times this in all). A PDF that runs out is refused `pdf_not_supported`, and so are the later PDFs of its upload; raise it on a slow NAS or ARM board (1 to 600) |
+| `AI_INGEST_PDF_UNCONFINED` | `false` | Render PDFs where the renderer's seccomp filter can't apply (another architecture, a kernel or container without seccomp); off, such PDFs are refused and the log says why |
 
 An empty variable counts as unset, so the Unraid template's empty fields keep the defaults.
 
@@ -366,20 +369,25 @@ what those can reach:
 
 - only `http` and `https`, with no `user:password@`, no cookies and no proxy from the environment;
 - only public addresses, plus what `AI_INGEST_URL_ALLOW_HOSTS` and upstream's `HTTP_ALLOW_LIST` name;
-  `HTTP_DISALLOW_LIST` refuses what it names. The connection goes to the address that was checked;
+  `HTTP_DISALLOW_LIST` refuses what it names. The connection goes to the address that was checked; an allowed address or
+  range vouches only for itself, so a host's other private addresses are left out;
 - at most 3 redirects, each checked again, never to another scheme and never from `https` to `http`;
-- the body uncompressed only, at most 30 MB, within `AI_INGEST_URL_TIMEOUT`; what comes back must be an image or a
-  PDF;
+- the body uncompressed only, at most 30 MB, within `AI_INGEST_URL_TIMEOUT`, which counts the address lookup too (a host
+  that doesn't resolve is `url_fetch_failed`); what comes back must be an image or a PDF;
 - logs name the host only, since a camera URL can carry a token.
 
 Keep `AI_INGEST_URL_ALLOW_HOSTS` to the one address you need, such as `192.168.1.20` for Home Assistant.
 
 ### PDFs
 
-PDFs are rendered with PDFium (`pypdfium2`, in the image), one page per card page, in a separate process with a 60 s
-limit, one PDF at a time per worker process. That process is confined as far as the kernel allows: no new privileges,
-no files but fonts (Landlock), no network sockets (seccomp, on x86-64 and arm64), no file writes and capped memory.
-The log says once which of these apply; it warns when the kernel has no Landlock.
+PDFs are rendered with PDFium (`pypdfium2`, in the image), one page per card page, in a separate process with a time
+limit (`AI_INGEST_PDF_CPU_SECONDS` of CPU, 20 by default, and 1.5 times that in all), one PDF at a time per worker
+process, with at most one card per group waiting. Once one of an upload's PDFs runs out of time, its other PDFs aren't
+tried; the inbox leaves the group's other PDFs for its next scan. That process is confined: no new privileges, no files
+but fonts (Landlock, where the kernel has it), and a seccomp filter (x86-64 and arm64) refusing network sockets, new
+processes, anything that reaches the server's process and any change to a file; no file writes and capped memory.
+Where the seccomp filter can't apply (another architecture, a kernel or container without seccomp), PDFs are refused
+unless `AI_INGEST_PDF_UNCONFINED=true`. The log says once which protections apply.
 
 ### Reverse proxy
 
@@ -420,10 +428,16 @@ pages one at a time.
 - Card photos, drafts and eval cases are stored under App Data (`groups/<group id>/ai-ingest/` and
   `groups/<group id>/eval-cards/`), so backups include them. The inbox isn't included, and neither are runtime files
   (the locks, the pause marker, `.ai-ingest-results/`, `.ai-ingest-inbox/`).
-- **A restore pauses card scanning and other writes.** Uploads get `503` with `Retry-After: 60` (the app retries on
-  its own), and the inbox and the background reader stop. Other changes in Mealie get `503` *A backup is being
-  restored. Try again in a minute.* Before it starts, the restore waits up to 45 seconds for writes in progress; if
-  they're still busy, it stops without changing anything, and you try again.
+- **A restore pauses Mealie.** Every request to the API gets `503` with `Retry-After: 60` while it runs (the app waits
+  and retries, and doesn't sign you out); a change shows *A backup is being restored. Try again in a minute.* A page
+  opened meanwhile says *A backup is being restored. This page will open when it's done.* and opens once it's over. The
+  inbox and the background reader stop. Before it starts, the restore waits up to 45 seconds for writes in progress; if
+  they're still busy, it stops without changing anything, and you try again. If another Mealie process is updating its
+  database, the restore says *Mealie is updating its database. Try the restore again in a minute.* A Mealie process that
+  starts during a restore (a restarted worker) waits for it to finish.
+- **Health checks.** While a restore runs, every API request answers `503 paused_for_restore`, reads included. The
+  image's `healthcheck.sh` counts that as healthy. A Kubernetes liveness probe should run that script (an exec probe) or
+  a TCP check, not an HTTP check on `/api/app/about`, or it restarts Mealie in the middle of the restore.
 - Cards being read during a restore go back in the queue. A reading the provider already returned is kept (in
   `.ai-ingest-results/`, for up to 24 hours) and used, so it isn't paid for twice. If Mealie crashes in the middle of
   a restore, the pause ends as soon as Mealie starts again (within 5 minutes where file locks don't work).
@@ -436,13 +450,21 @@ pages one at a time.
 Small fixes to upstream Mealie that come with this build. Each is a commented fork hook in upstream's code.
 
 - **Several workers start together:** database migrations run under a lock ([above](#how-many-cards-are-read-at-once)).
-- **Writes during a backup restore** get `503`, and the restore waits for writes in progress
-  ([above](#backups-and-restores)). Backups leave out the fork's runtime files.
+- **During a backup restore** every API request gets `503`, the restore waits for writes in progress, and a worker
+  starting meanwhile waits for the restore ([above](#backups-and-restores)). Backups leave out the fork's runtime files.
 - **Redirects:** recipe imports, image downloads and webhooks refuse a redirect from `https` to `http` or to another
   scheme. A recipe image import says *Url redirected to an insecure http:// address*; one refused webhook no longer
   stops the household's other webhooks.
-- **Downloads by the server** (recipe pages, recipe images) ask for uncompressed data and stop at 50 MB. A recipe
-  image over that is refused with `400`.
+- **Downloads by the server** (recipe pages, recipe images) stop at 50 MB, counted after decoding: Mealie decodes a
+  compressed download itself and stops at the limit, so a small compressed file can't fill memory. A recipe image over
+  that is refused with `400`. A gzip page missing only its checksum trailer is still read.
+- **Webhooks and recipe actions** read at most 1 MB of the answer (decoded the same way; a larger answer is refused and
+  logged, and doesn't stop the household's other webhooks), and give up on a request after 30 seconds, however slowly
+  the answer comes.
+- **`HTTP_ALLOW_LIST` addresses and ranges** allow only the addresses they cover: when a name resolves to an allowed
+  address and also to other private ones (a router's IPv6 ULA or link-local record), Mealie connects only to the allowed
+  ones. List the host name itself to allow all of its addresses.
+- **Docker's health check** counts a backup restore's `503` as healthy ([above](#backups-and-restores)).
 - **Apprise notifications** keep `+`, `&` and `%` in event fields such as a recipe's name, so Home Assistant's
   `from_json` reads `document_data`.
 - **Import with AI** records the picture it saved for a new recipe, so the recipe shows it.

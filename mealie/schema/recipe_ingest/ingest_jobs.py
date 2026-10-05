@@ -101,13 +101,17 @@ class RecipeIngestionJobSummary(MealieModel):
     committed_at: datetime | None = None
     """When the card was added as a recipe"""
     auto_retry_at: datetime | None = None
-    """A card that failed because every provider was over its monthly limit is read again by then (UTC)"""
+    """
+    A card that failed because every provider was over its monthly limit is read again automatically by then (UTC,
+    when the month's limit resets), or within about 10 minutes after the limit is raised
+    """
     expires_at: datetime | None = None
     """A failed card is removed then, with its photos (UTC)"""
     household_recipes_public: bool = False
     """
-    New recipes in the household can be seen without a login, so a card photo on one (its image or an attachment)
-    would be too; cards whose draft doesn't say leave it off then (`card_photo_default`, `card_cover_default`)
+    New recipes in the household can be seen without a login now (not a private household, and recipes created
+    public), so a card photo on one would be too: what the review page warns about. The photo switches' defaults follow
+    whether new recipes are created public (`card_photo_default`, `card_cover_default`)
     """
 
 
@@ -155,9 +159,15 @@ class RecipeIngestionJobOut(RecipeIngestionJobSummary):
     "Banana Bread (2)"; None when the name is only similar, or no free one is left
     """
     card_photo_default: bool = True
-    """Whether the card's photos are attached to the recipe when the draft doesn't say (not in public households)"""
+    """
+    Whether the card's photos are attached to the recipe when the draft doesn't say (not where the household's new
+    recipes are created public)
+    """
     card_cover_default: bool = True
-    """Whether the front of the card becomes the recipe's image when the draft doesn't say (not in public households)"""
+    """
+    Whether the front of the card becomes the recipe's image when the draft doesn't say (not where the household's new
+    recipes are created public)
+    """
 
 
 class RecipeIngestionJobState(MealieModel):

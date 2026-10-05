@@ -86,35 +86,42 @@ recipe cards**, or the link on the **Import with AI** page. The address is `/g/<
   Mealie again in that browser (a card whose tries ran out keeps its **Retry**). The browser still asks before you
   leave while uploads are running. If this browser can't keep them (private browsing, a full disk), the page says
   *Photos can't be kept on this device, so keep this page open until they're uploaded.*
-- **Two tabs:** one tab of the browser uploads at a time. Another tab's cards page says *Your recipe cards are being
-  added in another tab of this browser*, with **Use this tab**.
-- **Log out:** with photos still waiting, Log out asks first (*2 photos haven't been uploaded. Log out anyway?*).
+- **Two tabs:** one tab of the browser uploads at a time, over plain http too, so a card is never sent by two tabs at
+  once. Another tab's cards page says *Your recipe cards are being added in another tab of this browser*, with **Use
+  this tab**; a cards page left open in a background tab doesn't take the queue back. If the tab with your photos
+  couldn't save them on this device, it keeps them until they're uploaded and the other tab says so. If the other tab
+  has a card's front waiting for its back, this one says *That tab has a card's front waiting for its back. This tab
+  takes over once the back is taken there, or No back is tapped.* and takes over then.
+- **Log out:** with photos still waiting, Log out asks first (*2 photos haven't been uploaded. Log out anyway?*). It
+  counts the photos of a tab that's asleep in the background too.
 - **A card that fails while you're elsewhere** in Mealie shows a message with **Open recipe cards**, and a red badge on
   the sidebar entry.
 - **Where photos go:** a chip under the buttons says who reads the cards: *Read by Claude Sonnet (cloud)*, *Read with
-  OCR, then Claude Sonnet (cloud)*, *Read by qwen3-vl on your network*, or a lock and *Stays on this server*. Tap it
-  for **Keep these cards on this server** ([section 7](#7-keeping-cards-on-your-network)).
+  OCR, then Claude Sonnet (cloud)*, *Read by qwen3-vl on your network*, or a lock and *Stays on this server*. Tap it to
+  open a panel over the page with **Keep these cards on this server** ([section 7](#7-keeping-cards-on-your-network)).
 - **Metadata:** each photo is turned upright and stripped of its metadata (GPS, camera, time) during the upload. The
   file as uploaded isn't kept.
 
 The page also tells you when cards can't be read now: AI isn't set up, the group keeps cards on this server and nothing
-local can read them, every provider has used its monthly token limit (cards are then read again automatically when
-the limit resets, or sooner if a manager raises it), or nothing on the server is reading cards (*Cards are accepted,
-but nothing on the server is reading them, so they wait.*).
+local can read them, every provider has used its monthly token limit (cards are then read automatically when the limit
+resets, or within about 10 minutes after a manager raises it), or nothing on the server is reading cards (*Cards are
+accepted, but nothing on the server is reading them, so they wait.*).
 
 ---
 
 ## 3. Review and commit
 
-The list under the capture buttons shows each batch's cards: *Reading*, *Ready*, *Ready · 2 to check* or *Failed*
-with the reason, and **Review**, **Retry**, **Cancel** (while a card is being read) and **Discard**. A batch line
-counts its cards (*2 added, 2 still being read, 1 failed*) and starts with *Batch done:* once nothing is being read.
-**Review batch** opens the batch's first card that needs a look. Cards are reviewed in the order you shot them, so
-the screen matches the stack in your hand. **Recently added** lists the cards added in the last 7 days, newest first;
-**Load older cards** shows more.
+The list under the capture buttons shows each batch's cards: *Reading*, *Ready*, *Ready · 2 to check* or *Failed* with
+the reason, and **Review**, **Retry**, **Cancel** (while a card is being read) and **Discard**. A batch line counts its
+cards (*2 added, 2 still being read, 1 waiting for the monthly limit, 1 failed*) and starts with *Batch done:* once
+nothing is being read or waiting for the limit. **Retry failed** leaves cards waiting for the monthly limit alone;
+they're read again by themselves. **Review batch** opens the batch's first card that needs a look. Cards are reviewed in
+the order you shot them, so the screen matches the stack in your hand. **Recently added** lists the cards added in the
+last 7 days, newest first, under their recipe's name; **Load older cards** shows more.
 
-A failed card says when it tries again or goes: *Tries again on …* for a card that hit the monthly token limit, else
-*Removed on …*.
+A failed card says when it tries again or goes: *Tries again on …, or sooner if the limit is raised* for a card that hit
+the monthly token limit, else *Removed on …*. A card that must stay on this server while nothing on your network can
+read it offers **Read with cloud providers** (to its uploader and household managers) instead of **Retry**.
 
 The review page shows the card and the recipe as read. **Needs a look (N)** lists each thing to check, with its
 reason:
@@ -153,7 +160,8 @@ Errors (red) block the commit until you fix them or keep them; warnings (amber) 
 - **Duplicates:** a banner says *A recipe called "X" already exists. Adding this card makes "X (1)".*, *A recipe with
   a similar name already exists*, or *Another card waiting has the same name.* with **Open card**.
 - Edits save on their own (*Saved*), and a save that fails is tried again. Leaving with unsaved changes asks first. If
-  the card was changed somewhere else, **Reload this card**.
+  the card was changed somewhere else, **Reload this card**. If that happens as you commit with nothing unsaved (say, a
+  page was just added to it from another phone), the card reloads by itself and says so: check it, then commit again.
 - **Commit & next** creates the recipe and opens the next card, going on into the next batch; a clean card takes this
   one tap. **Skip** leaves a card for later.
 - **Undo:** the *Added …* line after a commit has **Undo**, and an added card's page has **Back to review**. Both
@@ -173,16 +181,18 @@ Errors (red) block the commit until you fix them or keep them; warnings (amber) 
   choose **Create "X"** (users who can organize); it shows as *X (new)* and is created when you commit. *No tags
   suggested* says why when suggestions were skipped.
 - If the name is taken, the recipe gets the first free *Name (1)*, *Name (2)* and so on.
-- **The card photo:** **Use the card photo as the recipe image** and **Attach the card photo to the recipe** (as
-  assets named *Recipe card*, *Recipe card (back)*). Both are on by default, except in a household whose new recipes
-  can be seen without logging in (not a private household, and recipes public by default): there they start off,
-  because anyone could see the photo. If you turn one on there, the page warns *Recipes in this household are public:
-  the card photo will be visible to anyone.* A portrait card is shown whole on the recipe's 4:3 picture.
+- **The card photo:** **Use the card photo as the recipe image** and **Attach the card photo to the recipe** (as assets
+  named *Recipe card*, *Recipe card (back)*). Both are on by default, except in a household whose new recipes are
+  created public (recipes public by default): there they start off, because anyone could see the photo once the
+  household isn't private, now or later. If you turn one on while the household's recipes can be seen without logging
+  in, the page warns *Recipes in this household are public: the card photo will be visible to anyone.* A portrait card
+  is shown whole on the recipe's 4:3 picture.
 
-**How long cards stay:** ready cards wait until you review them. The photos of committed cards are deleted after 14
-days (`AI_INGEST_RETENTION_DAYS`); a committed recipe keeps its own copy. Failed cards are removed 14 days after their
-last change. A card that failed on the monthly token limit is read again on the 1st of next month (UTC), or sooner once
-a manager raises the limit, and is kept until 14 days after that.
+**How long cards stay:** ready cards wait until you review them. The photos of committed cards are deleted after 14 days
+(`AI_INGEST_RETENTION_DAYS`); a committed recipe keeps its own copy. Failed cards are removed 14 days after their last
+change. A card that failed on the monthly token limit is read again on the 1st of next month (UTC), or sooner once a
+manager raises the limit (within about 10 minutes), and is kept until 14 days after that. Once it's read, you get a
+notification for it.
 
 ---
 
@@ -202,6 +212,8 @@ Every answer, accepted or refused, has a top-level `summary` to show:
 - *1 recipe card queued. You'll be notified when it's ready.* when a household notifier sends "Recipe cards ready"
   ([section 8](#8-recipe-cards-ready-notifications)), else *1 recipe card queued for review in Mealie.*
 - *No recipe cards were queued. 1 card was already scanned.* when nothing was used.
+- *1 card couldn't be used: the image URL isn't allowed.*
+- *Send your API token in the Authorization header to upload recipe cards.* when the header is missing.
 - The reason for a refusal, such as *Mealie didn't accept the API token. Check it and try again.* or *Too many recipe
   cards are waiting to be read. Try again when some have finished.*
 
@@ -245,8 +257,8 @@ Uploads from one user that follow each other within 2 minutes join one batch, so
 notification. Step 7 ends the batch, so it comes as soon as the cards are read; without it, 2 minutes after the last
 card.
 
-HEIC photos are fine. A file body must be `image/*` or `application/octet-stream`, so send a PDF as a form (Request
-Body **Form**, a File field `files`). A JSON body is limited to 45 MB, which is plenty for two photos.
+HEIC photos are fine. A file body must be `image/*`, `application/pdf` or `application/octet-stream`; a PDF can go as a
+file too. A JSON body is limited to 45 MB, which is plenty for two photos.
 
 ---
 
@@ -258,7 +270,7 @@ header; a browser cookie alone is refused.
 | Content type | Body | Use |
 |---|---|---|
 | `multipart/form-data` | every file part is a photo or PDF (call the field `files`); optional text fields below | `curl -F`, Shortcuts *Form* |
-| `image/*` or `application/octet-stream` | one file (a PDF as `application/octet-stream`); options in the query string | Shortcuts *File* |
+| `image/*`, `application/pdf` or `application/octet-stream` | one file (a photo or a PDF); options in the query string | Shortcuts *File* |
 | `application/json` | `{"images": [{"data": "<base64>", "filename": "front.jpg"}]}` plus options | Shortcuts *JSON*, scripts |
 
 A PDF or a multi-page TIFF gives the card all its pages (at most 4 in all).
@@ -285,9 +297,9 @@ curl -sS -H "Authorization: Bearer $MEALIE_TOKEN" \
 
 | Status | Meaning |
 |---|---|
-| `202` | queued; `rejected` lists files that weren't used: `duplicate`, `too_large`, `unsupported_format`, `pdf_not_supported` (a PDF that can't be opened), `too_many_pixels`, `unreadable_image`, `too_many_pages`, `url_not_allowed`, `url_fetch_failed`, or `quota` (a later card of the request would pass a cap below) |
+| `202` | queued; `rejected` lists files that weren't used: `duplicate`, `too_large`, `unsupported_format`, `pdf_not_supported` (a PDF that can't be opened or took too long to render, and the upload's PDFs after it), `too_many_pixels`, `unreadable_image`, `too_many_pages`, `url_not_allowed`, `url_fetch_failed`, or `quota` (a later card of the request would pass a cap below) |
 | `400` | nothing was accepted (`nothing_accepted`, the same body inside `detail`), the group can't read cards (`ai_not_enabled`), the card must stay local and can't (`local_only_unavailable`), or the body can't be read (`invalid_body`) |
-| `401` | no `Authorization` header, or a bad token |
+| `401` | no `Authorization` header (told to send one), or a bad token |
 | `404` | a `batchId` that isn't one of the household's batches |
 | `413` | over `AI_INGEST_MAX_UPLOAD_MB` (100 MB), or 45 MB for JSON |
 | `415` | another content type |
@@ -308,7 +320,7 @@ addresses, plus the ones the server lists in `AI_INGEST_URL_ALLOW_HOSTS` (such a
 | `GET /api/ai/ingest/batches/{id}` | the batch, with its counts and its cards in review order |
 | `POST /api/ai/ingest/batches/{id}/seal` | ends the batch: no more cards join it, and it notifies once its cards are read |
 | `POST /api/ai/ingest/batches/{id}/touch` | the capture page's heartbeat: keeps an app batch you started open for another 10 minutes (`409` once it's ended) |
-| `GET /api/ai/ingest/jobs/counts` | `ready`, `needsAttention`, `processing` and `failed` for the token user's household |
+| `GET /api/ai/ingest/jobs/counts` | `ready`, `needsAttention`, `processing`, `failed` and `waiting` for the token user's household (`waiting`: cards waiting for the monthly limit, not counted in `failed`) |
 
 `GET /api/ai/about` (no token needed) reports whether card scanning and the inbox are on, whether a card reader is
 running (`"worker": true`), and the upload limits.
@@ -387,9 +399,12 @@ setting. For Ollama, see the context length note in [`DEPLOY.md`](DEPLOY.md#olla
 
 ## 8. "Recipe cards ready" notifications
 
-Mealie sends one notification when a batch has been read: "Recipe cards ready" / "10 cards are ready to review (2
-need a look, 1 failed).", with a link to the batch's first card to review. It goes through the household's Apprise
-notifiers, so any Apprise service works (ntfy, Pushover, Telegram, HA and others).
+Mealie sends one notification when a batch has been read: "Recipe cards ready" / "10 cards are ready to review (2 need a
+look, 1 failed).", with a link to the batch's first card to review. When none of its cards is ready, it's titled "Recipe
+cards not read" ("No cards are ready to review (2 failed)."). Cards that waited for the monthly token limit send one
+more notification once they're read: "2 cards that waited for the monthly limit were read. 2 cards are ready to review."
+It goes through the household's Apprise notifiers, so any Apprise service works (ntfy, Pushover, Telegram, HA and
+others).
 
 1. Turn on **Show advanced features** in your profile settings. The notifiers page needs it.
 2. Open **Profile > Notifiers** (`/household/notifiers`) and create a notifier with your Apprise URL. Keep it
@@ -407,6 +422,8 @@ notifiers, so any Apprise service works (ntfy, Pushover, Telegram, HA and others
 - A notifier hears about its own household's cards only.
 - A batch where every card failed notifies too. A batch whose cards were last changed more than 24 hours ago never
   notifies, so restoring a backup doesn't repeat old notifications; a batch read over several days still does.
+- Cards waiting for the AI's monthly limit aren't counted as failed: the notification says when they'll be read, titled
+  "Recipe cards waiting" when nothing else is ready or failed, and another follows once they're read.
 - A notifier that fails is tried again every few minutes, up to 5 times, and the server log names it. Each notifier
   gets the notification once; only if Mealie stops between sending and recording it can one get it twice.
 - A failed test says *Test failed: The notifier didn't get it. Check its URL, and that the service it sends to is
@@ -553,9 +570,9 @@ script:
    answers, and HA answers every webhook ID, even a mistyped one; if nothing shows, compare the webhook IDs (HA logs
    `Received message for unregistered webhook <id>`).
 
-`document_data` is a JSON string with `batchId`, `jobIds`, `readyCount`, `needsAttentionCount`, `failedCount` and
-`reviewUrl`. Match on the event name, never on a number. `local_only: true` accepts the webhook only from your local
-network, so Mealie must reach HA there.
+`document_data` is a JSON string with `batchId`, `jobIds`, `readyCount`, `needsAttentionCount`, `failedCount`,
+`waitingCount` and `reviewUrl`. Match on the event name, never on a number. `local_only: true` accepts the webhook only
+from your local network, so Mealie must reach HA there.
 
 ### Photos the inbox didn't add
 
@@ -605,10 +622,11 @@ rest:
           - needsAttention
           - processing
           - failed
+          - waiting
 ```
 
 The counts are for the token user's household: `ready`, `needsAttention` (ready cards with something to check),
-`processing` and `failed`.
+`processing`, `failed` and `waiting` (cards waiting for the monthly limit, read again automatically).
 
 ### Asking by voice
 
@@ -662,7 +680,7 @@ clean. [`EVAL.md`](EVAL.md#cleaning-a-photo) has the details.
 | Uploads fail with `413` | A reverse proxy's body limit. For nginx, set `client_max_body_size 100m` ([`DEPLOY.md`](DEPLOY.md#reverse-proxy)). |
 | "Recipe card uploads are paused while a backup is restored" | Wait a minute; the app retries on its own. |
 | Cards come out sideways | Tesseract is missing or `AI_INGEST_ORIENT=false`. Use **⋯ > Rotate**. |
-| A card *Tries again on* the 1st of the month | Every provider for a step used its monthly token limit. A group manager can raise the limit to read it sooner. |
+| A card *Tries again on* the 1st of the month | Every provider for a step used its monthly token limit. A group manager can raise the limit; the card is then read within about 10 minutes. |
 | Inbox photos aren't picked up | `GET /api/ai/about` should show `"inbox": true`. Check the folder (group and household slugs), that the file has stopped changing, and *waiting in the inbox* on the Recipe cards page. |
 | An inbox subfolder stays where it is | Mealie's group can't write to it: create card folders group-writable (umask `002`). The cards page lists it under *Not added from the inbox*. |
 | Inbox photos land in `failed/` | Read the `.error.txt` next to the photo, or *Not added from the inbox* on the cards page. |

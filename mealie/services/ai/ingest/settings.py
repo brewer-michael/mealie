@@ -74,17 +74,20 @@ class IngestSettings(BaseSettings):
     """
     The CPU time one PDF's pages may take to render (the renderer's `RLIMIT_CPU`); its rendering may take 1.5 times
     this in all, waiting for a CPU included. A scanned card of 4 pages takes about 4 s on a current x86-64 core. A PDF
-    that runs out of it is refused `pdf_not_supported`, and so are the later PDFs of its upload (or of its group's
-    inbox scan), unrendered; the log says "A PDF wasn't rendered within ...". Raise it on a slow NAS or ARM board whose
-    card PDFs are refused that way. One process renders one PDF at a time, so a larger value also lets a hostile PDF
-    hold up other uploads' PDFs longer.
+    that runs out of it is refused `pdf_not_supported`, and so are the later PDFs of its upload, unrendered (the inbox
+    leaves its group's other PDFs in the folder for its next scan); the log says "A PDF wasn't rendered within ...".
+    Raise it on a slow NAS or ARM board whose card PDFs are refused that way. One process renders one PDF at a time,
+    so a larger value also lets a hostile PDF hold up other uploads' PDFs longer.
     """
     PDF_UNCONFINED: bool = False
     """
-    Render PDFs even where the system can't confine the renderer (neither Landlock nor its seccomp filter applies: a
-    kernel or container without Landlock, on an architecture other than x86-64 and arm64 or without seccomp), with only
-    an isolated interpreter and its time and memory limits; off: such PDFs are refused `pdf_not_supported`, and the log
-    says why
+    Render PDFs even where the system can't confine the renderer (its seccomp filter doesn't apply: an architecture
+    other than x86-64 and arm64, a kernel or container without seccomp; Landlock alone, which leaves UDP, TCP below ABI
+    4 and the server's process within reach, isn't enough), with only the protections that do apply (an isolated
+    interpreter, its time and memory limits, Landlock where the kernel has it); off: such PDFs are refused
+    `pdf_not_supported`, and the log says why. Run unconfined as root, a process the renderer starts can leave its
+    process group and outlive the time limit. The server closes its end of the renderer's output at the time limit
+    plus 5 s, so no server thread or pipe stays with it, but that process is left running.
     """
 
     # an empty variable is unset: Unraid and compose files pass unused ones as `''`

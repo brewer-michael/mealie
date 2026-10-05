@@ -286,7 +286,7 @@ Your LLM conversation agent then gets Mealie's own tools instead of the three La
 | `suggest_from_ingredients` | "What can I make with chicken and rice?" |
 | `whats_planned` | The plan for a day or a range, optionally one meal |
 | `get_shopping_list` | The open items on a list |
-| `recipe_card_queue` | How many scanned recipe cards are waiting to be reviewed: `ready`, `needs_attention`, `processing` and `failed` (counts only, never card text) |
+| `recipe_card_queue` | How many scanned recipe cards are waiting to be reviewed: `ready`, `needs_attention`, `processing`, `failed` and `waiting` (cards waiting for the monthly limit, e.g. "… 2 are waiting for the monthly limit."); counts only, never card text |
 | `add_to_shopping_list` | Add items, or a recipe's ingredients for N servings (only if you allow changes) |
 | `plan_meal` | Put a recipe or a note on the plan (only if you allow changes) |
 
@@ -408,8 +408,9 @@ part in several ways. The steps and the YAML are in the recipe card guide, [`doc
 
 By voice, Layer B's `recipe_card_queue` tool answers "Any recipe cards to review?" with counts only.
 
-The notifier sends two events to the same webhook: `recipe_ingestion_ready` ("Recipe cards ready") and
-`recipe_ingestion_rejected` ("Recipe cards not added", for inbox photos that couldn't be used). Match on
+The notifier sends two events to the same webhook: `recipe_ingestion_ready` ("Recipe cards ready", or "Recipe cards not
+read" when none of the batch's cards is ready, or "Recipe cards waiting" when its only cards wait for the monthly limit)
+and `recipe_ingestion_rejected` ("Recipe cards not added", for inbox photos that couldn't be used). Match on
 `trigger.json.event_type` in each automation.
 
 Use the `Kitchen Voice` user's token ([section 1](#use-a-dedicated-kitchen-voice-user-for-the-token)): cards it uploads

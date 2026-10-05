@@ -207,9 +207,10 @@ docker cp mealie:/app/data/recipe-card-eval.json .
   [`DEPLOY.md`](DEPLOY.md)) and `OCR_ENABLED` left on. Without them the script stops before reading any card; leave
   out `--ocr` instead. Orientation needs Tesseract and `AI_INGEST_ORIENT` left on, as in production; without them
   cards are read as intake leaves them.
-- `docker exec` doesn't run the container's entry script, so the script reads the settings passed as `*_FILE`
-  variables itself (for example `POSTGRES_PASSWORD_FILE`), the same list the entry script reads. A variable already
-  set wins, so `docker exec -e` overrides a secret.
+- `docker exec` doesn't run the container's entry script, so the script reads the settings passed as `*_FILE` variables
+  itself (for example `POSTGRES_PASSWORD_FILE`), the same list the entry script reads. As in the entry script, a set
+  `*_FILE` wins over the plain variable; to override a secret, clear its file variable too:
+  `docker exec -e POSTGRES_PASSWORD_FILE= -e POSTGRES_PASSWORD=…`.
 
 ## Reading the results
 
