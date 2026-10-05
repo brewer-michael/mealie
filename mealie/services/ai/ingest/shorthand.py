@@ -7,7 +7,7 @@ Case matters (T is a tablespoon, t a teaspoon), and only the token right after t
 amount joined to it: "plus 2 T.") is touched, so "don't" and "t-bone" are left alone. `prepare_line` does everything a
 line needs before the parser reads it:
 
-- a mixed number written with a dash ("2-1/4") is written with a space (`join_mixed_numbers`);
+- a mixed number written with a dash or "and" ("2-1/4", "2 and 1/2") is written with a space (`join_mixed_numbers`);
 - size words ("heaping", "scant", "med", "lg", …) are taken out wherever they stand (`extract_size_words`): the
   parser would join them to the unit ("cup scant") or the food ("heaping flour");
 - a size written in full right after the quantity ("1 large can", "1 small (3 oz.) pkg."): the parser reads "1
@@ -17,7 +17,8 @@ line needs before the parser reads it:
   parser reads them as a second amount, a range, or the food);
 - the shorthand unit is written out (`normalize_shorthand`), and "doz.", "env." and "sq." as dozen, envelope and
   square (with their longer and plural spellings: "tbls.", "pkgs."), and so is a case-sensitive shorthand unit after
-  a second, joined amount ("1 c. plus 2 T. flour"), which the parser would read as the food "T. flour".
+  a second, joined amount ("1 c. plus 2 T. flour"), which the parser would read as the food "T. flour", or in a
+  measure in parentheses ("1 env. (1 T.) gelatin"), which it would read as an alternative of "1 tesla".
 
 What was taken out leads the parsed line's note. Use it only for English cards, or cards whose language is unknown.
 The eval and the cross-read import the shorthand table rather than keeping their own.
@@ -190,6 +191,12 @@ _JOINED_SHORTHAND = re.compile(
 Case-sensitive shorthand after a second amount joined to the line, before more words: "1 c. plus 2 T. flour",
 "1 c. + 2 T. sugar". The parser would read "T. flour" as the food.
 """
+_MEASURE_SHORTHAND = re.compile(rf"(?P<amount>\(\s*+{QTY}\s*)(?P<unit>{_SHORTHAND_UNITS})\.?(?=\s*\))")
+"""
+Case-sensitive shorthand in a measure in parentheses: "1 env. (1 T.) gelatin", "1/2 c. (8 T.) butter", "1 T. (3 t.)
+sugar". The parser would read "T." as tesla and "t." as a metric ton, an alternative of "1 tesla"; written out, it
+reads the measure as the line's equivalent, which the note keeps as the card writes it.
+"""
 _NAME_AFTER = re.compile(r"[ \t]+(?P<letter>[^\W\d_])")
 _WORD_AFTER_LEAD = re.compile(rf"^{_LEAD}(?P<word>[^\W\d_½⅓⅔¼¾⅛⅜⅝⅞]+)\b")
 """The word after the leading quantity (not the "½" of "1½": a fraction glyph is a word character to `re`)"""
@@ -200,17 +207,19 @@ _QUANTITY_PARTS = re.compile(
 )
 
 _MIXED_NUMBER = re.compile(
-    r"(?<![\d/.,])(?P<whole>\d+)(?P<dash>\s*[-–—]\s*)(?P<fraction>(?P<numerator>\d+)/(?P<denominator>\d+)|[½⅓⅔¼¾⅛⅜⅝⅞])"
-    r"(?![\d/])"
+    r"(?<![\d/.,])(?P<whole>\d+)(?P<dash>\s*[-–—]\s*|\s+(?i:and)\s+|\s*&\s*)"
+    r"(?P<fraction>(?P<numerator>\d+)/(?P<denominator>\d+)|[½⅓⅔¼¾⅛⅜⅝⅞])(?![\d/])"
 )
 
 
 def join_mixed_numbers(text: str, *, keep_length: bool = False) -> str:
     """
     `text` with each mixed number written with a dash ("2-1/4 c. flour", "1 - 1/2 c. milk", as printed recipes write
-    them) written with a space: the parser would keep only the fraction. A range never goes down to a proper fraction,
-    so "2-3/4" is a mixed number, and "3-5/4" is left alone. `keep_length` puts a space for each character of the dash,
-    so positions in `text` still hold.
+    them) or "and" ("2 and 1/2 c. flour", "1 & 1/2 c. sugar") written with a space: the parser would keep only the
+    fraction, or only the whole number, and each part would count as an amount it lost. A range never goes down to a
+    proper fraction, so "2-3/4" is a mixed number, and "3-5/4" is left alone; nor does a second amount join a proper
+    fraction to a whole number with nothing between ("1 t. salt and 1/2 t. pepper" has its unit and food between).
+    `keep_length` puts a space for each character of the dash or the word, so positions in `text` still hold.
     """
 
     def join(match: re.Match[str]) -> str:
@@ -376,6 +385,7 @@ def prepare_line(line: str) -> PreparedLine:
         shorthand = (written, unit_name(match.group("unit")))
     text = normalize_shorthand(text)[0]
     text = _JOINED_SHORTHAND.sub(lambda joined: joined.group("amount") + UNITS[joined.group("unit")], text)
+    text = _MEASURE_SHORTHAND.sub(lambda measure: measure.group("amount") + UNITS[measure.group("unit")], text)
 
     unit, quantity = None, None
     if (after := _WORD_AFTER_LEAD.match(text)) and after.group("word").lower() in DROPPED_UNITS:

@@ -329,10 +329,11 @@ async def test_mixed_numbers_names_and_second_ingredients_through_the_parser(uni
     named = ["1 c. 2% milk", "2 c. V8 juice", "1 c. 7-Up", "1/2 tsp. 5-spice powder", '1 9" pie shell, baked']
     named += ["1 lb. 80/20 ground beef"]
     kept = ["1 c. butter (or 1 c. margarine)", "1 pkg. yeast (or 2 1/4 tsp.)"]
+    # the note keeps the alternative in the line's own words, not the parser's ("or 1 cups milk + 1 tbsps vinegar")
     substituted = {
-        "2 c. flour (or 1 1/2 c. bread flour)": ("flour", "1 1/2"),
-        "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)": ("buttermilk", "1 tbsp"),
-        "1 stick butter or 1/2 c. oleo": ("butter", "1/2"),
+        "2 c. flour (or 1 1/2 c. bread flour)": ("flour", "or 1 1/2 c. bread flour"),
+        "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)": ("buttermilk", "or 1 c. milk + 1 T. vinegar"),
+        "1 stick butter or 1/2 c. oleo": ("butter", "or 1/2 c. oleo"),
     }
     merged = {"1 c. sugar, 1 c. flour": "1", "1 c. sugar, 1 c. brown sugar": "1"}
 
@@ -344,9 +345,9 @@ async def test_mixed_numbers_names_and_second_ingredients_through_the_parser(uni
     kept += list(substituted)
     assert {line: flags[line] for line in mixed + named + kept} == {line: [] for line in mixed + named + kept}
     read = {line.original_text: line for line in parsed}
-    for line, (food, amount) in substituted.items():
+    for line, (food, note) in substituted.items():
         assert read[line].food is not None and read[line].food.name == food
-        assert amount in read[line].note
+        assert read[line].note == note
     starts = [12, 12]  # the second ingredient's amount, not the first one's
     assert {line: flags[line] for line in merged} == {
         line: [(CardFlagKind.check_parse, {"value": value, "start": start, "end": start + len(value)})]
@@ -699,7 +700,9 @@ async def test_a_written_out_unit_links_the_groups_unit_named_in_the_plural(uniq
 async def test_a_second_amounts_shorthand_isnt_read_as_the_food(unique_user_fn_scoped: TestUser):
     """
     "1 c. plus 2 T. flour" was the food "T. flour" (which commit would create) and the note "plus, plus 2 T.": its
-    shorthand is written out too. The line still asks for a look, and the note keeps the second amount once.
+    shorthand is written out too. The note keeps the second amount once, in the line's words ("plus 2 T.", never the
+    parser's "(2 tbsps)", which reads as the same amount in another measure): two amounts of one food, which the fields
+    can't hold, read right so. Only what the parser isn't sure of, or lost, asks for a look.
     """
     user = unique_user_fn_scoped
     seed_foods_and_units(user)
@@ -715,10 +718,16 @@ async def test_a_second_amounts_shorthand_isnt_read_as_the_food(unique_user_fn_s
 
     assert [line.food and line.food.name for line in parsed] == ["flour", "sugar", "milk", "sugar", "egg"]
     notes = [line.note for line in parsed]
-    assert [note.count("2") for note in notes[:2]] == [1, 1] and "1" in notes[2]
-    assert notes[3:] == ["plus 2 T.", "lg., or 2"]  # the joiner once, and the size once
+    # the joiner once, and the size once
+    assert notes == ["plus 2 T.", "+ 2 T.", "plus 1 T.", "plus 2 T.", "lg., or 2"]
     flags = _highlighted(parsed)
-    assert all(CardFlagKind.check_parse in [kind for kind, _ in flags[line]] for line in lines)
+    assert {line: [params for _, params in flags[line]] for line in lines} == {
+        "1 c. plus 2 T. flour": [{"confidence": 75}],
+        "1 c. + 2 T. sugar": [{"confidence": 75}],
+        "1/2 c. plus 1 T. milk": [{"confidence": 75}],
+        "1 c. sugar plus 2 T.": [],
+        "3 eggs or 2 lg.": [{"confidence": 85, "value": "2", "start": 10, "end": 11}],
+    }
 
 
 @pytest.mark.asyncio
@@ -734,3 +743,276 @@ async def test_a_size_word_that_starts_a_name_stays_in_it(unique_user_fn_scoped:
     flags = _highlighted([soda, can, onion])
     assert [kind for kind, _ in flags["1 c. Big Red soda"]] == [CardFlagKind.check_parse]
     assert flags["1 big onion"] == []
+
+
+def _seed_en_us(user: TestUser) -> None:
+    """Mealie's own en-US units and foods, as a group that seeded them has: "can", "stick", "envelope" linked"""
+    IngredientUnitsSeeder(user.repos).seed("en-US")
+    IngredientFoodsSeeder(user.repos).seed("en-US")
+
+
+MEASURE_SHORTHAND = {
+    "1 env. (1 T.) gelatin": "(1 T.)",
+    "1 env. (1 T.) unflavored gelatin": "(1 T.)",
+    "1 pkg. (1 T.) dry yeast": "(1 T.)",
+    "1/2 c. (8 T.) butter": "(8 T.)",
+    "1 stick (8 T.) butter": "(8 T.)",
+    "1/4 c. (4 T.) butter": "(4 T.)",
+    "1 T. (3 t.) sugar": "(3 t.)",
+    "1 pkg. (1 t.) yeast": "(1 t.)",
+    "1 pkg. (2 1/4 t.) yeast": "(2 1/4 t.)",
+    "1 env. (1 Tbsp.) gelatin": "(1 Tbsp.)",
+}
+"""
+Card shorthand in a measure in parentheses, which the parser read as tesla ("T.") or a metric ton ("t."), split off as
+an alternative of "1 tesla": the note said "or 1 tesla" and lost the card's "(1 T.)"
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", ["minimal", "en-US"])
+async def test_shorthand_in_a_measure_in_parentheses_is_the_cards_equivalent(
+    unique_user_fn_scoped: TestUser, seed: str
+):
+    """
+    The note keeps the card's measure as written, never a name the line doesn't hold ("or 1 tesla", "or 3
+    metric_ton"), and the line reads clean: the measure is the same amount, right after the unit
+    """
+    user = unique_user_fn_scoped
+    _seed_en_us(user) if seed == "en-US" else seed_foods_and_units(user)
+
+    parsed, linked = await _normalize_and_link(user, list(MEASURE_SHORTHAND))
+
+    assert {line.original_text: line.note for line in parsed} == MEASURE_SHORTHAND
+    assert not any(split_off(line) for line in parsed)
+    assert not any(word in line.display for line in parsed for word in ("tesla", "metric"))
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in MEASURE_SHORTHAND if line != "1 env. (1 T.) gelatin"} == {
+        line: [] for line in MEASURE_SHORTHAND if line != "1 env. (1 T.) gelatin"
+    }
+    # the parser is unsure of this one alone (80): never because of an alternative
+    assert flags["1 env. (1 T.) gelatin"] in ([], [(CardFlagKind.check_parse, {"confidence": 80})])
+
+
+@pytest.mark.asyncio
+async def test_composite_amounts_keep_the_lines_joiner_and_read_right(unique_user_fn_scoped: TestUser):
+    """
+    "1 c. + 2 T. sugar, divided" became "1 cup sugar (2 tbsps) divided": the "+" lost, the second amount read as the
+    same amount in another measure. The note keeps the line's words; the fields hold one quantity, so two amounts of
+    one food read right that way and aren't checked
+    """
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    composite = {
+        "1 c. + 2 T. sugar, divided": "+ 2 T., divided",
+        "1 c. plus 2 T. flour, sifted": "plus 2 T., sifted",
+        "2 c. + 2 T. flour, sifted": "+ 2 T., sifted",
+        "2 c. plus 2 T. flour (sifted)": "plus 2 T., sifted",
+        "1 c. + 2 T. butter, softened": "+ 2 T., softened",
+        "1 c. + 2 T. brown sugar, packed": "+ 2 T., packed",
+        "3 T. + 1 t. sugar, divided": "+ 1 t., divided",
+        "1 cup plus 2 tablespoons sugar, divided": "plus 2 tablespoons, divided",
+    }
+
+    parsed, linked = await _normalize_and_link(user, list(composite))
+
+    assert {line.original_text: line.note for line in parsed} == composite
+    assert all(line.note in line.display for line in parsed)
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in composite} == {line: [] for line in composite}
+
+
+@pytest.mark.asyncio
+async def test_the_parsers_renderings_are_written_as_the_line_writes_them(unique_user_fn_scoped: TestUser):
+    """
+    An alternative with its own amount, which the parser keeps whole in its note, read "or 1 tbsps oil" and "or 1 sticks
+    oleo": the note says it as the card does, and an amount the parser kept itself is never taken for one it lost
+    (the line written out in full, or a measure after a comma). A second ingredient is still checked, and so is an
+    alternative the parser split off (it dropped "4 tablespoon flour"), which the note keeps as the line writes it.
+    """
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    clean = {
+        "1 T. butter or 1 T. oil": "or 1 T. oil",
+        "1/2 c. butter or 1 stick oleo": "or 1 stick oleo",
+        "1 c. sugar or 3/4 c. honey": "or 3/4 c. honey",
+        "1 pkg. yeast or 2 1/4 t. yeast": "or 2 1/4 t. yeast",
+        "1 cup sugar or 3/4 cups honey": "or 3/4 cups honey",
+        "1 can tomatoes, 16 oz.": "16 oz.",
+    }
+    checked = {
+        "1 tsp. baking soda and 1 tsp. salt": ("and 1 tsp. salt", "1"),
+        "1 c. coconut and 1 c. nuts": ("and 1 c. nuts", "1"),
+        "2 tablespoons cornstarch or 4 tablespoons flour": ("or 4 tablespoons flour", "4"),
+    }
+
+    parsed, linked = await _normalize_and_link(user, [*clean, *checked])
+
+    notes = {line.original_text: line.note for line in parsed}
+    assert {line: notes[line] for line in clean} == clean
+    assert {line: notes[line] for line in checked} == {line: note for line, (note, _) in checked.items()}
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in clean} == {line: [] for line in clean}
+    assert {line: [params.get("value") for _, params in flags[line]] for line in checked} == {
+        line: [value] for line, (_, value) in checked.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_equivalent_measure_after_a_plural_unit_or_the_food_needs_no_tap(unique_user_fn_scoped: TestUser):
+    """
+    "2 cans (10 3/4 oz.) soup" compared the line's "cans" with the group's "can", and a measure after the food ("1/2 c.
+    butter (1 stick)") was always checked: both are the same amount in another measure, which the note keeps as written.
+    A joiner, a hedge, the line's own unit or an amount that can't be the same still ask for a look.
+    """
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    equivalent = {
+        "2 cans (10 3/4 oz.) cream of mushroom soup": "(10 3/4 oz.)",
+        "2 cans (15 oz.) black beans": "(15 oz.)",
+        "1 can (10 3/4 oz.) cream of mushroom soup": "(10 3/4 oz.)",
+        "1/2 c. butter (1 stick)": "(1 stick)",
+        "1/2 c. butter (1 stick), softened": "softened, (1 stick)",
+        "1 stick margarine (1/2 c.)": "(1/2 c.)",
+        "1 c. butter (2 sticks)": "(2 sticks)",
+        "3/4 c. butter (1 1/2 sticks)": "(1 1/2 sticks)",
+        "1/2 c. oleo (1 stick)": "(1 stick)",
+        "1 lb. butter (4 sticks)": "(4 sticks)",
+        "2 c. sugar (1 lb.)": "(1 lb.)",
+        "1 pkg. Jello (3 oz.)": "(3 oz.)",
+        "1 c. sour cream (8 oz.)": "(8 oz.)",
+    }
+    checked = {
+        "1 stick butter or oleo (1/2 c.)": "1/2",
+        "1 lb. powdered sugar (about 4 c.)": "4",
+        "1 c. sugar (2 T.)": "2",
+    }
+
+    parsed, linked = await _normalize_and_link(user, [*equivalent, *checked])
+
+    notes = {line.original_text: line.note for line in parsed}
+    assert {line: notes[line] for line in equivalent} == equivalent
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in equivalent} == {line: [] for line in equivalent}
+    assert {line: [params.get("value") for _, params in flags[line]] for line in checked} == {
+        line: [value] for line, value in checked.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_number_written_with_and_is_one_amount(unique_user_fn_scoped: TestUser):
+    """
+    "2 and 1/2 c. flour" was read right (2.5 cups) and still got the note "2, and 1/2 c." and a check: both parts
+    counted as lost. "2 & 1/2" the parser read as 2 with no unit.
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    lines = ["2 and 1/2 c. flour", "2 & 1/2 c. flour", "1 and 1/4 t. salt", "3 and 1/2 c. flour, sifted"]
+
+    parsed, linked = await _normalize_and_link(user, [*lines, "1 t. salt and 1/2 t. pepper"])
+
+    assert [(line.quantity, line.unit and line.unit.name, line.note) for line in parsed[: len(lines)]] == [
+        (2.5, "cup", ""),
+        (2.5, "cup", ""),
+        (1.25, "teaspoon", ""),
+        (3.5, "cup", "sifted"),
+    ]
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in lines} == {line: [] for line in lines}
+    # a second ingredient's amount after "and" is no fraction of the first
+    assert [params.get("value") for _, params in flags["1 t. salt and 1/2 t. pepper"]] == ["1/2"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_food_behind_a_package_size_keeps_its_unit(unique_user_fn_scoped: TestUser):
+    """ "and 1 (8 oz.) pkg. cream cheese" was kept as "and 1, cream cheese, (8 oz.)": its "pkg." lost, parts apart"""
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    lines = {
+        "1 c. milk and 1 (8 oz.) pkg. cream cheese": ("and 1 (8 oz.) pkg. cream cheese", "cream cheese"),
+        "1 c. butter or 1 (8 oz.) pkg. margarine": ("or 1 (8 oz.) pkg. margarine", "margarine"),
+    }
+
+    parsed, linked = await _normalize_and_link(user, list(lines))
+
+    assert {line.original_text: line.note for line in parsed} == {line: note for line, (note, _) in lines.items()}
+    flags = _highlighted(parsed, linked)
+    for line, (_, alternative) in lines.items():
+        (params,) = [params for kind, params in flags[line] if kind == CardFlagKind.check_parse]
+        assert params["alternative"] == alternative
+        assert line[params["start"] : params["end"]] == alternative
+
+
+@pytest.mark.asyncio
+async def test_a_number_a_word_describes_is_no_second_ingredient(unique_user_fn_scoped: TestUser):
+    """A temperature, size, count, share or age after a comma was read as a second ingredient's amount and checked"""
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    lines = {
+        "1/4 c. warm water, 110 degrees": "110 degrees",
+        "1 c. warm water, 105 to 115 degrees": "105-115 degrees",
+        "3 lb. roast, 2 inches thick": "2 inches thick",
+        "2 c. rice, 1 day old": "1 day old",
+        "1 lb. shrimp, 21 to 25 count": "21 to 25 count",
+        "1 c. milk, 2 percent": "2 percent",
+    }
+
+    parsed, linked = await _normalize_and_link(user, [*lines, "1 T. butter, 1 T. sugar"])
+
+    assert {line.original_text: line.note for line in parsed[: len(lines)]} == lines
+    flags = _highlighted(parsed, linked)
+    assert {line: flags[line] for line in lines} == {line: [] for line in lines}
+    assert [params.get("value") for _, params in flags["1 T. butter, 1 T. sugar"]] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_an_oven_temperature_or_a_pan_is_no_ingredient(unique_user_fn_scoped: TestUser):
+    """
+    "350 degrees" was read as 350 of the food "degrees", "Bake at 350°" as the food "Bake at 350°": clean, so "Add all
+    clean cards" created those foods. They're checked now; a warm liquid's temperature isn't.
+    """
+    user = unique_user_fn_scoped
+    _seed_en_us(user)
+    temperatures = {"350 degrees": (0, 11), "Bake at 350°": (8, 12)}
+    pans = {"9x13 pan": (5, 8), "8 inch square pan": (14, 17), "2 loaf pans": (7, 11)}
+    liquids = ["1 c. warm water (110°)", "1/4 c. warm water (110 degrees)", "1/2 c. warm milk, 110°"]
+
+    parsed, linked = await _normalize_and_link(user, [*temperatures, *pans, *liquids])
+
+    flags = _highlighted(parsed, linked)
+    for kind, lines in (("temperature", temperatures), ("pan", pans)):
+        for line, (start, end) in lines.items():
+            (params,) = [params for flag, params in flags[line] if flag == CardFlagKind.check_parse]
+            assert (params["not_ingredient"], params["start"], params["end"]) == (kind, start, end), line
+    assert {line: flags[line] for line in liquids} == {line: [] for line in liquids}
+
+
+LONG_NOTE = (
+    ", warmed gently in a small saucepan over low heat until it is just steaming but not boiling, stirring all the"
+    " while with a wooden spoon so that a skin does not form on top, then set aside off the heat to cool for a few"
+    " minutes while you get the rest of the ingredients ready; Grandma always said to use whole milk from the dairy"
+    " down the road rather than the store kind, and to never let it scorch on the bottom of the pan or the whole cake"
+    " will taste burnt and you will have to start over again from the very beginning"
+)
+
+
+@pytest.mark.asyncio
+async def test_a_line_over_the_bound_keeps_what_its_fields_lose_and_is_checked(unique_user_fn_scoped: TestUser):
+    """
+    A card's side note read into an ingredient line: parsing lost "to 3" and "or 3" from lines over 500 characters,
+    and nothing was checked. The note keeps them; a save doesn't search such a line for them, so it's checked.
+    """
+    user = unique_user_fn_scoped
+    seed_foods_and_units(user)
+    lines = {"2-3 c. milk" + LONG_NOTE: "to 3", "2 or 3 eggs" + LONG_NOTE: "or 3 eggs"}
+    assert all(len(line) > 500 for line in lines)
+
+    parsed, linked = await _normalize_and_link(user, list(lines))
+
+    assert all(line.note.endswith(f", {kept}") for line, kept in zip(parsed, lines.values(), strict=True))
+    assert all(kept in line.display for line, kept in zip(parsed, lines.values(), strict=True))
+    flags = _highlighted(parsed, linked)
+    assert all(
+        [params.get("too_long") for kind, params in flags[line] if kind == CardFlagKind.check_parse] == [True]
+        for line in lines
+    )

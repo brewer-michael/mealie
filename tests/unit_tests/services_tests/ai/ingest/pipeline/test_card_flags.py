@@ -1,11 +1,14 @@
 """`compute_flags` (docs/ai/PHASE2.md §4.6): every kind, stable ids, resolutions, edits and the reading flags on save"""
 
 import hashlib
+import io
 import json
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
+from PIL import Image, ImageDraw, ImageFont
 
 from mealie.schema.recipe_ingest import (
     CardDraft,
@@ -21,13 +24,17 @@ from mealie.schema.recipe_ingest import (
     ExtractionUnsure,
     FlagResolution,
     IngestReadPath,
+    OCRLine,
     PageOCR,
 )
+from mealie.services import ocr
 from mealie.services.ai.ingest.flag_rules import count_unresolved, is_clean
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.pipeline.flags import (
     MAX_ANALYSED_LINE,
     ORGANIZERS_STEP,
+    ParseMarks,
+    as_the_line_writes,
     compute_flags,
     flag_id,
     ingredient_hash,
@@ -36,8 +43,12 @@ from mealie.services.ai.ingest.pipeline.flags import (
     keep_alternatives,
     keep_lost_amounts,
     ocr_check_lines,
+    parse_marks,
+    split_off,
 )
+from mealie.services.ai.ingest.pipeline.ocrcheck import ocr_line_reader
 from mealie.services.recipe.import_workflow.steps import ResolveOrganizersStep
+from tests.unit_tests.services_tests.ai.ingest.pipeline.card_fakes import make_pages
 
 
 def ingredient(
@@ -561,6 +572,15 @@ def test_an_amount_the_parsed_fields_lost_is_flagged(line: CardDraftIngredient, 
         # "and" in a food's name, and a share that isn't an amount (the parser's own note looked like a kept amount)
         ingredient("1 c. half and half", quantity=1, unit="cup", food="half and half"),
         ingredient("1 lb. ground beef, 80% lean", quantity=1, unit="pound", food="ground beef", note="80% lean"),
+        # a number a word after it describes: a temperature, a size, a count, an age, a share
+        ingredient("1/4 c. warm water, 110 degrees", quantity=0.25, unit="cup", food="warm water", note="110 degrees"),
+        ingredient("3 lb. roast, 2 inches thick", quantity=3, unit="pound", food="roast", note="2 inches thick"),
+        ingredient("2 c. rice, 1 day old", quantity=2, unit="cup", food="rice", note="1 day old"),
+        ingredient("1 lb. shrimp, 21 to 25 count", quantity=1, unit="pound", food="shrimp", note="21 to 25 count"),
+        ingredient("1 c. milk, 2 percent", quantity=1, unit="cup", food="milk", note="2 percent"),
+        ingredient(
+            "1 c. warm water, 105 to 115 degrees", quantity=1, unit="cup", food="warm water", note="105-115 degrees"
+        ),
     ],
 )
 def test_an_amount_the_parsed_fields_keep_is_not(line: CardDraftIngredient):
@@ -653,6 +673,13 @@ def test_what_the_note_keeps_of_a_lost_amount(
             "1",
             15,
         ),
+        # a comma joins it, and no word after its amount describes it
+        (
+            ingredient("1 T. butter, 1 T. sugar", quantity=1, unit="tablespoon", food="butter", note="1 T. sugar"),
+            "1",
+            13,
+        ),
+        (ingredient("1 c. flour, 1 t. salt", quantity=1, unit="cup", food="flour", note="1 t. salt"), "1", 12),
     ],
 )
 def test_a_second_ingredient_the_note_keeps_is_flagged(line: CardDraftIngredient, value: str, start: int):
@@ -707,6 +734,109 @@ def test_an_alternative_the_fields_hold_adds_nothing(line: str, names: list[list
     assert keep_alternatives(line, "x", names, fields) == ("x", False)
 
 
+@pytest.mark.parametrize(
+    ("line", "names", "fields"),
+    [
+        # a measure in parentheses the parser misread, "T." as tesla and "t." as a metric ton: only an amount
+        ("1 env. (1 T.) gelatin", [["1 tesla"]], ["gelatin", "envelope"]),
+        ("1 T. (3 t.) sugar", [["3 metric_ton"]], ["sugar", "tablespoon"]),
+        ("1 pkg. (2 1/4 t.) yeast", [["2 ¹/₄ metric_ton"]], ["yeast", "package"]),
+        # a substitute the parser named that the line doesn't, and no joiner's words it lacks
+        ("1 c. butter", [["margarine"]], ["butter", "cup"]),
+    ],
+)
+def test_a_name_the_line_doesnt_hold_is_never_added(line: str, names: list[list[str]], fields: list[str]):
+    """The note said "or 1 tesla" (and lost the card's "(1 T.)"): only the line's own words are ever added"""
+    assert keep_alternatives(line, "", names, fields) == ("", False)
+    note, lost = keep_lost_amounts(line, 1.0, fields[1], fields[0], "")
+    assert note == ("" if "(" not in line else line[line.index("(") : line.index(")") + 1])
+
+
+def test_a_second_food_behind_a_package_size_is_kept_whole():
+    """Its "pkg." and its size were lost from the note ("and 1, cream cheese, (8 oz.)")"""
+    line = "1 c. milk and 1 (8 oz.) pkg. cream cheese"
+    names = [["8 ounce pkg. cream cheese"]]
+    assert keep_alternatives(line, "and 1", names, ["milk", "cup", "and 1, (8 oz.)"]) == (
+        "and 1 (8 oz.) pkg. cream cheese",
+        True,
+    )
+    parsed = ingredient(line, quantity=1, unit="cup", food="milk", note="and 1 (8 oz.) pkg. cream cheese")
+    parsed.extracted_hash = ingredient_hash(parsed, split=True, appended=False)
+    flag = only(compute_flags(draft(ingredients=[parsed]), None, {}), CardFlagKind.check_parse)
+    assert flag.params == {"alternative": "cream cheese", "start": 29, "end": 41}
+
+
+def test_alternatives_are_kept_in_linear_time():
+    """
+    Each alternative was looked up from the line's start, and the fields' words rebuilt: 23 s for 3,200 alternatives on
+    a line pasted into the review page. Writing the parser's renderings as the line does reads it once too.
+    """
+    import gc
+    import time
+
+    names = [f"{a}{b}{c}" for a in "abcdefghij" for b in "abcdefghij" for c in "abcdefghijklmnop"]
+    line = "1 c. butter" + "".join(f" or 2 c. {name}" for name in names)
+    gc.collect()
+    started = time.perf_counter()
+    note, split = keep_alternatives(line, "", [[name] for name in names], ["butter", "cup"])
+    written = as_the_line_writes(line.replace(" or", ", or"), ", ".join(f"or 2 cups {name}" for name in names))
+    plus = as_the_line_writes("1 c." + " + 2 T." * len(names) + " flour", f"({', '.join(['2 tbsps'] * len(names))})")
+    elapsed = time.perf_counter() - started
+    assert split and note == ", ".join(f"or 2 c. {name}" for name in names)
+    assert written == ", ".join(f"or 2 c. {name}" for name in names) and plus == ", ".join(["+ 2 T."] * len(names))
+    assert elapsed < 1.0  # about 0.1 s; 1,600 took 6 s and 9 s
+
+
+@pytest.mark.parametrize(
+    ("line", "note", "written"),
+    [
+        # an alternative or a second food with its own amount: the parser's units, its plural after 1
+        ("1 T. butter or 1 T. oil", "or 1 tbsps oil", "or 1 T. oil"),
+        ("1/2 c. butter or 1 stick oleo", "or 1 sticks oleo", "or 1 stick oleo"),
+        ("1 T. butter or 1 T. oil, melted", "melted, or 1 tbsps oil", "melted, or 1 T. oil"),
+        ("1 tsp. baking soda and 1 tsp. salt", "and 1 tsps salt", "and 1 tsp. salt"),
+        (
+            "1 c. buttermilk (or 1 c. milk + 1 T. vinegar)",
+            "or 1 cups milk + 1 tbsps vinegar",
+            "or 1 c. milk + 1 T. vinegar",
+        ),
+        # the amounts after the first, which it puts in parentheses before the rest: read as the same amount
+        ("1 c. + 2 T. sugar, divided", "(2 tbsps) divided", "+ 2 T., divided"),
+        ("1 c. plus 2 T. flour", "(2 tbsps)", "plus 2 T."),
+        ("1 cup plus 2 tablespoons sugar", "(2 tablespoons)", "plus 2 tablespoons"),
+        ("1 c. (8 oz.) sour cream", "(8 oz)", "(8 oz.)"),
+        # anything else as the parser wrote it: no food after its amount, another amount, words the line hasn't
+        ("2 c. flour and 1 t. baking powder", "and 1 tsps", "and 1 tsps"),
+        ("1 c. sugar or 3/4 c. honey", "or 1/2 cups honey", "or 1/2 cups honey"),
+        ("1 c. sugar or 3/4 c. honey", "or 3/4 cups syrup", "or 3/4 cups syrup"),
+        ("1 c. sugar", "(2 tbsps) sifted", "(2 tbsps) sifted"),
+        ("1/2 c. butter, softened", "softened", "softened"),
+    ],
+)
+def test_the_parsers_renderings_are_written_as_the_line_writes_them(line: str, note: str, written: str):
+    assert as_the_line_writes(line, note) == written
+
+
+def test_only_amounts_parsing_appended_are_checked():
+    """
+    Whether parsing appended amounts the fields lost to the note is in the line's hash: an amount the parser kept in
+    its own note, reading just as an appended one would ("or 4 tablespoons flour", "16 oz."), was taken for a lost one
+    """
+    line, note = "2 tablespoons cornstarch or 4 tablespoons flour", "or 4 tablespoons flour"
+    parsed = ingredient(line, quantity=2, unit="tablespoon", food="cornstarch", note=note)
+    for appended, value in ((False, None), (True, "4"), (None, "4")):  # None: hashed before parsing said
+        parsed.extracted_hash = ingredient_hash(parsed, appended=appended)
+        assert parse_marks(parsed) == ParseMarks(split=False, appended=appended)
+        flags = compute_flags(draft(ingredients=[parsed]), None, {})
+        assert [flag.params.get("value") for flag in flags if flag.kind == CardFlagKind.check_parse] == (
+            [value] if value else []
+        )
+    parsed.extracted_hash = ingredient_hash(parsed, split=True, appended=False)
+    assert is_unedited(parsed) and split_off(parsed)
+    parsed.note = "edited"
+    assert parse_marks(parsed) is None and not split_off(parsed)
+
+
 def test_an_alternative_the_parser_split_off_is_checked():
     """
     The parser moved "margarine" out of "1/2 c. butter or margarine" (its substitutions, which nothing wrote): the note
@@ -747,6 +877,21 @@ MEASURES = [
     ("1 lb. (2 c.) butter", 1, "pound", "butter", "(2 c.)"),
     ("1 T. (1/2 oz.) gelatin", 1, "tbsp", "gelatin", "(1/2 oz.)"),
     ("1 large can (28 oz.) tomatoes", 1, "can", "tomatoes", "large, (28 oz.)"),
+    # a container's plural, the group's unit named in the singular
+    ("2 cans (10 3/4 oz.) cream of mushroom soup", 2, "can", "cream of mushroom soup", "(10 3/4 oz.)"),
+    ("2 jars (16 oz.) salsa", 2, "jar", "salsa", "(16 oz.)"),
+    ("2 sticks (1 c.) butter", 2, "stick", "butter", "(1 c.)"),
+    # after the food, ending the line or before a comment only
+    ("1/2 c. butter (1 stick)", 0.5, "cup", "butter", "(1 stick)"),
+    ("1/2 c. butter (1 stick), softened", 0.5, "cup", "butter", "softened, (1 stick)"),
+    ("1 stick margarine (1/2 c.)", 1, "stick", "margarine", "(1/2 c.)"),
+    ("3/4 c. butter (1 1/2 sticks)", 0.75, "cup", "butter", "(1 1/2 sticks)"),
+    ("1 lb. butter (4 sticks)", 1, "pound", "butter", "(4 sticks)"),
+    ("2 c. sugar (1 lb.)", 2, "cup", "sugar", "(1 lb.)"),
+    ("1 c. sugar (8 oz.)", 1, "cup", "sugar", "(8 oz.)"),
+    ("1 pkg. Jello (3 oz.)", 1, "package", "Jello", "(3 oz.)"),
+    ("1 c. sour cream (8 oz.)", 1, "cup", "sour cream", "(8 oz.)"),
+    ("1 can tomatoes, 16 oz.", 1, "can", "tomatoes", "16 oz."),
 ]
 
 
@@ -759,8 +904,8 @@ def test_a_measure_in_parentheses_after_the_unit_is_kept_and_not_checked(
     package size before the unit ("1 (8 oz.) pkg.", taken out before parsing), so one of the commonest printed card
     lines doesn't need a tap
     """
-    base = "large" if line.startswith("1 large") else ""  # what `prepare_line` took out leads the note
-    assert keep_lost_amounts(line, quantity, unit, food, base)[0] == note
+    base = "large" if line.startswith("1 large") else "softened" if line.endswith("softened") else ""
+    assert keep_lost_amounts(line, quantity, unit, food, base)[0] == note  # (`prepare_line`'s words lead the note)
 
     parsed = ingredient(line, quantity=quantity, unit=unit, food=food, note=note)
     assert CardFlagKind.check_parse not in kinds(
@@ -775,9 +920,14 @@ def test_a_measure_in_parentheses_after_the_unit_is_kept_and_not_checked(
         ("1 c. (or 2) eggs", 1, "cup", "egg", "(or 2)", "2"),
         ("1 can (8-10 oz.) beans", 1, "can", "beans", "(8-10 oz.)", "8-10"),
         ("2 c. (3 c.) flour", 2, "cup", "flour", "(3 c.)", "3"),
-        # not right after the unit, or after a unit the parser read otherwise
-        ("1 c. sugar (8 oz.)", 1, "cup", "sugar", "(8 oz.)", "8"),
+        ("2 cans (3 cans) beans", 2, "can", "beans", "(3 cans)", "3"),
+        # after a unit the parser read otherwise
         ("1 pkg. (8 oz.) cream cheese", 1, "ounce", "cream cheese", "(8 oz.)", "8"),
+        # after the food: not plausibly the same amount, a hedge, a joiner in the food, or more after it
+        ("1 c. sugar (2 tbsp.)", 1, "cup", "sugar", "(2 tbsp.)", "2"),
+        ("1 lb. powdered sugar (about 4 c.)", 1, "pound", "powdered sugar", "(about 4 c.)", "4"),
+        ("1 stick butter or oleo (1/2 c.)", 1, "stick", "butter", "(1/2 c.)", "1/2"),
+        ("1 c. sugar (8 oz.) firmly packed", 1, "cup", "sugar", "(8 oz.)", "8"),
     ],
 )
 def test_any_other_amount_in_parentheses_is_checked(
@@ -1391,6 +1541,133 @@ def test_the_digits_tesseract_confuses(mine: str, theirs: str, confused: bool):
     assert card_flags._misread_digits(mine, theirs) is confused
 
 
+@pytest.mark.parametrize(
+    ("drafted", "read", "again", "flagged"),
+    [
+        # the image reader's misread of a digit Tesseract confuses, which its second reading confirms
+        ("Bake at 350° for 80 minutes.", "Bake at 350° for 30 minutes.", "Bake at 350° for 30 minutes.", ("80", "30")),
+        ("Bake at 360°.", "Bake at 350°.", "Bake at 350°.", ("360", "350")),
+        ("8 eggs", "- 6 eggs", "- 6 eggs", ("8", "6")),
+        ("7 onion", "- 1 onion", "- 1C onion", ("7", "1")),  # a number run into the next word is still read
+        # Tesseract's own misread: read again, it says what the draft does
+        ("1 onion", "- 7 onion", "- 1 onion", None),
+        ("1 C. raisins", "- 71 C. raisins", "- 1C. raisins", None),
+        # no second reading, or one saying another number again, or as many numbers no more: as before, no flag
+        ("Bake at 350° for 80 minutes.", "Bake at 350° for 30 minutes.", None, None),
+        ("8 eggs", "- 6 eggs", "- 9 eggs", None),
+        ("8 eggs", "- 6 eggs", "- 6 eggs, 2 yolks", None),
+    ],
+)
+def test_a_digit_tesseract_confuses_is_read_again(
+    drafted: str, read: str, again: str | None, flagged: tuple[str, str] | None
+):
+    """
+    A number that differs from Tesseract's only by digits it confuses was never flagged, so the free check of a printed
+    card missed the image reader's own "80" for a printed "30". Its line is read again: the reading decides.
+    """
+    step = drafted.startswith("Bake")
+    card = draft(ingredients=[] if step else [ingredient(drafted)], steps=[CardDraftStep(text=drafted)] if step else [])
+    asked: list[int] = []
+
+    def reread(index: int) -> str | None:
+        asked.append(index)
+        return again
+
+    flags = compute_flags(card, ExtractionMeta(), {}, ocr_lines=["Pound Cake", read], ocr_reread=reread)
+
+    assert asked == [1]  # the line holding the number, read again only for a digit Tesseract confuses
+    found = [flag for flag in flags if flag.kind == CardFlagKind.read_disagreement]
+    assert [(flag.source, flag.params["value"], flag.params["read"]) for flag in found] == (
+        [(CardFlagSource.ocr, *flagged)] if flagged else []
+    )
+
+
+def test_a_steps_number_is_read_again_from_the_line_holding_it():
+    """A step Tesseract read over two lines: the second, which holds the "30", is read again"""
+    card = draft(steps=[CardDraftStep(text="Mix well, pour into the pan and bake 80 minutes.")])
+    lines = ["Pound Cake", "Mix well, pour into the pan", "and bake 30 minutes."]
+    asked: list[int] = []
+
+    def reread(index: int) -> str | None:
+        asked.append(index)
+        return {2: "and bake 30 minutes."}.get(index)
+
+    flag = only(
+        compute_flags(card, ExtractionMeta(), {}, ocr_lines=lines, ocr_reread=reread), CardFlagKind.read_disagreement
+    )
+    assert asked == [2] and (flag.params["value"], flag.params["read"]) == ("80", "30")
+    # a clearly different number needs no second reading
+    card.steps[0].text = card.steps[0].text.replace("80", "45")
+    asked.clear()
+    flag = only(
+        compute_flags(card, ExtractionMeta(), {}, ocr_lines=lines, ocr_reread=reread), CardFlagKind.read_disagreement
+    )
+    assert asked == [] and flag.params["read"] == "30"
+
+
+def test_the_ocr_checks_lines_are_read_again_from_their_boxes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """The OCR check's lines are the pages' lines in order: each is read again from its page, by its box, once"""
+    pages = make_pages(tmp_path, 2)
+    front = [OCRLine(text="Pound Cake", x=0.1, y=0.1, width=0.5, height=0.05)]
+    front.append(OCRLine(text="1 cup butter", x=0.1, y=0.3, width=0.5, height=0.05))
+    pages[0].meta.ocr = PageOCR(text="Pound Cake\n\n1 cup butter", confidence=90.0, lines=front)
+    pages[1].meta.ocr = PageOCR(text="Bake at 350° for 30 minutes.", confidence=90.0)  # read before boxes were kept
+    read: list[tuple[Path, float]] = []
+
+    def read_line(path: Path, x: float, y: float, width: float, height: float) -> str:
+        read.append((path, y))
+        return f"line at {y}"
+
+    monkeypatch.setattr(ocr, "read_line", read_line)
+    monkeypatch.setattr(ocr, "binary_available", lambda: True)
+    reader = ocr_line_reader(pages)
+    assert reader is not None
+    assert [reader(index) for index in (1, 1, 0, 2, 3)] == ["line at 0.3", "line at 0.3", "line at 0.1", None, None]
+    assert read == [(pages[0].page_path, 0.3), (pages[0].page_path, 0.1)]
+    assert ocr_check_lines([page.meta.ocr for page in pages], IngestReadPath.image, "Pound Cake") == [
+        "Pound Cake",
+        "1 cup butter",
+        "Bake at 350° for 30 minutes.",
+    ]
+
+    monkeypatch.setattr(ocr, "binary_available", lambda: False)
+    assert ocr_line_reader(pages) is None
+
+
+@pytest.mark.skipif(not ocr.binary_available(), reason="tesseract is not installed")
+def test_a_readers_misread_digit_on_a_printed_card_is_caught(tmp_path: Path):
+    """
+    The image reader's "7" for the card's printed "1", which Tesseract reads right: a digit it confuses, so it was never
+    flagged. Read again, the line says "1": flagged. The card as printed raises nothing.
+    """
+    lines = ["Pound Cake", "1 cup butter", "2 cups sugar", "4 eggs", "Bake at 350 for 30 minutes."]
+    image = Image.new("RGB", (1600, 900), "white")
+    draw = ImageDraw.Draw(image)
+    for index, text in enumerate(lines):
+        draw.text((80, 80 + index * 150), text, fill="black", font=ImageFont.load_default(size=72))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    (page,) = make_pages(tmp_path, data=buffer.getvalue())
+    result = ocr.extract_text(page.page_path, require_enabled=False)
+    found = [OCRLine(text=line.text, x=line.x, y=line.y, width=line.width, height=line.height) for line in result.lines]
+    page.meta.ocr = PageOCR(text=result.text, confidence=result.confidence, lines=found)
+    transcription = "\n".join(lines)
+    ocr_lines = ocr_check_lines([page.meta.ocr], IngestReadPath.image, transcription)
+    assert ocr_lines is not None and "1 cup butter" in ocr_lines
+
+    def flags_of(butter: str) -> list[CardFlag]:
+        card = draft(
+            name="Pound Cake",
+            ingredients=[ingredient(butter), ingredient("2 cups sugar"), ingredient("4 eggs")],
+            steps=[CardDraftStep(text=lines[-1])],
+        )
+        return compute_flags(card, ExtractionMeta(), {}, ocr_lines=ocr_lines, ocr_reread=ocr_line_reader([page]))
+
+    flag = only(flags_of("7 cup butter"), CardFlagKind.read_disagreement)
+    assert (flag.source, flag.params["value"], flag.params["read"]) == (CardFlagSource.ocr, "7", "1")
+    assert CardFlagKind.read_disagreement not in kinds(flags_of("1 cup butter"))
+
+
 def test_the_ocr_checks_flags_stay_while_they_hold_on_a_save():
     """A save has no Tesseract text: the flag stays while the number is still there, then goes"""
     card = draft(steps=[CardDraftStep(text=PRINTED_STEP)])
@@ -1502,10 +1779,72 @@ def test_lost_amounts_are_found_in_linear_time(line: str, monkeypatch: pytest.Mo
     assert elapsed < 1.0  # well under 0.1 s; it was 3 to 7 s
 
 
-def test_a_line_longer_than_any_cards_is_not_searched_for_lost_amounts():
-    """A line of a misread page: its text is kept, and the search for what its fields lost has a bound"""
-    line = "1 c. sugar" + " or 2" * MAX_ANALYSED_LINE
-    assert keep_lost_amounts(line, 1.0, "cup", "sugar", "melted") == ("melted", [])
-    parsed = ingredient(line, quantity=1, unit="cup", food="sugar", confidence=0.5)
+def test_a_line_longer_than_any_cards_keeps_what_its_fields_lost_and_is_checked():
+    """
+    A line of a misread page: parsing keeps what its fields lost in the note, like any line's (it lost the "to 3" of
+    lines over 500 characters). A save doesn't search such a line for which of the note's parts parsing kept, so while
+    it's as parsed with amounts kept, it's checked; one parsing kept nothing for is judged by its fields
+    """
+    line = "2-3 c. milk, " + "warmed gently " * 40
+    assert len(line) > MAX_ANALYSED_LINE
+    note, lost = keep_lost_amounts(line, 2.0, "cup", "milk", line[13:].strip())
+    assert note.endswith(", to 3") and [amount.value for amount in lost] == ["2-3"]
+
+    parsed = ingredient(line, quantity=2, unit="cup", food="milk", note=note)
+    for appended, params in ((True, {"too_long": True}), (None, {"too_long": True}), (False, None)):
+        parsed.extracted_hash = ingredient_hash(parsed, appended=appended)
+        flags = compute_flags(draft(ingredients=[parsed]), None, {})
+        assert [flag.params for flag in flags if flag.kind == CardFlagKind.check_parse] == ([params] if params else [])
+    # what the fields still lack is found whatever the line's length
+    parsed.note = line[13:].strip()
+    parsed.extracted_hash = ingredient_hash(parsed, appended=True)
     flag = only(compute_flags(draft(ingredients=[parsed]), None, {}), CardFlagKind.check_parse)
-    assert flag.params == {"confidence": 50}
+    assert flag.params == {"value": "2-3", "start": 0, "end": 3}
+
+
+@pytest.mark.parametrize(
+    ("line", "quantity", "unit", "food", "kind", "span"),
+    [
+        # an oven temperature read as the amount, or as a food with no amount
+        ("350 degrees", 350, None, "degrees", "temperature", (0, 11)),
+        ("Bake at 350°", None, None, "Bake at 350°", "temperature", (8, 12)),
+        ("350°", None, None, "350°", "temperature", (0, 4)),
+        ("Oven 350", 350, None, "Oven", "temperature", (5, 8)),
+        ("Preheat oven to 375 degrees F", 375, None, "Preheat oven", "temperature", (16, 29)),
+        # a pan, its size only
+        ("9x13 pan", 9, None, "pan", "pan", (5, 8)),
+        ("1 9x13 pan, greased", 1, None, "pan", "pan", (7, 10)),
+        ('8" square pan', 8, "quart", "pan", "pan", (10, 13)),
+        ("8 inch square pan", None, None, "pan", "pan", (14, 17)),
+        ("2 loaf pans", 2, None, "loaf pans", "pan", (7, 11)),
+    ],
+)
+def test_an_oven_temperature_or_a_pan_read_as_an_ingredient_is_checked(
+    line: str, quantity: float | None, unit: str | None, food: str, kind: str, span: tuple[int, int]
+):
+    """Commit would add "degrees", "Bake at 350°" or "pan" to the group's foods: the card wasn't clean"""
+    parsed = ingredient(line, quantity=quantity, unit=unit, food=food, linked=False)
+    flag = only(compute_flags(draft(ingredients=[parsed]), None, {}), CardFlagKind.check_parse)
+    assert flag.params == {"not_ingredient": kind, "start": span[0], "end": span[1]}
+    assert line[span[0] : span[1]]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # a warm liquid's temperature is no oven's, and a pie shell's size no pan
+        ingredient("1 c. warm water (110°)", quantity=1, unit="cup", food="warm water", note="110°"),
+        ingredient("1/4 c. water at 110 degrees", quantity=0.25, unit="cup", food="water at 110 degrees"),
+        ingredient(
+            "1 pkg. yeast in 1/4 c. water (105-115 degrees)",
+            quantity=1,
+            unit="package",
+            food="yeast water",
+            note="in 1/4 c., 105-115 degrees",
+        ),
+        ingredient("1 9-inch pie shell", quantity=1, food="pie shell", note="9 inch"),
+        ingredient("1 c. butter, for the pan", quantity=1, unit="cup", food="butter", note="for the pan"),
+    ],
+)
+def test_an_ingredient_with_a_temperature_or_a_pan_is_one(line: CardDraftIngredient):
+    assert CardFlagKind.check_parse not in kinds(compute_flags(draft(ingredients=[line]), None, {}))

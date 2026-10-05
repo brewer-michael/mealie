@@ -44,6 +44,17 @@ nearly blank page reads as a few specks whichever way up, and any ratio over an 
 the sideways banana card's wrong readings score about 300, its right one over 8000 (docs/ai/PHASE2.md F7).
 """
 
+LINE_HEIGHT = 40
+"""
+Fork: the height in pixels a line is scaled to before `read_line` reads it again. A printed card's line is 80 to 100
+pixels high at the page's scale, where Tesseract reads an italic "1" as "7"; at this height it reads it right: on 54
+live printed card renders, every number this reading found was the card's (cropped to the digit alone and read for
+digits only, Tesseract got one in ten wrong).
+"""
+
+LINE_MARGIN = 0.4
+"""Fork: the margin `read_line` keeps around a line's box, in line heights (a box hugs its letters)"""
+
 OMP_THREAD_LIMIT = "1"
 """
 Threads each Tesseract process may use, unless the environment already sets `OMP_THREAD_LIMIT`.
@@ -190,7 +201,7 @@ def _parse_tsv(tsv: str) -> list[_Word]:
     return words
 
 
-def _read_words(image: Image.Image, work_dir: Path, deadline: float) -> list[_Word]:
+def _read_words(image: Image.Image, work_dir: Path, deadline: float, *, single_line: bool = False) -> list[_Word]:
     tesseract = _tesseract_path()
     if not tesseract:
         return []
@@ -198,7 +209,10 @@ def _read_words(image: Image.Image, work_dir: Path, deadline: float) -> list[_Wo
     image_path = work_dir / "image.png"
     image.save(image_path, dpi=(300, 300))
 
-    args = [tesseract, str(image_path), "stdout", "-l", get_app_settings().OCR_LANGUAGES, "tsv"]
+    args = [tesseract, str(image_path), "stdout", "-l", get_app_settings().OCR_LANGUAGES]
+    if single_line:
+        args += ["--psm", "7"]  # fork: `read_line`
+    args.append("tsv")
     timeout = deadline - time.monotonic()
     if timeout <= 0:
         raise subprocess.TimeoutExpired(args, 0)
@@ -340,3 +354,46 @@ def extract_text(path: Path, *, min_ratio: float = 1.0, require_enabled: bool = 
         rotation_scores=scores,
         lines=_to_lines(words, turned.size),
     )
+
+
+def read_line(path: Path, x: float, y: float, width: float, height: float) -> str | None:
+    """
+    Fork: one line of an image read again on its own, in Tesseract's single-line mode: its box (`x`, `y`, `width` and
+    `height` in fractions of the image's width and height, as `OCRLine` gives them) with a margin (`LINE_MARGIN`),
+    scaled so the line is `LINE_HEIGHT` pixels high. A second reading of a number the page's reading may have got
+    wrong. None when Tesseract isn't installed, the box holds nothing, or the read fails or times out (`OCR_TIMEOUT`).
+    Blocking: run it off the event loop.
+    """
+    if not binary_available() or width <= 0 or height <= 0:
+        return None
+
+    deadline = time.monotonic() + get_app_settings().OCR_TIMEOUT
+    try:
+        image = _prepare(path)
+        margin = height * image.height * LINE_MARGIN
+        box = (
+            max(0, round(x * image.width - margin)),
+            max(0, round(y * image.height - margin)),
+            min(image.width, round((x + width) * image.width + margin)),
+            min(image.height, round((y + height) * image.height + margin)),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        line = image.crop(box)
+        scale = LINE_HEIGHT / max(height * image.height, 1.0)
+        line = line.resize(
+            (max(1, round(line.width * scale)), max(1, round(line.height * scale))), Image.Resampling.LANCZOS
+        )
+        with tempfile.TemporaryDirectory(prefix="mealie-ocr-") as work_dir:
+            words = _read_words(line, Path(work_dir), deadline, single_line=True)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"OCR timed out reading a line of {path.name} again")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Tesseract failed to read a line of {path.name} again: {(e.stderr or '').strip()}")
+        return None
+    except Exception:
+        logger.exception(f"Failed to read a line of {path.name} again with OCR")
+        return None
+
+    return " ".join(word.text for word in words) or None

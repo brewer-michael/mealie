@@ -266,6 +266,27 @@ def test_shorthand_after_a_joined_amount_is_written_out(line: str, text: str):
 
 
 @pytest.mark.parametrize(
+    "line, text",
+    [
+        # a measure in parentheses: the parser read "T." as tesla and "t." as a metric ton ("or 1 tesla")
+        ("1 env. (1 T.) gelatin", "1 envelope (1 tbsp) gelatin"),
+        ("1/2 c. (8 T.) butter", "1/2 cup (8 tbsp) butter"),
+        ("1 T. (3 t.) sugar", "1 tbsp (3 tsp) sugar"),
+        ("1 pkg. (2 1/4 t.) yeast", "1 package (2 1/4 tsp) yeast"),
+        ("1 stick (1/2 C.) butter", "1 stick (1/2 cup) butter"),
+        ("1 pkg. yeast ( 1 T. )", "1 package yeast ( 1 tbsp )"),
+        # anything else in parentheses, and case still matters
+        ("1 c. (1 stick plus 2 T.) butter", "1 cup (1 stick plus 2 T.) butter"),
+        ("1 c. sugar (2 T. more)", "1 cup sugar (2 T. more)"),
+        ("1 c. milk (Tabasco)", "1 cup milk (Tabasco)"),
+        ("1 can (8 oz.) tomatoes", "1 can (8 oz.) tomatoes"),
+    ],
+)
+def test_shorthand_in_a_measure_in_parentheses_is_written_out(line: str, text: str):
+    assert prepare_line(line).text == text
+
+
+@pytest.mark.parametrize(
     "line, unit",
     [("1 doz. eggs", "dozen"), ("1 dozen eggs", "dozen"), ("2 Dozen rolls", "dozen"), ("1 c. sugar", None)],
 )
@@ -329,6 +350,17 @@ def test_a_units_spellings():
         ("1-½ c. sugar", "1 ½ c. sugar"),
         ("1 can (10-3/4 oz.) soup", "1 can (10 3/4 oz.) soup"),
         ("Bake 1-1/2 hours", "Bake 1 1/2 hours"),
+        # or with "and": both parts counted as amounts the parser lost ("2, and 1/2 c."), or it kept only the 2
+        ("2 and 1/2 c. flour", "2 1/2 c. flour"),
+        ("1 AND 1/4 t. soda", "1 1/4 t. soda"),
+        ("2 & 1/2 c. flour", "2 1/2 c. flour"),
+        ("1&1/2 c. sugar", "1 1/2 c. sugar"),
+        ("3 and ½ c. flour", "3 ½ c. flour"),
+        # a second amount after "and" has its unit and food between, and a fraction that isn't proper is no part
+        ("1 t. salt and 1/2 t. pepper", "1 t. salt and 1/2 t. pepper"),
+        ("2 eggs and 1/2 c. milk", "2 eggs and 1/2 c. milk"),
+        ("3 and 5/4 c. water", "3 and 5/4 c. water"),
+        ("2 and 1/2", "2 1/2"),
         # ranges go up, so stay as they are
         ("1/2-3/4 c. sugar", "1/2-3/4 c. sugar"),
         ("2-3 lb. roast", "2-3 lb. roast"),
@@ -337,7 +369,7 @@ def test_a_units_spellings():
         ("1 1/2 c. flour", "1 1/2 c. flour"),
     ],
 )
-def test_a_mixed_number_written_with_a_dash_is_written_with_a_space(line: str, joined: str):
+def test_a_mixed_number_written_with_a_dash_or_and_is_written_with_a_space(line: str, joined: str):
     assert join_mixed_numbers(line) == joined
     kept = join_mixed_numbers(line, keep_length=True)
     assert len(kept) == len(line) and kept.split() == joined.split()

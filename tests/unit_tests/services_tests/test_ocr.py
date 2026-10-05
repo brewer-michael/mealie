@@ -223,3 +223,59 @@ def test_finds_which_way_up_a_handwritten_card_is(default_ocr_settings: None):
 
     assert result.rotation in (90, 270)
     assert result.text
+
+
+def _printed_card(path: Path, lines: list[str]) -> None:
+    image = Image.new("RGB", (1600, 160 + len(lines) * 130), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=72)
+    for index, line in enumerate(lines):
+        draw.text((80, 80 + index * 130), line, fill="black", font=font)
+    image.save(path)
+
+
+@requires_tesseract
+def test_a_line_is_read_again_on_its_own(default_ocr_settings: None, tmp_path: Path):
+    """Fork: one line, cropped by its box and scaled to `LINE_HEIGHT`, in Tesseract's single-line mode"""
+    path = tmp_path / "card.png"
+    _printed_card(path, ["Pound Cake", "1 cup butter", "2 cups sugar", "Bake at 350 for 30 minutes."])
+    result = ocr.extract_text(path)
+    boxes = {line.text.lower(): line for line in result.lines}
+    assert "1 cup butter" in boxes
+
+    calls: list[list[str]] = []
+    run = subprocess.run
+
+    def record(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        calls.append(args)
+        return run(args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(tesseract_module.subprocess, "run", record)
+        line = boxes["1 cup butter"]
+        assert ocr.read_line(path, line.x, line.y, line.width, line.height) == "1 cup butter"
+    assert len(calls) == 1 and calls[0][calls[0].index("--psm") + 1] == "7"
+    assert ocr.read_line(path, line.x, line.y, 0.0, line.height) is None  # an empty box
+
+
+def test_a_line_is_read_again_only_with_tesseract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    path = tmp_path / "card.png"
+    Image.new("RGB", (400, 200), "white").save(path)
+    monkeypatch.setattr(tesseract_module, "_tesseract_path", lambda: None)
+    assert ocr.read_line(path, 0.1, 0.1, 0.5, 0.1) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.CalledProcessError(1, "tesseract", stderr="boom"), subprocess.TimeoutExpired("tesseract", 60)],
+)
+def test_a_line_that_fails_to_read_again_is_none(
+    fake_tesseract: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+):
+    def fail(*_, **__):
+        raise error
+
+    monkeypatch.setattr(tesseract_module.subprocess, "run", fail)
+    path = tmp_path / "card.png"
+    Image.new("RGB", (400, 200), "white").save(path)
+    assert ocr.read_line(path, 0.1, 0.1, 0.5, 0.1) is None

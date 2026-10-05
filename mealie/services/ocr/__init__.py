@@ -1,4 +1,4 @@
-from .tesseract import OCRLine, OCRResult, binary_available, extract_text, is_available
+from .tesseract import OCRLine, OCRResult, binary_available, extract_text, is_available, read_line
 
 __all__ = [
     "OCRLine",
@@ -6,4 +6,5 @@ __all__ = [
     "binary_available",
     "extract_text",
     "is_available",
+    "read_line",
 ]

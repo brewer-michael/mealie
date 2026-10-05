@@ -228,6 +228,87 @@ def test_a_marker_line_without_its_neighbours_is_placed_by_its_own_line():
     assert hint.y == pytest.approx((7 + 0.5) / 11 - 0.06, abs=1e-4)
 
 
+PECAN_PIE_BACK = [
+    line("Directions", 0.065, 0.04),
+    line("1. Beat eggs, sugar, syrup, butter and — |", 0.123, 0.04),
+    line("vanilla.", 0.173, 0.03),
+]
+"""The same card's back: "3 eggs" is in its first step"""
+
+
+def test_a_short_line_whose_neighbour_tesseract_didnt_read_is_beside_the_other():
+    """
+    Tesseract read neither "3 eggs" nor the "Ingredients" heading above it: the re-read started on the back's "1. Beat
+    eggs, sugar, ..." (`partial_ratio` finds "3 eggs" in it). It's just above "1 C. sugar", the line after it.
+    """
+    pages = [page(lines=PECAN_PIE_LINES), page(1, lines=PECAN_PIE_BACK)]
+
+    hint = region_hint(pages, PECAN_PIE, "3 eggs")
+
+    assert hint is not None and (hint.page, hint.source) == (0, RegionHintSource.ocr)
+    assert 0.066 < hint.y + hint.height / 2 < 0.189  # below the title, just above "1 C. sugar"
+    # a line it read itself is found as a whole, on its own page
+    read = [*PECAN_PIE_LINES[:1], line("- 3 eggs", 0.15, 0.03), *PECAN_PIE_LINES[1:]]
+    hint = region_hint([page(lines=read), page(1, lines=PECAN_PIE_BACK)], PECAN_PIE, "3 eggs")
+    assert hint is not None and (hint.page, hint.y) == (0, pytest.approx(0.135, abs=1e-4))
+
+
+def test_a_neighbour_is_matched_as_a_whole():
+    """
+    "1 cup buttermilk" is inside "Buttermilk Pancakes": when Tesseract read neither it nor "2 eggs", the title isn't
+    taken for the line before "2 eggs" (the hint was a band just below it); its line in the transcription places it
+    """
+    transcription = "# Buttermilk Pancakes\n- 1 c. flour\n- 1 cup buttermilk\n- 2 eggs"
+    lines = [line("Buttermilk Pancakes", 0.05, 0.06), line("- 1 c. flour", 0.2, 0.04)]
+
+    hint = region_hint([page(lines=lines)], transcription, "2 eggs")
+
+    assert hint is not None and hint.source == RegionHintSource.position
+    assert hint.y == pytest.approx(3.5 / 4 - 0.06, abs=1e-4)
+
+
+CAKE = """# Grandma's Cake
+- 2 cups flour
+- 1 cup sugar
+- 1 egg
+- 1 cup milk
+## Frosting
+- 2 cups powdered sugar
+- 1 egg
+- 1 tsp vanilla"""
+
+CAKE_LINES = [
+    line("Grandma's Cake", 0.05, 0.04),
+    line("2 cups flour", 0.12, 0.04),
+    line("1 cup sugar", 0.17, 0.04),
+    line("1 egg", 0.22, 0.04),
+    line("1 cup milk", 0.27, 0.04),
+    line("Frosting", 0.40, 0.04),
+    line("2 cups powdered sugar", 0.47, 0.04),
+    line("1 egg", 0.52, 0.04),
+    line("1 tsp vanilla", 0.57, 0.04),
+]
+
+
+@pytest.mark.parametrize(
+    ("lines", "transcription", "y"),
+    [
+        (CAKE_LINES, CAKE, (0.2, 0.5)),  # between its neighbours
+        ([line for line in CAKE_LINES if "sugar" not in line.text], CAKE, (0.2, 0.5)),  # as a whole line
+        ([line for line in CAKE_LINES if line.text != "1 egg"], CAKE, (0.19, 0.49)),  # in the gap there
+        ([], CAKE, (0.3289, 0.7733)),  # by its line in the transcription
+    ],
+)
+def test_a_short_line_the_card_says_twice_is_found_by_which_it_is(
+    lines: list[OCRLine], transcription: str, y: tuple[float, float]
+):
+    """The frosting's "1 egg" got the cake's place: the second line saying it is the second"""
+    pages = [page(lines=lines or None)]
+    hints = [region_hint(pages, transcription, "1 egg", occurrence) for occurrence in (0, 1)]
+    assert [hint.y if hint else None for hint in hints] == [pytest.approx(value, abs=1e-4) for value in y]
+    assert region_hint(pages, transcription, "1 egg", 5) == hints[1]  # past the last: the last
+
+
 @pytest.fixture()
 def tesseract_on(monkeypatch: pytest.MonkeyPatch):
     for key, value in {"OCR_ENABLED": "true", "OCR_LANGUAGES": "eng", "OCR_TIMEOUT": "60"}.items():

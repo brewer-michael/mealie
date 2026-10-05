@@ -69,6 +69,7 @@ from ..shorthand import (
     SIZE_WORDS,
     UNITS,
     prepare_line,
+    quantity_value,
     unit_spellings,
 )
 from .cardtext import (
@@ -222,13 +223,19 @@ so a line's are all read in linear time: the spaces between amounts used to be t
 to the end of the line for each "½" (seconds for a few thousand characters).
 """
 _LETTERS = re.compile(r"[^\W\d_]+")
-_ALTERNATIVE_JOINER = re.compile(r"[+&/]|\b(?:and|or|plus)\b", re.IGNORECASE)
+_ALTERNATIVE_JOINER = re.compile(r"[+&]|(?<!\d)/(?!\d)|\b(?:and|or|plus)\b", re.IGNORECASE)
+"""What joins an alternative or a second food to a line: a slash between words ("butter/margarine"), not a fraction's"""
+_MEASURE_AFTER_AMOUNT = re.compile(r"\s*+\([^()]{0,24}\)")
+"""A package's size in parentheses after an alternative's amount: the "(8 oz.)" of "and 1 (8 oz.) pkg. cream cheese" """
 _ALTERNATIVE_LEAD = re.compile(
-    rf"(?P<joiner>[+&/]|(?:and|or|plus)\b)\s*+\(?\s*+(?:{QTY}\s*+)?(?:[^\W\d_]+\.?\s*+){{0,2}}", re.IGNORECASE
+    rf"(?P<joiner>[+&/]|(?:and|or|plus)\b)\s*+\(?\s*+(?:{QTY}\s*+)?(?:\([^()]{{0,24}}\)\s*+)?"
+    r"(?:[^\W\d_]+\.?\s*+){0,2}",
+    re.IGNORECASE,
 )
 """
-What leads an alternative or a second food on a line, up to its name: the joiner, an amount and a unit or a word or two
-("or " of "butter or margarine", "and 1 t. " of "flour and 1 t. baking powder", "/" of "butter/margarine")
+What leads an alternative or a second food on a line, up to its name: the joiner, an amount (with a package size) and
+a unit or a word or two ("or " of "butter or margarine", "and 1 t. " of "flour and 1 t. baking powder", "and 1 (8 oz.)
+pkg. " of "milk and 1 (8 oz.) pkg. cream cheese", "/" of "butter/margarine")
 """
 _AMOUNT_AFTER_JOINER = re.compile(rf"\s*+\(?\s*+{QTY}")
 _ALTERNATIVE_START = re.compile(rf"^(?P<joiner>[+&/]|(?:and|or|plus)\b)\s*+\(?\s*+(?P<amount>{QTY})?", re.IGNORECASE)
@@ -238,11 +245,23 @@ _ALTERNATIVE_LOOKBACK = 48
 MAX_ANALYSED_LINE = 500
 """
 An ingredient line longer than this (a card's never is: a misread page, or text pasted into one line) isn't searched
-for amounts its fields lost, so a save's flags take bounded time whatever the draft holds; it keeps its text, and the
-parser's confidence still decides `check_parse`
+again on a save for the amounts parsing kept in its note: finding which of the note's parts they are reads the line
+once per part, so a save's flags take bounded time whatever the draft holds. Such a line still loses nothing at
+parse time (`keep_lost_amounts` reads any line in linear time), and while it's as parsed with amounts kept, it gets
+`check_parse` (`params.too_long`), so the reviewer looks at it.
 """
 _SECOND_FOOD_FILLER = frozenset({"of", "more", "each", "extra", "additional", "about"})
 """Words after a joined amount that name no food ("1 c. sugar plus 2 T. more"): the same ingredient again"""
+_DESCRIBING_WORDS = frozenset(
+    """degree degrees deg f inch inches in thick wide long high deep count ct percent pct day days old minute minutes
+    min mins hour hours hr hrs week weeks month months year years""".split()
+)
+"""
+Words that make a number after a comma a description, not a second ingredient's amount: a temperature, a size, a
+count, a share or an age ("1/4 c. warm water, 110 degrees", "3 lb. roast, 2 inches thick", "1 lb. shrimp, 21 to 25
+count", "2 c. rice, 1 day old", "1 c. milk, 2 percent")
+"""
+_RANGE_END = re.compile(rf"\s*+(?:[-–]|to\b)\s*+{QTY}", re.IGNORECASE)
 _WORD = re.compile(r"[^\W\d_]+\.?")
 _UNIT_NAMES = sorted(word for word in _UNIT_WORDS if len(word) >= 5)
 """Unit words written in full, which a card abbreviates in its own way ("tblsp." for "tablespoon")"""
@@ -314,9 +333,11 @@ def is_english(language: str | None) -> bool:
 # Ingredient lines
 
 
-def _hashed(fields: list, *, split: bool) -> str:
+def _hashed(fields: list, *, split: bool, appended: bool | None = None) -> str:
     if split:
         fields = [*fields, "split"]
+    if appended is not None:
+        fields = [*fields, "appended" if appended else "whole"]
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
@@ -329,27 +350,42 @@ def _hash_fields(ingredient: CardDraftIngredient) -> list:
     ]
 
 
-def ingredient_hash(ingredient: CardDraftIngredient, *, split: bool = False) -> str:
+def ingredient_hash(ingredient: CardDraftIngredient, *, split: bool = False, appended: bool | None = None) -> str:
     """
-    A hash of an ingredient's parsed fields, stored as `extracted_hash` when it's extracted. `split`: the parser split
-    an alternative or a second food off the line, which the note keeps (`keep_alternatives`); the hash says so, and
-    `check_parse` names it while the line is as parsed (`split_off`). The draft needs no field for it: once the line
-    is edited, its parse flags drop off anyway.
+    A hash of an ingredient's parsed fields, stored as `extracted_hash` when it's extracted, with what parsing did that
+    the fields can't say. `split`: the parser split an alternative or a second food off the line, which the note keeps
+    (`keep_alternatives`); `check_parse` names it while the line is as parsed (`split_off`). `appended`: whether
+    parsing appended amounts the fields lost to the note (`keep_lost_amounts`), so `check_parse` asks about those only,
+    never about an amount the parser kept in its own note ("1 can tomatoes, 16 oz.", "or 4 tablespoons flour"); None
+    when it isn't known (a line hashed before parsing recorded it), and the note is searched for them as it reads. The
+    draft needs no field for either: once the line is edited, its parse flags drop off anyway.
     """
-    return _hashed(_hash_fields(ingredient), split=split)
+    return _hashed(_hash_fields(ingredient), split=split, appended=appended)
 
 
-def _parse_split(ingredient: CardDraftIngredient) -> bool | None:
-    """Whether the parser split something off the line (`ingredient_hash`); None once its fields are edited"""
+@dataclass(frozen=True)
+class ParseMarks:
+    """What parsing did to a line that its fields can't say (`ingredient_hash`), while the line is as parsed"""
+
+    split: bool = False
+    appended: bool | None = None
+
+
+def parse_marks(ingredient: CardDraftIngredient) -> ParseMarks | None:
+    """What parsing did to the line (`ingredient_hash`); None once its fields are edited"""
     if not ingredient.extracted_hash:
         return None
     fields = _hash_fields(ingredient)
-    return next((split for split in (False, True) if _hashed(fields, split=split) == ingredient.extracted_hash), None)
+    for split in (False, True):
+        for appended in (False, True, None):
+            if _hashed(fields, split=split, appended=appended) == ingredient.extracted_hash:
+                return ParseMarks(split=split, appended=appended)
+    return None
 
 
 def is_unedited(ingredient: CardDraftIngredient) -> bool:
     """Whether an ingredient's parsed fields are still as extracted"""
-    return _parse_split(ingredient) is not None
+    return parse_marks(ingredient) is not None
 
 
 def split_off(ingredient: CardDraftIngredient) -> bool:
@@ -357,7 +393,8 @@ def split_off(ingredient: CardDraftIngredient) -> bool:
     Whether the parser split an alternative or a second food off the line (`keep_alternatives`), and its fields are
     still as it read them
     """
-    return _parse_split(ingredient) is True
+    marks = parse_marks(ingredient)
+    return marks is not None and marks.split
 
 
 def ingredient_line(ingredient: CardDraftIngredient) -> str:
@@ -691,14 +728,31 @@ def _words_at(text: str) -> list[tuple[int, int, str]]:
     return [(match.start(), match.end(), match.group(0).lower()) for match in _LETTERS.finditer(blanked)]
 
 
-def _held_by(names: Iterable[str]) -> Callable[[str], bool]:
+class _HeldWords:
     """
-    Whether a word (lowercase) is one of the words of `names`, but for a simple plural either way round
-    (`_same_word`), checked in constant time
+    Whether a word (lowercase) is one of the words of some names, but for a simple plural either way round
+    (`_same_word`), checked in constant time; more names are added as they come (`add`), each word once
     """
-    words = {word for name in names for word in letters_only(name).split()}
-    forms = {form for word in words for form in _inflections(word)}
-    return lambda word: word in forms or not words.isdisjoint(_inflections(word))
+
+    def __init__(self, names: Iterable[str] = ()) -> None:
+        self.words: set[str] = set()
+        self.forms: set[str] = set()
+        self.add(names)
+
+    def add(self, names: Iterable[str]) -> None:
+        for name in names:
+            for word in letters_only(name).split():
+                if word not in self.words:
+                    self.words.add(word)
+                    self.forms |= _inflections(word)
+
+    def __call__(self, word: str) -> bool:
+        return word in self.forms or not self.words.isdisjoint(_inflections(word))
+
+
+def _held_by(names: Iterable[str]) -> _HeldWords:
+    """Whether a word (lowercase) is one of the words of `names`, but for a simple plural either way round"""
+    return _HeldWords(names)
 
 
 def _amounts(text: str, *, in_a_name: bool = False) -> list[Fraction]:
@@ -745,17 +799,23 @@ def _second_ingredient(line: str, food: str | None) -> LostAmount | None:
     (`keep_alternatives`). The fields hold its amount, but it's no ingredient of the recipe, so the line is checked
     (`kept` None). The same food again ("1 c. plus 2 T. flour", "2 T. + 1 t. sugar", "1 c. sugar plus 2 T. more") is
     one ingredient; an alternative after "or" ("2 c. flour (or 1 1/2 c. bread flour)", "1 c. buttermilk (or 1 c. milk
-    + 1 T. vinegar)"), which the note keeps whole, reads as written.
+    + 1 T. vinegar)"), which the note keeps whole, reads as written; and so does a number a word after it describes
+    (`_DESCRIBING_WORDS`: "1/4 c. warm water, 110 degrees", "1 lb. shrimp, 21 to 25 count").
     """
     held = _held_by([food] if food else [])
     for joined in _JOINED_AMOUNT.finditer(line):
         if joined.group("joiner").lower() == "or":
             return None
-        end = _unit_end(line, joined.end("amount"))
+        end = joined.end("amount")
+        if range_end := _RANGE_END.match(line, end):
+            end = range_end.end()  # "21 to 25 count": the words after the range
+        end = _unit_end(line, end)
         if end >= len(line) or not line[end].isspace():
             continue  # no food after it ("+ 2 T."), or not an amount of one ("80% lean")
         rest = _REST_OF_AMOUNT.match(line, end)
         words = letters_only(rest.group(0)).split() if rest else []
+        if words and words[0] in _DESCRIBING_WORDS:
+            continue  # a temperature, size, count, share or age ("water, 110 degrees"), not a second food's amount
         if any(not held(word) for word in words if word not in _SECOND_FOOD_FILLER and word not in _SIZE_WORD_TOKENS):
             span = stripped_span(line, joined.span("amount"))
             return LostAmount(value=line[span[0] : span[1]], span=span, kept=None)
@@ -811,11 +871,9 @@ def lost_amounts(line: str, quantity: float | None, unit: str | None, food: str 
     one quantity, so a range's end ("2-3 T. milk" is read as 2), a second number ("2 or 3 eggs", the "10 3/4 oz." of
     "1 can (10 3/4 oz.) soup", the "2 T." of "1 c. sugar + 2 T."), a second ingredient run into the food or kept only in
     the note, or a "dozen" would be gone from the recipe commit writes from the fields. The amounts are counted: the
-    quantity and each number the note or a name keeps account for one each. A line longer than `MAX_ANALYSED_LINE`
-    isn't searched. Every step reads the line in linear time.
+    quantity and each number the note or a name keeps account for one each. Every step reads the line in linear time,
+    so a line of any length is searched.
     """
-    if len(line) > MAX_ANALYSED_LINE:
-        return []
     in_fields = Counter(_amounts(note))
     for name in (unit, food):
         if name:
@@ -894,6 +952,80 @@ _EQUIVALENT = re.compile(rf"\(\s*+(?P<amount>{QTY})\s*+-?\s*+(?P<unit>[^\W\d_]+)
 _SIZES = "|".join(sorted((*FULL_SIZE_WORDS, *ITEM_SIZE_WORDS, *SIZE_WORDS), key=len, reverse=True))
 _UNIT_BEFORE_EQUIVALENT = re.compile(rf"^\s*+[-•*]?\s*+{QTY}\s*+(?:(?i:{_SIZES})\.?\s++)?(?P<unit>[^\W\d_]+)\.?\s*+$")
 """The line before such a measure: its quantity and unit only, a size word too ("1 pkg. ", "1/2 c. ", "1 large can ")"""
+_FOOD_BEFORE_EQUIVALENT = re.compile(
+    rf"^\s*+[-•*]?\s*+{QTY}\s*+(?:(?i:{_SIZES})\.?\s++)?(?P<unit>[^\W\d_]+)\.?\s++(?P<food>[^\d()]+?)\s*+$"
+)
+"""The line before a measure that ends it: its quantity, unit and food ("1/2 c. butter ", "1 pkg. Jello ")"""
+_COMMENT_AFTER_EQUIVALENT = re.compile(r"\s*+(?:,[^\d()]*)?")
+"""What may follow a measure after the food: nothing, or a comment ("(1 stick), softened")"""
+_MEASURE = re.compile(rf"(?P<amount>{QTY})\s*+-?\s*+(?P<unit>[^\W\d_]+)\.?")
+"""A measure after a comma, ending the line: the "16 oz." of "1 can tomatoes, 16 oz." """
+_VOLUMES = {
+    "teaspoon": 1.0,
+    "tablespoon": 3.0,
+    "cup": 48.0,
+    "stick": 24.0,  # of butter: half a cup
+    "fluid ounce": 6.0,
+    "pint": 96.0,
+    "quart": 192.0,
+    "gallon": 768.0,
+    "milliliter": 0.2029,
+    "liter": 202.9,
+}
+"""Volumes in teaspoons, by the unit's name (`shorthand.UNIT_SPELLINGS`' first spelling)"""
+_WEIGHTS = {"ounce": 28.35, "pound": 453.6, "gram": 1.0, "kilogram": 1000.0, "milligram": 0.001}
+"""Weights in grams, by the unit's name; an ounce may be a fluid ounce too"""
+_TEASPOON_ML = 4.93
+_SAME_MEASURE = 1.6
+"""Two measures of one kind are the same amount when neither is more than this many times the other"""
+_DENSITY = (0.1, 2.5)
+"""Grams per milliliter a food a card weighs and measures may have (cereal to honey)"""
+
+
+def _same_unit(written: tuple[str, ...], parsed: tuple[str, ...]) -> bool:
+    """
+    Whether two units' spellings (`unit_spellings`) are one unit's, a plural either way round: the line's "cans" is the
+    group's "can" (a unit outside `shorthand.UNIT_SPELLINGS` has only its own spelling)
+    """
+    return written == parsed or (len(written) == len(parsed) == 1 and _same_word(written[0], parsed[0]))
+
+
+def _measures(spellings: tuple[str, ...]) -> list[tuple[str, float]]:
+    """What a unit measures: `("volume", teaspoons)` or `("weight", grams)` (both for an ounce), or nothing known"""
+    name = spellings[0] if spellings else ""
+    if len(spellings) == 1 and name.endswith("s") and name[:-1] in _VOLUMES:
+        name = name[:-1]  # "sticks"
+    found: list[tuple[str, float]] = []
+    if name in _VOLUMES:
+        found.append(("volume", _VOLUMES[name]))
+    if name in _WEIGHTS:
+        found.append(("weight", _WEIGHTS[name]))
+    if name == "ounce":
+        found.append(("volume", _VOLUMES["fluid ounce"]))
+    return found
+
+
+def _plausibly_the_same(first: tuple[float, tuple[str, ...]], second: tuple[float, tuple[str, ...]]) -> bool:
+    """
+    Whether two amounts (`(quantity, unit spellings)`) may be the same amount: of one kind within `_SAME_MEASURE`, a
+    volume and a weight within `_DENSITY`, or units it can't tell ("can", "pkg."). "1 c. sugar (2 tbsp.)" isn't.
+    """
+    first_measures, second_measures = _measures(first[1]), _measures(second[1])
+    if not first_measures or not second_measures or first[0] <= 0 or second[0] <= 0:
+        return True
+    for kind, size in first_measures:
+        for other_kind, other_size in second_measures:
+            amount, other = first[0] * size, second[0] * other_size
+            if kind == other_kind:
+                ratio = amount / other
+            elif kind == "weight":
+                ratio = amount / (other * _TEASPOON_ML)  # grams per milliliter
+            else:
+                ratio = other / (amount * _TEASPOON_ML)
+            low, high = (1 / _SAME_MEASURE, _SAME_MEASURE) if kind == other_kind else _DENSITY
+            if low <= ratio <= high:
+                return True
+    return False
 
 
 def _written_unit(token: str) -> tuple[str, ...]:
@@ -904,44 +1036,83 @@ def _written_unit(token: str) -> tuple[str, ...]:
     return unit_spellings(token)
 
 
-def _equivalent(line: str, lost: LostAmount, unit: str | None) -> bool:
+def _equivalent(line: str, lost: LostAmount, quantity: float | None, unit: str | None) -> bool:
     """
-    Whether a lost amount is the same amount in another measure, in parentheses right after the line's quantity and
-    unit, which the note keeps as written: "1 pkg. (8 oz.) cream cheese", "1 can (10 3/4 oz.) soup", "1/2 c. (1 stick)
-    butter". The fields read the line right, as for a package size before the unit ("1 (8 oz.) pkg.", taken out
-    before parsing), so it isn't checked. One with a joiner or a range ("1 c. (or 2) eggs", "(8-10 oz.)"), in the
-    line's own unit ("2 c. (3 c.) flour"), after a unit the parser didn't read, or anywhere else is a second amount.
+    Whether a lost amount is the same amount in another measure, which the note keeps as written: in parentheses right
+    after the line's quantity and unit ("1 pkg. (8 oz.) cream cheese", "1 can (10 3/4 oz.) soup", "2 cans (15 oz.)
+    beans", "1/2 c. (1 stick) butter"), or ending the line after its food, a comment aside ("1/2 c. butter (1 stick),
+    softened", "1 c. sour cream (8 oz.)", "1 stick margarine (1/2 c.)"). The fields read the line right, as for a
+    package size before the unit ("1 (8 oz.) pkg.", taken out before parsing), so it isn't checked. One with a
+    joiner, a range or a word more ("1 c. (or 2) eggs", "(8-10 oz.)", "(about 4 c.)"), in the line's own unit ("2 c.
+    (3 c.) flour"), not plausibly the same amount ("1 c. sugar (2 tbsp.)"), after a unit the parser didn't read,
+    after a food a joiner or a number is in ("1 stick butter or oleo (1/2 c.)"), or anywhere else is a second amount.
     """
-    if not unit or not lost.kept or not (measure := _EQUIVALENT.fullmatch(lost.kept)):
+    if not unit or not lost.kept:
+        return False
+    if measure := _EQUIVALENT.fullmatch(lost.kept):
+        opening = line.rfind("(", 0, lost.span[0])
+        if opening < 0 or not line.startswith(lost.kept, opening):
+            return False
+        after = opening + len(lost.kept)
+    elif (measure := _MEASURE.fullmatch(lost.kept)) and line.endswith(lost.kept):
+        # after a comma, ending the line: "1 can tomatoes, 16 oz."
+        opening = line.rfind(",", 0, lost.span[0])
+        if opening < 0 or line[opening + 1 : lost.span[0]].strip():
+            return False
+        after = len(line)
+    else:
         return False
     if not _is_unit_word(measure.group("unit").lower()):
         return False
-    opening = line.rfind("(", 0, lost.span[0])
-    if opening < 0 or not line.startswith(lost.kept, opening):
-        return False
-    written = _UNIT_BEFORE_EQUIVALENT.match(line, 0, opening)
-    if written is None:
-        return False
     parsed = unit_spellings(unit)
-    return _written_unit(written.group("unit")) == parsed != _written_unit(measure.group("unit"))
+    in_measure = _written_unit(measure.group("unit"))
+    if _same_unit(in_measure, parsed):
+        return False
+    if (written := _UNIT_BEFORE_EQUIVALENT.match(line, 0, opening)) and line[opening] == "(":
+        pass
+    elif (written := _FOOD_BEFORE_EQUIVALENT.match(line, 0, opening)) is None or re.search(
+        _JOINER, written.group("food"), re.IGNORECASE
+    ):
+        return False
+    elif not _COMMENT_AFTER_EQUIVALENT.fullmatch(line, after):
+        return False
+    if not _same_unit(_written_unit(written.group("unit")), parsed):
+        return False
+    amount = quantity_value(measure.group("amount"))
+    if quantity is None or amount is None:
+        return True
+    return _plausibly_the_same((quantity, parsed), (amount, in_measure))
 
 
-def _lost_amount(ingredient: CardDraftIngredient, *, english: bool) -> LostAmount | None:
+def _describes(line: str, lost: LostAmount) -> bool:
+    """
+    Whether a lost amount is a number a word after it describes (`_DESCRIBING_WORDS`): a temperature, size, count,
+    share or age ("1 lb. shrimp, 21 to 25 count", "1/4 c. warm water, 110 degrees"), which the note keeps as written
+    and the recipe doesn't measure out
+    """
+    rest = _REST_OF_AMOUNT.match(line, _unit_end(line, lost.span[1]))
+    words = letters_only(rest.group(0)).split() if rest else []
+    return bool(words) and words[0] in _DESCRIBING_WORDS
+
+
+def _lost_amount(ingredient: CardDraftIngredient, *, english: bool, appended: bool | None) -> LostAmount | None:
     """
     The first amount the parsed line lost: one the fields still lack (a draft parsed before notes kept them), or one
     its note keeps at its end exactly as `keep_lost_amounts` appended it at parse time, but for the same amount in
-    another measure right after the unit (`_equivalent`). The note parsing started from began with what was taken out
-    of an English card's line before parsing (`prepare_line`): a package size "(8 oz.)" there was never lost. Only the
-    last few of the note's parts can be what was appended (one per number on the line, a parenthesis or two over), so
-    a long note is never read again for each of its parts.
+    another measure (`_equivalent`) and a number a word describes (`_describes`). `appended`: whether parsing
+    appended any (`ParseMarks`); when it appended none, the note's amounts are the parser's own, and none was lost;
+    when it isn't known, the note is searched. The note parsing started from began with what was taken out of an
+    English card's line before parsing (`prepare_line`): a package size "(8 oz.)" there was never lost. Only the last
+    few of the note's parts can be what was appended (one per number on the line, a parenthesis or two over), so a
+    long note is never read again for each of its parts; and a line longer than `MAX_ANALYSED_LINE` isn't searched.
     """
     line, quantity, note = ingredient.original_text, ingredient.quantity, ingredient.note
     unit = ingredient.unit.name if ingredient.unit else None
     food = ingredient.food.name if ingredient.food else None
-    if len(line) > MAX_ANALYSED_LINE:
-        return None
     if lost := lost_amounts(line, quantity, unit, food, note):
         return lost[0]
+    if appended is False or len(line) > MAX_ANALYSED_LINE:
+        return None
 
     taken_out = ", ".join(prepare_line(line).notes) if english else ""
     starts = [0, *(separator.start() for separator in re.finditer(", ", note))]
@@ -952,7 +1123,11 @@ def _lost_amount(ingredient: CardDraftIngredient, *, english: bool) -> LostAmoun
             continue
         kept, lost = keep_lost_amounts(line, quantity, unit, food, base)
         if lost and kept == note:
-            checked = [amount for amount in lost if not _equivalent(line, amount, unit)]
+            checked = [
+                amount
+                for amount in lost
+                if not _equivalent(line, amount, quantity, unit) and not _describes(line, amount)
+            ]
             return checked[0] if checked else None
     return None
 
@@ -981,42 +1156,85 @@ def _alternative_part(line: str, start: int, end: int, held: Callable[[str], boo
     return line[start:end]
 
 
-def _alternative_words(name: str) -> list[str]:
+def _alternative_words(name: str, on_line: Callable[[str], bool]) -> list[str]:
     """
     The words of an alternative's name as the parser gave it, without an amount's unit: "8 ounce yogurt" is "yogurt",
-    "10 ³/₄ ounce" nothing (the line's amount, which `keep_lost_amounts` keeps)
+    "10 ³/₄ ounce" nothing (the line's amount, which `keep_lost_amounts` keeps). A name with an amount is that amount
+    and its unit as the parser renders it, but for the words the line has (`on_line`): its "1 tesla" or "3 metric_ton"
+    for a measure it misread ("(1 T.)", "(3 t.)") is only an amount too, never a name the card doesn't hold.
     """
     words = [word for word in letters_only(name).split() if word.isalpha()]
     if any(character.isnumeric() for character in name):
-        words = [word for word in words if not _is_unit_word(word)]
+        words = [word for word in words if not _is_unit_word(word) and on_line(word)]
     return words
 
 
-def _unheld_after_joiner(line: str, held: Callable[[str], bool]) -> tuple[int, int] | None:
+class _LineWords:
     """
-    Where the first words after a joiner (and an amount) on the line that the fields don't hold are: the "oleo" of "1
-    c. butter or oleo" when the parser linked it to the group's "margarine"
+    A line's words (`_words_at`), indexed by every simple plural of each, so a name is found where it stands in time
+    linear in how often its rarest word is on the line, not in the line's length: a line of a thousand alternatives
+    looked each one up from its start (quadratic time, seconds)
     """
-    for joiner in _ALTERNATIVE_JOINER.finditer(line):
-        start = joiner.end()
-        if amount := _AMOUNT_AFTER_JOINER.match(line, start):
-            start = _unit_end(line, amount.end())
-        rest = _REST_OF_AMOUNT.match(line, start)
-        if rest is None:
-            continue
-        found = _words_at(rest.group(0))
-        if found and not all(held(word) for _, _, word in found):
-            return start + found[0][0], start + found[-1][1]
-    return None
+
+    def __init__(self, line: str) -> None:
+        self.words = _words_at(line)
+        self.at: dict[str, list[int]] = {}
+        for index, (_, _, word) in enumerate(self.words):
+            for form in _inflections(word):
+                self.at.setdefault(form, []).append(index)
+
+    def _positions(self, word: str) -> set[int]:
+        """Where a word stands, but for a simple plural either way round (`_same_word`), and a few more to check"""
+        return {index for form in _inflections(word) for index in self.at.get(form, ())}
+
+    def run(self, name: Sequence[str]) -> tuple[int, int] | None:
+        """Where the words of `name` stand in a row, but for simple plurals: the last place"""
+        if not name:
+            return None
+        sizes = [sum(len(self.at.get(form, ())) for form in _inflections(word)) for word in name]
+        rarest = min(range(len(name)), key=sizes.__getitem__)
+        for start in sorted((index - rarest for index in self._positions(name[rarest])), reverse=True):
+            if start < 0 or start + len(name) > len(self.words):
+                continue
+            if all(_same_word(self.words[start + offset][2], word) for offset, word in enumerate(name)):
+                return self.words[start][0], self.words[start + len(name) - 1][1]
+        return None
 
 
-def _find_run(words: Sequence[tuple[int, int, str]], name: Sequence[str]) -> tuple[int, int] | None:
-    """Where the words of `name` stand in a row among `words` (`_words_at`), but for simple plurals: the last place"""
-    found: tuple[int, int] | None = None
-    for index in range(len(words) - len(name) + 1):
-        if all(_same_word(words[index + offset][2], word) for offset, word in enumerate(name)):
-            found = (words[index][0], words[index + len(name) - 1][1])
-    return found
+class _AfterJoiners:
+    """
+    The words after each joiner (and an amount) on a line, read once: where the first that the fields don't hold are
+    (`first_unheld`). What the fields hold only grows, so the joiners already passed are never read again.
+    """
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+        self.segments: list[tuple[int, list[tuple[int, int, str]]]] | None = None
+        self.next = 0
+
+    def _read(self) -> list[tuple[int, list[tuple[int, int, str]]]]:
+        segments: list[tuple[int, list[tuple[int, int, str]]]] = []
+        for joiner in _ALTERNATIVE_JOINER.finditer(self.line):
+            start = joiner.end()
+            if amount := _AMOUNT_AFTER_JOINER.match(self.line, start):
+                start = _unit_end(self.line, amount.end())
+            if rest := _REST_OF_AMOUNT.match(self.line, start):
+                segments.append((start, _words_at(rest.group(0))))
+        return segments
+
+    def first_unheld(self, held: Callable[[str], bool]) -> tuple[int, int] | None:
+        """
+        Where the first words after a joiner that the fields don't hold are: the "oleo" of "1 c. butter or oleo" when
+        the parser linked it to the group's "margarine"
+        """
+        if self.segments is None:
+            self.segments = self._read()
+        while self.next < len(self.segments):
+            start, found = self.segments[self.next]
+            if found and not all(held(word) for _, _, word in found):
+                return start + found[0][0], start + found[-1][1]
+            self.next += 1
+        return None
 
 
 def _renders(part: str, kept: str) -> bool:
@@ -1043,43 +1261,141 @@ def keep_alternatives(
     flour and 1 t. baking powder" "and 1 t. baking powder" (in place of the parser's "and 1 tsps"); and whether one
     was. `alternatives`: each split-off ingredient by the names the parser gave it (its text, or the linked food's name
     and plural). One whose words `fields` (the food, unit and note as parsed, lost amounts kept) already hold, or that
-    is only an amount ("8 ounce" for "(8 oz.)", which `keep_lost_amounts` keeps), adds nothing. Nothing read from the
-    card is lost, and `check_parse` asks the reviewer to look while the line is as parsed (`ingredient_hash`'s `split`).
+    is only an amount ("8 ounce" for "(8 oz.)", "1 tesla" for "(1 T.)": `_alternative_words`), adds nothing, and so
+    does one the line doesn't name: only the line's own words are ever added. Nothing read from the card is lost, and
+    `check_parse` asks the reviewer to look while the line is as parsed (`ingredient_hash`'s `split`). Each
+    alternative is looked up once, in time linear in the line (`_LineWords`, `_AfterJoiners`).
     """
-    known = [text for text in fields if text]
-    held = _held_by(known)
-    words = _words_at(line)
+    held = _held_by(text for text in fields if text)
+    on_line = _held_by([line])
+    words = _LineWords(line)
+    after_joiners = _AfterJoiners(line)
     parts = note.split(", ") if note else []
+    rendered = len(parts) - 1  # the note's last part, while it's the parser's own (an alternative may replace it)
     split = False
     for names in alternatives:
         part: str | None = None
-        named: str | None = None
         for name in names:
-            name_words = _alternative_words(name)
+            name_words = _alternative_words(name, on_line)
             if not name_words or all(held(word) for word in name_words):
                 break  # only an amount ("8 ounce" for "(8 oz.)", which the note keeps), or nothing lost
             missing = [word for word in name_words if not held(word)]
             # by its name as the line writes it, else by the words the fields lack ("turkey" for "ground turkey")
-            if run := _find_run(words, name_words) or _find_run(words, missing):
+            if run := words.run(name_words) or words.run(missing):
                 part = _alternative_part(line, *run, held)
                 break
-            named = named or name.strip()
         else:
             # the parser named it otherwise (a food linked by an alias): the line's words after a joiner that the
-            # fields lack ("or oleo"), else the parser's name
-            if run := _unheld_after_joiner(line, held):
+            # fields lack ("or oleo"); a name the line doesn't hold is never added
+            if run := after_joiners.first_unheld(held):
                 part = _alternative_part(line, *run, held)
-            elif named:
-                part = f"or {named}"
         if not part:
             continue
-        if parts and _renders(parts[-1], part):
+        if parts and rendered == len(parts) - 1 and _renders(parts[-1], part):
             parts[-1] = part
+            rendered = -1
         else:
             parts.append(part)
-        held = _held_by([*known, *parts])
+        held.add([part])
         split = True
     return ", ".join(parts), split
+
+
+_EXTRA_AMOUNTS = re.compile(r"\((?P<amounts>[^()]+)\)(?:\s+(?P<rest>.+))?", re.DOTALL)
+"""The NLP parser's rendering of a line's amounts after its first, leading its note: "(2 tbsps) sifted" """
+_PART_END = re.compile(r"[,;()]")
+_PART_TRIES = 4
+_PART_SLACK = 24
+"""
+A note's part is looked for among the line's next few amounts after the same joiner, and in a part of the line at most
+twice its length and this much more (the parser writes units out: "tbsps" for "T."), so a long line takes linear time
+"""
+_PLURAL_END = re.compile(r"(?:ies|es|s)$")
+
+
+def _what_it_says(text: str) -> tuple[tuple[Fraction, ...], tuple[str, ...]]:
+    """
+    A text's amounts (`_amounts`) and its words but for units, plurals aside: what "or 1 tbsps oil" and "or 1 T. oil"
+    both say
+    """
+    words = (_PLURAL_END.sub("", word) for word in letters_only(text).split() if not _is_unit_word(word))
+    return tuple(_amounts(text)), tuple(words)
+
+
+def _joined_part(line: str, start: int, limit: int) -> str | None:
+    """
+    The line from a joiner at `start` to the end of what it joins: the next comma or semicolon beside it, or the
+    parenthesis closing around it, else the line's end ("or 1 c. milk + 1 T. vinegar" of "1 c. buttermilk (or 1 c.
+    milk + 1 T. vinegar)"); None when that's more than `limit` characters on, so it's read in bounded time
+    """
+    depth = 0
+    for mark in _PART_END.finditer(line, start, min(len(line), start + limit + 1)):
+        if mark.group(0) == "(":
+            depth += 1
+        elif mark.group(0) == ")" and depth:
+            depth -= 1
+        elif not depth:
+            return line[start : mark.start()].strip()
+    return line[start:].strip() if len(line) - start <= limit else None
+
+
+def _own_amounts(line: str) -> dict[tuple[Fraction, ...], str]:
+    """
+    The line's own words for the amounts the parser puts in parentheses ("2 tbsps"), by what they hold: each amount
+    joined to the line with its joiner and unit ("+ 2 T.", "plus 2 T."), else a measure in parentheses ("(8 oz.)")
+    """
+    own: dict[tuple[Fraction, ...], str] = {}
+    for joined in _JOINED_AMOUNT.finditer(line):
+        if joined.group("joiner").lower() in ("or", ",", ";"):
+            continue
+        end = _unit_end(line, joined.end("amount"))
+        if end > joined.end("amount"):
+            written = line[joined.start() : end].strip()
+            own.setdefault(tuple(_amounts(written)), written)
+    for measure in _EQUIVALENT.finditer(line):
+        own.setdefault(tuple(_amounts(measure.group(0))), measure.group(0))
+    return own
+
+
+def as_the_line_writes(line: str, note: str) -> str:
+    """
+    The parser's note with its renderings of the line's amounts in the line's own words: an alternative or a second
+    food with its amount ("or 1 tbsps oil" is "or 1 T. oil", "or 1 sticks oleo" "or 1 stick oleo", "and 1 tsps salt"
+    "and 1 tsp. salt"), and the amounts after the first that it puts in parentheses before the rest ("(2 tbsps) sifted"
+    of "1 c. plus 2 T. flour, sifted" is "plus 2 T., sifted": "(2 tbsps)" read as a measure of the same amount, its
+    "plus" lost). A part is rewritten only when the line's says the same amounts and, units and plurals aside, the same
+    words; anything else stays as the parser wrote it. The line is read once, whatever the note holds.
+    """
+    if not note:
+        return note
+    if extra := _EXTRA_AMOUNTS.fullmatch(note):
+        own_amounts = _own_amounts(line)
+        own = [own_amounts.get(tuple(_amounts(amount))) for amount in extra.group("amounts").split(", ")]
+        if all(own) and not any(_what_it_says(amount)[1] for amount in extra.group("amounts").split(", ")):
+            rest = extra.group("rest")
+            note = ", ".join(part for part in (*own, rest) if part)
+
+    # the line's joined amounts by their joiner and amount, in order: a note's part is the line's from one of them
+    joined: dict[tuple[str, tuple[Fraction, ...]], list[int]] = {}
+    for found in _JOINED_AMOUNT.finditer(line):
+        joined.setdefault((found.group("joiner").lower(), tuple(_amounts(found.group("amount")))), []).append(
+            found.start()
+        )
+    tried: dict[tuple[str, tuple[Fraction, ...]], int] = {}
+    parts = note.split(", ")
+    for index, part in enumerate(parts):
+        start = _ALTERNATIVE_START.match(part)
+        if not (start and start.group("amount")):
+            continue
+        key = (start.group("joiner").lower(), tuple(_amounts(start.group("amount"))))
+        starts, said = joined.get(key, []), _what_it_says(part)
+        # the parser's parts come in the line's order: from where the last one was found, a few tries each
+        for position in range(tried.get(key, 0), min(tried.get(key, 0) + _PART_TRIES, len(starts))):
+            written = _joined_part(line, starts[position], 2 * len(part) + _PART_SLACK)
+            if written is not None and _what_it_says(written) == said:
+                parts[index], tried[key] = written, position + 1
+                break
+    return ", ".join(parts)
 
 
 def _split_alternative(ingredient: CardDraftIngredient) -> tuple[str, tuple[int, int] | None]:
@@ -1095,7 +1411,11 @@ def _split_alternative(ingredient: CardDraftIngredient) -> tuple[str, tuple[int,
         start = _ALTERNATIVE_START.match(part)
         if start is None:
             continue
-        name_start = _unit_end(part, start.end("amount")) if start.group("amount") else start.end()
+        name_start = start.end()
+        if start.group("amount"):
+            # past the amount, a package size in parentheses and the unit ("and 1 (8 oz.) pkg. cream cheese")
+            measure = _MEASURE_AFTER_AMOUNT.match(part, start.end("amount"))
+            name_start = _unit_end(part, measure.end() if measure else start.end("amount"))
         name = part[name_start:].strip(" ()")
         if not name or all(held(word) for word in letters_only(name).split()):
             continue
@@ -1113,6 +1433,53 @@ def _size_word_in_names(ingredient: CardDraftIngredient) -> str | None:
             if word.lower().rstrip(".") in _SIZE_WORD_TOKENS:
                 return word
     return None
+
+
+_OVEN_WORDS = frozenset("bake baked baking broil preheat preheated oven degree degrees deg fahrenheit celsius".split())
+_PAN_WORDS = frozenset("pan pans dish dishes plate plates tin tins skillet skillets casserole sheet sheets".split())
+_NOT_INGREDIENT_WORDS = frozenset(
+    {
+        *_OVEN_WORDS,
+        *_PAN_WORDS,
+        *"""at to for in into a an the or and x by f c min mins minute minutes hr hrs hour hours until moderate slow
+        hot inch inches square round loaf bundt tube cake pie glass jelly roll springform oblong deep shallow greased
+        grease floured""".split(),
+    }
+)
+"""
+The words of a line that is only an oven temperature or a pan ("Bake at 350°", "350 degrees", "Oven 350", "9x13 pan",
+"1 9x13 pan, greased", '8" square pan', "2 loaf pans"): no ingredient
+"""
+MIN_OVEN_NUMBER = 150
+"""A number from which a line of oven words only ("Oven 350") says a temperature"""
+
+
+def _not_an_ingredient(ingredient: CardDraftIngredient) -> tuple[str, tuple[int, int]] | None:
+    """
+    Whether the parser read an oven temperature or a pan as an ingredient, which commit would add as a food ("350
+    degrees" read as 350 "degrees", "Bake at 350°" as the food "Bake at 350°", "9x13 pan" as 9 "pan"): `"temperature"`
+    or `"pan"`, and where it is. A temperature is one read as the amount, or as the food of a line with no amount, or
+    on a line of oven words only; a pan, a line of pan words and sizes only. A warm liquid's temperature ("1 c. warm
+    water (110°)", "1/4 c. water, 110 degrees") is neither.
+    """
+    line = ingredient.original_text
+    temperatures = find_temperatures(line)
+    for temperature in temperatures:
+        span = (temperature.span[0], temperature.span[0] + len(temperature.text))
+        if ingredient.quantity is not None and math.isclose(ingredient.quantity, temperature.value):
+            return "temperature", span
+        if ingredient.quantity is None and ingredient.food and temperature.text in ingredient.food.name:
+            return "temperature", span
+    words = _words_at(line)
+    if not words or any(word not in _NOT_INGREDIENT_WORDS for _, _, word in words):
+        return None
+    if temperatures:
+        return "temperature", (temperatures[0].span[0], temperatures[0].span[0] + len(temperatures[0].text))
+    if any(word in _OVEN_WORDS for _, _, word in words):
+        if number := next((n for n in find_numbers(line) if n.value >= MIN_OVEN_NUMBER), None):
+            return "temperature", stripped_span(line, number.span)
+    pan = next(((start, end) for start, end, word in words if word in _PAN_WORDS), None)
+    return ("pan", pan) if pan else None
 
 
 def _abbreviates_a_unit(word: str) -> bool:
@@ -1261,21 +1628,31 @@ def _ingredient_flags(
     assert ingredient is not None
     field, ref = target.field, target.ref
     parsed = ingredient.parse_confidence is not None
-    unedited = is_unedited(ingredient)
+    marks = parse_marks(ingredient)
+    unedited = marks is not None
 
     # the parser's reading, while the line is as it read it
-    if parsed and unedited:
+    if parsed and marks is not None:
         params: dict = {}
         if ingredient.parse_confidence is not None and ingredient.parse_confidence < REVIEW_CONFIDENCE:
             params["confidence"] = round(ingredient.parse_confidence * 100)
-        if lost := _lost_amount(ingredient, english=english):
+        if not_ingredient := _not_an_ingredient(ingredient):
+            # an oven temperature or a pan read as an ingredient ("350 degrees", "9x13 pan"): commit would create its
+            # food; it belongs in the steps
+            kind, where = not_ingredient
+            params.update(not_ingredient=kind, **_position(where))
+        elif lost := _lost_amount(ingredient, english=english, appended=marks.appended):
             params.update(value=lost.value, **_position(lost.span))
+        elif marks.appended is not False and len(ingredient.original_text) > MAX_ANALYSED_LINE:
+            # amounts parsing may have kept in the note, which a save doesn't search such a line for: looked at all
+            # the same
+            params["too_long"] = True
         elif size := _size_word_in_names(ingredient):
             # a size word the parser joined to the unit or food ("cup scant"): commit would create that unit or food
             params["value"] = size
             if found := re.search(rf"(?<![\w.]){re.escape(size)}(?!\w)", ingredient.original_text, re.IGNORECASE):
                 params.update(_position(found.span()))
-        if split_off(ingredient):
+        if marks.split:
             # an alternative or a second food the parser split off, which the note keeps: the reviewer sees the split
             name, span = _split_alternative(ingredient)
             params["alternative"] = name
@@ -1469,7 +1846,10 @@ OCR_DIGIT_CONFUSIONS = frozenset(frozenset(pair) for pair in ("17", "08", "38", 
 """
 Digits Tesseract reads one for the other on printed cards: an italic "1" as "7" (3 of 10 printed cards in a live run
 were flagged so, "Use '7 onion'"), "0" and "8", "5" and "6". Its word confidence doesn't tell them apart (the "7"s
-scored 69 to 92), so a number that differs from the draft's only by them isn't a disagreement worth a look.
+scored 69 to 92); they're also the digits an image reader may misread on a faded card. So a number that differs from
+the draft's only by them is read again (`compute_flags`' `ocr_reread`: the line alone, at a scale where Tesseract
+reads them right) and flagged when that reading says what the first did, not what the draft does; without a second
+reading it isn't a disagreement worth a look.
 """
 _STROKE_DIGITS = "17"
 """A stroke Tesseract splits off a "1" or reads beside one: the italic "1" read as "71" """
@@ -1523,12 +1903,50 @@ def _misread_digits(mine: str, theirs: str) -> bool:
     )
 
 
-def _ocr_flags(flags: _Flags, target: _Target, lines: Sequence[str], after: int) -> int | None:
+def _read_again(
+    lines: Sequence[str], window: tuple[int, int], position: int, reread: Callable[[int], str | None] | None
+) -> NumberMatch | None:
+    """
+    Tesseract's second reading (`reread`) of the `position`th number its `lines` in `window` hold, as the OCR check
+    reads them (`_ocr_flags`): the line holding it read again on its own. None without one, or when that reading says
+    as many numbers no more.
+    """
+    if reread is None:
+        return None
+    first, last = window
+    text, skip = without_list_marker(" ".join(lines[first:last]))
+    read = _clean_numbers(text)
+    if not 0 <= position < len(read):
+        return None
+    at, start = read[position].span[0] + skip, 0
+    for index in range(first, last):
+        end = start + len(lines[index])
+        if at < end:
+            again = reread(index)
+            if again is None:
+                return None
+            # its numbers by position: one run into its unit ("1C.") is still the number read there
+            joined = " ".join([*lines[first:index], again.strip(), *lines[index + 1 : last]])
+            numbers = find_numbers(without_list_marker(joined)[0])
+            return numbers[position] if len(numbers) == len(read) else None
+        start = end + 1  # the space joining it to the next line
+    return None
+
+
+def _ocr_flags(
+    flags: _Flags,
+    target: _Target,
+    lines: Sequence[str],
+    after: int,
+    reread: Callable[[int], str | None] | None = None,
+) -> int | None:
     """
     The OCR check's flag for a target: the first number of the draft's line that Tesseract read, clearly, as another
     whole number in the same place ("375" where Tesseract read "350"). Only plain numbers are compared (Tesseract
-    misreads fractions), only when both say as many numbers, and never digits Tesseract confuses ("1" read as "7":
-    `_misread_digits`). Returns an ingredient's aligned line, as `_cross_read_flags` does.
+    misreads fractions), and only when both say as many numbers. A number that differs only by digits Tesseract
+    confuses ("1" read as "7": `_misread_digits`) is read again (`reread`, `_read_again`): flagged when the second
+    reading says what the first did (a reader's "7" for a printed "1"), not when it says what the draft does (the italic
+    "1" Tesseract read as "7"), and not without one. Returns an ingredient's aligned line, as `_cross_read_flags` does.
     """
     if not target.text.strip() or target.field not in (FIELD_INGREDIENTS, FIELD_STEPS):
         return None
@@ -1538,12 +1956,12 @@ def _ocr_flags(flags: _Flags, target: _Target, lines: Sequence[str], after: int)
         window = align_step(target.text, lines)
         if window is None:
             return None
-        aligned = " ".join(lines[window[0] : window[1]])
     else:
         index = align_ingredient(target.text, lines, after)
         if index is None:
             return None
-        aligned = lines[index]
+        window = (index, index + 1)
+    aligned = " ".join(lines[window[0] : window[1]])
 
     _, skip = without_list_marker(target.text) if target.is_step else (target.text, 0)
     drafted = [number for number in find_numbers(target.text) if number.span[0] >= skip]
@@ -1551,11 +1969,15 @@ def _ocr_flags(flags: _Flags, target: _Target, lines: Sequence[str], after: int)
     if not drafted or len(drafted) != len(read):
         return index
 
-    for mine, theirs in zip(drafted, read, strict=True):
+    for position, (mine, theirs) in enumerate(zip(drafted, read, strict=True)):
         if not (_PLAIN_NUMBER.match(mine.text) and _PLAIN_NUMBER.match(theirs.text)):
             continue
-        if mine.value == theirs.value or _misread_digits(mine.text, theirs.text):
+        if mine.value == theirs.value:
             continue
+        if _misread_digits(mine.text, theirs.text):
+            again = _read_again(lines, window, position, reread)
+            if again is None or again.value != theirs.value:
+                continue  # read again as the draft has it (or otherwise, or not at all): Tesseract's misread
         start, end = mine.span
         flags.add(
             CardFlagKind.read_disagreement,
@@ -1577,6 +1999,7 @@ def _reading_flags(
     extraction: ExtractionMeta | None,
     transcription: str | None,
     ocr_lines: Sequence[str] | None,
+    ocr_reread: Callable[[int], str | None] | None = None,
 ) -> None:
     """`unsure`, `not_on_card`, `marker_dropped`, the cross-read's and the OCR check's flags, against what was read"""
     unsure = _unsure_targets(extraction.unsure, targets) if extraction else {}
@@ -1620,7 +2043,7 @@ def _reading_flags(
             if aligned is not None:
                 last_ingredient = aligned
         if ocr_lines:
-            aligned = _ocr_flags(flags, target, ocr_lines, last_ocr_line)
+            aligned = _ocr_flags(flags, target, ocr_lines, last_ocr_line, ocr_reread)
             if aligned is not None:
                 last_ocr_line = aligned
 
@@ -1700,6 +2123,7 @@ def compute_flags(
     units: Iterable[str] = (),
     ocr_lines: Sequence[str] | None = None,
     linked: Mapping[UUID, Collection[str]] | None = None,
+    ocr_reread: Callable[[int], str | None] | None = None,
 ) -> list[CardFlag]:
     """
     Every flag the draft raises, in reading order (the card's own flags first), keyed `"<kind>:<field>:<ref>"`, with
@@ -1712,8 +2136,9 @@ def compute_flags(
 
     Extraction also passes `units`, the names, plurals, abbreviations and aliases of the group's units (a short word
     that is one of them is a lost unit, `unit_unclear`), and `ocr_lines` (`ocr_check_lines`) for a printed card's
-    OCR check. A save passes neither: the flags they raised are kept from `previous` while they still hold (a
-    `unit_unclear` while its line is as extracted).
+    OCR check, with `ocr_reread`: Tesseract's second reading of one of those lines, by its index, or None (the
+    pipeline's `ocr_line_reader`), for a number it may have misread. A save passes neither: the flags they raised
+    are kept from `previous` while they still hold (a `unit_unclear` while its line is as extracted).
 
     `linked` holds every name of the group's foods and units the draft links, by id (`IngestMatcher.linked_names`):
     a line still as parsed whose food or unit none of them is on gets `linked_fuzzy`. Without it, `linked_fuzzy`
@@ -1761,7 +2186,7 @@ def compute_flags(
         )
 
     reading = _Flags()
-    _reading_flags(reading, draft, targets, extraction, transcription, ocr_lines)
+    _reading_flags(reading, draft, targets, extraction, transcription, ocr_lines, ocr_reread)
     if previous is None:
         reading_flags = list(reading.flags.values())
     else:

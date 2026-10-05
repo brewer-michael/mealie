@@ -13,6 +13,8 @@ production pipeline.
 - `parse_lines`: chosen ingredient lines parsed by the AI ingredient parser, in any language.
 - `reread_region`: one region of a page read again, as a proposal; `region_hint`: where on the card a field's text
   probably is, so the selection to re-read starts there.
+- `ocr_line_reader`: Tesseract's second reading of a line of a printed card, for the OCR check of its numbers
+  (`flags.compute_flags`' `ocr_reread`), which extraction passes, and a save that computes a reading's flags again.
 - `options_for_group`: the options from the group's recipe card settings.
 """
 
@@ -59,6 +61,7 @@ from .flags import ORGANIZERS_STEP, compute_flags, ocr_check_lines, organizers_o
 from .ingredients import IngredientLine, normalize_ingredients, parse_lines
 from .llm_schemas import OpenAIRecipeCardTranscription
 from .models import CardExtraction, CardPage, CardPipelineOptions, CardReadPath
+from .ocrcheck import ocr_line_reader
 from .orient import OrientDecision, decide_orientation, orient_page, orientation_available, oriented_meta
 from .regions import RegionHint, region_hint
 from .reread import reread_region
@@ -75,6 +78,7 @@ __all__ = [
     "RegionHint",
     "decide_orientation",
     "extract_card",
+    "ocr_line_reader",
     "options_for_group",
     "orient_page",
     "orientation_available",
@@ -381,7 +385,15 @@ async def _finish(ctx: CardWorkflowContext, result: WorkflowResult, extraction: 
     )
     ocr_lines = ocr_check_lines([page.meta.ocr for page in ctx.pages], extraction.read_path, compiled.content)
     flags = compute_flags(
-        draft, extraction, {}, transcription=compiled.content, units=units, ocr_lines=ocr_lines, linked=linked
+        draft,
+        extraction,
+        {},
+        transcription=compiled.content,
+        units=units,
+        ocr_lines=ocr_lines,
+        linked=linked,
+        # a number Tesseract may have misread is read again from its page (rarely: in the task's thread)
+        ocr_reread=ocr_line_reader(ctx.pages) if ocr_lines else None,
     )
     return CardExtraction(
         draft=draft,

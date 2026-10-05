@@ -14,8 +14,11 @@ thread. Nothing is written: `IngestMatcher` only reads, and commit links the nam
    it fails they stay as text (`not_parsed`). `parse_lines` parses chosen lines with it in any language.
 4. Nothing read is lost: an amount the parsed fields don't hold (a range's end, "(10 3/4 oz.)", "+ 2 T.") is kept in
    the note (`flags.keep_lost_amounts`), and so is an alternative or a second food the parser split off the line ("or
-   margarine", "and 1 t. baking powder": `flags.keep_alternatives`); `check_parse` still asks the reviewer to look,
-   but for a measure in parentheses right after the unit ("1 pkg. (8 oz.) cream cheese").
+   margarine", "and 1 t. baking powder": `flags.keep_alternatives`), only ever in the line's own words: the parser's
+   renderings of the line's amounts are written as the line writes them ("or 1 T. oil", "plus 2 T., sifted":
+   `flags.as_the_line_writes`). `check_parse` still asks the reviewer to look at what parsing kept, but for the same
+   amount in another measure ("1 pkg. (8 oz.) cream cheese", "1/2 c. butter (1 stick)"); the line's hash says whether
+   parsing kept any (`flags.ingredient_hash`), so an amount the parser kept itself is never taken for one.
 5. `original_text` is the card's line again (the parser stores its own input there), and `display` is rebuilt, since
    it goes stale once the matcher swaps in the group's units and foods.
 """
@@ -48,7 +51,7 @@ from mealie.services.parser_services.openai.parser import OpenAIParser
 from ..matching import IngestMatcher
 from ..shorthand import PreparedLine, prepare_line, unit_spellings
 from .cardtext import canonical_markers, markers_in
-from .flags import ingredient_hash, is_english, keep_alternatives, keep_lost_amounts
+from .flags import as_the_line_writes, ingredient_hash, is_english, keep_alternatives, keep_lost_amounts
 from .service import end_transaction
 
 logger = get_logger(__name__)
@@ -162,15 +165,19 @@ def _from_parsed(
     elif unit is not None and prepared.shorthand:
         # "2 sq. chocolate" is read as "2 square chocolate": the group's square, else a new one, never its quart
         unit = _written_out_unit(prepared.shorthand[1], unit, matcher)
-    # what was taken out before parsing leads the note
-    note = ", ".join(part for part in (*prepared.notes, (result.note or "").strip()) if part)
+    # what was taken out before parsing leads the note; the parser's renderings of the line's amounts are in the
+    # line's words ("or 1 T. oil", not "or 1 tbsps oil"; "plus 2 T., sifted", not "(2 tbsps) sifted")
+    parser_note = as_the_line_writes(text, (result.note or "").strip())
+    note = ", ".join(part for part in (*prepared.notes, parser_note) if part)
     unit_ref, food_ref = _ref(unit), _ref(result.food)
     unit_name, food_name = unit_ref.name if unit_ref else None, food_ref.name if food_ref else None
     # an alternative or a second food the parser split off, as the line has it; judged against the note with the
     # amounts the fields lost kept ("8 ounce yogurt" of "1 c. (8 oz.) sour cream or yogurt" adds only "or yogurt")
     restored, _ = keep_lost_amounts(text, quantity, unit_name, food_name, note)
     note, split = keep_alternatives(text, note, _alternatives(result, matcher), (food_name, unit_name, restored))
-    note, _ = keep_lost_amounts(text, quantity, unit_name, food_name, note)
+    kept, _ = keep_lost_amounts(text, quantity, unit_name, food_name, note)
+    # whether the note now keeps amounts the fields lost: only those are checked, never the parser's own
+    appended, note = kept != note, kept
     # rebuilt rather than kept: the parser's display was made before the matcher linked the unit and food
     display = RecipeIngredient(quantity=quantity, unit=unit, food=result.food, note=note).display
     ingredient = CardDraftIngredient(
@@ -184,7 +191,7 @@ def _from_parsed(
         display=display or text,
         parse_confidence=parsed.confidence.average,
     )
-    ingredient.extracted_hash = ingredient_hash(ingredient, split=split)
+    ingredient.extracted_hash = ingredient_hash(ingredient, split=split, appended=appended)
     return ingredient
 
 
