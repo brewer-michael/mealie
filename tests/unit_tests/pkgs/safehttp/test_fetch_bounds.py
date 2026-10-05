@@ -1,5 +1,5 @@
 """
-Fork: safehttp reads a body as the server sent it and never past a cap (fetch.py, DEFAULT_MAX_BYTES). curl used to
+Fork: safehttp reads a body as the server sent it and never past a cap (decoding.py, DEFAULT_MAX_BYTES). curl used to
 inflate gzip into memory faster than `_read_capped` counted it, and closing a response it stopped reading waited for
 the rest of the body. Requests keep the impersonated browser's Accept-Encoding, and every coding it offers is decoded
 here within the cap, a slice at a time, without holding the event loop. Most of these go over a real connection,
@@ -22,6 +22,7 @@ from typing import Any
 import brotli
 import pytest
 
+from mealie.pkgs.safehttp import decoding as decoders
 from mealie.pkgs.safehttp import fetch
 
 MIB = 1024 * 1024
@@ -176,7 +177,7 @@ async def test_a_page_is_asked_for_with_the_browsers_own_accept_encoding(
     assert method == "GET"
     offered = {coding.strip() for coding in headers["accept-encoding"].split(",")}
     assert {"gzip", "deflate", "br"} <= offered
-    assert offered <= set(fetch._DECODERS), f"{impersonation} offers a coding that isn't decoded: {offered}"
+    assert offered <= set(decoders._DECODERS), f"{impersonation} offers a coding that isn't decoded: {offered}"
 
 
 PAGE = b"<html>" + b"waffles " * 10_000 + b"</html>"
@@ -202,11 +203,11 @@ def pieces(data: bytes, count: int) -> list[bytes]:
         ("deflate", raw_deflate(PAGE)),  # without a zlib header, as old IIS and PHP servers send it
         ("deflate", gzip.compress(PAGE)),  # a gzip header under deflate, which curl reads too
         ("gzip", gzip.compress(PAGE[:9000]) + gzip.compress(PAGE[9000:])),  # two members
-        ("gzip", b"".join(gzip.compress(piece) for piece in pieces(PAGE, fetch._MAX_FRAMES))),
+        ("gzip", b"".join(gzip.compress(piece) for piece in pieces(PAGE, decoders._MAX_FRAMES))),
         ("gzip", gzip.compress(PAGE) + b"\0" * 512),  # zero padding
         ("zstd", zstd.compress(PAGE)),
         ("zstd", zstd.compress(PAGE[:9000]) + zstd.compress(PAGE[9000:])),  # two frames
-        ("zstd", b"".join(zstd.compress(piece) for piece in pieces(PAGE, fetch._MAX_FRAMES))),
+        ("zstd", b"".join(zstd.compress(piece) for piece in pieces(PAGE, decoders._MAX_FRAMES))),
         ("br", brotli.compress(PAGE)),
         ("gzip, br", brotli.compress(gzip.compress(PAGE))),  # gzip applied first, then br
         ("none", PAGE),  # curl's name for no coding
@@ -397,8 +398,8 @@ def _flip(data: bytes, at: int) -> bytes:
         ("gzip", gzip.compress(PAGE)[:-8] + b"\1\2\3"),
         ("gzip", gzip.compress(PAGE)[:-4] + b"garbage"),
         ("gzip", gzip.compress(PAGE[:9000])[:-8] + gzip.compress(PAGE[9000:])),
-        ("gzip", b"".join(gzip.compress(piece) for piece in pieces(PAGE, fetch._MAX_FRAMES + 1))),
-        ("zstd", b"".join(zstd.compress(piece) for piece in pieces(PAGE, fetch._MAX_FRAMES + 1))),
+        ("gzip", b"".join(gzip.compress(piece) for piece in pieces(PAGE, decoders._MAX_FRAMES + 1))),
+        ("zstd", b"".join(zstd.compress(piece) for piece in pieces(PAGE, decoders._MAX_FRAMES + 1))),
     ],
     ids=[
         "corrupt gzip",
@@ -442,7 +443,7 @@ async def test_a_body_that_doesnt_decode_fails_like_an_error(
     monkeypatch.setattr(fetch, "_read_capped", recorded)
 
     assert await fetch.resilient_fetch(server.url) is None
-    assert [type(outcome) for outcome in read] == [fetch.UnreadableEncodingError]
+    assert [type(outcome) for outcome in read] == [decoders.UnreadableEncodingError]
 
 
 EMPTY_ZSTD_FRAME = zstd.compress(b"")
@@ -462,10 +463,10 @@ EMPTY_GZIP_MEMBER = gzip.compress(b"")
 )
 def test_a_frame_flood_is_refused_at_once(codings: list[str], body: bytes):
     """Each frame costs a new decoder: tens of thousands of empty ones held the event loop for the whole timeout"""
-    decoding = fetch._Decoding(codings, fetch.DEFAULT_MAX_BYTES)
+    decoding = decoders._Decoding(codings, fetch.DEFAULT_MAX_BYTES)
     started = time.monotonic()
 
-    with pytest.raises(fetch.UnreadableEncodingError, match="frames"):
+    with pytest.raises(decoders.UnreadableEncodingError, match="frames"):
         for start in range(0, len(body), 1024):  # as `_read_capped` feeds it
             for _ in decoding.feed(body[start : start + 1024]):
                 pass
@@ -507,7 +508,7 @@ async def test_reading_a_body_gives_the_event_loop_turns(
     However slow a body is to decode, the loop gets a turn every `_LOOP_TURN`: here the frame cap is lifted, so the
     floods decode until the timeout
     """
-    monkeypatch.setattr(fetch, "_MAX_FRAMES", 10**9)
+    monkeypatch.setattr(decoders, "_MAX_FRAMES", 10**9)
     server.headers = {"Content-Type": "text/html", "Content-Encoding": coding}
     server.body = body
 
@@ -543,7 +544,7 @@ def stored_gzip(data: bytes) -> bytes:
 @pytest.mark.parametrize("chunk", [1024, 64 * MIB], ids=["1 KiB chunks", "at once"])
 def test_a_body_is_decoded_a_slice_at_a_time(codings: list[str], body: bytes, chunk: int):
     """No stage makes more than a slice per call (br: about one more of its blocks), and none of the body is lost"""
-    decoding = fetch._Decoding(codings, fetch.DEFAULT_MAX_BYTES)
+    decoding = decoders._Decoding(codings, fetch.DEFAULT_MAX_BYTES)
     decoded = bytearray()
     largest = 0
     for start in range(0, len(body), chunk):
@@ -553,7 +554,7 @@ def test_a_body_is_decoded_a_slice_at_a_time(codings: list[str], body: bytes, ch
     decoding.finish()
 
     assert decoded == ZEROS
-    assert largest <= 2 * fetch._DECODE_SLICE
+    assert largest <= 2 * decoders._DECODE_SLICE
 
 
 @functools.cache

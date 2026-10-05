@@ -1,6 +1,7 @@
 """
-Fork: safehttp refuses a webhook's redirect from https to plain http (mealie/pkgs/safehttp/redirects.py). That webhook
-isn't sent, and the household's other webhooks still are.
+Fork: safehttp refuses a webhook's redirect from https to plain http (mealie/pkgs/safehttp/redirects.py), and an answer
+over its cap or one that doesn't decode (mealie/pkgs/safehttp/decoding.py). Either way the household's other webhooks
+are still sent.
 """
 
 import httpx
@@ -67,3 +68,23 @@ def test_a_refused_redirect_doesnt_stop_the_other_webhooks(hooks: Hooks):
 def test_hard_fail_still_raises_the_refusal(hooks: Hooks):
     with pytest.raises(safehttp.UnsafeRedirectError):
         WebhookPublisher(hard_fail=True).publish(_event(), ["https://hooks.example/downgraded"])
+
+
+@pytest.mark.parametrize("refusal", [safehttp.ResponseTooLargeError, safehttp.UnreadableEncodingError])
+def test_a_refused_answer_doesnt_stop_the_other_webhooks(monkeypatch: pytest.MonkeyPatch, refusal: type[Exception]):
+    sent: list[str] = []
+
+    def post(url: str, **kwargs: object) -> httpx.Response:
+        sent.append(url)
+        if url.endswith("/huge"):
+            raise refusal("refused")
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(safehttp, "post", post)
+    urls = ["https://hooks.example/huge", "https://hooks.example/second"]
+
+    WebhookPublisher().publish(_event(), urls)
+    assert sent == urls
+
+    with pytest.raises(refusal):
+        WebhookPublisher(hard_fail=True).publish(_event(), urls)

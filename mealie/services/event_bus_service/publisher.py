@@ -64,5 +64,12 @@ class WebhookPublisher:
                     raise
                 get_logger().warning(f"Webhook not sent: {e}")
                 continue
+            except (safehttp.ResponseTooLargeError, safehttp.UnreadableEncodingError) as e:
+                # fork hook (safehttp/decoding.py): the webhook was sent, but its answer was refused unread (over
+                # 1 MiB, or not decodable); that mustn't stop the household's other webhooks
+                if self.hard_fail:
+                    raise
+                get_logger().warning(f"Webhook sent, but its answer was refused: {e}")
+                continue
             if self.hard_fail:
                 r.raise_for_status()

@@ -236,8 +236,10 @@ def post(
     Drop-in for `requests.post(url, json=..., timeout=...)` on server-initiated
     requests to user-supplied URLs. Redirects are followed and re-validated per hop.
     """
+    from .decoding import _send, post_options  # fork hook: the answer is read within a cap, and in time (decoding.py)
     from .redirects import check_redirect  # fork hook: no redirect off http(s), or from https to http
 
-    transport = SafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout)
+    options = post_options(timeout)  # fork hook (decoding.py)
+    transport = SafeTransport(allow_hosts=allow_hosts, deny_hosts=deny_hosts, timeout=timeout, curl_options=options)
     with httpx.Client(transport=transport, follow_redirects=True, event_hooks={"response": [check_redirect]}) as client:
-        return client.post(url, json=json, timeout=timeout, **kwargs)
+        return _send(client, "POST", url, json=json, timeout=timeout, **kwargs)  # fork hook (decoding.py): client.post

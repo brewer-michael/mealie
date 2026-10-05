@@ -1,3 +1,4 @@
+from .decoding import UnreadableEncodingError  # fork
 from .fetch import (
     BROWSER_IMPERSONATIONS,
     DEFAULT_MAX_BYTES,  # fork
@@ -31,6 +32,7 @@ __all__ = [
     "ForceTimeoutException",
     "ResponseTooLargeError",
     "resilient_fetch",
+    "UnreadableEncodingError",
     "UnsafeRedirectError",
     "acheck_redirect",
     "check_redirect",
