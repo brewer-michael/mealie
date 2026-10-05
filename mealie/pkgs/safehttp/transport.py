@@ -103,6 +103,7 @@ class _SafeTransportMixin:
         self._log = log
         self._allow = _parse_host_list(allow_hosts)
         self._deny = _parse_host_list(deny_hosts)
+        self._proxied = bool(kwargs.get("proxy"))  # fork hook (`_validate`): the pin is inert through a proxy
         if timeout is not None:
             self.timeout = timeout
 
@@ -157,14 +158,26 @@ class _SafeTransportMixin:
             raise InvalidDomainError(f"request blocked by disallow list: {request.url}")
 
         allow_hosts, allow_networks = self._allow
-        # fork hook: an allowed network lets through only the addresses inside it, so one allowed address in a DNS
-        # answer can't carry a private one along (a rebinding name answering [127.0.0.1, <allowed LAN address>]);
-        # a listed host name still allows its whole answer
-        if host.lower() not in allow_hosts:
+        if not _matches(host, ips, allow_hosts, allow_networks):
             for ip in ips:
-                if is_blocked_ip(ip) and not _matches("", [ip], set(), allow_networks):
+                if is_blocked_ip(ip):
                     self._warn(request, f"resolves to non-public address {ip}")
                     raise InvalidDomainError(f"invalid request on local resource: {request.url} -> {ip}")
+        elif host.lower() not in allow_hosts:
+            # fork hook: an allowed network vouches only for the addresses inside it. The answer's other non-public
+            # addresses (a rebinding name's 127.0.0.1 beside an allowed LAN address, a LAN host's own ULA or link-local
+            # AAAA beside its allowed IPv4) are left out of the pin, so curl never connects to them. A proxy resolves
+            # the name itself, which makes the pin inert, so there they refuse the request. A listed host name still
+            # allows its whole answer.
+            unvetted = [ip for ip in ips if is_blocked_ip(ip) and not _matches("", [ip], set(), allow_networks)]
+            if unvetted and self._proxied:
+                self._warn(request, f"resolves to non-public address {unvetted[0]}, which a proxy could connect to")
+                raise InvalidDomainError(f"invalid request on local resource: {request.url} -> {unvetted[0]}")
+            if unvetted:
+                if self._log:
+                    left_out = ", ".join(map(str, unvetted))
+                    self._log.info(f"[safehttp] {request.url}: leaving out {left_out}, outside the allow list")
+                ips = [ip for ip in ips if ip not in unvetted]  # never empty: an address matched an allowed network
 
         if literal is not None:
             # curl connects straight to the literal address; nothing to pin.

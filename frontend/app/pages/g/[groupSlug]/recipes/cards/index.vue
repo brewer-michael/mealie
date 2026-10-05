@@ -117,7 +117,7 @@
         <div v-if="queueKeptInMemoryElsewhere" class="queue-kept-in-memory mt-2">
           {{ $t("recipe-ingest.capture.queue-kept-in-memory") }}
         </div>
-        <!-- this tab lost the queue with photos it couldn't save: they upload from here, so it must stay open -->
+        <!-- photos only this tab has (not saved here as the queue left, or given to it after): they upload from here -->
         <div v-if="uploadingLeftovers" class="uploading-leftovers mt-2">
           {{ $t("recipe-ingest.capture.uploading-leftovers") }}
         </div>

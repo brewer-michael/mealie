@@ -438,7 +438,7 @@ class FrozenChannel {
 }
 
 describe("a tab that lost the queue without noticing (frozen in the background while another took it)", () => {
-  test("Use this tab takes it after a moment; the frozen tab neither sends nor writes once it wakes", async () => {
+  test("Use this tab takes it after a moment; once the frozen tab wakes, it writes nothing and sends only what it was given", async () => {
     const locks = fakeLocks();
     vi.stubGlobal("navigator", { locks });
     vi.stubGlobal("BroadcastChannel", FrozenChannel);
@@ -457,7 +457,8 @@ describe("a tab that lost the queue without noticing (frozen in the background w
     const storage = b.storage.indexedDbUploadStorage(b.storage.uploadStorageName("u1"), browser);
     const before = await storage.load();
 
-    // A runs again before it's told: a photo, a retry, an answer... nothing goes out, nothing is written
+    // A runs again before it's told: a photo and a chosen file. Nothing is written; B never had them, so A sends them
+    // (once each), and nothing B sends
     await as(a, async () => {
       a.queue.takePhoto(photo("card two"));
       await a.queue.addPhotos([photo("tray")]);
@@ -465,8 +466,10 @@ describe("a tab that lost the queue without noticing (frozen in the background w
     const after = await storage.load();
     expect([...after.records.keys()].sort()).toEqual([...before.records.keys()].sort());
     expect(after.photos.size).toBe(before.photos.size);
-    expect(sent.map(request => request.photo)).toEqual(["card one", "card one"]);
+    expect(sent.slice(0, 2).map(request => request.photo)).toEqual(["card one", "card one"]);
+    expect(sent.slice(2).map(request => `${request.tab}:${request.photo}`).sort()).toEqual(["A:card two", "A:tray"]);
     expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
 
     locks.wake();
     await settle();
@@ -539,6 +542,61 @@ describe.each([
     await settle(100);
     expect(b.queue.queueElsewhere.value).toBe(false);
     expect(requests).toEqual([{ tab: "B", photos: ["private card"], localOnly: true }]);
+  });
+
+  test("photos given to a tab after its queue went to another tab go from that tab, and the other tab counts them", async () => {
+    const a = await openTab("A");
+    await as(a, () => {
+      a.queue.mode.value = "front-and-back";
+      a.queue.takePhoto(photo("card front"));
+      a.queue.takePhoto(photo("card back"));
+    });
+    const b = await openTab("B");
+    await as(b, () => b.queue.takeOverQueue());
+    await settle(100);
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    requests.length = 0;
+
+    // A's camera and file picker were still open as the queue went: what they give A now goes from A, as cards (a
+    // front doesn't wait for a back that can't come, chosen files pair as in the tray)
+    await as(a, async () => {
+      a.queue.takePhoto(photo("late photo"));
+      await a.queue.addPhotos([photo("late front"), photo("late back")]);
+    });
+    await settle(50);
+    expect(requests.map(request => `${request.tab}:${request.photos.join("+")}`).sort()).toEqual([
+      "A:late front+late back",
+      "A:late photo",
+    ]);
+    expect(a.queue.cards.value.map(card => card.status)).toEqual(["uploading", "uploading"]);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
+    expect(b.queue.cards.value).toHaveLength(1);
+    // B's logout asks about them: its card's two photos and A's three
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(5);
+  });
+
+  test("a card taken over goes with the switch when it changes here while the card waits for its batch", async () => {
+    sharedLocalStorage();
+    const a = await openTab("A");
+    api.createBatch.mockImplementation(() => new Promise(() => {})); // the card never goes from A
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    const b = await openTab("B");
+    let create!: (answer: unknown) => void;
+    api.createBatch.mockImplementation(() => new Promise((resolve) => {
+      create = resolve;
+    }));
+
+    await as(b, () => b.queue.takeOverQueue());
+    await settle(100);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    expect(b.queue.cards.value.map(card => [card.status, card.localOnlyChoice])).toEqual([["uploading", false]]);
+    // the user turns "Keep these cards on this server" on in B before the card's batch is there
+    await as(b, () => {
+      b.queue.localOnly.value = true;
+    });
+    await as(b, () => create({ data: { id: "server-batch", source: "app" }, error: null }));
+    expect(requests).toEqual([{ tab: "B", photos: ["card one"], localOnly: true }]);
   });
 
   test("a front waiting for its back, taken over by a tab opened in One side mode, pairs with the back", async () => {
@@ -765,7 +823,7 @@ describe("the tab keeping the queue is suspended in the background (Web Locks)",
 });
 
 describe("without Web Locks, the tab keeping the queue frozen in the background", () => {
-  test("its lease runs out, another tab takes the queue, and the frozen tab sends nothing once it wakes", async () => {
+  test("its lease runs out, another tab takes the queue, and once the frozen tab wakes it sends only what it was given", async () => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("BroadcastChannel", FrozenChannel);
     // A's timers don't run (it renews nothing) and it hears nothing
@@ -790,15 +848,110 @@ describe("without Web Locks, the tab keeping the queue frozen in the background"
     expect(b.queue.queueElsewhere.value).toBe(false);
     expect(sent).toEqual([{ tab: "A", photo: "card one" }, { tab: "B", photo: "card one" }]);
 
-    // A runs again before it's told: what it does goes nowhere
+    // A runs again before it's told: a photo and a retry. Card one is B's now and doesn't go again; card two never
+    // reached the storage (B doesn't have it), so it goes from A, once
     await as(a, async () => {
       a.queue.takePhoto(photo("card two"));
       a.queue.retry(a.queue.cards.value[0]?.key ?? "");
     });
     await settle(50);
-    expect(sent.map(request => request.photo)).toEqual(["card one", "card one"]);
+    expect(sent).toEqual([{ tab: "A", photo: "card one" }, { tab: "B", photo: "card one" }, { tab: "A", photo: "card two" }]);
     expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
     expect(b.queue.queueElsewhere.value).toBe(false);
+    vi.restoreAllMocks();
+  }, 20_000);
+});
+
+describe("a tab that loses the queue while it's writing", () => {
+  test("waits for the write: a card it wrote before the other tab read the queue goes from that tab only", async () => {
+    vi.stubGlobal("navigator", { locks: fakeLocks() });
+    const gate = () => {
+      let open = () => {};
+      const opened = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      return { opened, open };
+    };
+    const slowSave = { on: false, gate: gate() };
+    const a = await loadTab("A");
+    await connectTab(a, "u1", (id) => {
+      const real = a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser);
+      return { ...real, save: (change, tab) => (slowSave.on ? slowSave.gate.opened.then(() => real.save(change, tab)) : real.save(change, tab)) };
+    });
+    await settle();
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    // card two's write is slow
+    slowSave.on = true;
+    await as(a, () => a.queue.takePhoto(photo("card two")));
+
+    // B takes the queue (A, stuck writing, doesn't hand it over in time), but reads it only a moment later
+    const claimGate = gate();
+    const b = await loadTab("B");
+    await connectTab(b, "u1", (id) => {
+      const real = b.storage.indexedDbUploadStorage(b.storage.uploadStorageName(id), browser);
+      return { ...real, claim: tab => claimGate.opened.then(() => real.claim(tab)) };
+    });
+    await as(b, () => b.queue.takeOverQueue());
+    await settle();
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    // (A sent both cards while it kept the queue; the tab keeping it next sends again what the storage holds)
+    expect(sent).toEqual([{ tab: "A", photo: "card one" }, { tab: "A", photo: "card two" }]);
+
+    // A's write goes before B reads the queue: card two is B's to send now, not A's as well
+    await as(a, () => slowSave.gate.open());
+    await settle();
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.cards.value).toEqual([]);
+    await as(b, () => claimGate.open());
+    await settle(50);
+    expect(sent.slice(2).map(request => `${request.tab}:${request.photo}`).sort()).toEqual(["B:card one", "B:card two"]);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+  }, 10_000);
+});
+
+describe("without Web Locks, the tab keeping the queue wakes after another took it", () => {
+  test("its overdue renewal finds out first: a photo its camera gives it then goes from it, and is counted", async () => {
+    vi.stubGlobal("navigator", {});
+    // A's timers don't run while it's in the background: its lease renewal is run by hand when it wakes
+    const a = await loadTab("A");
+    let renewA: () => void = () => {};
+    const frozenInterval = vi.fn((renew: () => void, ms?: number) => {
+      if (ms === a.storage.QUEUE_RENEW_MS) {
+        renewA = renew;
+      }
+      return 0 as unknown as ReturnType<typeof setInterval>;
+    });
+    vi.stubGlobal("setInterval", frozenInterval);
+    await connectTab(a);
+    vi.unstubAllGlobals();
+    vi.stubGlobal("navigator", {});
+    await settle();
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    const b = await openTab("B");
+
+    // A's lease runs out: B takes the queue, and sends the stored card
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + b.storage.QUEUE_LEASE_MS + 1000);
+    sendingTab = "B";
+    await new Promise(resolve => setTimeout(resolve, b.storage.QUEUE_RENEW_MS + 500));
+    await settle();
+    expect(b.queue.queueElsewhere.value).toBe(false);
+
+    // A wakes: its overdue renewal finds the lease taken before the camera gives it the photo
+    await as(a, () => renewA());
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    await as(a, () => a.queue.takePhoto(photo("late photo")));
+    await settle(50);
+    expect(sent).toEqual([
+      { tab: "A", photo: "card one" },
+      { tab: "B", photo: "card one" },
+      { tab: "A", photo: "late photo" },
+    ]);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
+    // B's logout asks about it
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(2);
     vi.restoreAllMocks();
   }, 20_000);
 });

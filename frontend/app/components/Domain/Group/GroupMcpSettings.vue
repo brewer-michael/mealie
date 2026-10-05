@@ -114,9 +114,9 @@
         />
       </template>
     </BaseCardSectionTitle>
-    <p class="text-body-medium mb-4">
+    <div class="text-body-medium mb-4">
       {{ $t("mcp.oauth-clients-description") }}
-    </p>
+    </div>
     <!-- Another secret would replace the one shown before it's been copied -->
     <div v-if="newSecret" class="text-body-medium font-weight-medium mt-2 mb-4 secret-pending">
       {{ $t("mcp.secret-pending") }}

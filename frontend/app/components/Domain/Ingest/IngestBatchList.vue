@@ -90,7 +90,10 @@
         >
           {{ $t("recipe-ingest.queue.add-clean", batch.clean.length) }}
         </v-btn>
-        <!-- not while its clean cards are being added: the review would open cards on their way to becoming recipes -->
+        <!--
+          not while its clean cards are being added: the review would open cards on their way to becoming recipes. A
+          disabled link would still be focused and followed with Enter, so it's no link then (a disabled button)
+        -->
         <v-btn
           v-if="batch.ready"
           class="batch-review"
@@ -98,7 +101,7 @@
           color="primary"
           variant="flat"
           :disabled="cleanBusy === batch.id"
-          :to="`/g/${groupSlug}/recipes/cards/review?batch=${batch.id}`"
+          :to="cleanBusy === batch.id ? undefined : `/g/${groupSlug}/recipes/cards/review?batch=${batch.id}`"
         >
           {{ $t("recipe-ingest.queue.review-batch") }}
         </v-btn>

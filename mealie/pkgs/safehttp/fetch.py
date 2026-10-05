@@ -2,7 +2,7 @@ import asyncio
 import random
 import time
 import zlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from compression import zstd
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -57,8 +57,8 @@ _CHALLENGE_BODY_SAMPLE = 4096
 # and closing a response it stopped reading waited for (and held) the rest of the body. So curl decodes nothing and
 # stops receiving at the cap, and a refused body stops the transfer. Requests keep the impersonated browser's own
 # Accept-Encoding (any other value would contradict its fingerprint), and a compressed body is decoded here, never past
-# the cap, for every coding a browser offers: gzip, deflate (zlib or raw), zstd and br. A caller without `max_bytes`
-# gets this cap.
+# the cap, for every coding a browser offers: gzip, deflate (zlib or raw), zstd and br. It is decoded a slice at a time
+# (`_DECODE_SLICE`), with turns for the event loop (`_pace`). A caller without `max_bytes` gets this cap.
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 IDENTITY = "identity"
 _NO_CODING = frozenset({IDENTITY, "none"})
@@ -67,6 +67,18 @@ _MAX_CODINGS = 5
 """Codings applied one over the other that are decoded at most, as curl"""
 ZSTD_WINDOW_LOG_MAX = 23
 """An 8 MiB zstd window at most, as browsers allow (RFC 9659 §3): a frame asking for more is refused, not allocated"""
+_DECODE_SLICE = 1024 * 1024
+"""
+The most output one decoder call makes (br: about one more of its blocks). Each slice goes through the stages after it
+and into the body before the next is made, so a few MiB are in flight past the body, never a cap's worth per stage
+"""
+_MAX_FRAMES = 64
+"""
+The zstd frames, or gzip members, one body holds at most (a real one has one, or a few): each costs a new decoder, so a
+body of thousands of empty ones would spend seconds decoding nothing
+"""
+_LOOP_TURN = 0.01
+"""Seconds a body is read and decoded at most before the event loop gets a turn"""
 
 _BASE_BACKOFF = 1.0
 _MAX_BACKOFF = 5.0
@@ -174,19 +186,24 @@ def _over_the_cap(error: BaseException) -> bool:
 class _Decoder:
     """
     Fork hook (DEFAULT_MAX_BYTES): one content coding's decoder that never makes more than `max_bytes` of output (br
-    may overshoot by one of its blocks before that's noticed). `feed` decodes what has arrived; `finish` refuses a
-    stream that ended early. Anything that doesn't decode is an `UnreadableEncodingError`, never a shorter body.
+    may overshoot by one of its blocks before that's noticed). `feed` decodes what has arrived, yielding each call's
+    output (a slice, `_DECODE_SLICE`, at most; maybe nothing) before it makes the next; `finish` refuses a stream that
+    ended early. Anything that doesn't decode is an `UnreadableEncodingError`, never a shorter body.
     """
 
     def __init__(self, coding: str, max_bytes: int) -> None:
         self.coding = coding
         self._max_bytes = max_bytes
         self._fed = False
+        self._frames = 1
         self.size = 0
 
-    def _room(self) -> int:
-        # never 0, which would mean "no limit" to zlib and zstd: past the cap it has already raised
-        return self._max_bytes + 1 - self.size
+    def _limit(self) -> int:
+        """
+        The most output the next call may make: a slice, or the rest of the cap and a byte past it (never 0, which would
+        mean "no limit" to zlib and zstd: past the cap it has already raised)
+        """
+        return min(self._max_bytes + 1 - self.size, _DECODE_SLICE)
 
     def _count(self, piece: bytes) -> bytes:
         self.size += len(piece)
@@ -194,19 +211,28 @@ class _Decoder:
             raise ResponseTooLargeError(f"response body decodes past {self._max_bytes} bytes")
         return piece
 
+    def _next_frame(self) -> None:
+        """Counts a zstd frame or gzip member past the first: no more than `_MAX_FRAMES`"""
+        self._frames += 1
+        if self._frames > _MAX_FRAMES:
+            raise self._unreadable(f"more than {_MAX_FRAMES} frames")
+
     def _unreadable(self, why: object) -> UnreadableEncodingError:
         return UnreadableEncodingError(f"response body isn't valid {self.coding}: {why}")
 
-    def feed(self, data: bytes) -> bytes:
+    def feed(self, data: bytes) -> Iterator[bytes]:
         raise NotImplementedError
 
     def finish(self) -> None:
         raise NotImplementedError
 
 
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
 def _zlib_wrapped(head: bytes) -> bool:
     """Whether a deflate body starts with a zlib (or gzip) header, rather than being raw deflate as old IIS sends"""
-    if head[:2] == b"\x1f\x8b":
+    if head[:2] == _GZIP_MAGIC:
         return True
     cmf, flg = head[0], head[1]
     return cmf & 0x0F == 8 and cmf >> 4 <= 7 and (cmf << 8 | flg) % 31 == 0
@@ -215,8 +241,9 @@ def _zlib_wrapped(head: bytes) -> bool:
 class _ZlibDecoder(_Decoder):
     """
     gzip, x-gzip and deflate. A gzip or zlib header is read either way (as curl does); deflate without one is raw
-    deflate. A gzip body may hold several members, each decoded in turn and counted toward the same cap, and may end
-    in zero padding (as `gzip.decompress` reads it); anything else after the stream is refused.
+    deflate. A gzip body may hold several members (`_MAX_FRAMES`), each decoded in turn and counted toward the same cap,
+    and may end in zero padding (as `gzip.decompress` reads it); anything else after the stream is refused. A stream
+    whose deflate data ended but whose checksum trailer is missing or cut short is read, as curl reads it.
     """
 
     _AUTO = zlib.MAX_WBITS | 32
@@ -227,29 +254,52 @@ class _ZlibDecoder(_Decoder):
         self._head = b""
         """A deflate body's first bytes, until they tell a header from raw deflate"""
         self._inflate = None if coding == "deflate" else zlib.decompressobj(self._AUTO)
+        self._new_member(raw=False)
 
-    def feed(self, data: bytes) -> bytes:
+    def _new_member(self, raw: bool) -> None:
+        """Starts on a member (raw deflate has no trailer to check)"""
+        self._raw = raw
+        self._magic = b""
+        """The member's first two bytes: gzip's magic number, else a zlib header"""
+        self._check = 0
+        """The CRC-32 (gzip) or Adler-32 (zlib) of the member's output so far, as its trailer should hold it"""
+        self._isize = 0
+
+    def feed(self, data: bytes) -> Iterator[bytes]:
         self._fed = self._fed or bool(data)
         if self._inflate is None:
             self._head += data
             if len(self._head) < 2:
-                return b""
+                return
             data, self._head = self._head, b""
-            self._inflate = zlib.decompressobj(self._AUTO if _zlib_wrapped(data) else -zlib.MAX_WBITS)
+            self._new_member(raw=not _zlib_wrapped(data))
+            self._inflate = zlib.decompressobj(-zlib.MAX_WBITS if self._raw else self._AUTO)
 
-        out = bytearray()
-        while data:
+        while True:
             if self._inflate.eof:
-                data = self._next_member(data)
+                if data:
+                    data = self._next_member(data)
                 if not data:
-                    break
+                    return
+            if len(self._magic) < 2:
+                self._magic += data[: 2 - len(self._magic)]
+                self._check = 0 if self._magic == _GZIP_MAGIC else 1  # CRC-32's start value, else Adler-32's
+            limit = self._limit()
             try:
-                piece = self._inflate.decompress(data, self._room())
+                piece = self._inflate.decompress(data, limit)
             except zlib.error as e:
                 raise self._unreadable(e) from e
-            out += self._count(piece)
             data = self._inflate.unused_data if self._inflate.eof else self._inflate.unconsumed_tail
-        return bytes(out)
+            yield self._count(self._checked(piece))
+            if not data and len(piece) < limit:
+                return  # all taken, and no output held back for want of room
+
+    def _checked(self, piece: bytes) -> bytes:
+        if not self._raw:
+            gzip = self._magic == _GZIP_MAGIC
+            self._check = zlib.crc32(piece, self._check) if gzip else zlib.adler32(piece, self._check)
+            self._isize += len(piece)
+        return piece
 
     def _next_member(self, data: bytes) -> bytes:
         """What follows the end of the stream: the next gzip member (zero padding skipped), else an error"""
@@ -257,18 +307,42 @@ class _ZlibDecoder(_Decoder):
             raise self._unreadable("data after the end of the stream")
         rest = data.lstrip(b"\0")
         if rest:
+            self._next_frame()
             self._inflate = zlib.decompressobj(self._GZIP)  # anything but a gzip member fails its header check
+            self._new_member(raw=False)
         return rest
 
     def finish(self) -> None:
         if not self._fed:
             return  # an empty body, as curl reads it
-        if self._inflate is None or not self._inflate.eof:
+        if self._inflate is None or not (self._inflate.eof or self._only_its_trailer_is_missing()):
             raise self._unreadable("the stream ends early")
+
+    def _only_its_trailer_is_missing(self) -> bool:
+        """
+        Whether the member's deflate data ended, and only its trailer is missing or cut short: the trailer it should
+        have, fed to a copy of the decompressor from the part of it that arrived, ends the stream. A stream cut inside
+        its deflate data can't end within a trailer's length, and a part that arrived wrong fails zlib's check.
+        """
+        if self._inflate is None or self._raw or len(self._magic) < 2:
+            return False
+        if self._magic == _GZIP_MAGIC:
+            trailer = self._check.to_bytes(4, "little") + (self._isize & 0xFFFFFFFF).to_bytes(4, "little")
+        else:
+            trailer = self._check.to_bytes(4, "big")
+        for arrived in range(len(trailer)):
+            probe = self._inflate.copy()
+            try:
+                rest = probe.decompress(trailer[arrived:])
+            except zlib.error:
+                continue
+            if probe.eof and not rest and not probe.unused_data:
+                return True
+        return False
 
 
 class _ZstdDecoder(_Decoder):
-    """zstd: each frame in turn, counted toward the same cap, with a browser's window limit"""
+    """zstd: each frame in turn (`_MAX_FRAMES`), counted toward the same cap, with a browser's window limit"""
 
     def __init__(self, coding: str, max_bytes: int) -> None:
         super().__init__(coding, max_bytes)
@@ -278,23 +352,23 @@ class _ZstdDecoder(_Decoder):
     def _frame() -> zstd.ZstdDecompressor:
         return zstd.ZstdDecompressor(options={zstd.DecompressionParameter.window_log_max: ZSTD_WINDOW_LOG_MAX})
 
-    def feed(self, data: bytes) -> bytes:
+    def feed(self, data: bytes) -> Iterator[bytes]:
         self._fed = self._fed or bool(data)
-        out = bytearray()
         while True:
             if self._zstd.eof:
                 data = self._zstd.unused_data + data
                 if not data:
-                    return bytes(out)
-                self._zstd = self._frame()  # the next frame
+                    return
+                self._next_frame()
+                self._zstd = self._frame()
             elif not data and self._zstd.needs_input:
-                return bytes(out)
+                return
             try:
-                piece = self._zstd.decompress(data, self._room())
+                piece = self._zstd.decompress(data, self._limit())
             except zstd.ZstdError as e:
                 raise self._unreadable(e) from e
             data = b""
-            out += self._count(piece)
+            yield self._count(piece)
 
     def finish(self) -> None:
         if self._fed and not self._zstd.eof:
@@ -302,23 +376,28 @@ class _ZstdDecoder(_Decoder):
 
 
 class _BrotliDecoder(_Decoder):
-    """br, through brotli's output limit (`process`, then `process(b"")` until it can take more input)"""
+    """
+    br, through brotli's output limit: `process`, then `process(b"")` until it makes nothing more and can take more
+    input (it can take more before it has made all it holds)
+    """
 
     def __init__(self, coding: str, max_bytes: int) -> None:
         super().__init__(coding, max_bytes)
         self._brotli = brotli.Decompressor()
 
-    def feed(self, data: bytes) -> bytes:
+    def feed(self, data: bytes) -> Iterator[bytes]:
         self._fed = self._fed or bool(data)
-        out = bytearray()
+        if not data:
+            return
         try:
-            if data:
-                out += self._count(self._brotli.process(data, output_buffer_limit=self._room()))
-            while not self._brotli.can_accept_more_data():
-                out += self._count(self._brotli.process(b"", output_buffer_limit=self._room()))
+            piece = self._brotli.process(data, output_buffer_limit=self._limit())
+            while True:
+                yield self._count(piece)
+                if not piece and self._brotli.can_accept_more_data():
+                    return
+                piece = self._brotli.process(b"", output_buffer_limit=self._limit())
         except brotli.error as e:  # corrupt, or data after the end of the stream
             raise self._unreadable(e) from e
-        return bytes(out)
 
     def finish(self) -> None:
         if self._fed and not self._brotli.is_finished():
@@ -346,10 +425,23 @@ class _Decoding:
             raise UnreadableEncodingError(f"response body is encoded with {', '.join(codings)!r}, not decoded here")
         self._stages = [_DECODERS[coding](coding, max_bytes) for coding in reversed(codings)]
 
-    def feed(self, data: bytes) -> bytes:
-        for stage in self._stages:
-            data = stage.feed(data)
-        return data
+    def feed(self, data: bytes) -> Iterator[bytes]:
+        """
+        What `data` decodes to, a slice at a time: each stage's slice goes through the stages after it before the stage
+        makes the next. An empty piece follows any decoder call that leaves nothing to pass on, so the reader gets
+        control back between any two calls (`_pace`).
+        """
+        return self._through(0, data)
+
+    def _through(self, stage: int, data: bytes) -> Iterator[bytes]:
+        if stage == len(self._stages):
+            yield data
+            return
+        for piece in self._stages[stage].feed(data):
+            if piece:
+                yield from self._through(stage + 1, piece)
+            else:
+                yield piece
 
     def finish(self) -> None:
         for stage in self._stages:
@@ -365,6 +457,21 @@ def codings_of(headers: httpx.Headers) -> list[str]:
     """Fork hook: the body's content codings in the order they were applied, lower-case, none for identity"""
     codings = (coding.strip().lower() for coding in headers.get("content-encoding", "").split(","))
     return [coding for coding in codings if coding and coding not in _NO_CODING]
+
+
+async def _pace(start_time: float, turn: float, timeout: int) -> float:
+    """
+    Fork hook: raises ForceTimeoutException once a body has taken `timeout` to read, and gives the event loop a turn
+    when it has had none for `_LOOP_TURN`: curl's queue seldom runs dry, so reading and decoding a body otherwise held
+    the loop until the end. Returns when the loop last had a turn.
+    """
+    now = time.monotonic()
+    if now - start_time > timeout:
+        raise ForceTimeoutException()
+    if now - turn < _LOOP_TURN:
+        return turn
+    await asyncio.sleep(0)
+    return time.monotonic()
 
 
 @asynccontextmanager
@@ -404,13 +511,15 @@ async def _read_capped(resp: httpx.Response, timeout: int, max_bytes: int | None
 
     content = bytearray()  # fork: `bytes +=` copied the whole body for every 1 KiB chunk
     start_time = time.monotonic()
+    turn = start_time  # fork hook (`_pace`)
     async for chunk in resp.aiter_bytes(chunk_size=1024):
-        content += decoding.feed(chunk) if decoding else chunk
-        if time.monotonic() - start_time > timeout:
-            raise ForceTimeoutException()
-        # Servers that omit or understate Content-Length are caught by the running total.
-        if max_bytes is not None and len(content) > max_bytes:
-            raise ResponseTooLargeError(f"response body exceeds {max_bytes} bytes")
+        # fork hook: decoded a slice at a time (`_DECODE_SLICE`), each counted before the next is made
+        for piece in decoding.feed(chunk) if decoding else (chunk,):
+            content += piece
+            # Servers that omit or understate Content-Length are caught by the running total.
+            if max_bytes is not None and len(content) > max_bytes:
+                raise ResponseTooLargeError(f"response body exceeds {max_bytes} bytes")
+            turn = await _pace(start_time, turn, timeout)
     if decoding:
         decoding.finish()  # fork hook: a stream that ends early is refused, never returned short
     return bytes(content)

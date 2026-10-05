@@ -1293,6 +1293,38 @@ describe("useRecipeIngestReview", () => {
     expect(review.committing.value).toBe(false);
   });
 
+  test.each([
+    ["offline", { data: null, error: { message: "Network Error" } }],
+    ["a server error", apiError(503, { code: "paused_for_restore" })],
+  ])("a commit refused as stale whose reload fails (%s) doesn't say it was reloaded, nor commit the stale version again", async (_name, failedRead) => {
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
+    api.commit.mockResolvedValueOnce(conflictError);
+    const { review, navigate } = await loaded();
+
+    api.getJob.mockResolvedValueOnce(failedRead);
+    expect(await review.commit()).toBe("conflict");
+    await flushPromises();
+
+    expect(api.commit).toHaveBeenCalledExactlyOnceWith("j1", { draftVersion: 3 });
+    expect(review.draftVersion.value).toBe(3);
+    // the "Reload this card" dialog asks, rather than a notice saying it was
+    expect(review.conflict.value).toBe(true);
+    expect(review.notice.value).toBeNull();
+    expect(navigate).not.toHaveBeenCalled();
+
+    // Commit again: held back until the card is reloaded
+    expect(await review.commit()).toBe("conflict");
+    expect(api.commit).toHaveBeenCalledOnce();
+
+    // the dialog's Reload, once the card can be read: the new version, and Commit sends it
+    api.getJob.mockResolvedValueOnce(ok(job({ flags: [], draftVersion: 4 })));
+    await review.reload();
+    expect([review.conflict.value, review.draftVersion.value, review.loadState.value]).toEqual([false, 4, "ready"]);
+    api.commit.mockResolvedValueOnce(ok({ recipeId: "r1", slug: "banana-mug-cake", nextJobId: "j2", warnings: [] }));
+    expect(await review.commit()).toBe("committed");
+    expect(api.commit).toHaveBeenLastCalledWith("j1", { draftVersion: 4 });
+  });
+
   test("a commit refused as stale while an edit waits to be saved opens the reload dialog instead", async () => {
     api.getJob.mockResolvedValueOnce(ok(job({ flags: [] })));
     let answer: (value: unknown) => void = () => {};

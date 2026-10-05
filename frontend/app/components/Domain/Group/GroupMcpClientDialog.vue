@@ -73,10 +73,10 @@
         <v-radio :label="$t('mcp.client-type-confidential')" :value="true" />
         <v-radio :label="$t('mcp.client-type-public')" :value="false" />
       </v-radio-group>
-      <p v-else-if="client" class="text-body-medium mb-4">
+      <div v-else-if="client" class="text-body-medium mb-4">
         {{ client.isConfidential ? $t("mcp.confidential-client") : $t("mcp.public-client") }}.
         {{ $t("mcp.client-type-fixed") }}
-      </p>
+      </div>
 
       <fieldset class="redirect-uris mb-4">
         <legend class="text-title-small mb-2">
@@ -114,9 +114,9 @@
         >
           {{ $t("mcp.add-redirect-uri") }}
         </v-btn>
-        <p class="text-body-small text-medium-emphasis mt-1">
+        <div class="text-body-small text-medium-emphasis mt-1">
           {{ $t("mcp.redirect-uris-hint") }}
-        </p>
+        </div>
       </fieldset>
 
       <v-checkbox

@@ -1231,10 +1231,14 @@ describe("Review batch while the batch's clean cards are added", () => {
     await flushPromises();
     await wrapper.get(".dialog-confirm").trigger("click");
     await flushPromises();
-    expect(wrapper.get(".batch-review").attributes("disabled")).toBe("true");
+    // a disabled button, no link: Vuetify renders a disabled link as a focusable <a href>, which Enter follows
+    expect(wrapper.get(".batch-review").element.tagName).toBe("BUTTON");
+    expect((wrapper.get(".batch-review").element as HTMLButtonElement).disabled).toBe(true);
+    expect(wrapper.get(".batch-review").attributes("href")).toBeUndefined();
 
     answer();
     await flushPromises();
     expect(wrapper.get(".batch-review").attributes("disabled")).toBe("false");
+    expect(wrapper.get(".batch-review").attributes("href")).toBe("/g/home/recipes/cards/review?batch=b1");
   });
 });

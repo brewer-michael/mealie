@@ -1730,8 +1730,8 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
     void loadBatch();
   }
 
-  /** Fetches the job again without dropping unsaved edits */
-  async function refresh() {
+  /** Fetches the job again without dropping unsaved edits; false when it couldn't be read (offline, a server error) */
+  async function refresh(): Promise<boolean> {
     // the first save that may overlap the read: the one in flight now, else the next
     const firstOverlapping = saving ? saveSeq : saveSeq + 1;
     const { data, error } = await api.recipeIngest.getJob(jobId);
@@ -1739,7 +1739,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       if (errorStatusOf(error) === 404) {
         loadState.value = "not-found";
       }
-      return;
+      return false;
     }
     // a save that overlapped the read lands first, so the read's version is compared with the one it returned:
     // the read may have seen that save, which isn't a change from somewhere else (docs/ai/PHASE2.md §6.6)
@@ -1747,6 +1747,7 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
       await saving;
     }
     applyJob(data, false, { save: saveSeq >= firstOverlapping, clearedError: clearedErrorSeq >= firstOverlapping });
+    return true;
   }
 
   /** "Reload this card": drops the unsaved edits and loads the stored card */
@@ -2706,7 +2707,14 @@ export function useRecipeIngestReview(jobId: string, options: RecipeIngestReview
           }
           // nothing unsaved: the card changed elsewhere since this page read it (a page merged into it is read
           // again, or another device saved), so it's shown as it is now
-          await refresh();
+          if (!(await refresh())) {
+            // it couldn't be read (offline, a server error): what's shown is stale, and committing it again would be
+            // refused the same way, so the "Reload this card" dialog asks instead (and holds the commit back)
+            if (loadState.value === "ready") {
+              conflict.value = true;
+            }
+            return "conflict";
+          }
           if (loadState.value === "ready" && !conflict.value) {
             notify("warning", i18n.t("recipe-ingest.review.commit-reloaded"));
           }

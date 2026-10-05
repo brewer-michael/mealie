@@ -45,6 +45,7 @@ describe("typecheck:fork", () => {
       "app/pages/admin/backups.test.ts",
       "app/plugins/__tests__/axios-restore-pause.test.ts",
       "app/composables/__tests__/use-auth-backend-restore-pause.test.ts",
+      "app/pages/login.test.ts",
     ]) {
       expect(isForkFile(file), file).toBe(true);
     }
@@ -56,6 +57,7 @@ describe("typecheck:fork", () => {
       "app/lib/api/user/recipes/recipe.ts",
       "app/plugins/axios.ts",
       "app/composables/use-auth-backend.ts",
+      "app/pages/login.vue",
     ]) {
       expect(isForkFile(file), file).toBe(false);
     }

@@ -31,6 +31,7 @@ export const FORK_PATHS = [
   /^app\/pages\/g\/\[groupSlug\]\/recipes\/cards\//,
   /^app\/pages\/g\/\[groupSlug\]\/r\/create\/ai\.test\.ts$/,
   /^app\/pages\/group\/index\.test\.ts$/,
+  /^app\/pages\/login\.test\.ts$/,
   /^app\/pages\/oauth\/consent\./,
   /^app\/pages\/user\/profile\/connected-apps\.vue$/,
 ];

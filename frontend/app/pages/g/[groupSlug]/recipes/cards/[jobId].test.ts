@@ -1,6 +1,6 @@
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import ReviewPage from "./[jobId].vue";
 import BaseDialog from "~/components/global/BaseDialog.vue";
@@ -1418,7 +1418,8 @@ describe("the recipe card review page", () => {
 });
 
 describe("the review page's spacing and hint lines (read from the sources: jsdom lays nothing out)", () => {
-  const app = resolve(__dirname, "../../../../..");
+  const frontend = resolve(__dirname, "../../../../../..");
+  const app = join(frontend, "app");
   // the review page and the components it's built from
   const REVIEW_COMPONENT
     = /^Ingest(Ingredient|Step|RecipeFields|Flag|Region|CardViewer|ReviewBar|OrganizerSelector|EvalCaseDialog|NoteList|ProposalBanner|Transcription|NeedsALook)\w*\.vue$/;
@@ -1431,11 +1432,22 @@ describe("the review page's spacing and hint lines (read from the sources: jsdom
   ];
   const source = (file: string) => readFileSync(join(app, file), "utf8");
 
-  test("no <p> carries a margin helper, which upstream's unlayered `p { margin: 0 }` would cancel (LB2)", () => {
-    expect(files.length).toBeGreaterThan(15);
-    const spaced = files.flatMap(file => [...source(file).matchAll(/<p\b([^>]*)>/g)]
-      .filter(([, attributes]) => /class="[^"]*\bm[tbsexy]?-n?\d+\b/.test(attributes!))
-      .map(([tag]) => `${file}: ${tag!.replace(/\s+/g, " ")}`));
+  /** Every .vue file of the fork, as `pnpm typecheck:fork` names them (`scripts/typecheck-fork.mjs`) */
+  async function forkVueFiles(): Promise<string[]> {
+    const script = join(frontend, "scripts/typecheck-fork.mjs");
+    const { isForkFile } = (await import(/* @vite-ignore */ script)) as { isForkFile: (file: string) => boolean };
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true })
+      .flatMap(entry => (entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)]));
+    return walk(app).filter(file => file.endsWith(".vue") && isForkFile(relative(frontend, file)));
+  }
+
+  test("no <p> of the fork carries a top or bottom margin helper, which upstream's unlayered `p { margin: 0 }` would cancel (LB2)", async () => {
+    const forkFiles = await forkVueFiles();
+    expect(forkFiles.length).toBeGreaterThan(30);
+    expect(forkFiles).toEqual(expect.arrayContaining(files.map(file => join(app, file))));
+    const spaced = forkFiles.flatMap(file => [...readFileSync(file, "utf8").matchAll(/<p\b((?:[^>"]|"[^"]*")*)>/g)]
+      .filter(([, attributes]) => /\bclass="[^"]*\bm[atby]-(?:(?:sm|md|lg|xl|xxl)-)?(?:n?[1-9]\d*|auto)\b/.test(attributes!))
+      .map(([tag]) => `${relative(frontend, file)}: ${tag!.replace(/\s+/g, " ")}`));
     expect(spaced).toEqual([]);
   });
 

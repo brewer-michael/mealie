@@ -16,9 +16,9 @@
       </div>
     </v-alert>
     <AppLoader v-if="!loaded && loading" />
-    <p v-else-if="loaded && !connections.length" class="text-body-large text-center my-6 no-connections">
+    <div v-else-if="loaded && !connections.length" class="text-body-large text-center my-6 no-connections">
       {{ $t("mcp.no-connected-apps") }}
-    </p>
+    </div>
 
     <v-list v-if="connections.length">
       <template v-for="connection in connections" :key="connection.clientId">

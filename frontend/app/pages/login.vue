@@ -214,6 +214,7 @@
 import { useDark, useSessionStorage, whenever } from "@vueuse/core";
 import { useLoggedInState } from "~/composables/use-logged-in-state";
 import { usePasswordField } from "~/composables/use-passwords";
+import { restoreRetryAfterMs } from "~/composables/use-recipe-ingest-restore";
 import { alert } from "~/composables/use-toast";
 import { useAsyncKey } from "~/composables/use-utils";
 import { isSafeRedirectTarget } from "~/lib/validators/redirect";
@@ -384,6 +385,13 @@ function alertOnError(error: any) {
   }
   else if (error.response?.status === 423) {
     alert.error(i18n.t("user.account-locked-please-try-again-later"));
+  }
+  // fork hook (docs/ai/PHASE2.md §3.9): signing in while a backup is restored says so, not "Something went wrong"
+  else if (restoreRetryAfterMs(error) !== null) {
+    // the axios interceptor toasts the server's message ("A backup is being restored. Try again in a minute.")
+    if (!error.response.data.detail.message) {
+      alert.error(i18n.t("recipe-ingest.restore.sign-in-paused"));
+    }
   }
   else {
     alert.error(i18n.t("events.something-went-wrong"));

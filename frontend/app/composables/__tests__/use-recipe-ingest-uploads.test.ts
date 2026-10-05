@@ -1606,6 +1606,33 @@ describe("choices this browser remembers, changed in another of its tabs", () =>
     expect(uploadOptions(2)).toMatchObject({ localOnly: false });
   });
 
+  test("a card read back after a reload goes with the switch when it changes while the card waits for its batch", async () => {
+    const storage = memoryUploadStorage();
+    // offline: the card is stored with the switch off, and never gets its batch
+    api.createBatch.mockImplementation(() => new Promise(() => {}));
+    const before = useRecipeIngestUploads();
+    await before.connect("u1", () => storage);
+    before.takePhoto(photo("card-one.jpg"));
+    await flushPromises();
+    expect(api.upload).not.toHaveBeenCalled();
+
+    // the page is reloaded: the card is read back with the switch it was stored with, and waits for its batch again
+    resetRecipeIngestUploads();
+    const created = deferred<unknown>();
+    api.createBatch.mockImplementation(() => created.promise);
+    const queue = useRecipeIngestUploads();
+    await queue.connect("u1", () => storage);
+    await flushPromises();
+    expect(queue.cards.value.map(card => [card.status, card.localOnlyChoice])).toEqual([["uploading", false]]);
+
+    queue.localOnly.value = true;
+    created.resolve({ data: { id: "b1", source: "app" }, error: null, response: null });
+    await flushPromises();
+    await vi.waitFor(() => expect(api.upload).toHaveBeenCalledTimes(1));
+    expect(uploadOptions(0)).toMatchObject({ localOnly: true });
+    expect(queue.cards.value.map(card => card.localOnly)).toEqual([true]);
+  });
+
   test("a front read back while this tab is in One side mode pairs with the next photo, as its \"Back side\" says", async () => {
     const storage = memoryUploadStorage();
     const queue = useRecipeIngestUploads();

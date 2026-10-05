@@ -47,9 +47,9 @@
           </i18n-t>
         </v-card-title>
         <v-card-text>
-          <p class="mb-2">
+          <div class="mb-2">
             {{ $t("mcp.consent.it-will-be-able-to") }}
-          </p>
+          </div>
           <ul class="ms-6 mb-2">
             <li>{{ $t("mcp.consent.read-access") }}</li>
           </ul>
@@ -72,18 +72,18 @@
           >
             {{ $t("mcp.consent.decision-failed") }}
           </v-alert>
-          <p class="text-body-medium mt-4 mb-1 signed-in-as">
+          <div class="text-body-medium mt-4 mb-1 signed-in-as">
             {{ $t("mcp.consent.signed-in-as", { name: accountName }) }}
-          </p>
-          <p class="text-body-small text-medium-emphasis mb-1 redirect-notice">
+          </div>
+          <div class="text-body-small text-medium-emphasis mb-1 redirect-notice">
             {{ $t("mcp.consent.redirect-notice", { host: request.redirectHost }) }}
-          </p>
+          </div>
           <p class="text-body-small text-medium-emphasis mb-0">
             {{ $t("mcp.consent.only-approve") }}
           </p>
-          <p v-if="state === 'redirecting'" class="text-body-medium mt-4 mb-0" role="status">
+          <div v-if="state === 'redirecting'" class="text-body-medium mt-4 mb-0" role="status">
             {{ $t("mcp.consent.redirecting", { host: request.redirectHost }) }}
-          </p>
+          </div>
         </v-card-text>
         <v-card-actions class="flex-wrap">
           <v-btn variant="text" size="small" :disabled="busy" @click="switchAccount">
@@ -119,9 +119,9 @@
           >
             {{ problemMessage }}
           </v-alert>
-          <p v-if="accountName" class="text-body-medium mt-4 mb-0">
+          <div v-if="accountName" class="text-body-medium mt-4 mb-0">
             {{ $t("mcp.consent.signed-in-as", { name: accountName }) }}
-          </p>
+          </div>
         </v-card-text>
         <v-card-actions class="flex-wrap">
           <v-btn v-if="accountName" variant="text" size="small" @click="switchAccount">

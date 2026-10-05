@@ -1965,6 +1965,11 @@
       "pages": "{count} page | {count} pages",
       "verified-chip": "Verified",
       "load-failed": "Couldn't load the eval cases"
+    },
+    "restore": {
+      "page-title": "A backup is being restored",
+      "page-text": "This page will open when it's done.",
+      "sign-in-paused": "A backup is being restored. Try again in a minute."
     }
   }
 }

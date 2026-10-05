@@ -266,9 +266,32 @@ const chip = computed<Chip>(() => {
   min-width: 0;
 }
 
+/*
+ * the actions take the line's width at most and wrap within it, flush right: on a phone, a failed card's Read with cloud
+ * providers, Retry and Discard don't fit beside each other, and none may be pushed past the edge
+ */
 .job-actions {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 4px;
   margin-left: auto;
+}
+
+/* a label longer than the line (Read with cloud providers on a 320 px phone) wraps inside its button */
+.job-actions .v-btn {
+  max-width: 100%;
+}
+
+.job-actions .v-btn:not(.v-btn--icon) {
+  height: auto;
+  min-height: var(--v-btn-height);
+}
+
+.job-actions :deep(.v-btn__content) {
+  white-space: normal;
 }
 
 .job-title {

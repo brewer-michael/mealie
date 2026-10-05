@@ -5,9 +5,9 @@
         {{ $t('search.advanced') }}
       </v-expansion-panel-title>
       <v-expansion-panel-text>
-        <p class="text-body-medium mb-4">
+        <div class="text-body-medium mb-4">
           {{ $t('group.ai-provider-settings.advanced-routes-description') }}
-        </p>
+        </div>
         <GroupAIProviderRouteSelect
           v-for="routeSlot in ADVANCED_AI_PROVIDER_SLOTS"
           :key="routeSlot"
