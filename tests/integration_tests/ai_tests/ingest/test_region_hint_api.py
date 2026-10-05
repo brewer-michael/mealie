@@ -38,15 +38,15 @@ def _fake_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     use_fake_flags(monkeypatch)
 
 
-def _card(user: TestUser, *, ocr: bool, **columns: Any) -> UUID:
+def _card(user: TestUser, *, ocr: bool, lines: list[tuple[str, float, float]] = LINES, **columns: Any) -> UUID:
     columns.setdefault("transcription", TRANSCRIPTION)
     job_id = seed_job(user, page_count=2, **columns)
     if ocr:
         pages = job_row(job_id)["pages"]
         pages[0]["ocr"] = {
-            "text": "\n".join(text for text, _, _ in LINES),
+            "text": "\n".join(text for text, _, _ in lines),
             "confidence": 88.0,
-            "lines": [{"text": text, "x": 0.08, "y": y, "width": 0.7, "height": h} for text, y, h in LINES],
+            "lines": [{"text": text, "x": 0.08, "y": y, "width": 0.7, "height": h} for text, y, h in lines],
         }
         set_columns(job_id, pages=pages)
     return job_id
@@ -146,3 +146,48 @@ def test_no_hint_is_a_404(api_client: TestClient, unique_user_fn_scoped: TestUse
 def test_another_households_card_is_not_found(api_client: TestClient, unique_user: TestUser, h2_user: TestUser):
     job_id = _card(h2_user, ocr=True)
     assert_code(_hint(api_client, unique_user, job_id, "name"), 404, "not_found")
+
+
+TWO_EGGS = [
+    # a short line the card says twice: in the cake and in the frosting
+    ("Two Egg Cake", 0.05, 0.05),
+    ("For the cake", 0.15, 0.03),
+    ("1 egg", 0.20, 0.03),
+    ("2 c. flour", 0.25, 0.03),
+    ("For the frosting", 0.40, 0.03),
+    ("1 egg", 0.45, 0.03),
+    ("1 c. powdered sugar", 0.50, 0.03),
+    ("Beat well and bake.", 0.70, 0.03),
+]
+
+
+def test_a_line_the_card_says_twice_is_found_as_the_one_it_is(api_client: TestClient, unique_user_fn_scoped: TestUser):
+    """The frosting's "1 egg" is the card's second, not the cake's: by which of the draft's "1 egg" lines it is"""
+    user = unique_user_fn_scoped
+    texts = [text for text, _, _ in TWO_EGGS]
+    lines = [
+        CardDraftIngredient(title=title, original_text=text, note=text, display=text)
+        for title, text in (
+            ("For the cake", "1 egg"),
+            ("For the cake", "2 c. flour"),
+            ("For the frosting", "1 Egg"),  # as the hint compares lines: case and spacing aside
+            ("For the frosting", "1 c. powdered sugar"),
+        )
+    ]
+    draft = banana_draft(name="Two Egg Cake", ingredients=lines, description="")
+    for ocr in (True, False):
+        job_id = _card(user, ocr=ocr, lines=TWO_EGGS, transcription="\n".join(texts), draft=draft)
+        cake, frosting = (_hint(api_client, user, job_id, "ingredients", lines[i].reference_id) for i in (0, 2))
+        assert cake.status_code == frosting.status_code == 200, (cake.text, frosting.text)
+        cake_hint, frosting_hint = cake.json(), frosting.json()
+        if ocr:
+            # between the Tesseract lines most like the transcription's lines around each
+            assert (cake_hint["source"], frosting_hint["source"]) == ("ocr", "ocr")
+            assert _covers(cake_hint, 0.20, 0.23) and cake_hint["y"] + cake_hint["height"] <= 0.25
+            assert _covers(frosting_hint, 0.45, 0.48) and frosting_hint["y"] >= 0.43
+        else:
+            # without them, the transcription's lines: the cake's "1 egg" is the front's third of four, the
+            # frosting's the back's second
+            assert (cake_hint["source"], frosting_hint["source"]) == ("position", "position")
+            assert (cake_hint["page"], frosting_hint["page"]) == (0, 1)
+            assert _covers(cake_hint, 0.625, 0.625) and _covers(frosting_hint, 0.375, 0.375)

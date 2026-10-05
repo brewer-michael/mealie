@@ -428,3 +428,32 @@ def _keep_every_marker_of(api_client: TestClient, user: TestUser, job_id: UUID) 
     job = api_client.get(job_url(job_id), headers=user.token).json()
     markers = {flag["id"]: "kept" for flag in job["flags"] if flag["kind"] in ("illegible", "blank")}
     return _put(api_client, user, job_id, job["draft"], flagResolutions=markers)
+
+
+def test_a_kept_line_is_asked_about_only_the_amounts_parsing_lost(
+    api_client: TestClient, unique_user_fn_scoped: TestUser
+):
+    """
+    A line kept with a marker is parsed around it, and its parse is checked as a freshly read line's: an amount the
+    parser kept in its own note ("or 3/4 c. honey", "plus 2 T.") was never lost, so `check_parse` doesn't name it
+    """
+    user = unique_user_fn_scoped
+    lines = ["1 c. [illegible] sugar or 3/4 c. honey", "[blank] c. flour, plus 2 T."]
+    card = "Honey Cake\n" + "\n".join(lines) + "\nMix and bake."
+    draft = banana_draft(
+        name="Honey Cake",
+        ingredients=[_text_line(text) for text in lines],
+        steps=[CardDraftStep(text="Mix and bake.")],
+    )
+    extraction = ExtractionMeta(read_path="image", provider="Claude", model="claude-sonnet", language="en")
+    flags = compute_flags(draft, extraction, {}, transcription=card)
+    job_id = seed_job(user, draft=draft, flags=flags, transcription=card, extraction=extraction)
+
+    saved = _keep_every_marker_of(api_client, user, job_id)
+    answered = {line["referenceId"]: line for line in saved["ingredients"]}
+    refs = [str(line.reference_id) for line in draft.ingredients]
+    assert _fields(answered[refs[0]]) == (1, "cup", "sugar", "[illegible], or 3/4 c. honey")
+    assert _fields(answered[refs[1]]) == (None, "cup", "flour", "[blank], plus 2 T.")
+    for ref in refs:
+        lost = _flags_of(saved, ref).get("check_parse", {}).get("params", {}).get("value")
+        assert lost is None, (ref, lost)

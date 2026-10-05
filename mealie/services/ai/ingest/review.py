@@ -31,7 +31,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -104,6 +104,8 @@ from mealie.services.ai.ingest.matching import IngestMatcher
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 from mealie.services.ai.ingest.pipeline.cardtext import MARKER_RE, canonical_markers, markers_in
 from mealie.services.ai.ingest.pipeline.ingredients import IngredientLine, normalize_lines
+from mealie.services.ai.ingest.pipeline.models import CardPage
+from mealie.services.ai.ingest.pipeline.ocrcheck import ocr_line_reader
 from mealie.services.ai.ingest.pipeline.regions import region_hint
 from mealie.services.ai.ingest.pipeline.reread import field_name
 from mealie.services.ai.ingest.runner.dispatcher import dispatcher
@@ -339,12 +341,14 @@ def _adopted_reading_flags(
     *,
     pages: Sequence[PageMeta] = (),
     units: Iterable[str] = (),
+    ocr_reread: Callable[[int], str | None] | None = None,
 ) -> list[CardFlag]:
     """
     The flags of each whole-card proposal (a re-extract of an edited draft) that `draft` took up, computed as the
-    re-extract computed them: against the job's transcription, extraction and pages, which are that reading's, and the
-    group's `units` (`IngestMatcher.unit_names`). A save that accepts the proposal passes them as `previous`, so the
-    new reading's reading flags (Tesseract's check of a printed card's numbers, a lost unit that is one of the group's
+    re-extract computed them: against the job's transcription, extraction and pages, which are that reading's, the
+    group's `units` (`IngestMatcher.unit_names`), and Tesseract's second reading of a line whose number it may have
+    misread (`ocr_reread`, `OCRRereads`). A save that accepts the proposal passes them as `previous`, so the new
+    reading's reading flags (Tesseract's check of a printed card's numbers, a lost unit that is one of the group's
     own, included) are raised on the draft it became (its ingredient and step ids are new, so none of the stored flags
     matches them). Accepting keeps the proposal's ingredient, step and note ids; a dismissed one shares none with the
     draft.
@@ -364,10 +368,47 @@ def _adopted_reading_flags(
         if ids & proposed_ids or (not proposed_ids and proposed == draft):
             flags.extend(
                 card_flags.compute_flags(
-                    proposed, extraction, {}, transcription=transcription, units=units, ocr_lines=ocr_lines
+                    proposed,
+                    extraction,
+                    {},
+                    transcription=transcription,
+                    units=units,
+                    ocr_lines=ocr_lines,
+                    ocr_reread=ocr_reread if ocr_lines else None,
                 )
             )
     return flags
+
+
+REREAD_ATTEMPTS = 3
+"""How often a save adopting a reading reads Tesseract's second readings again for pages that changed meanwhile"""
+
+
+class PagesChanged(Exception):
+    """The card's pages changed since Tesseract's second readings for a save were read (`OCRRereads`)"""
+
+
+@dataclass(frozen=True)
+class OCRRereads:
+    """
+    Tesseract's second readings of a printed card's lines (`pipeline.ocr_line_reader`), by the OCR check's line index:
+    the lines the check of the whole-card proposals a save adopts asks about (`_adopted_reading_flags`), read before
+    the draft's write (`ReviewService._adopted_ocr_rereads`). Tesseract takes seconds, and the write reads the row in
+    a transaction nothing slow may hold open. They hold for the pages they were read from.
+    """
+
+    pages: list[PageMeta]
+    lines: Mapping[int, str | None]
+
+    def reader(self, pages: Sequence[PageMeta]) -> Callable[[int], str | None]:
+        """
+        The readings as `compute_flags`' `ocr_reread`, in the write, for the row's `pages`: with them unchanged, so
+        are the adopted proposals, their reading and the lines the check asks about. `PagesChanged` when they changed
+        since (a merge added one): the save reads them again.
+        """
+        if list(pages) != self.pages:
+            raise PagesChanged
+        return self.lines.get
 
 
 def _has_parts(ingredient: CardDraftIngredient) -> bool:
@@ -453,8 +494,13 @@ class KeptLine:
             note=marker_note or note,
         ).display
         ingredient.display = display or self.text
-        # as read: its flags are a parsed line's, against the line as written (`flags.ingredient_line`)
-        ingredient.extracted_hash = card_flags.ingredient_hash(ingredient, split=card_flags.split_off(parsed))
+        # as read: its flags are a parsed line's, against the line as written (`flags.ingredient_line`), with what
+        # parsing did that its fields can't say: an alternative split off, and whether amounts the fields lost were
+        # appended to the note (never the parser's own amounts, which `check_parse` doesn't ask about)
+        marks = card_flags.parse_marks(parsed)
+        ingredient.extracted_hash = card_flags.ingredient_hash(
+            ingredient, split=bool(marks and marks.split), appended=marks.appended if marks else None
+        )
         return ingredient
 
 
@@ -606,6 +652,38 @@ def _target_text(draft: CardDraft, target: ProposalTarget) -> str | None:
             note = draft.notes[int(target.ref)]
         text = note.text if note else None
     return text.strip() if text and text.strip() else None
+
+
+def _target_occurrence(draft: CardDraft, target: ProposalTarget, text: str) -> int:
+    """
+    Which of its field's lines saying `text` (the target's, `_target_text`) the target is, 0 for the first: the
+    region hint's `occurrence`, so a line the card says twice ("1 egg" in the cake and in the frosting) is found as the
+    draft's second when it's the second. Lines say the same as the hint compares them: case and spacing aside.
+    """
+    field = field_name(target.field.strip())
+    refs: list[str]
+    if field == card_flags.FIELD_INGREDIENTS:
+        refs = [str(line.reference_id) for line in draft.ingredients]
+    elif field == card_flags.FIELD_STEPS:
+        refs = [str(step.id) for step in draft.steps]
+    elif field == card_flags.FIELD_NOTES:
+        refs = [str(note.id) for note in draft.notes]
+    else:
+        return 0
+    if target.ref in refs:
+        place = refs.index(target.ref)
+    elif field == card_flags.FIELD_NOTES and target.ref and target.ref.isdigit():
+        place = int(target.ref)  # a note by its place, from a client before note ids
+    else:
+        return 0
+
+    def said(line: str | None) -> str:
+        return " ".join((line or "").lower().split())
+
+    wanted = said(text)
+    return sum(
+        1 for ref in refs[:place] if said(_target_text(draft, ProposalTarget(field=target.field, ref=ref))) == wanted
+    )
 
 
 def _stored_form(draft: CardDraft) -> Any:
@@ -1490,6 +1568,7 @@ class ReviewService:
         resolved_proposals = {str(proposal_id) for proposal_id in update.resolved_proposal_ids}
         units = self._unit_names() if resolved_proposals else []
         linked = self._linked_names(draft)
+        rereads: OCRRereads | None = None
 
         def mutate(row: RowMapping) -> dict[str, Any] | None:
             # compared as read, so a draft stored by an older schema version (notes without ids) isn't "changed" by
@@ -1515,7 +1594,15 @@ class ReviewService:
             transcription = row["transcription"]
             adopted = [p for p in _parse_proposals(row["proposals"]) if str(p.id) in resolved_proposals]
             pages = parse_pages(row["pages"]) if adopted else []
-            adopted_flags = _adopted_reading_flags(draft, adopted, extraction, transcription, pages=pages, units=units)
+            adopted_flags = _adopted_reading_flags(
+                draft,
+                adopted,
+                extraction,
+                transcription,
+                pages=pages,
+                units=units,
+                ocr_reread=rereads.reader(pages) if rereads and adopted else None,
+            )
             previous = [*stored_flags, *adopted_flags]
             flags = resolve_flags(
                 draft, extraction, resolutions, transcription=transcription, previous=previous, linked=linked
@@ -1538,10 +1625,17 @@ class ReviewService:
             return values
 
         where = [Job.status == IngestStatus.ready.value, Job.draft_version == update.draft_version]
-        try:
-            written = self.repos.jobs.update_job_json(job_id, mutate, where=where)
-        except JobConflict:
-            written = None
+        written = None
+        for _ in range(REREAD_ATTEMPTS):
+            # Tesseract's second readings for an adopted reading's OCR check, read before the write (`OCRRereads`)
+            rereads = self._adopted_ocr_rereads(job_id, draft, update, resolved_proposals, units)
+            try:
+                written = self.repos.jobs.update_job_json(job_id, mutate, where=where)
+            except JobConflict:
+                written = None
+            except PagesChanged:
+                continue  # read again from the pages as they are now; a row that keeps changing is a conflict
+            break
 
         if written is None:
             job = self.job(job_id)
@@ -1561,6 +1655,48 @@ class ReviewService:
             duplicate_job=duplicates.job,
             duplicate_name=duplicates.name,
         )
+
+    def _adopted_ocr_rereads(
+        self, job_id: UUID, draft: CardDraft, update: CardDraftUpdate, resolved: Collection[str], units: Sequence[str]
+    ) -> OCRRereads | None:
+        """
+        For a save adopting whole-card proposals: Tesseract's second readings of the lines their OCR check asks about
+        (`_adopted_reading_flags` with `pipeline.ocr_line_reader` of the card's pages, as the re-extract read them),
+        read here, before the draft's write and with no transaction open; none when the check reads no line again
+        (it isn't a printed card the image provider read, the numbers agree, or Tesseract isn't installed). None for a
+        save that adopts none, or that will be refused. Blocking (Tesseract).
+        """
+        if not resolved:
+            return None
+        job = self.repos.jobs.get(job_id)
+        if self.session.in_transaction():
+            self.session.commit()  # the write reads the row again: no snapshot stays open while Tesseract reads
+        if job is None or job.status != IngestStatus.ready.value or job.draft_version != update.draft_version:
+            return None
+        adopted = [proposal for proposal in _parse_proposals(job.proposals) if str(proposal.id) in resolved]
+        if not adopted:
+            return None
+        pages = parse_pages(job.pages)
+        extraction = _parse_extraction(job.extraction)
+        read_path = extraction.read_path if extraction else None
+        lines: dict[int, str | None] = {}
+        if is_slimmed(job) or not card_flags.ocr_check_lines(
+            [page.ocr for page in pages], read_path, job.transcription
+        ):
+            return OCRRereads(pages=pages, lines=lines)
+        reader = ocr_line_reader(
+            [CardPage(dir=storage.page_dir(job.group_id, job.id, page.index), meta=page) for page in pages]
+        )
+        if reader is None:
+            return OCRRereads(pages=pages, lines=lines)
+
+        def read(index: int) -> str | None:
+            if index not in lines:
+                lines[index] = reader(index)
+            return lines[index]
+
+        _adopted_reading_flags(draft, adopted, extraction, job.transcription, pages=pages, units=units, ocr_reread=read)
+        return OCRRereads(pages=pages, lines=lines)
 
     def _unit_names(self) -> list[str]:
         """The group's unit names for `unit_unclear` (`IngestMatcher.unit_names`), read before a draft's write"""
@@ -1812,15 +1948,18 @@ class ReviewService:
         Where on an upright page the target field's text probably is, for the re-read selection to start there
         (§6.5, `pipeline.region_hint`): by the lines Tesseract found when it oriented the page, else by the text's line
         in the transcription. The text is what the card says for the field: an ingredient's line as read
-        (`original_text`; a line added on the page, as it reads now), a step's or note's text, or a single field's.
-        404 `not_found` when the draft has no such text or neither finds it (the reviewer typed it, or there's no
-        reading to go by), as for a card that isn't there: the page starts the selection as it would without a hint.
+        (`original_text`; a line added on the page, as it reads now), a step's or note's text, or a single field's;
+        of the field's lines saying the same, by which it is (`_target_occurrence`). 404 `not_found` when the draft has
+        no such text or neither finds it (the reviewer typed it, or there's no reading to go by), as for a card that
+        isn't there: the page starts the selection as it would without a hint.
         """
         job = self.job(job_id)
         draft = _parse_draft(job.draft)
         pages = [] if is_slimmed(job) else parse_pages(job.pages)
         text = _target_text(draft, target) if draft is not None and pages else None
-        hint = region_hint(pages, job.transcription, text) if text else None
+        hint = None
+        if draft is not None and text:
+            hint = region_hint(pages, job.transcription, text, _target_occurrence(draft, target, text))
         if hint is None:
             raise not_found()
         return RegionHintOut(

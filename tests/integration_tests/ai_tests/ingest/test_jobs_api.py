@@ -9,7 +9,7 @@ are shared with the other job, review and commit tests in this folder.
 import io
 import re
 import time
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -128,6 +128,7 @@ def fake_compute_flags(
     units: Iterable[str] = (),
     ocr_lines: Sequence[str] | None = None,
     linked: Mapping[UUID, Collection[str]] | None = None,
+    ocr_reread: Callable[[int], str | None] | None = None,
 ) -> list[CardFlag]:
     """
     A small stand-in for B1's flag rules, so these tests don't depend on them: markers are errors, a missing name is

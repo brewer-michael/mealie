@@ -5,7 +5,7 @@ from mealie.services.ai.ingest import review
 from mealie.services.ai.ingest.pipeline import flags as card_flags
 
 
-def _parsed(note: str, *, split: bool) -> CardDraftIngredient:
+def _parsed(note: str, *, split: bool, appended: bool | None = None) -> CardDraftIngredient:
     line = CardDraftIngredient(
         original_text="1/2 c. [illegible] or margarine",
         quantity=0.5,
@@ -13,7 +13,7 @@ def _parsed(note: str, *, split: bool) -> CardDraftIngredient:
         food=CardDraftRef(name="butter"),
         note=note,
     )
-    line.extracted_hash = card_flags.ingredient_hash(line, split=split)
+    line.extracted_hash = card_flags.ingredient_hash(line, split=split, appended=appended)
     return line
 
 
@@ -39,3 +39,24 @@ def test_a_kept_line_nothing_was_split_off_says_so_too():
     assert line is not None
     assert not card_flags.split_off(line)
     assert card_flags.is_unedited(line)
+
+
+def test_a_kept_line_says_whether_parsing_appended_lost_amounts():
+    """
+    Whether parsing appended amounts the fields lost to the note is in the kept line's hash too: `check_parse` asks
+    about those only, never about an amount the parser kept in its own note ("or 3/4 c. honey")
+    """
+    kept = review.KeptLine(
+        text="1 c. [illegible] sugar or 3/4 c. honey",
+        parse_text="1 c. sugar or 3/4 c. honey",
+        markers=("[illegible]",),
+        amount_marker=False,
+    )
+    for appended in (False, True, None):
+        line = kept.ingredient(_parsed("or 3/4 c. honey", split=False, appended=appended))
+        assert line is not None
+        assert card_flags.parse_marks(line) == card_flags.ParseMarks(split=False, appended=appended)
+
+    split = kept.ingredient(_parsed("or 3/4 c. honey", split=True, appended=False))
+    assert split is not None
+    assert card_flags.parse_marks(split) == card_flags.ParseMarks(split=True, appended=False)
