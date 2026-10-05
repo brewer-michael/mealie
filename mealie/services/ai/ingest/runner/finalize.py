@@ -24,7 +24,7 @@ between the read and the write makes it read again, so neither is lost.
   banner (a re-read the reviewer cancelled leaves no banner). A card whose first reading failed because every
   provider was over its monthly limit (`limit_reached`) is read again automatically: `auto_retry_at` is set to the
   first instant of next month (UTC), when the limits reset (`runner/retries.py` also reads it sooner once the limit no
-  longer applies). Any other failure clears it.
+  longer applies, and keeps its lift backoff on the row). Any other failure clears them, as reading the card does.
 """
 
 from dataclasses import dataclass
@@ -39,7 +39,14 @@ from sqlalchemy.orm import Session
 
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
 from mealie.repos.repository_ai_routing import month_range
-from mealie.repos.repository_recipe_ingest import TASK_CLEARED, IngestQueue, naive_utc, update_job_json, utcnow
+from mealie.repos.repository_recipe_ingest import (
+    LIFT_CLEARED,
+    TASK_CLEARED,
+    IngestQueue,
+    naive_utc,
+    update_job_json,
+    utcnow,
+)
 from mealie.schema.recipe_ingest import (
     CardDraft,
     CardFlag,
@@ -134,6 +141,7 @@ def finalize_extract(session: Session, job_id: UUID, token: UUID, result: Extrac
             **TASK_CLEARED,
             **_NO_ERROR,
             "auto_retry_at": None,  # read: no longer waiting for a monthly limit
+            **LIFT_CLEARED,
             "transcription": result.transcription,
             "extraction": result.extraction,
             "pages": result.pages,
@@ -278,7 +286,8 @@ def finalize_failure(
     A task that ended without a result (§3.6): a `processing` job becomes `failed` with the code; a `ready` job keeps
     its draft and shows the code as a banner, except for a cancellation the reviewer asked for, which leaves no
     banner (as cancelling a queued task doesn't). A failed card that hit the monthly limits (`limit_reached`) waits
-    to be read again from the next reset (`auto_retry_at`); any other failure clears that.
+    to be read again from the next reset (`auto_retry_at`), keeping its lift backoff (`runner/retries.py`); any other
+    failure clears both.
     """
     outcome: list[Applied] = []
 
@@ -287,8 +296,11 @@ def finalize_failure(
         error = {"error_code": code.value, "error_params": params or None}
         if row["status"] == IngestStatus.processing:
             outcome.append(Applied.failed)
-            retry = next_limit_reset() if code == IngestErrorCode.limit_reached else None
-            return {**TASK_CLEARED, **error, "status": IngestStatus.failed.value, "auto_retry_at": retry}
+            if code == IngestErrorCode.limit_reached:
+                waits: dict[str, Any] = {"auto_retry_at": next_limit_reset()}
+            else:
+                waits = {"auto_retry_at": None, **LIFT_CLEARED}
+            return {**TASK_CLEARED, **error, "status": IngestStatus.failed.value, **waits}
         outcome.append(Applied.error)
         if code == IngestErrorCode.cancelled:
             return dict(TASK_CLEARED)

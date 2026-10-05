@@ -42,7 +42,8 @@ repository factory stays untouched.
 - `IngestQueue(session)`, across households, for the runner: `get`, `queued_ids` (fair across groups, with the
   optional per-group cap), `claim`, `holds`, `heartbeat`, `set_progress`, `expired`, `requeue_expired`, `release`,
   `release_owned` (every running task of one dispatcher), `requeue_all_running` (after a backup restore),
-  `cancel_requeued`, `waiting_for_limit` and `retry_after_limit` (cards that failed `limit_reached`),
+  `cancel_requeued`, `waiting_for_limit` and `retry_after_limit` (cards that failed `limit_reached`, and their lift
+  backoff),
   `update_job_json`.
 """
 
@@ -175,6 +176,10 @@ class LimitWait:
     """The card's own `local_only` (its group's setting applies on top)"""
     auto_retry_at: datetime
     """When it's read again whatever the limits say: the first instant of the next month (UTC)"""
+    lift_retries: int = 0
+    """How often a "lifted" limit has queued it again since it began waiting for this reset"""
+    lift_retry_at: datetime | None = None
+    """The earliest the next "lifted" limit may queue it again; None: at once"""
 
 
 def _rowcount(result: sa.Result) -> int:
@@ -285,6 +290,12 @@ TASK_CLEARED: dict[str, Any] = {
 }
 """The values that leave a job with no task"""
 
+LIFT_CLEARED: dict[str, Any] = {"lift_retries": 0, "lift_retry_at": None}
+"""
+The values that start a card's lift backoff over (`runner/retries.py`): it no longer waits for a monthly limit, or its
+reset has come
+"""
+
 
 def enqueue_task(
     session: Session,
@@ -329,6 +340,7 @@ def _cancel_queued(session: Session, conditions: Sequence[sa.ColumnElement[bool]
                 "error_code": IngestErrorCode.cancelled.value,
                 "error_params": None,
                 "auto_retry_at": None,  # only a card that failed `limit_reached` waits to be read again
+                **LIFT_CLEARED,
             }
         )
     )
@@ -1157,7 +1169,15 @@ class IngestQueue:
     def waiting_for_limit(self) -> list[LimitWait]:
         """Every card waiting for a monthly limit to reset or be raised (`auto_retry_at`), the soonest retry first"""
         stmt = (
-            sa.select(Job.id, Job.group_id, Job.household_id, Job.local_only, Job.auto_retry_at)
+            sa.select(
+                Job.id,
+                Job.group_id,
+                Job.household_id,
+                Job.local_only,
+                Job.auto_retry_at,
+                Job.lift_retries,
+                Job.lift_retry_at,
+            )
             .where(*self._waiting_for_limit())
             .order_by(Job.auto_retry_at, Job.id)
         )
@@ -1168,32 +1188,53 @@ class IngestQueue:
                 household_id=row.household_id,
                 local_only=bool(row.local_only),
                 auto_retry_at=naive_utc(row.auto_retry_at),
+                lift_retries=row.lift_retries or 0,
+                lift_retry_at=naive_utc(row.lift_retry_at) if row.lift_retry_at is not None else None,
             )
             for row in self.session.execute(stmt)
         ]
         _end_transaction(self.session)
         return waiting
 
-    def retry_after_limit(self, job_id: UUID, household_id: UUID) -> bool:
+    def retry_after_limit(
+        self, wait: LimitWait, now: datetime, *, next_lift_at: datetime | None = None, commit: bool = True
+    ) -> bool:
         """
         Reads a card that failed `limit_reached` again, as a manual retry does: `processing` with a new extract task,
         its error and `auto_retry_at` cleared. Conditional on it still waiting (not retried, discarded or changed
-        meanwhile). Whether it was queued; wake the dispatcher afterwards.
+        meanwhile), and on why it's queued:
+        - its reset has come (`auto_retry_at <= now`): its lift backoff starts over;
+        - or, with `next_lift_at`, the limit was lifted: the last lift's wait is over (`lift_retry_at <= now`) and no
+          other lift queued it since `wait` was read (`lift_retries`), so two processes can't both; `lift_retries`
+          goes up by one, and should this lift not help the card (it fails `limit_reached` again), the next may
+          queue it from `next_lift_at`.
+        Whether it was queued; wake the dispatcher afterwards. With `commit=False` the caller ends the transaction.
         """
+        if next_lift_at is None:
+            where = [Job.auto_retry_at <= now]
+            lift: dict[str, Any] = LIFT_CLEARED
+        else:
+            where = [
+                Job.lift_retries == wait.lift_retries,
+                sa.or_(Job.lift_retry_at.is_(None), Job.lift_retry_at <= now),
+            ]
+            lift = {"lift_retries": wait.lift_retries + 1, "lift_retry_at": next_lift_at}
         return enqueue_task(
             self.session,
-            job_id,
-            household_id,
+            wait.job_id,
+            wait.household_id,
             IngestTaskKind.extract,
             None,
             limits.PRIORITY_EXTRACT,
-            where=self._waiting_for_limit(),
+            where=[*self._waiting_for_limit(), *where],
             values={
                 "status": IngestStatus.processing.value,
                 "error_code": None,
                 "error_params": None,
                 "auto_retry_at": None,
+                **lift,
             },
+            commit=commit,
         )
 
     def update_job_json(

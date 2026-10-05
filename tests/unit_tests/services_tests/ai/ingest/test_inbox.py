@@ -510,9 +510,8 @@ def test_two_processes_scanning_at_once_never_pass_the_quota(
     assert len(_claimed(folder)) == 1  # the second process's card waits in its claim
 
 
-def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_of_the_scan_arent_rendered(
-    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
-):
+def _renders(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """The PDFs rendered (by size), quickly, with a short time limit"""
     monkeypatch.setattr(images, "pdf_render_cpu_seconds", lambda: 2)
     monkeypatch.setattr(images, "pdf_render_timeout", lambda: 30)
     monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 200)
@@ -524,6 +523,18 @@ def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_of_the_scan_arent_ren
         return real_run(document)
 
     monkeypatch.setattr(images, "_run_renderer", run_renderer)
+    return rendered
+
+
+def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_wait_for_the_next_scan(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The PDF that ran out of render time goes to failed/. The group's other PDFs of that scan aren't rendered then, nor
+    failed: they stay where they are, unclaimed, and the next scan renders them with time of its own (a slow NAS's
+    stack of scans isn't failed for one slow one)
+    """
+    rendered = _renders(monkeypatch)
     folder = _folder(root, reader)
     hostile = nested_pdf()
     _drop(folder, "1-hostile.pdf", hostile, age=OLD + 10)  # taken first: the oldest
@@ -533,14 +544,44 @@ def test_once_a_pdf_runs_out_of_time_the_groups_other_pdfs_of_the_scan_arent_ren
 
     assert _scan_twice() == 1  # the photo
     assert rendered == [len(hostile)]  # the scan's second PDF wasn't rendered
-    for name in ("1-hostile.pdf", "2-scan.pdf"):
-        assert "pdf_not_supported" in (folder / "failed" / f"{name}.error.txt").read_text()
+    assert "pdf_not_supported" in (folder / "failed" / "1-hostile.pdf.error.txt").read_text()
+    assert sorted(os.listdir(folder / "failed")) == ["1-hostile.pdf", "1-hostile.pdf.error.txt"]
+    assert (folder / "2-scan.pdf").is_file()  # where it was, unclaimed
+    assert _claimed(folder) == []
     assert len(_jobs(reader)) == before + 1
 
-    # the next scan renders the group's PDFs again
-    _drop(folder, "4-scan.pdf", _pdf((60, 40)))
-    assert _scan_twice() == 1
+    # the next scan renders it
+    assert inbox.scan_once() == 1
     assert len(rendered) == 2
+    assert (folder / "processed" / _month() / "2-scan.pdf").is_file()
+    assert len(_jobs(reader)) == before + 2
+
+
+def test_a_pdf_claimed_after_the_groups_render_time_ran_out_keeps_its_claim(
+    root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch
+):
+    """A PDF that's only found to be one once claimed (it changed meanwhile) isn't failed either: its claim stays"""
+    rendered = _renders(monkeypatch)
+    monkeypatch.setattr(inbox, "_holds_pdf", lambda *args: False)
+    folder = _folder(root, reader)
+    hostile = nested_pdf()
+    _drop(folder, "1-hostile.pdf", hostile, age=OLD + 10)
+    _drop(folder, "2-scan.pdf", _pdf((60, 40)))
+    before = len(_jobs(reader))
+
+    assert _scan_twice() == 0
+    assert rendered == [len(hostile)]
+    assert sorted(os.listdir(folder / "failed")) == ["1-hostile.pdf", "1-hostile.pdf.error.txt"]
+    [claimed] = _claimed(folder)
+    assert claimed.endswith("__2-scan.pdf")
+
+    # retried once its claim is stale, with time of its own
+    stale_ms = inbox._now_ms() - (limits.INBOX_CLAIM_RETRY + 1) * 1000
+    os.rename(folder / inbox.CLAIM_DIR / claimed, folder / inbox.CLAIM_DIR / f"{stale_ms}__{uuid4().hex}__2-scan.pdf")
+    assert inbox.scan_once() == 1
+    assert len(rendered) == 2
+    assert _claimed(folder) == []
+    assert len(_jobs(reader)) == before + 1
 
 
 def test_the_per_user_cap_leaves_inbox_cards_alone(root: Path, reader: TestUser, monkeypatch: pytest.MonkeyPatch):

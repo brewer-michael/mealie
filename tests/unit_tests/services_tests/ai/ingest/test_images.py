@@ -5,7 +5,9 @@ import io
 import json
 import math
 import os
+import signal
 import struct
+import sys
 import tempfile
 import time
 import zlib
@@ -982,7 +984,8 @@ def _pdf_page(content: bytes, xobjects: list[bytes], page_size: tuple[int, int] 
     names = b" ".join(b"/X%d %d 0 R" % (number, number) for number in range(1, len(objects) + 1))
     objects.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
     objects.append(
-        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] /Contents %d 0 R /Resources << /XObject << %s >> >> >>"
+        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] /Contents %d 0 R /Resources << /XObject << %s >> "
+        b"/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>"  # /F1 for text
         % (len(objects) + 2, *page_size, len(objects), names)
     )
     objects.append(b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % len(objects))
@@ -1005,6 +1008,26 @@ def _image_xobject(width: int, height: int) -> bytes:
         b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 "
         b"/Filter /FlateDecode /Length %d >>\nstream\n" % (width, height, len(data)) + data + b"\nendstream"
     )
+
+
+def _mask_xobject(width: int, height: int) -> bytes:
+    """An image mask (one bit a pixel, painted in the fill colour): a scanner's compact PDF draws its text as one"""
+    data = zlib.compress(bytes((width + 7) // 8 * height))
+    return (
+        b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ImageMask true /BitsPerComponent 1 "
+        b"/Filter /FlateDecode /Length %d >>\nstream\n" % (width, height, len(data)) + data + b"\nendstream"
+    )
+
+
+LETTER = (612, 792)
+LETTER_AT_300_DPI = (2550, 3300)
+TEXT = b"BT /F1 10 Tf 72 400 Td (2 cups flour) Tj ET"
+
+
+def _at_300_dpi(raw: bytes) -> bool:
+    """Whether a one-page Letter PDF is rendered at 300 dpi (PDFium rounds each side up)"""
+    ((width, height),) = _rendered_sizes(raw)
+    return abs(width - LETTER_AT_300_DPI[0]) <= 1 and abs(height - LETTER_AT_300_DPI[1]) <= 1
 
 
 @pytest.mark.parametrize("resolution", [72, 300])
@@ -1037,6 +1060,50 @@ def test_a_page_without_a_scan_is_rendered_at_300_dpi():
     for raw in (drawing, logo):
         ((width, height),) = _rendered_sizes(raw)
         assert abs(width - 1200) <= 1 and abs(height - 1800) <= 1  # PDFium rounds each side up
+
+
+@pytest.mark.parametrize("background", [(16, 16), (612, 792)], ids=["a texture", "72 dpi"])
+@pytest.mark.parametrize("drawn", [TEXT, b"0 0 0 rg 72 400 200 2 re f"], ids=["text", "a path"])
+def test_text_over_a_low_resolution_background_is_rendered_at_300_dpi(background: tuple[int, int], drawn: bytes):
+    # a designed card: vector text over a full-page paper texture holds the text's resolution, not the texture's (a
+    # 16 x 16 texture made it a 16 x 21 page)
+    raw = _pdf_page(b"q 612 0 0 792 0 0 cm /X1 Do Q " + drawn, [_image_xobject(*background)], page_size=LETTER)
+    assert _at_300_dpi(raw)
+
+
+def test_a_photo_header_over_half_the_page_with_text_below_is_rendered_at_300_dpi():
+    raw = _pdf_page(b"q 612 0 0 396 0 396 cm /X1 Do Q " + TEXT, [_image_xobject(400, 300)], page_size=LETTER)
+    assert _at_300_dpi(raw)  # not at the photo's 47 dpi (464 x 600)
+
+
+def test_a_compact_scans_text_layer_sets_its_resolution():
+    # a scanner's compact (MRC) PDF: a 100 dpi colour background, then the text as a 300 dpi image mask over the page
+    full = b"q 612 0 0 792 0 0 cm /X1 Do Q q 0 0 0 rg 612 0 0 792 0 0 cm /X2 Do Q"
+    assert _at_300_dpi(_pdf_page(full, [_image_xobject(850, 1100), _mask_xobject(2550, 3300)], page_size=LETTER))
+    # or several masks, one a block of text, each under half the page: still 300 dpi, not the background's
+    blocks = b"q 612 0 0 792 0 0 cm /X1 Do Q q 0 0 0 rg 500 0 0 100 56 600 cm /X2 Do Q"
+    assert _at_300_dpi(_pdf_page(blocks, [_image_xobject(850, 1100), _mask_xobject(2083, 417)], page_size=LETTER))
+
+
+def test_the_finest_of_several_page_covering_images_sets_the_resolution():
+    # on equal areas the first drawn (a downsampled background) no longer wins
+    content = b"q 600 0 0 800 0 0 cm /X1 Do Q q 600 0 0 800 0 0 cm /X2 Do Q"
+    assert _rendered_sizes(_pdf_page(content, [_image_xobject(150, 200), _image_xobject(450, 600)])) == [(450, 600)]
+
+
+@pytest.mark.parametrize(
+    "content, xobject",
+    [
+        pytest.param(b"q 600 0 0 800 0 0 cm /X1 Do Q", _image_xobject(1200, 1600), id="a photo"),
+        pytest.param(  # an OCR'd ("searchable") scan: its text is invisible (render mode 3)
+            b"q 600 0 0 800 0 0 cm /X1 Do Q BT 3 Tr " + TEXT[3:], _image_xobject(1200, 1600), id="a searchable scan"
+        ),
+        pytest.param(b"q 0 0 0 rg 600 0 0 800 0 0 cm /X1 Do Q", _mask_xobject(1200, 1600), id="a black and white mask"),
+    ],
+)
+def test_a_scan_alone_keeps_its_own_resolution(content: bytes, xobject: bytes):
+    # what LU9 keeps: a page that is only a scan is neither enlarged to 300 dpi nor to the long side allowed
+    assert _rendered_sizes(_pdf_page(content, [xobject])) == [(1200, 1600)]
 
 
 @pytest.mark.parametrize("pixels", [100_000, 99_999, 2_000_000])
@@ -1159,6 +1226,76 @@ def test_a_renderer_that_hangs_is_stopped(fake_renderer, monkeypatch: pytest.Mon
         images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
     assert e.value.reason == IngestRejectReason.pdf_not_supported
     assert time.monotonic() - started < 10
+
+
+def _running(pid: int) -> bool:
+    """Whether process `pid` still runs (killed, it may wait as a zombie for a parent that doesn't reap it)"""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _started_process(pidfile: Path) -> int:
+    deadline = time.monotonic() + 10
+    while not pidfile.exists() or not pidfile.read_text():
+        assert time.monotonic() < deadline, "the renderer's process never started"
+        time.sleep(0.05)
+    return int(pidfile.read_text())
+
+
+def _forking_renderer(pidfile: Path, *, leave_group: bool) -> str:
+    """A renderer that starts a process keeping its stdout open, as one a hostile PDF took over might where nothing
+    refuses it (`AI_INGEST_PDF_UNCONFINED`), then hangs"""
+    return (
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        + ("    os.setsid()\n" if leave_group else "")
+        + f"    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "    time.sleep(20)\n"
+        "    os._exit(0)\n"
+        "time.sleep(20)\n"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process groups and /proc: Linux")
+def test_a_process_the_renderer_started_is_stopped_with_it(fake_renderer, monkeypatch: pytest.MonkeyPatch, tmp_path):
+    # it's in the renderer's process group, killed with it at the time limit: its output ends and the render with it
+    pidfile = tmp_path / "started.pid"
+    fake_renderer(_forking_renderer(pidfile, leave_group=False))
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 1.0)
+    started = time.monotonic()
+    with pytest.raises(images.RenderTimedOut):
+        images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+    assert time.monotonic() - started < 1.0 + images.RENDER_OUTPUT_GRACE
+
+    pid = _started_process(pidfile)
+    deadline = time.monotonic() + 5
+    while _running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _running(pid)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process groups and /proc: Linux")
+def test_a_process_that_left_the_renderers_group_doesnt_hold_the_render(
+    fake_renderer, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    # one that left the group (setsid) outlives the kill and keeps the output open: the wait for the output is bounded,
+    # so the render still ends at its time limit (the render slot isn't held until that process ends), with a warning
+    pidfile = tmp_path / "started.pid"
+    fake_renderer(_forking_renderer(pidfile, leave_group=True))
+    monkeypatch.setattr(images, "pdf_render_timeout", lambda: 1.0)
+    monkeypatch.setattr(images, "RENDER_OUTPUT_GRACE", 0.5)
+    warnings: list[str] = []
+    monkeypatch.setattr(images.logger, "warning", warnings.append)
+    try:
+        started = time.monotonic()
+        with pytest.raises(images.RenderTimedOut):
+            images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
+        assert time.monotonic() - started < 5
+        assert any("outlived" in message for message in warnings)
+    finally:
+        os.kill(_started_process(pidfile), signal.SIGKILL)
 
 
 def test_a_pdf_that_takes_too_much_cpu_time_is_stopped_by_its_limit(monkeypatch: pytest.MonkeyPatch):

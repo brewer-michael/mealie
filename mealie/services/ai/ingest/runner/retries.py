@@ -11,18 +11,20 @@ builds every recipe, and the image slot reads the photo unless OCR can. Only a "
 cards) waits for a check that says so, rather than being read again at every run while a "lifted" answer is kept.
 A lift that doesn't help a card at all (OCR stands in for an image slot over its limit, but finds no text on the card,
 so the card fails `limit_reached` again while the check keeps saying "lifted") queues it again only after
-`LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT` (`_lift_waits`), until its reset.
+`LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT`, until its reset. That wait is kept on
+the card (`lift_retries`, `lift_retry_at`), so every worker process keeps it.
 
-Queueing a card also arms its batch's notification again (`events.arm_limit_wave`, in the same transaction), so the
-household hears once the cards that waited are read: one notification per batch for the cards queued together.
+Queueing a card also arms its batch's notification again (`events.arm_limit_wave`, in the queueing's transaction, once
+the card was queued), so the household hears once the cards that waited are read: one notification per batch for the
+cards queued together.
 
-Everything here is a conditional update on the card still waiting, so every worker process running it is harmless.
+Everything here is a conditional update on the card still waiting as the run read it, so every worker process running
+it is harmless: a run working from a list another process has acted on since queues nothing and arms nothing.
 """
 
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from mealie.core.root_logger import get_logger
@@ -36,6 +38,7 @@ from mealie.services.ai.policy import ai_call_policy
 from mealie.services.openai import OpenAIService
 
 from .. import events, limits, storage
+from ..intake import lock_household_intake
 from .classify import safe_trace
 
 logger = get_logger(__name__)
@@ -48,23 +51,15 @@ _still_applies: dict[_LimitKey, float] = {}
 _still_applies_lock = threading.Lock()
 
 LIFT_RETRY_MAX_WAIT = 6 * 60 * 60
-"""The longest a card waits for a "lifted" answer to queue it again (`_lift_waits`)"""
+"""The longest a card waits for a "lifted" answer to queue it again (`lift_wait`)"""
 
 
-@dataclass(frozen=True)
-class _LiftWait:
-    queued_at: float
-    """When a "lifted" answer last queued the card (by `time.monotonic()`)"""
-    wait: float
-    """How long after that another may queue it: `LIMIT_RECHECK_INTERVAL`, doubling up to `LIFT_RETRY_MAX_WAIT`"""
-
-
-_lift_waits: dict[UUID, _LiftWait] = {}
-"""
-The cards a "lifted" answer queued, by job id, kept while they wait (or are being read) so a lift that doesn't help a
-card reads it less and less often; an entry goes once its card no longer waits and its wait is over. Guarded by
-`_still_applies_lock`.
-"""
+def lift_wait(lifts: int) -> float:
+    """
+    Seconds after a "lifted" answer queued a card for the `lifts`th time before another may queue it again, should it
+    fail `limit_reached` again: `LIMIT_RECHECK_INTERVAL`, doubling each time, up to `LIFT_RETRY_MAX_WAIT`
+    """
+    return min(limits.LIMIT_RECHECK_INTERVAL * 2 ** min(max(lifts - 1, 0), 16), LIFT_RETRY_MAX_WAIT)
 
 
 def _slot_over_limit(service: OpenAIService, slot: AIProviderSlot) -> bool | None:
@@ -128,33 +123,9 @@ def _lifted(wait: LimitWait, group_local_only: bool, this_run: dict[_LimitKey, b
 
 
 def forget_checks() -> None:
-    """Clears the per-group limit checks and the cards' waits after a lift (tests)"""
+    """Clears this process's per-group limit checks (tests)"""
     with _still_applies_lock:
         _still_applies.clear()
-        _lift_waits.clear()
-
-
-def _lift_may_queue(job_id: UUID, now: float) -> bool:
-    """Whether a "lifted" answer may queue the card now: never queued by one, or its wait since is over"""
-    with _still_applies_lock:
-        last = _lift_waits.get(job_id)
-    return last is None or now - last.queued_at >= last.wait
-
-
-def _lift_queued(job_id: UUID, now: float) -> None:
-    """A "lifted" answer queued the card now: the next may do so `LIMIT_RECHECK_INTERVAL` on, or twice its last wait"""
-    with _still_applies_lock:
-        last = _lift_waits.get(job_id)
-        wait = limits.LIMIT_RECHECK_INTERVAL if last is None else min(2 * last.wait, LIFT_RETRY_MAX_WAIT)
-        _lift_waits[job_id] = _LiftWait(queued_at=now, wait=wait)
-
-
-def _forget_lift_waits(waiting: set[UUID], now: float) -> None:
-    """Drops the waits of cards no longer waiting whose wait is over: read since, retried by hand, or gone"""
-    with _still_applies_lock:
-        for job_id, last in list(_lift_waits.items()):
-            if job_id not in waiting and now - last.queued_at >= last.wait:
-                del _lift_waits[job_id]
 
 
 def retry_waiting(now: datetime) -> int:
@@ -166,7 +137,6 @@ def retry_waiting(now: datetime) -> int:
         return 0
     with session_context() as session:
         waiting = IngestQueue(session).waiting_for_limit()
-    _forget_lift_waits({wait.job_id for wait in waiting}, time.monotonic())
     if not waiting:
         return 0
 
@@ -178,6 +148,7 @@ def retry_waiting(now: datetime) -> int:
             break
         try:
             due = wait.auto_retry_at <= now
+            next_lift_at: datetime | None = None
             if not due:
                 if wait.group_id not in group_local_only:
                     with session_context() as session:
@@ -187,18 +158,23 @@ def retry_waiting(now: datetime) -> int:
                         session.commit()
                 if not _lifted(wait, group_local_only[wait.group_id], this_run):
                     continue
-                if not _lift_may_queue(wait.job_id, time.monotonic()):
+                if wait.lift_retry_at is not None and wait.lift_retry_at > now:
                     continue  # the last lift didn't help it: it waits a while before the next one reads it
+                next_lift_at = now + timedelta(seconds=lift_wait(wait.lift_retries + 1))
             with session_context() as session:
+                # the household's intake lock before the card's row, as every writer of its cards takes them
+                lock_household_intake(session, wait.household_id)
+                if not IngestQueue(session).retry_after_limit(wait, now, next_lift_at=next_lift_at, commit=False):
+                    # no longer waiting as read: queued by another process, retried by hand, read or discarded
+                    session.rollback()
+                    continue
                 # the batch notifies again once the card is read (its notification went out when it failed), armed
-                # in the transaction the queueing commits
+                # in the queueing's transaction, now that the card is queued
                 events.arm_limit_wave(session, wait.job_id)
-                if IngestQueue(session).retry_after_limit(wait.job_id, wait.household_id):
-                    retried += 1
-                    if not due:
-                        _lift_queued(wait.job_id, time.monotonic())
-                    reason = "its retry time has come" if due else "its monthly limit no longer applies"
-                    logger.info(f"Recipe card job {wait.job_id}: read again, {reason}")
+                session.commit()
+            retried += 1
+            reason = "its retry time has come" if due else "its monthly limit no longer applies"
+            logger.info(f"Recipe card job {wait.job_id}: read again, {reason}")
         except Exception as e:
             if storage.is_paused():
                 break  # a backup restore began: the rows are being replaced

@@ -679,6 +679,8 @@ _UNCONFINED = "unconfined"
 """The renderer's error where it couldn't be confined and rendered nothing (`AI_INGEST_PDF_UNCONFINED` is off)"""
 _TIME_LIMIT_SIGNALS = (-signal.SIGKILL, -signal.SIGXCPU)
 """The exit statuses of a renderer stopped by its CPU time limit (`RLIMIT_CPU`, soft and hard alike)"""
+RENDER_OUTPUT_GRACE = 5.0
+"""Seconds the renderer's output may take to end once it's killed: what still holds it then is left behind"""
 _sandbox_logged = False
 
 
@@ -689,10 +691,21 @@ class _RenderedFrames:
         self.pages: list[SpooledTemporaryFile[bytes]] = []
         self.result: dict | None = None
         self.broken = False
+        self.closed = False
 
     def read(self, stream: BinaryIO) -> None:
+        """
+        The frames up to the result, then `stream` closed: by this thread, as closing it from another while a read
+        waits for the renderer would wait too
+        """
         try:
-            while self.result is None:
+            self._read(stream)
+        finally:
+            stream.close()
+
+    def _read(self, stream: BinaryIO) -> None:
+        try:
+            while self.result is None and not self.closed:
                 header = stream.read(_FRAME_HEADER)
                 if len(header) < _FRAME_HEADER:
                     return  # it ended without a result: crashed, or killed
@@ -734,6 +747,7 @@ class _RenderedFrames:
         return result
 
     def close(self) -> None:
+        self.closed = True  # a reader left behind (`_run_renderer`) stops at its next frame
         for page in self.pages:
             page.close()
 
@@ -753,22 +767,22 @@ def _log_sandbox(result: dict) -> None:
     listed = ", ".join(applied) or "time and memory limits only"
     if result.get("error") == _UNCONFINED:
         logger.error(
-            "PDFs are refused (pdf_not_supported): this system can't confine the PDF renderer (neither Landlock nor "
-            f"a seccomp filter applied; it has {listed}). AI_INGEST_PDF_UNCONFINED=true renders them anyway, with "
-            "time and memory limits only."
+            "PDFs are refused (pdf_not_supported): this system can't confine the PDF renderer (its seccomp filter, "
+            f"for Linux on x86-64 or arm64, didn't apply; it has {listed}). AI_INGEST_PDF_UNCONFINED=true renders "
+            "them anyway, with those protections only."
         )
-    elif any(item.startswith("landlock-files") for item in applied):
-        logger.info(f"PDF pages are rendered in a confined process: {listed}")
+    elif "seccomp" not in applied:
+        logger.warning(
+            "PDF pages are rendered in a process this system can't confine (no seccomp filter: it could open network "
+            f"sockets and reach the server's process), as AI_INGEST_PDF_UNCONFINED allows: {listed}"
+        )
     elif "seccomp-files" in applied:
         logger.info(
             "PDF pages are rendered in a confined process, without Landlock: it can open no file, so a PDF's fonts "
             f"that aren't in it are drawn with PDFium's own: {listed}"
         )
     else:
-        logger.warning(
-            "PDF pages are rendered in a process this system can't confine (no Landlock, no seccomp filter), as "
-            f"AI_INGEST_PDF_UNCONFINED allows: {listed}"
-        )
+        logger.info(f"PDF pages are rendered in a confined process: {listed}")
 
 
 def _pdf_pages(raw: BinaryIO, raw_sha256: str, raw_bytes: int) -> list[DocumentPage]:
@@ -836,6 +850,7 @@ def _run_renderer(document: Path) -> _RenderedFrames:
             stderr=subprocess.DEVNULL,
             env={name: os.environ[name] for name in _CHILD_ENVIRONMENT if name in os.environ},
             close_fds=True,
+            start_new_session=True,  # a process group of its own, killed with what it started (`_stop_renderer`)
         )
     except OSError as e:
         logger.error(f"Couldn't start the PDF renderer: {e}")
@@ -843,6 +858,7 @@ def _run_renderer(document: Path) -> _RenderedFrames:
 
     frames = _RenderedFrames()
     assert process.stdout is not None
+    # the reader closes the renderer's stdout once it's done with it
     reader = threading.Thread(target=frames.read, args=(process.stdout,), name="pdf-render-output", daemon=True)
     reader.start()
     timed_out = False
@@ -856,14 +872,16 @@ def _run_renderer(document: Path) -> _RenderedFrames:
             except subprocess.TimeoutExpired:
                 timed_out = True
         if timed_out or frames.broken:
-            process.kill()
-            reader.join()
+            _stop_renderer(process)
+            reader.join(RENDER_OUTPUT_GRACE)  # its output ends with it
+            if reader.is_alive():
+                # a process it started that left its group still holds the output: the reader is left to end with
+                # it, and the render slot isn't held for it
+                logger.warning("A process the PDF renderer started outlived it; it was left behind")
         returncode = process.wait()
     except BaseException:
-        process.kill()  # this thread was interrupted: the renderer doesn't outlive it
+        _stop_renderer(process)  # this thread was interrupted: the renderer doesn't outlive it
         raise
-    finally:
-        process.stdout.close()
 
     if timed_out or (not frames.broken and returncode in _TIME_LIMIT_SIGNALS):
         frames.close()
@@ -878,6 +896,19 @@ def _run_renderer(document: Path) -> _RenderedFrames:
         frames.close()
         raise PageRejected(IngestRejectReason.pdf_not_supported)
     return frames
+
+
+def _stop_renderer(process: subprocess.Popen[bytes]) -> None:
+    """
+    Kills the renderer and every process it started that stayed in its process group (it leads one of its own): one
+    left running would keep its stdout open. Its seccomp filter refuses it new processes; this is for where it has none.
+    """
+    if process.returncode is None and hasattr(os, "killpg"):  # not reaped yet: its pid is still its group's
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    process.kill()
 
 
 def normalize_page(raw: BinaryIO, page_dir: Path, index: int, *, original_filename: str | None) -> PageMeta:

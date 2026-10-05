@@ -1,7 +1,8 @@
 """
 Upgrades and downgrades cc5357be7e71 (recipe card ingestion's tables, `ai_providers.runs_locally` and
-`ai_usage_log.job_id`) and 0c2bef734816 (notification delivery, automatic retry and `recipe_created` columns) on a
-scratch database of the engine the suite runs on: a SQLite file, or a PostgreSQL database created for the test.
+`ai_usage_log.job_id`), 0c2bef734816 (notification delivery, automatic retry and `recipe_created` columns) and
+0f77cc21b216 (a waiting card's lift backoff) on a scratch database of the engine the suite runs on: a SQLite file, or
+a PostgreSQL database created for the test.
 """
 
 import os
@@ -25,6 +26,7 @@ from mealie.db.models._model_utils.guid import GUID
 REVISION = "cc5357be7e71"
 DOWN_REVISION = "970cf50b85f4"
 DELIVERY_REVISION = "0c2bef734816"
+LIFT_REVISION = "0f77cc21b216"
 TABLES = {
     "recipe_ingestion_batches",
     "recipe_ingestion_jobs",
@@ -346,3 +348,43 @@ def test_delivery_columns_upgrade_backfills_and_downgrades(db_url: str):
     command.upgrade(cfg, DELIVERY_REVISION)
     with _connect(db_url) as conn:
         assert _job_columns(conn, COMMITTED_ID)["recipe_event_sent_at"] is not None
+
+
+# ==================================================================================================================
+# 0f77cc21b216: a waiting card's lift backoff
+
+
+def test_lift_backoff_columns_upgrade_and_downgrade(db_url: str):
+    cfg = _alembic_cfg()
+    command.upgrade(cfg, DELIVERY_REVISION)
+    with _connect(db_url) as conn:
+        _insert_job(conn, status="failed", job_id=READY_ID)
+
+    command.upgrade(cfg, LIFT_REVISION)
+
+    with _connect(db_url) as conn:
+        columns = {column["name"]: column for column in sa.inspect(conn).get_columns("recipe_ingestion_jobs")}
+        assert {"lift_retries", "lift_retry_at"} <= set(columns)
+        assert not columns["lift_retries"]["nullable"] and columns["lift_retry_at"]["nullable"]
+        # a card waiting before the upgrade starts with no backoff
+        row = conn.execute(
+            sa.text("SELECT lift_retries, lift_retry_at FROM recipe_ingestion_jobs WHERE id = :id"),
+            {"id": _guid(conn, READY_ID)},
+        ).one()
+        assert (row.lift_retries, row.lift_retry_at) == (0, None)
+        # and a card inserted without them gets the default
+        _insert_job(conn, with_settings=False)
+        assert conn.execute(sa.text("SELECT max(lift_retries) FROM recipe_ingestion_jobs")).scalar_one() == 0
+
+    command.downgrade(cfg, DELIVERY_REVISION)
+
+    with _connect(db_url) as conn:
+        columns = {column["name"] for column in sa.inspect(conn).get_columns("recipe_ingestion_jobs")}
+        assert not {"lift_retries", "lift_retry_at"} & columns
+        assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == DELIVERY_REVISION
+        assert conn.execute(sa.text("SELECT count(*) FROM recipe_ingestion_jobs")).scalar_one() == 2
+
+    # and back again
+    command.upgrade(cfg, LIFT_REVISION)
+    with _connect(db_url) as conn:
+        assert conn.execute(sa.text("SELECT sum(lift_retries) FROM recipe_ingestion_jobs")).scalar_one() == 0

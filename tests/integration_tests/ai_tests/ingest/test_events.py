@@ -5,9 +5,11 @@ and a link only, and never through `EventBusService.dispatch`. Delivery is check
 claim's lease: at least once per notifier, given up on after `NOTIFY_ATTEMPTS`.
 """
 
+import calendar
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -16,13 +18,18 @@ from uuid import UUID, uuid4
 import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
+from mealie.db import db_setup
 from mealie.db.db_setup import session_context
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import IngestRepos, utcnow
+from mealie.repos.repository_recipe_ingest import IngestQueue, IngestRepos, LimitWait, utcnow
 from mealie.schema.household.group_events import GroupEventNotifierSave
-from mealie.schema.recipe_ingest import IngestRejectReason, IngestSource, IngestStatus
+from mealie.schema.recipe_ingest import IngestErrorCode, IngestRejectReason, IngestSource, IngestStatus
 from mealie.services.ai.ingest import events, limits
+from mealie.services.ai.ingest.i18n import translator_for
+from mealie.services.ai.ingest.runner import retries
+from mealie.services.ai.ingest.runner.finalize import next_limit_reset
 from mealie.services.event_bus_service.event_bus_service import EventBusService
 from mealie.services.event_bus_service.publisher import ApprisePublisher
 from tests.utils import api_routes
@@ -135,22 +142,29 @@ def make_batch(
     locale: str | None = "en-US",
 ) -> UUID:
     """
-    A batch created `age` ago with one job per card: a status (`ready`, `failed`, `processing`, `committed`), or
-    `ready!` for a ready card with something to check. Every card carries `CARD_TITLE`. Its cards were last written
-    `active` ago, when it was also sealed.
+    A batch created `age` ago with one job per card: a status (`ready`, `failed`, `processing`, `committed`),
+    `ready!` for a ready card with something to check, or `waiting` for a card that failed `limit_reached` and waits
+    for the next reset. Every card carries `CARD_TITLE`. Its cards were last written `active` ago, when it was also
+    sealed.
     """
     now = utcnow()
+    waits = {
+        "status": IngestStatus.failed.value,
+        "error_code": IngestErrorCode.limit_reached.value,
+        "auto_retry_at": next_limit_reset(),
+    }
     with session_context() as session:
         repos = IngestRepos(session, UUID(user.group_id), UUID(user.household_id))
         batch_id = repos.batches.create(source=source, created_by=user.user_id, locale=locale, now=now - age)
         for position, card in enumerate(cards):
             needs_attention = card.endswith("!")
+            status = {"status": IngestStatus(card.rstrip("!")).value} if card != "waiting" else waits
             repos.jobs.create(
                 {
                     "batch_id": batch_id,
                     "position": position,
                     "source": source.value,
-                    "status": IngestStatus(card.rstrip("!")).value,
+                    **status,
                     "title": CARD_TITLE,
                     "source_sha256": uuid4().hex * 2,
                     "warning_count": 1 if needs_attention else 0,
@@ -253,6 +267,7 @@ def test_only_the_households_enabled_notifiers_that_opted_in(
         "readyCount": 3,
         "needsAttentionCount": 1,
         "failedCount": 1,
+        "waitingCount": 0,
         "reviewUrl": f"http://localhost:8080/g/{group_slug(api_client, unique_user)}/recipes/cards/review"
         f"?batch={batch_id}",
     }
@@ -278,6 +293,25 @@ def test_only_the_households_enabled_notifiers_that_opted_in(
         # a batch whose every card failed still says so, and its title doesn't say they're ready
         (["failed", "failed"], "Recipe cards not read", "No cards are ready to review (2 failed)."),
         (["failed"], "Recipe cards not read", "No cards are ready to review (1 failed)."),
+        # cards waiting for the monthly limit wait: they haven't failed, and are read again on their own
+        (
+            ["waiting", "waiting"],
+            "Recipe cards waiting",
+            "2 cards are waiting for the monthly limit. They'll be read when it resets on {reset}, or sooner if "
+            "it's raised.",
+        ),
+        (
+            ["ready", "failed", "waiting"],
+            "Recipe cards ready",
+            "1 card is ready to review (1 failed). 1 card is waiting for the monthly limit. It'll be read when it "
+            "resets on {reset}, or sooner if it's raised.",
+        ),
+        (
+            ["failed", "waiting", "committed"],
+            "Recipe cards not read",
+            "No cards are ready to review (1 failed). 1 card is waiting for the monthly limit. It'll be read when it "
+            "resets on {reset}, or sooner if it's raised.",
+        ),
     ],
 )
 def test_the_message_counts(
@@ -288,10 +322,27 @@ def test_the_message_counts(
 
     assert events.maybe_notify_batch(batch_id) is True
     [sent] = published
+    reset = next_limit_reset()
+    body = body.format(reset=f"{calendar.month_abbr[reset.month]} {reset.day}")
     assert (sent.event.message.title, sent.event.message.body) == (title, body)
     assert sent.data.failed_count == cards.count("failed")
+    assert sent.data.waiting_count == cards.count("waiting")
     # the same event type either way, so a Home Assistant automation matches it
     assert sent.event.event_type == events.AIEventTypes.recipe_ingestion_ready
+
+
+def test_the_test_notification_counts_waiting_cards_apart(unique_user_fn_scoped: TestUser, published: Outbox):
+    """As a batch's notification does: a card waiting for the monthly limit hasn't failed"""
+    user = unique_user_fn_scoped
+    make_batch(user, "ready", "failed", "waiting", "waiting")
+    target = events.NotifierURL(uuid4(), "Kitchen HA", "json://ha.local/hook")
+    with session_context() as session:
+        sent = events.send_test_notification(
+            session, UUID(user.group_id), UUID(user.household_id), target, translator_for("en-US")
+        )
+    assert sent is True
+    [test] = published
+    assert (test.data.ready_count, test.data.failed_count, test.data.waiting_count) == (1, 1, 2)
 
 
 def test_a_language_without_the_texts_falls_back_to_english(
@@ -833,6 +884,255 @@ def test_queueing_a_card_that_waited_arms_its_batch_again(unique_user_fn_scoped:
     )
     with session_context() as session:
         assert events._record(session, stale.lease, [], notified_at=utcnow()) is False
+
+
+# ==================================================================================================================
+# A card queued again while its batch's notification is being claimed, by another process at the same moment
+
+CLAIM_STATEMENT = "UPDATE recipe_ingestion_batches SET notify_claimed_at"
+ARM_STATEMENT = "SELECT recipe_ingestion_batches.notified_at"
+
+
+def _postgres() -> bool:
+    return db_setup.engine.dialect.name == "postgresql"
+
+
+def _waits_for_a_lock(statement: str) -> bool:
+    """PostgreSQL: whether another session's statement starting with `statement` waits for a lock (False on SQLite)"""
+    if not _postgres():
+        return False
+    with session_context() as session:
+        waiting = session.execute(
+            sa.text("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE :query"),
+            {"query": f"{statement}%"},
+        ).scalar_one()
+        session.commit()
+    return waiting > 0
+
+
+def _until(condition: Callable[[], bool], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _set_job(job_id: UUID, **values: Any) -> None:
+    with session_context() as session:
+        values = {"update_at": utcnow(), **values}
+        session.execute(sa.update(RecipeIngestionJob).where(RecipeIngestionJob.id == job_id).values(**values))
+        session.commit()
+
+
+def _waits_for_its_reset(job_id: UUID) -> None:
+    """The card failed `limit_reached`, and its retry time has come"""
+    _set_job(
+        job_id,
+        status=IngestStatus.failed.value,
+        error_code=IngestErrorCode.limit_reached.value,
+        auto_retry_at=utcnow() - timedelta(seconds=5),
+        task_kind=None,
+        task_state=None,
+    )
+
+
+def _read(job_id: UUID) -> None:
+    """The card was read: its first extraction's finalize"""
+    _set_job(
+        job_id, status=IngestStatus.ready.value, error_code=None, auto_retry_at=None, task_kind=None, task_state=None
+    )
+
+
+def _only_the_batchs_waiting_cards(monkeypatch: pytest.MonkeyPatch, batch_id: UUID) -> None:
+    """The retry phase reads every group's waiting cards: keep it to the batch's"""
+    ids = set(_job_ids(batch_id))
+    waiting_for_limit = IngestQueue.waiting_for_limit
+
+    def own(self: IngestQueue) -> list[LimitWait]:
+        return [wait for wait in waiting_for_limit(self) if wait.job_id in ids]
+
+    monkeypatch.setattr(IngestQueue, "waiting_for_limit", own)
+
+
+class _Running:
+    """A call in a thread of its own (another process's), with what it returned or raised"""
+
+    def __init__(self, call: Callable[[], Any]) -> None:
+        self.result: Any = None
+        self.error: BaseException | None = None
+
+        def run() -> None:
+            try:
+                self.result = call()
+            except BaseException as e:
+                self.error = e
+
+        self.thread = threading.Thread(target=run)
+        self.thread.start()
+
+    def join(self) -> Any:
+        self.thread.join(30)
+        assert not self.thread.is_alive()
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_a_card_queued_while_its_wave_is_claimed_is_in_the_wave(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The retry phase queues a card that waited (arming its batch's wave) while another card of the wave finishes and
+    claims it. The claim waits for the queueing's commit and then finds the card being read, so it leaves the wave to
+    the card's own finalize: once read, the card is in it. (PostgreSQL's claim checked the cards as they were when its
+    statement began, before the queueing committed, and sent the wave without the card, for good.)
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready", "waiting", "waiting")
+    _, first, second = _job_ids(batch_id)
+    _only_the_batchs_waiting_cards(monkeypatch, batch_id)
+    assert events.maybe_notify_batch(batch_id) is True  # the batch's own notification
+
+    _waits_for_its_reset(first)
+    assert retries.retry_waiting(utcnow()) == 1  # queued, its batch's wave armed
+    _read(first)
+    _waits_for_its_reset(second)
+
+    # the retry phase's transaction stops before its commit, with the second card queued and the wave armed
+    held, go = threading.Event(), threading.Event()
+    arming: dict[str, threading.Thread] = {}
+    arm = events.arm_limit_wave
+
+    def arm_and_mark(session: Session, job_id: UUID) -> None:
+        arm(session, job_id)
+        arming["thread"] = threading.current_thread()
+
+    def before_commit(session: Session) -> None:
+        if arming.get("thread") is threading.current_thread() and not held.is_set():
+            held.set()
+            assert go.wait(30)
+
+    def claim() -> bool:
+        return events.maybe_notify_batch(batch_id)  # the first card's finalize
+
+    monkeypatch.setattr(events, "arm_limit_wave", arm_and_mark)
+    sa.event.listen(Session, "before_commit", before_commit)
+    try:
+        queueing = _Running(lambda: retries.retry_waiting(utcnow()))
+        assert held.wait(30)
+        if _postgres():
+            claiming = _Running(claim)
+            assert _until(lambda: _waits_for_a_lock(CLAIM_STATEMENT), 10)  # for the batch's row
+        go.set()
+        assert queueing.join() == 1
+        if not _postgres():
+            claiming = _Running(claim)  # SQLite serializes the two writers: the claim comes after the commit
+        assert claiming.join() is False  # the second card is being read: the wave is its finalize's
+    finally:
+        go.set()
+        sa.event.remove(Session, "before_commit", before_commit)
+
+    _read(second)
+    assert events.maybe_notify_batch(batch_id) is True
+    [wave] = [sent for sent in for_batch(published, batch_id) if "waited" in sent.event.message.body]
+    assert wave.data.job_ids == [first, second]
+    assert wave.event.message.body.startswith("2 cards that waited for the monthly limit were read.")
+
+
+def test_a_card_queued_while_its_batch_is_claimed_is_counted_once_read(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The retry phase queues a card that waited while the batch's last card finishes and claims the batch's own
+    notification. The queueing waits for the claim's commit, finds it and starts the notification over, so once the
+    card is read the batch is told again, counting it. (On PostgreSQL the queueing read the batch's state without
+    waiting for the claim, found nothing claimed and left it: the card was never counted.)
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready", "waiting", "processing")
+    _, waiting, last = _job_ids(batch_id)
+    _only_the_batchs_waiting_cards(monkeypatch, batch_id)
+    _waits_for_its_reset(waiting)
+    assert events.maybe_notify_batch(batch_id) is False  # the last card is still being read
+
+    claimed, queued = threading.Event(), threading.Event()
+    finishing: dict[str, threading.Thread] = {}
+
+    def after_execute(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if finishing.get("thread") is threading.current_thread() and statement.startswith(CLAIM_STATEMENT):
+            if not claimed.is_set() and _postgres():
+                claimed.set()
+                # the claim holds the batch's row, uncommitted, while the retry phase queues the card: until the
+                # queueing is done, or waits for the row
+                _until(lambda: queued.is_set() or _waits_for_a_lock(ARM_STATEMENT), 10)
+
+    def finish_the_last_card() -> bool:
+        finishing["thread"] = threading.current_thread()
+        _read(last)
+        return events.maybe_notify_batch(batch_id)
+
+    def queue_the_waiting_card() -> int:
+        try:
+            return retries.retry_waiting(utcnow())
+        finally:
+            queued.set()
+
+    sa.event.listen(db_setup.engine, "after_cursor_execute", after_execute)
+    try:
+        finishing_card = _Running(finish_the_last_card)
+        if _postgres():
+            assert claimed.wait(30)
+        else:
+            finishing_card.join()  # SQLite serializes the two writers: the queueing comes after the claim's commit
+        queueing = _Running(queue_the_waiting_card)
+        assert queueing.join() == 1
+        finishing_card.join()
+    finally:
+        sa.event.remove(db_setup.engine, "after_cursor_execute", after_execute)
+
+    told = len(for_batch(published, batch_id))
+    _read(waiting)
+    assert events.maybe_notify_batch(batch_id) is True  # the card is told once read
+    [sent] = for_batch(published, batch_id)[told:]
+    # the batch's notification started over (and counts it), or went out first and the card is a wave of its own
+    if sent.data.job_ids == [waiting]:
+        assert sent.event.message.body.startswith("1 card that waited for the monthly limit was read.")
+    else:
+        assert (sent.data.ready_count, sent.data.failed_count) == (3, 0)
+
+
+def test_a_batch_housekeeping_reaches_late_gets_a_full_lease(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    A housekeeping run that reaches a batch long after it began (earlier batches' notifiers were slow) takes its
+    lease from the time it claims it, so another process's housekeeping doesn't take the batch over and send it again
+    while the first is still sending
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready")
+    other_process: list[bool] = []
+    deliver = published.deliver
+
+    def deliver_while_another_process_runs(event: events.AIEvent, url: str) -> bool:
+        data = event.document_data
+        if isinstance(data, events.EventIngestionReadyData) and data.batch_id == batch_id and not other_process:
+            other_process.append(False)
+            other_process[0] = events._notify_batch(batch_id, utcnow())
+        return deliver(event, url)
+
+    monkeypatch.setattr(events, "deliver", deliver_while_another_process_runs)
+    events.housekeeping(utcnow() - LEASE)  # the run began a lease ago
+
+    assert other_process == [False]
+    assert published.tried(batch_id, "ha.local") == 1
+    state = notify_state(batch_id)
+    assert state["notified_at"] is not None and state["notify_attempts"] == 1
 
 
 def test_given_up_after_the_last_attempt(

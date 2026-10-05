@@ -174,6 +174,14 @@ class RecipeIngestionJob(SqlAlchemyBase, BaseMixins):
     error_params: orm.Mapped[Any] = orm.mapped_column(JsonText, nullable=True)
     auto_retry_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
     """A card that failed `limit_reached` is read again from then (next month), or once the limit no longer applies"""
+    lift_retries: orm.Mapped[int] = orm.mapped_column(sa.Integer, nullable=False, default=0, server_default="0")
+    """How often a "lifted" limit queued the card again while it waited for this reset (`runner/retries.py`)"""
+    lift_retry_at: orm.Mapped[datetime | None] = orm.mapped_column(NaiveDateTime, nullable=True)
+    """
+    The earliest the next "lifted" limit may queue it: a lift that doesn't help the card (it fails `limit_reached`
+    again) reads it less and less often, in every worker process alike. Cleared, with `lift_retries`, once it's read,
+    fails otherwise or its reset comes.
+    """
 
     commit_recipe_id: orm.Mapped[GUID | None] = orm.mapped_column(GUID, nullable=True)
     """The recipe id a commit reserved before creating anything (§7)"""

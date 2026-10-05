@@ -171,6 +171,7 @@ def test_the_test_notification(api_client: TestClient, unique_user_fn_scoped: Te
         "readyCount": 0,
         "needsAttentionCount": 0,
         "failedCount": 0,
+        "waitingCount": 0,
         "reviewUrl": f"http://localhost:8080/g/{slug}/recipes/cards",
     }
 

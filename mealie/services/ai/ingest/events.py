@@ -10,23 +10,30 @@ still processing and one was written in the last 24 hours. `maybe_notify_batch` 
 processes finishing the last two cards at the same moment can't both send it. It then sends to each notifier on its
 own, checks Apprise's answer, and records each notifier that got it (a hash in `notify_delivered`) before the next
 send; `notified_at` is set once every notifier has it. The lease is renewed every third of it while the sends run
-(`Heartbeat`), so a slow notifier never lets another process start the same attempt over. A notifier that failed, or
+(`Heartbeat`), so a slow notifier never lets another process start the same attempt over; the lease starts when the
+batch is claimed, however long the housekeeping run that reached it has been going. A notifier that failed, or
 a process that died part way, is tried again by housekeeping once the lease has passed, skipping the notifiers that
 already have it; after 5 attempts the batch is given up on (`notified_at` set, an error logged). A notifier gets it
 twice only if the process dies between sending to it and recording that. The 24 hours count from the cards' last
 activity, not the batch's creation: a batch read over days still notifies, while a batch whose cards were last written
 over 24 hours ago (a restored backup's) never does, and housekeeping settles it so a later edit doesn't either.
 
-**Its title follows what it says:** "Recipe cards ready" when a card is ready to review, else "Recipe cards not read".
-The event type is `recipe_ingestion_ready` either way, so a Home Assistant automation matches both.
+**Its title follows what it says:** "Recipe cards ready" when a card is ready to review, else "Recipe cards not read",
+or "Recipe cards waiting" when its only cards to tell of wait for a monthly limit. The event type is
+`recipe_ingestion_ready` every time, so a Home Assistant automation matches them all.
 
 **Cards that waited for a monthly limit.** A card that failed `limit_reached` is read again automatically later
-(`runner/retries.py`), after its batch's notification went out. Queueing it arms the batch's notification again for a
-"wave" (`arm_limit_wave`, in the queueing's transaction): `notified_at` and the attempt are cleared and the card's id is
-kept in `notify_delivered` (`limit-wave:<job id>`, beside the delivery hashes). Once none of the batch's cards is still
-being read, the notification goes out as above, at least once per notifier, counting only the wave's cards ("2 cards
+(`runner/retries.py`), at the next reset or sooner once the limit is raised. Its batch's notification says it waits,
+never that it failed ("2 cards are waiting for the monthly limit. They'll be read when it resets on Nov 1, or sooner if
+it's raised.", after what the batch's other cards came to; `waiting_count`, apart from `failed_count`). Queueing it
+again arms the batch's notification again for a "wave" (`arm_limit_wave`, in the queueing's transaction, once the card
+was queued): `notified_at` and the attempt are cleared and the card's id is kept in `notify_delivered`
+(`limit-wave:<job id>`, beside the delivery hashes). Once none of the batch's cards is still being read, the
+notification goes out as above, at least once per notifier, counting only the wave's cards that were read ("2 cards
 that waited for the monthly limit were read. 1 card is ready to review (1 failed)."), one per batch for the cards
-queued together. When none of them was read (each failed `limit_reached` again, and waits on), nothing is sent.
+queued together. When none of them was read (each failed `limit_reached` again, and waits on), nothing is sent. A claim
+re-checks, in a statement of its own, that no card of the batch is being read: on PostgreSQL its conditional update
+may have waited for a queueing's commit and checked the cards as they were before it.
 
 **Counts and a link only:** no card names or text, since notifications leave the server. Logs name a notifier by its
 id and name, never by its URL, which holds its secrets.
@@ -40,7 +47,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import partial
@@ -110,6 +117,9 @@ class EventIngestionReadyData(EventDocumentDataBase):
     needs_attention_count: int
     """Ready cards with an unresolved error or warning"""
     failed_count: int
+    """Cards that couldn't be read, not counting those waiting for a monthly limit"""
+    waiting_count: int = 0
+    """Cards waiting for a monthly limit: read again automatically once it resets or is raised"""
     review_url: str
     """`BASE_URL/g/<group-slug>/recipes/cards/review?batch=<id>`: the batch's first card to review"""
 
@@ -290,12 +300,35 @@ class Heartbeat:
 # The message
 
 
-def ready_message(counts: RecipeIngestionJobCounts, translator: Translator, *, waited: int = 0) -> EventBusMessage:
+def reset_date(when: datetime, translator: Translator) -> str:
+    """The day a monthly limit resets ('Nov 1'), from `auto_retry_at` (UTC), in the notification's language"""
+    month = translator.t(f"recipe-ingest.months-short.{when.month}")
+    return translator.t("recipe-ingest.notification-reset-date", month=month, day=when.day)
+
+
+def ready_message(
+    counts: RecipeIngestionJobCounts,
+    translator: Translator,
+    *,
+    waited: int = 0,
+    waiting: int = 0,
+    reset: datetime | None = None,
+) -> EventBusMessage:
     """
     'Recipe cards ready' / '10 cards are ready to review (2 need a look, 1 failed).', titled 'Recipe cards not read'
     when none is ready. `waited`: the cards read after waiting for a monthly limit (a wave), which the body says first:
-    '2 cards that waited for the monthly limit were read. 1 card is ready to review (1 failed).'
+    '2 cards that waited for the monthly limit were read. 1 card is ready to review (1 failed).' `waiting`: the cards
+    waiting for a monthly limit, which aren't failed and are said last, read at `reset` at the latest: '… 2 cards are
+    waiting for the monthly limit. They'll be read when it resets on Nov 1, or sooner if it's raised.'; with no card
+    ready or failed, that's the whole body, titled 'Recipe cards waiting'.
     """
+    waits = ""
+    if waiting:
+        date = reset_date(reset, translator) if reset is not None else ""
+        waits = translator.t("recipe-ingest.notification-waiting", count=waiting, date=date)
+        if not counts.ready and not counts.failed:
+            return EventBusMessage(title=translator.t("recipe-ingest.notification-title-waiting"), body=waits)
+
     ready = translator.t("recipe-ingest.notification-ready", count=counts.ready)
     details: list[str] = []
     if counts.needs_attention:
@@ -313,6 +346,8 @@ def ready_message(counts: RecipeIngestionJobCounts, translator: Translator, *, w
     if waited:
         read = translator.t("recipe-ingest.notification-limit-wave", count=waited)
         body = translator.t("recipe-ingest.notification-limit-wave-body", waited=read, summary=body)
+    if waits:
+        body = translator.t("recipe-ingest.notification-waiting-body", summary=body, waiting=waits)
     title = "recipe-ingest.notification-title" if counts.ready else "recipe-ingest.notification-title-none-ready"
     return EventBusMessage(title=translator.t(title), body=body)
 
@@ -451,20 +486,31 @@ class _Claim:
         return self.lease.attempt
 
 
+def _being_read(session: Session, batch_id: UUID) -> bool:
+    """Whether a card of the batch is processing, as committed by now"""
+    processing = sa.exists().where(Job.batch_id == batch_id, Job.status == IngestStatus.processing.value)
+    return bool(session.execute(sa.select(processing)).scalar())
+
+
 def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
     """
-    Takes the batch's notification for `limits.NOTIFY_LEASE` seconds if it's due, free and has attempts left, in one
-    conditional update that no two processes can both win; this attempt, or None
+    Takes the batch's notification for `limits.NOTIFY_LEASE` seconds from now (or `now`, when later) if it's due at
+    `now`, free and has attempts left, in one conditional update that no two processes can both win; this attempt, or
+    None. A run of housekeeping may reach a batch long after its `now`: the lease still starts when it's claimed.
     """
     stmt = (
         sa.update(Batch)
         .where(*_claimable(batch_id, now))
-        .values(notify_claimed_at=now, notify_attempts=Batch.notify_attempts + 1)
+        .values(notify_claimed_at=max(now, utcnow()), notify_attempts=Batch.notify_attempts + 1)
     )
     try:
         result = session.execute(stmt, execution_options={"synchronize_session": False})
         claim = None
-        if isinstance(result, CursorResult) and result.rowcount == 1:
+        # PostgreSQL: an update that waited for the batch's row (a card being queued again arms the batch in the
+        # queueing's transaction, `arm_limit_wave`) checked "no card processing" as the cards were when it began, before
+        # that card was queued; checked again in a statement of its own, which sees it. The card's own finalize then
+        # sends the notification, with it.
+        if isinstance(result, CursorResult) and result.rowcount == 1 and not _being_read(session, batch_id):
             # read before the commit: until then the row is this transaction's
             attempt, claimed_at, delivered = session.execute(
                 sa.select(Batch.notify_attempts, Batch.notify_claimed_at, Batch.notify_delivered).where(
@@ -472,7 +518,10 @@ def _claim(session: Session, batch_id: UUID, now: datetime) -> _Claim | None:
                 )
             ).one()
             claim = _Claim(_Lease(batch_id, attempt, claimed_at), frozenset(delivered or ()))
-        session.commit()
+        if claim is None:
+            session.rollback()  # nothing claimed, or a card is being read after all: the claim is undone
+        else:
+            session.commit()
     except BaseException:
         session.rollback()
         raise
@@ -524,11 +573,13 @@ ARM_TRIES = 10
 
 def arm_limit_wave(session: Session, job_id: UUID) -> None:
     """
-    Arms the notification of the batch of a card the automatic retry queues after it waited for a monthly limit
-    (`runner/retries.py`), in the caller's transaction, which the queueing then commits, so the card is never queued
-    without it. Under the household's intake lock (`intake.lock_household_intake`), so two processes arming one batch
-    keep both cards, and fenced on the notification's state as read, so it never lands between another process's
-    claim and its record:
+    Arms the notification of the batch of a card the automatic retry has just queued after it waited for a monthly
+    limit (`runner/retries.py`), in the queueing's transaction, which the caller then commits, so the card is never
+    queued without it, nor the batch armed for a card that wasn't queued. Under the household's intake lock
+    (`intake.lock_household_intake`), so two processes arming one batch keep both cards; the batch's row is read
+    locked (`FOR UPDATE` on PostgreSQL, where a claim being made meanwhile is waited for and seen; SQLite serializes
+    writers already), and the write fenced on the notification's state as read, so it never lands between another
+    process's claim and its record:
     - the batch's notification went out: it's due again once the card is read, for a wave of the cards that waited
       (`notified_at`, the claim and the attempts cleared, the card's id kept in `notify_delivered`);
     - a wave is pending: the card joins it, and one being sent starts over (its counts didn't have the card);
@@ -541,9 +592,9 @@ def arm_limit_wave(session: Session, job_id: UUID) -> None:
     lock_household_intake(session, job.household_id)
     for _ in range(ARM_TRIES):
         state = session.execute(
-            sa.select(Batch.notified_at, Batch.notify_claimed_at, Batch.notify_attempts, Batch.notify_delivered).where(
-                Batch.id == job.batch_id
-            )
+            sa.select(Batch.notified_at, Batch.notify_claimed_at, Batch.notify_attempts, Batch.notify_delivered)
+            .where(Batch.id == job.batch_id)
+            .with_for_update()
         ).one_or_none()
         if state is None:
             return
@@ -575,11 +626,58 @@ def arm_limit_wave(session: Session, job_id: UUID) -> None:
     raise RuntimeError(f"Recipe card batch {job.batch_id}: its notification kept changing; not armed")
 
 
-def _event(
-    session: Session, batch: Batch, counts: RecipeIngestionJobCounts, job_ids: list[UUID], waited: int = 0
-) -> AIEvent:
+def _waiting_for_limit() -> list[sa.ColumnElement[bool]]:
+    """
+    A card waiting for a monthly limit: it failed `limit_reached` and is read again automatically (`auto_retry_at`),
+    so no notification calls it failed
+    """
+    return [
+        Job.status == IngestStatus.failed.value,
+        Job.error_code == IngestErrorCode.limit_reached.value,
+        Job.auto_retry_at.is_not(None),
+    ]
+
+
+@dataclass(frozen=True)
+class _Tally:
+    """What a notification says of some of a batch's cards"""
+
+    counts: RecipeIngestionJobCounts
+    """Ready, needing a look, and failed (not counting those waiting)"""
+    read: list[UUID]
+    """The cards that are ready or failed, in review order"""
+    waiting: int = 0
+    reset: datetime | None = None
+    """When the waiting cards are read at the latest: the last of their `auto_retry_at`"""
+
+
+def _tally(session: Session, batch: Batch, *only: sa.ColumnElement[bool]) -> tuple[_Tally, list[UUID]]:
+    """The batch's cards (those where `only` holds) counted for a notification, and all of their ids in review order"""
+    repos = IngestRepos(session, batch.group_id, batch.household_id)
+    waits = sa.and_(*_waiting_for_limit())
+    rows = session.execute(
+        sa.select(Job.id, Job.status, Job.error_count, Job.warning_count, waits.label("waits"), Job.auto_retry_at)
+        .where(Job.batch_id == batch.id, *only, *repos.jobs.scope)
+        .order_by(Job.position, Job.created_at, Job.id)
+    ).all()
+    ready = [row for row in rows if row.status == IngestStatus.ready.value]
+    failed = [row for row in rows if row.status == IngestStatus.failed.value and not row.waits]
+    waiting = [naive_utc(row.auto_retry_at) for row in rows if row.waits]
+    counts = RecipeIngestionJobCounts(
+        ready=len(ready),
+        needs_attention=sum(1 for row in ready if row.error_count or row.warning_count),
+        failed=len(failed),
+    )
+    read = {row.id for row in [*ready, *failed]}
+    tally = _Tally(counts, [row.id for row in rows if row.id in read], len(waiting), max(waiting, default=None))
+    return tally, [row.id for row in rows]
+
+
+def _event(session: Session, batch: Batch, tally: _Tally, job_ids: list[UUID], waited: int = 0) -> AIEvent:
+    translator = translator_for(batch.locale)
+    counts = tally.counts
     return AIEvent(
-        message=ready_message(counts, translator_for(batch.locale), waited=waited),
+        message=ready_message(counts, translator, waited=waited, waiting=tally.waiting, reset=tally.reset),
         event_type=AIEventTypes.recipe_ingestion_ready,
         integration_id=INTERNAL_INTEGRATION_ID,
         document_data=EventIngestionReadyData(
@@ -588,54 +686,33 @@ def _event(
             ready_count=counts.ready,
             needs_attention_count=counts.needs_attention,
             failed_count=counts.failed,
+            waiting_count=tally.waiting,
             review_url=cards_url(group_slug(session, batch.group_id), batch.id),
         ),
     )
 
 
 def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
-    """The batch's notification; None when it has nothing to look at (no ready or failed card)"""
-    repos = IngestRepos(session, batch.group_id, batch.household_id)
-    counts = repos.batches.counts(batch.id)
-    if not counts.ready and not counts.failed:
+    """
+    The batch's notification; None when it has nothing to look at (no ready, failed or waiting card). A card waiting
+    for a monthly limit is said to wait, not to have failed; its batch notifies again once it's read (a wave).
+    """
+    tally, job_ids = _tally(session, batch)
+    if not tally.read and not tally.waiting:
         return None
-
-    job_ids = session.execute(
-        sa.select(Job.id)
-        .where(Job.batch_id == batch.id, *repos.jobs.scope)
-        .order_by(Job.position, Job.created_at, Job.id)
-    ).scalars()
-    return _event(session, batch, counts, list(job_ids))
+    return _event(session, batch, tally, job_ids)
 
 
 def _wave_event(session: Session, batch: Batch, wave: set[UUID]) -> AIEvent | None:
     """
-    The notification of a wave of the batch's cards that waited for a monthly limit, counting only those (`job_ids`
-    too); None when none of them was read: each failed `limit_reached` again and waits on, or is gone
+    The notification of a wave of the batch's cards that waited for a monthly limit, counting only those that were
+    read (`job_ids` too); None when none of them was: each failed `limit_reached` again and waits on (for a wave of
+    its own once read), or is gone
     """
-    repos = IngestRepos(session, batch.group_id, batch.household_id)
-    rows = session.execute(
-        sa.select(Job.id, Job.status, Job.error_count, Job.warning_count, Job.error_code, Job.auto_retry_at)
-        .where(Job.batch_id == batch.id, Job.id.in_(wave), *repos.jobs.scope)
-        .order_by(Job.position, Job.created_at, Job.id)
-    ).all()
-    ready = [row for row in rows if row.status == IngestStatus.ready.value]
-    waiting = IngestErrorCode.limit_reached.value
-    failed = [
-        row
-        for row in rows
-        if row.status == IngestStatus.failed.value and not (row.error_code == waiting and row.auto_retry_at)
-    ]
-    if not ready and not failed:
+    tally, _ = _tally(session, batch, Job.id.in_(wave))
+    if not tally.read:
         return None
-    counts = RecipeIngestionJobCounts(
-        ready=len(ready),
-        needs_attention=sum(1 for row in ready if row.error_count or row.warning_count),
-        failed=len(failed),
-    )
-    read = {row.id for row in [*ready, *failed]}
-    job_ids = [row.id for row in rows if row.id in read]
-    return _event(session, batch, counts, job_ids, waited=len(read))
+    return _event(session, batch, replace(tally, waiting=0, reset=None), tally.read, waited=len(tally.read))
 
 
 def maybe_notify_batch(batch_id: UUID) -> bool:
@@ -840,7 +917,10 @@ def send_test_notification(
     data shape (with no batch, and the household's current counts), so a Home Assistant automation can be tried out.
     Whether it was delivered; a failure is logged (by the notifier's id and name, never its URL). Blocking (Apprise).
     """
-    counts = IngestRepos(session, group_id, household_id).jobs.counts()
+    repos = IngestRepos(session, group_id, household_id)
+    counts = repos.jobs.counts()
+    waiting = session.execute(sa.select(sa.func.count(Job.id)).where(*_waiting_for_limit(), *repos.jobs.scope))
+    waiting_count = waiting.scalar_one()  # counted apart from the failed ones, as a batch's notification counts them
     slug = group_slug(session, group_id)
     if session.in_transaction():
         session.commit()  # nothing held open while Apprise sends
@@ -857,7 +937,8 @@ def send_test_notification(
             job_ids=[],
             ready_count=counts.ready,
             needs_attention_count=counts.needs_attention,
-            failed_count=counts.failed,
+            failed_count=counts.failed - waiting_count,
+            waiting_count=waiting_count,
             review_url=cards_url(slug),
         ),
     )

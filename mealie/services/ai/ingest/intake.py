@@ -10,7 +10,7 @@ inbox.
 group has at most one card waiting for that slot or holding it, an upload's (`ingest_async`) or the inbox scan's
 (`ingest`) alike, so another group's PDF waits for one card per group rendering at most. Once a PDF of one sender (a
 request's cards, or one inbox scan's cards of a group: `RenderBudget`) runs out of render time, the sender's later PDFs
-are refused `pdf_not_supported` without being rendered.
+are refused `pdf_not_supported` without being rendered (the inbox leaves them for its next scan instead).
 
 **One household's intakes take turns.** The transaction starts with the household's intake lock
 (`lock_household_intake`): a transaction-level advisory lock on PostgreSQL, the database's write lock on SQLite (plus
@@ -230,7 +230,8 @@ class RenderBudget:
     """
     One sender's PDF rendering: a request's cards (an `IntakeService`'s), or one inbox scan's cards of a group. Once
     one of its PDFs runs out of render time (`images.RenderTimedOut`), its later PDFs are refused `pdf_not_supported`
-    without being rendered: the process's render slot is everyone's.
+    without being rendered: the process's render slot is everyone's. The inbox doesn't hand them over then: they stay
+    in the folder for its next scan, which has a budget of its own.
     """
 
     timed_out: bool = False

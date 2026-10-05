@@ -991,7 +991,11 @@ def test_a_groups_pdfs_hold_up_another_groups_for_one_card_at_most(
             group.start_soon(send, _service(db, user), card, _options(user), "b.pdf")
 
     anyio.run(main)
-    assert short_renders == ["a1.pdf", "b.pdf", "a2.pdf", "a3.pdf"]
+    # which of the group's requests gets the slot first is up to the threads that sniff them: the other group's PDF
+    # comes right after it
+    first, other, *rest = short_renders
+    assert other == "b.pdf"
+    assert sorted([first, *rest]) == ["a1.pdf", "a2.pdf", "a3.pdf"]
     _accepted(outcomes["b.pdf"])
     assert [outcomes[name].reason for name in ("a1.pdf", "a2.pdf", "a3.pdf")] == [
         IngestRejectReason.pdf_not_supported

@@ -46,8 +46,11 @@ to intake, then moved to `processed/` (or `failed/` with the reason).
   card's insert (`IntakeOptions.group_cap`), with uploads and other processes' scans: a card that finds it reached
   there keeps its claim, retried after `INBOX_CLAIM_RETRY` once the group has room, and the group takes nothing more
   in that scan.
-- **PDFs:** once one of a group's PDFs runs out of render time in a scan, the group's other PDFs of that scan are
-  refused `pdf_not_supported` without being rendered (`intake.RenderBudget`).
+- **PDFs:** once one of a group's PDFs runs out of render time in a scan (it goes to `failed/`, `pdf_not_supported`),
+  the group's other PDFs aren't rendered in that scan, nor failed: they stay where they are, unclaimed, and the next
+  scan renders them with time of its own (`intake.RenderBudget`), so a group renders at most one PDF that runs out of
+  time per scan. One found to be a PDF only once claimed (it changed since it settled) keeps its claim, retried after
+  `INBOX_CLAIM_RETRY`.
 - **Folders Mealie creates** get `AI_INGEST_INBOX_DIR_MODE` (2775 by default: setgid and group-writable, so whatever
   writes the photos as a member of Mealie's group can write there), set on the open folder so the umask can't strip
   it. Folders that already exist are never changed.
@@ -684,15 +687,19 @@ def _open_card(dirs: _FolderDirs, claimed: str, root: Path) -> list[tuple[Binary
     The claimed entry's pages, opened: the file itself, or a folder's regular files in name order, refused with
     `too_many_pages` before any is opened when there are more than a card can have
     """
-    claim_dir = dirs.claim_dir()
-    st = os.stat(claimed, dir_fd=claim_dir, follow_symlinks=False)
+    return _open_entry(dirs.claim_dir(), claimed, root)
+
+
+def _open_entry(dir_fd: int, name: str, root: Path) -> list[tuple[BinaryIO, str]]:
+    """`_open_card` for the entry `name` of the folder `dir_fd`"""
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if stat.S_ISREG(st.st_mode):
-        return [(open_page(claimed, root, dir_fd=claim_dir), "")]
+        return [(open_page(name, root, dir_fd=dir_fd), "")]
     if not stat.S_ISDIR(st.st_mode):
         raise _Refused("not-a-file-or-folder")
 
     try:
-        card_fd = _open_dir(claimed, claim_dir, claimed)
+        card_fd = _open_dir(name, dir_fd, name)
     except _UnsafeFolder as e:
         raise _Refused("not-a-file-or-folder") from e  # swapped for a link since
 
@@ -712,6 +719,32 @@ def _open_card(dirs: _FolderDirs, claimed: str, root: Path) -> list[tuple[Binary
     finally:
         os.close(card_fd)
     return opened
+
+
+def _is_pdf(file: BinaryIO) -> bool:
+    """Whether an opened page is a PDF, by its first bytes as intake tells one (`images.sniff`)"""
+    file.seek(0)
+    try:
+        return images.sniff(file.read(images.SNIFF_BYTES)) == "pdf"
+    finally:
+        file.seek(0)
+
+
+def _holds_pdf(dir_fd: int, name: str, root: Path) -> bool:
+    """
+    Whether the entry `name` of the folder `dir_fd` (a file, or a card folder's pages) is or has a PDF, opened as a
+    claimed one is (`_open_entry`) but not claimed; False when it can't be opened that way (claiming it refuses it, for
+    its own reason)
+    """
+    try:
+        pages = _open_entry(dir_fd, name, root)
+    except OSError, _Refused:
+        return False
+    try:
+        return any(_is_pdf(file) for file, _ in pages)
+    finally:
+        for file, _ in pages:
+            file.close()
 
 
 # ==================================================================================================================
@@ -1301,6 +1334,8 @@ class _Taken:
     """It went to `failed/`"""
     reason: IngestRejectReason | None = None
     """Why it was refused, when there's a code for it"""
+    deferred: bool = False
+    """It keeps its claim, for a later scan"""
 
 
 def _ingest_claimed(
@@ -1317,7 +1352,8 @@ def _ingest_claimed(
     """
     Intake for one claimed entry, then where it goes; `locale` is the household's (`household_locale`), `renders` the
     group's PDFs in this scan. Raises `QuotaReached` (the claim stays) when the group's processing quota, counted in
-    the insert, is reached.
+    the insert, is reached. A PDF claimed after the group's render time ran out in this scan keeps its claim too
+    (`deferred`): intake would refuse it unrendered.
     """
     folder = dirs.folder
     parsed = _parse_claim(claimed)
@@ -1330,6 +1366,12 @@ def _ingest_claimed(
     except _Refused as e:
         fail(dirs, claimed, name, _refusal_note(translator_for(locale), e), e.reason)
         return _Taken(refused=True, reason=e.reason)
+
+    if renders is not None and renders.timed_out and any(_is_pdf(file) for file, _ in pages):
+        for file, _ in pages:
+            file.close()
+        logger.info(f"A recipe card PDF in the inbox of {folder.key} waits: its group's render time ran out this scan")
+        return _Taken(deferred=True)  # retried after INBOX_CLAIM_RETRY, with render time of its own
 
     try:
         card = IntakeCard(
@@ -1390,10 +1432,15 @@ class _FolderScan:
     """Jobs created"""
     refused: int = 0
     """Entries refused (to `failed/`), recorded for the folder's next notification"""
+    deferred: int = 0
+    """PDFs left for a later scan, once the group's render time ran out in this one"""
     paused: bool = False
     """A restore paused ingestion: the scan stops"""
     complete: bool = False
-    """Everything the folder had to take was taken: the scan wasn't stopped by its budget, the pause or the gate"""
+    """
+    Everything the folder had to take was taken: the scan wasn't stopped by its budget, the pause or the gate, and
+    left no PDF for a later scan
+    """
 
 
 def _scan_folder(
@@ -1418,6 +1465,11 @@ def _scan_folder(
         gate = _gate(session, folder, gates)
         if not gate.open:
             return result
+        if gate.renders.timed_out and _holds_pdf(dirs.claim_dir() if kind == "stale" else dirs.fd, name, root):
+            # one of the group's PDFs ran out of render time in this scan: its others stay where they are (a stale
+            # claim stays stale), and the next scan renders them with time of its own
+            result.deferred += 1
+            continue
 
         try:
             claimed = reclaim(dirs, name) if kind == "stale" else claim(dirs, name)
@@ -1478,7 +1530,9 @@ def _scan_folder(
         if taken.refused:
             result.refused += 1
             _record_refusals(folder, [taken.reason])  # at once: a later error in this scan doesn't lose it
-    result.complete = True
+        if taken.deferred:
+            result.deferred += 1
+    result.complete = not result.deferred
     return result
 
 

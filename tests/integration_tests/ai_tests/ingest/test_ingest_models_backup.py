@@ -178,6 +178,9 @@ def _seed(user: TestUser) -> dict[str, Any]:
                     "pages": [_page(0), _page(1)],
                     "source_sha256": f"{position}" * 64,
                     "error_code": IngestErrorCode.provider_failed.value if status == IngestStatus.failed else None,
+                    # a waiting card's lift backoff: its count and its time come back as they were
+                    "lift_retries": 2 if status == IngestStatus.failed else 0,
+                    "lift_retry_at": now + timedelta(minutes=20) if status == IngestStatus.failed else None,
                     "commit_recipe_id": uuid4()
                     if status in (IngestStatus.committing, IngestStatus.committed)
                     else None,

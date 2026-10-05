@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from mealie.core.root_logger import get_logger
 from mealie.db.models.recipe_ingest import RecipeIngestionJob
-from mealie.repos.repository_recipe_ingest import TASK_CLEARED, ExpiredLease, IngestQueue
+from mealie.repos.repository_recipe_ingest import LIFT_CLEARED, TASK_CLEARED, ExpiredLease, IngestQueue
 from mealie.schema.recipe_ingest import IngestErrorCode, IngestStatus, IngestTaskState
 
 from .. import limits
@@ -61,7 +61,9 @@ def _poison(session: Session, lease: ExpiredLease, now: datetime) -> IngestStatu
             IngestStatus.failed,
             sa.update(Job)
             .where(*still_expired, Job.status == IngestStatus.processing.value)
-            .values(**TASK_CLEARED, **error, **bump, status=IngestStatus.failed.value, auto_retry_at=None),
+            .values(
+                **TASK_CLEARED, **error, **bump, **LIFT_CLEARED, status=IngestStatus.failed.value, auto_retry_at=None
+            ),
         ),
         (
             IngestStatus.ready,

@@ -4,6 +4,7 @@ automatically, at the next reset (the first of next month, UTC) or once the limi
 every 10 minutes per group, under the card's own policy), as a manual retry would; any other failure clears the retry.
 """
 
+import calendar
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -11,21 +12,27 @@ from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
-from ingest_runner_testing import FakeHandlers, Jobs, run, settle
+from ingest_runner_testing import FakeHandlers, Jobs, extract_result, run, settle
 
 from mealie.db.db_setup import session_context
-from mealie.db.models.recipe_ingest import RecipeIngestionBatch
+from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.repos.repository_recipe_ingest import IngestQueue, IngestRepos, LimitWait, naive_utc, utcnow
 from mealie.schema.group.ai_providers import AIProviderCreate, AIProviderSettingsUpdate, AIProviderSlot
 from mealie.schema.group.ai_routing import AIUsageLogCreate
 from mealie.schema.household.group_events import GroupEventNotifierSave
-from mealie.schema.recipe_ingest import IngestErrorCode, IngestStatus, IngestTaskState, RecipeIngestionSettingsUpdate
+from mealie.schema.recipe_ingest import (
+    IngestErrorCode,
+    IngestStatus,
+    IngestTaskKind,
+    IngestTaskState,
+    RecipeIngestionSettingsUpdate,
+)
 from mealie.services import ocr
 from mealie.services.ai.errors import AIProviderLimitReachedError
 from mealie.services.ai.ingest import events, limits
 from mealie.services.ai.ingest.runner import retries
 from mealie.services.ai.ingest.runner.dispatcher import IngestDispatcher
-from mealie.services.ai.ingest.runner.finalize import finalize_failure, next_limit_reset
+from mealie.services.ai.ingest.runner.finalize import finalize_extract, finalize_failure, next_limit_reset
 from mealie.services.ai.ingest.runner.retries import retry_waiting
 from mealie.services.ai.ingest.runner.types import TaskContext, TaskFailed
 from tests.utils.fixture_schemas import TestUser
@@ -191,22 +198,21 @@ def test_a_card_that_fails_again_after_a_lift_waits_for_a_new_check(jobs: Jobs, 
     assert jobs.row(job_id)["status"] == IngestStatus.failed
 
 
-class _Clock:
-    """`time.monotonic()` as `retries` reads it, moved on by the test"""
-
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def monotonic(self) -> float:
-        return self.now
-
-
-def _read_and_over_the_limit_again(job_id: UUID) -> None:
-    """The card a lift queued is read, and fails `limit_reached` again: finalize puts it back to waiting"""
+def _read_and_over_the_limit_again(jobs: Jobs, job_id: UUID) -> None:
+    """
+    The card a lift queued is read, and fails `limit_reached` again: finalize puts it back to waiting (its reset kept
+    a month away, so the test's time travel never reaches it)
+    """
     token = uuid4()
     with session_context() as session:
         assert IngestQueue(session).claim(job_id, token=token, owner="test", now=utcnow(), group_cap=0)
         finalize_failure(session, job_id, token, IngestErrorCode.limit_reached)
+    jobs.update(job_id, auto_retry_at=utcnow() + timedelta(days=30))
+
+
+def _lift_backoff(jobs: Jobs, job_id: UUID) -> tuple[int, datetime | None]:
+    row = jobs.row(job_id)
+    return row["lift_retries"], naive_utc(row["lift_retry_at"]) if row["lift_retry_at"] else None
 
 
 def test_a_card_a_lift_doesnt_help_is_read_again_less_and_less_often(
@@ -217,50 +223,77 @@ def test_a_card_a_lift_doesnt_help_is_read_again_less_and_less_often(
     the card, so it fails `limit_reached` again while the check keeps saying "lifted") queues it again only after
     `LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT`: not at every run until the reset
     """
-    clock = _Clock()
-    monkeypatch.setattr(retries, "time", clock)
-    interval = limits.LIMIT_RECHECK_INTERVAL
-    monkeypatch.setattr(retries, "LIFT_RETRY_MAX_WAIT", 3 * interval)
-    job_id = _waiting(jobs)
+    interval = timedelta(seconds=limits.LIMIT_RECHECK_INTERVAL)
+    monkeypatch.setattr(retries, "LIFT_RETRY_MAX_WAIT", 3 * limits.LIMIT_RECHECK_INTERVAL)
+    job_id = _waiting(jobs, retry_in=timedelta(days=30))
     limit.set(False)
 
-    assert retry_waiting(utcnow()) == 1
-    for wait in (interval, 2 * interval, 3 * interval):  # doubled each time, up to the longest wait
-        _read_and_over_the_limit_again(job_id)
-        queued_at = clock.now
-        while clock.now + limits.HOUSEKEEPING_INTERVAL < queued_at + wait:  # every run until then
-            clock.now += limits.HOUSEKEEPING_INTERVAL
-            assert retry_waiting(utcnow()) == 0
+    queued_at = utcnow()
+    assert retry_waiting(queued_at) == 1
+    for lifts, wait in enumerate((interval, 2 * interval, 3 * interval), start=1):  # doubled, up to the longest
+        _read_and_over_the_limit_again(jobs, job_id)
+        assert _lift_backoff(jobs, job_id) == (lifts, queued_at + wait)  # kept on the card
+        now = queued_at
+        while now + timedelta(seconds=limits.HOUSEKEEPING_INTERVAL) < queued_at + wait:  # every run until then
+            now += timedelta(seconds=limits.HOUSEKEEPING_INTERVAL)
+            assert retry_waiting(now) == 0
             assert jobs.row(job_id)["status"] == IngestStatus.failed
-        clock.now = queued_at + wait
-        assert retry_waiting(utcnow()) == 1
+        queued_at += wait
+        assert retry_waiting(queued_at) == 1
         assert _queued_again(jobs, job_id)
 
-    # its reset has come: read again whatever the last lift said
-    _read_and_over_the_limit_again(job_id)
+    # its reset has come: read again whatever the last lift said, and the backoff starts over
+    _read_and_over_the_limit_again(jobs, job_id)
     assert retry_waiting(utcnow() + timedelta(days=40)) == 1
+    assert _queued_again(jobs, job_id)
+    assert _lift_backoff(jobs, job_id) == (0, None)
 
 
-def test_a_lifts_wait_goes_with_the_card_no_longer_waiting(
-    jobs: Jobs, limit: LimitChecks, monkeypatch: pytest.MonkeyPatch
-):
-    clock = _Clock()
-    monkeypatch.setattr(retries, "time", clock)
-    read, waiting = _waiting(jobs), _waiting(jobs)
+def test_every_worker_process_keeps_a_cards_lift_backoff(jobs: Jobs, limit: LimitChecks):
+    """
+    Every worker process runs the retry phase: one that never queued the card (nothing of it in its memory) still
+    waits for the backoff the last lift set, so the card isn't read once per process
+    """
+    interval = timedelta(seconds=limits.LIMIT_RECHECK_INTERVAL)
+    job_id = _waiting(jobs, retry_in=timedelta(days=30))
     limit.set(False)
-    assert retry_waiting(utcnow()) == 2
-    assert set(retries._lift_waits) >= {read, waiting}
+    start = utcnow()
+    assert retry_waiting(start) == 1  # one process's lift queues it
+    _read_and_over_the_limit_again(jobs, job_id)  # and it doesn't help
 
-    # one is read at last, the other fails again; once their waits are over, only the waiting card's is kept
-    jobs.update(read, status=IngestStatus.ready.value, task_kind=None, task_state=None)
-    _read_and_over_the_limit_again(waiting)
-    clock.now += limits.LIMIT_RECHECK_INTERVAL
-    limit.set(True)  # and the limit applies again
-    assert retry_waiting(utcnow()) == 0
-    assert read not in retries._lift_waits
-    assert waiting in retries._lift_waits
+    now = start
+    while now + timedelta(seconds=limits.HOUSEKEEPING_INTERVAL) < start + interval:
+        now += timedelta(seconds=limits.HOUSEKEEPING_INTERVAL)
+        retries.forget_checks()  # the run of another process, with its own memory
+        assert retry_waiting(now) == 0
     retries.forget_checks()
-    assert retries._lift_waits == {}
+    assert retry_waiting(start + interval) == 1
+    assert _lift_backoff(jobs, job_id) == (2, start + 3 * interval)
+
+
+def test_a_cards_lift_backoff_goes_once_it_no_longer_waits(jobs: Jobs, limit: LimitChecks):
+    """
+    A card a lift queued keeps its backoff only while it fails `limit_reached` again: reading it, or another failure,
+    clears it
+    """
+    read, failed, waits = (_waiting(jobs, retry_in=timedelta(days=30)) for _ in range(3))
+    limit.set(False)
+    assert retry_waiting(utcnow()) == 3
+    assert {_lift_backoff(jobs, job_id)[0] for job_id in (read, failed, waits)} == {1}
+
+    for job_id in (read, failed):
+        token = uuid4()
+        with session_context() as session:
+            assert IngestQueue(session).claim(job_id, token=token, owner="test", now=utcnow(), group_cap=0)
+            if job_id == read:
+                finalize_extract(session, job_id, token, extract_result())
+            else:
+                finalize_failure(session, job_id, token, IngestErrorCode.no_recipe_found)
+    _read_and_over_the_limit_again(jobs, waits)
+
+    assert _lift_backoff(jobs, read) == (0, None)
+    assert _lift_backoff(jobs, failed) == (0, None)
+    assert _lift_backoff(jobs, waits)[0] == 1
 
 
 def test_a_lift_is_checked_once_per_tick_for_a_groups_cards(jobs: Jobs, limit: LimitChecks):
@@ -378,7 +411,7 @@ def test_a_card_retried_by_hand_and_read_no_longer_waits(
 
 
 def _notified_batch(jobs: Jobs) -> None:
-    """The batch was sealed and its notification went out (saying its waiting cards failed)"""
+    """The batch was sealed and its notification went out (saying its waiting cards wait for the monthly limit)"""
     with session_context() as session:
         session.execute(
             sa.update(RecipeIngestionBatch)
@@ -451,6 +484,52 @@ def test_cards_read_after_waiting_for_the_limit_notify_their_batch_once(
     assert len(notifications) == 1
 
 
+def test_cards_over_the_limit_are_told_they_wait_then_that_they_were_read(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+):
+    """
+    Cards uploaded while the monthly limit is reached fail `limit_reached` within seconds: their batch's notification
+    says they wait (as the upload's summary did), not that they failed, and once they're read a second one says so
+    """
+    first, second = jobs.create(), jobs.create()
+    jobs.repos.batches.seal(jobs.batch_id, utcnow())
+
+    async def limit_reached(ctx: TaskContext) -> Any:
+        raise AIProviderLimitReachedError("every provider is over its monthly limit")
+
+    async def read_both() -> None:
+        await dispatcher.run_once()
+        await settle(dispatcher)
+
+    handlers.default = limit_reached
+    run(read_both())
+    [waiting] = notifications
+    reset = next_limit_reset()
+    assert waiting.event_type == events.AIEventTypes.recipe_ingestion_ready  # Home Assistant's automation matches it
+    assert waiting.message.title == "Recipe cards waiting"
+    assert waiting.message.body == (
+        f"2 cards are waiting for the monthly limit. They'll be read when it resets on "
+        f"{calendar.month_abbr[reset.month]} {reset.day}, or sooner if it's raised."
+    )
+    data = waiting.document_data
+    assert isinstance(data, events.EventIngestionReadyData)
+    assert (data.ready_count, data.failed_count, data.waiting_count) == (0, 0, 2)
+
+    # the reset comes: both are read, and the household hears so once
+    handlers.default = None
+    for job_id in (first, second):
+        jobs.update(job_id, auto_retry_at=utcnow() - timedelta(seconds=1))
+    assert retry_waiting(utcnow()) == 2
+    run(read_both())
+    [_, read] = notifications
+    assert read.message.title == "Recipe cards ready"
+    assert read.message.body == "2 cards that waited for the monthly limit were read. 2 cards are ready to review."
+
+
 def test_a_card_that_fails_the_limit_again_sends_nothing(
     dispatcher: IngestDispatcher,
     jobs: Jobs,
@@ -509,3 +588,77 @@ def test_a_card_that_fails_for_good_after_the_wait_is_told(
     assert sent.message.body == (
         "1 card that waited for the monthly limit was read. No cards are ready to review (1 failed)."
     )
+
+
+def _notify_state(batch_id: UUID) -> dict[str, Any]:
+    with session_context() as session:
+        row = session.execute(
+            sa.select(
+                RecipeIngestionBatch.notified_at,
+                RecipeIngestionBatch.notify_claimed_at,
+                RecipeIngestionBatch.notify_attempts,
+                RecipeIngestionBatch.notify_delivered,
+            ).where(RecipeIngestionBatch.id == batch_id)
+        ).one()
+        return dict(row._mapping)
+
+
+def _read(jobs: Jobs, job_id: UUID) -> None:
+    jobs.update(
+        job_id, status=IngestStatus.ready.value, task_kind=None, task_state=None, error_code=None, auto_retry_at=None
+    )
+
+
+def test_a_pass_with_an_older_list_doesnt_send_a_wave_again(
+    monkeypatch: pytest.MonkeyPatch, jobs: Jobs, limit: LimitChecks, notifications: list[events.AIEvent]
+):
+    """
+    Every worker process runs the retry phase: two read the waiting cards at the same time, one queues the card, which
+    is read and its wave sent, and the other reaches the card later in its list. The card no longer waits, so that
+    pass neither queues it nor arms its batch again: the wave isn't sent twice.
+    """
+    job_id = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    _notified_batch(jobs)
+    with session_context() as session:
+        older_list = IngestQueue(session).waiting_for_limit()
+    assert [wait.job_id for wait in older_list] == [job_id]
+
+    assert retry_waiting(utcnow()) == 1  # the first process
+    _read(jobs, job_id)
+    assert events.maybe_notify_batch(jobs.batch_id) is True
+    assert len(notifications) == 1
+    notified = _notify_state(jobs.batch_id)
+
+    monkeypatch.setattr(IngestQueue, "waiting_for_limit", lambda self: older_list)
+    assert retry_waiting(utcnow()) == 0  # the second, from the list it read before the card was queued
+    assert _notify_state(jobs.batch_id) == notified
+    assert events.maybe_notify_batch(jobs.batch_id) is False
+    assert len(notifications) == 1
+
+
+def test_a_card_retried_by_hand_meanwhile_doesnt_arm_its_batch(
+    monkeypatch: pytest.MonkeyPatch, jobs: Jobs, limit: LimitChecks, notifications: list[events.AIEvent]
+):
+    """A manual retry never sends a wave: nor does a retry pass that reaches the card after it, from its list"""
+    job_id = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    _notified_batch(jobs)
+    with session_context() as session:
+        older_list = IngestQueue(session).waiting_for_limit()
+    notified = _notify_state(jobs.batch_id)
+
+    # the user retries it by hand (the review page's Retry) after the pass read its list
+    assert jobs.repos.jobs.enqueue_task(
+        job_id,
+        IngestTaskKind.extract,
+        None,
+        limits.PRIORITY_EXTRACT,
+        where=[RecipeIngestionJob.status == IngestStatus.failed.value],
+        values={"status": IngestStatus.processing.value, "error_code": None, "error_params": None},
+    )
+    monkeypatch.setattr(IngestQueue, "waiting_for_limit", lambda self: older_list)
+    assert retry_waiting(utcnow()) == 0
+    assert _notify_state(jobs.batch_id) == notified
+
+    _read(jobs, job_id)
+    assert events.maybe_notify_batch(jobs.batch_id) is False
+    assert notifications == []

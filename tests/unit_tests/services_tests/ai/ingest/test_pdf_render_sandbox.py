@@ -1,10 +1,11 @@
 """
 Fork: the PDF renderer confines itself before PDFium parses the document (pdf_render.sandbox): no new privileges, no
-file opened but fonts and no TCP connection (Landlock); no socket, io_uring, ptrace, other process's memory or signal
-but to itself, and without Landlock no file opened at all (seccomp); no file written, few descriptors. Where it can't
-be confined, it renders nothing unless `AI_INGEST_PDF_UNCONFINED` allows it. Each check runs in a child process of its
-own, as the renderer does, and is skipped where this kernel lacks that protection; "without Landlock" stubs Landlock
-out, as on a kernel or in a container without it.
+file opened but fonts and no TCP connection (Landlock); no socket, io_uring, new process, nothing of another process's
+(ptrace, its memory, a signal, its resource limits, priority or scheduling), no change to a file short of writing it,
+and without Landlock no file opened at all (seccomp); no file written, few descriptors. Where its seccomp filter can't
+apply, it renders nothing unless `AI_INGEST_PDF_UNCONFINED` allows it. Each check runs in a child process of its own, as
+the renderer does, and is skipped where this kernel lacks that protection; "without Landlock" stubs Landlock out, as on
+a kernel or in a container without it, and "Landlock ABI 2" makes it the version of Linux 5.19 to 6.1.
 """
 
 import io
@@ -12,6 +13,7 @@ import json
 import logging
 import os
 import socket
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -25,13 +27,18 @@ from mealie.services.ai.ingest import images, limits, pdf_render
 from mealie.services.ai.ingest.settings import IngestSettings
 
 SYSCALLS = {
-    # the kernel's numbers (x86-64: asm/unistd_64.h; arm64: asm-generic/unistd.h), apart from pdf_render's own table
+    # the kernel's numbers (x86-64: arch/x86/entry/syscalls/syscall_64.tbl; arm64: scripts/syscall.tbl), apart from
+    # pdf_render's own table
     "x86_64": {
         "io_uring_setup": 425,
         "ptrace": 101,
         "process_vm_readv": 310,
         "perf_event_open": 298,
         "pidfd_open": 434,
+        "pidfd_send_signal": 424,
+        "ioprio_get": 252,
+        "ioprio_set": 251,
+        "clone3": 435,
     },
     "aarch64": {
         "io_uring_setup": 425,
@@ -39,20 +46,42 @@ SYSCALLS = {
         "process_vm_readv": 270,
         "perf_event_open": 241,
         "pidfd_open": 434,
+        "pidfd_send_signal": 424,
+        "ioprio_get": 31,
+        "ioprio_set": 30,
+        "clone3": 435,
     },
 }
 PROBE = """
-import ctypes, errno, json, os, signal, socket, sys
+import ctypes, errno, json, os, resource, signal, socket, sys, threading
 sys.path.insert(0, sys.argv[1])
 import pdf_render
 
 outside, port, existing, landlock = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 numbers = json.loads(sys.argv[6])
+folder = os.path.dirname(outside)
+victim = os.path.join(folder, "victim.txt")  # the server's database, its secret, a backup
 if landlock == "stubbed":
     pdf_render._landlock = lambda libc: []  # a kernel or container without Landlock
+elif landlock == "abi 2":
+    real_libc = pdf_render._libc
+
+    class Abi2:  # the C library, but Landlock's version query answers 2: truncating isn't a right Landlock handles
+        def __init__(self):
+            self.libc = real_libc()
+
+        def __getattr__(self, name):
+            return getattr(self.libc, name)
+
+        def syscall(self, number, *args):
+            if number.value == 444 and len(args) == 3 and getattr(args[2], "value", None) == 1:
+                return 2
+            return self.libc.syscall(number, *args)
+
+    pdf_render._libc = Abi2
 listening = socket.create_connection  # imported before; the socket below is made before the sandbox too
 early = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-written = open(existing, "wb")
+written = open(existing, "r+b")
 signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # a write past RLIMIT_FSIZE fails instead of killing the probe
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -78,21 +107,39 @@ def profile(pid):
     ctypes.memmove(attr, (1).to_bytes(4, "little") + (128).to_bytes(4, "little"), 8)
     return syscall("perf_event_open", attr, ctypes.c_int(pid), ctypes.c_int(-1), ctypes.c_int(-1), ctypes.c_ulong(0))
 
-ring = ctypes.create_string_buffer(120)
-seen = {"io_uring-before": syscall("io_uring_setup", ctypes.c_uint32(4), ring),
-        "process-memory-before": read_own_memory(),
-        "profile-before": profile(os.getpid()),
-        "pidfd-before": syscall("pidfd_open", ctypes.c_int(os.getpid()), ctypes.c_uint(0))}
-
-protections = pdf_render.sandbox()
-seen["protections"] = protections
-
 def attempt(name, action):
     try:
         action()
         seen[name] = "allowed"
-    except OSError as e:
+    except (OSError, RuntimeError) as e:  # RuntimeError: a thread that can't be started
         seen[name] = type(e).__name__
+
+parent = os.getppid()
+try:
+    kept_attribute = "user.kept" in os.listxattr(victim)
+except OSError:
+    kept_attribute = False
+ring = ctypes.create_string_buffer(120)
+seen = {"io_uring-before": syscall("io_uring_setup", ctypes.c_uint32(4), ring),
+        "process-memory-before": read_own_memory(),
+        "profile-before": profile(os.getpid()),
+        "pidfd-before": syscall("pidfd_open", ctypes.c_int(os.getpid()), ctypes.c_uint(0)),
+        "clone3-before": syscall("clone3", None, ctypes.c_size_t(0))}
+# each change to the parent below sets what it already has: harmless even where the filter would let it through
+attempt("limit-parent-before", lambda: resource.prlimit(parent, resource.RLIMIT_NOFILE))
+io_priority = libc.syscall(ctypes.c_long(numbers.get("ioprio_get", -1)), ctypes.c_int(1), ctypes.c_int(parent))
+seen["ioprio-before"] = (
+    syscall("ioprio_set", ctypes.c_int(1), ctypes.c_int(parent), ctypes.c_int(io_priority))
+    if io_priority >= 0 else "unknown"
+)
+parent_pidfd = libc.syscall(ctypes.c_long(numbers.get("pidfd_open", -1)), ctypes.c_int(parent), ctypes.c_uint(0))
+seen["pidfd-signal-before"] = (  # signal 0: only whether it may
+    syscall("pidfd_send_signal", ctypes.c_int(parent_pidfd), ctypes.c_int(0), None, ctypes.c_uint(0))
+    if parent_pidfd >= 0 else "unknown"
+)
+
+protections = pdf_render.sandbox()
+seen["protections"] = protections
 
 attempt("read-outside", lambda: open(outside, "rb").read())
 attempt("create-file", lambda: open(os.path.join(os.path.dirname(outside), "new.txt"), "wb"))
@@ -112,8 +159,74 @@ seen["process-memory"] = read_own_memory()
 seen["profile-parent"] = profile(os.getppid())
 seen["pidfd-parent"] = syscall("pidfd_open", ctypes.c_int(os.getppid()), ctypes.c_uint(0))  # then pidfd_getfd
 seen["no-new-privs"] = libc.prctl(39, 0, 0, 0, 0)  # PR_GET_NO_NEW_PRIVS
+
+# another process: its resource limits (read only here), priority, CPUs, I/O priority, a signal through a pidfd
+attempt("limit-parent", lambda: resource.prlimit(parent, resource.RLIMIT_NOFILE))
+attempt("limit-itself", lambda: resource.prlimit(os.getpid(), resource.RLIMIT_NOFILE))
+attempt("limit-0", lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))  # prlimit64 on pid 0
+attempt("priority-parent", lambda: os.setpriority(os.PRIO_PROCESS, parent, os.getpriority(os.PRIO_PROCESS, parent)))
+attempt("affinity-parent", lambda: os.sched_setaffinity(parent, os.sched_getaffinity(parent)))
+seen["ioprio-parent"] = (
+    syscall("ioprio_set", ctypes.c_int(1), ctypes.c_int(parent), ctypes.c_int(io_priority))
+    if io_priority >= 0 else "unknown"
+)
+seen["pidfd-signal"] = (
+    syscall("pidfd_send_signal", ctypes.c_int(parent_pidfd), ctypes.c_int(0), None, ctypes.c_uint(0))
+    if parent_pidfd >= 0 else "unknown"
+)
+
+# a new process, and a thread
+def fork():
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+
+def thread():
+    ran = []
+    started = threading.Thread(target=ran.append, args=(1,))
+    started.start()
+    started.join()
+
+attempt("fork", fork)
+attempt("thread", thread)
+seen["clone3"] = syscall("clone3", None, ctypes.c_size_t(0))
+
+# changing a file short of writing to it
+attempt("unlink", lambda: os.unlink(victim))
+attempt("rename", lambda: os.rename(victim, victim + ".moved"))
+attempt("truncate", lambda: os.truncate(victim, 0))
+attempt("chmod", lambda: os.chmod(victim, 0o666))
+attempt("chown", lambda: os.chown(victim, os.getuid(), os.getgid()))
+attempt("utime", lambda: os.utime(victim, (0, 0)))
+attempt("link", lambda: os.link(victim, os.path.join(folder, "hard-link")))
+attempt("symlink", lambda: os.symlink(victim, os.path.join(folder, "soft-link")))
+attempt("mkdir", lambda: os.mkdir(os.path.join(folder, "new-folder")))
+attempt("rmdir", lambda: os.rmdir(os.path.join(folder, "empty")))
+attempt("mkfifo", lambda: os.mkfifo(os.path.join(folder, "fifo")))
+attempt("ftruncate", lambda: os.ftruncate(written.fileno(), 0))
+attempt("fchmod", lambda: os.fchmod(written.fileno(), 0o666))
+if kept_attribute:  # where the file system has extended attributes (the test set one)
+    attempt("setxattr", lambda: os.setxattr(victim, "user.added", b"1"))
+    attempt("removexattr", lambda: os.removexattr(victim, "user.kept"))
 sys.stdout.write(json.dumps(seen))
 """
+CHANGES = ["unlink", "rename", "truncate", "chmod", "chown", "utime", "link", "symlink", "mkdir", "rmdir", "mkfifo"]
+CHANGES += ["ftruncate", "fchmod"]
+
+
+def _snapshot(folder: Path) -> dict[str, tuple]:
+    """What's in `folder`, each entry's kind, mode, modification time, extended attributes and content"""
+    entries = {}
+    for path in sorted(folder.iterdir()):
+        status = path.lstat()
+        try:
+            attributes = sorted(os.listxattr(path, follow_symlinks=False))
+        except OSError:
+            attributes = []
+        content = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+        entries[path.name] = (status.st_mode, status.st_mtime_ns, attributes, content)
+    return entries
 
 
 @pytest.fixture()
@@ -126,12 +239,25 @@ def listener() -> Iterator[socket.socket]:
 
 
 def _probe(tmp_path: Path, listener: socket.socket, landlock: str) -> dict:
-    """What a sandboxed child could still do, with Landlock as the kernel has it or `stubbed` out"""
+    """
+    What a sandboxed child could still do, with Landlock as the kernel has it, `stubbed` out or at `abi 2`; `unchanged`:
+    whether the files in its folder were left as they were
+    """
     if sys.platform != "linux":
         pytest.skip("the renderer is confined on Linux only")
     outside = tmp_path / "secret.txt"
     outside.write_text("the server's secret")
     existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"kept")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("the server's database")
+    victim.chmod(0o600)
+    try:
+        os.setxattr(victim, "user.kept", b"1")
+    except OSError:
+        pass  # a file system without extended attributes
+    (tmp_path / "empty").mkdir()
+    before = _snapshot(tmp_path)
     completed = subprocess.run(
         [
             sys.executable,
@@ -151,8 +277,7 @@ def _probe(tmp_path: Path, listener: socket.socket, landlock: str) -> dict:
     )
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
     seen = json.loads(completed.stdout)
-    assert not (tmp_path / "new.txt").exists()
-    assert existing.read_bytes() == b""
+    seen["unchanged"] = _snapshot(tmp_path) == before
     return seen
 
 
@@ -161,7 +286,10 @@ def probe(tmp_path: Path, listener: socket.socket) -> dict:
     return _probe(tmp_path, listener, "as-is")
 
 
-@pytest.fixture(params=["as-is", "stubbed"], ids=["landlock as the kernel has it", "without landlock"])
+@pytest.fixture(
+    params=["as-is", "stubbed", "abi 2"],
+    ids=["landlock as the kernel has it", "without landlock", "landlock abi 2"],
+)
 def either_probe(request: pytest.FixtureRequest, tmp_path: Path, listener: socket.socket) -> dict:
     return _probe(tmp_path, listener, request.param)
 
@@ -178,6 +306,8 @@ def test_no_file_can_be_opened_but_fonts(probe: dict):
     assert probe["list-folder"] == "PermissionError"
     if "read-font" in probe:
         assert probe["read-font"] == "allowed"
+    if "seccomp" in probe["protections"]:  # Landlock alone leaves a file's mode, owner and times
+        assert probe["unchanged"]
 
 
 def test_without_landlock_no_file_can_be_opened_at_all(tmp_path: Path, listener: socket.socket):
@@ -192,7 +322,20 @@ def test_without_landlock_no_file_can_be_opened_at_all(tmp_path: Path, listener:
     assert probe["list-folder"] == "PermissionError"
     if "read-font" in probe:
         assert probe["read-font"] == "PermissionError"
+    assert probe["unchanged"]
     assert pdf_render.confined(probe["protections"])
+
+
+def test_landlock_alone_doesnt_confine_the_renderer():
+    # without the seccomp filter (another architecture, a kernel without seccomp) Landlock leaves it UDP, TCP below ABI
+    # 4, and the server's process: its resource limits, priority and scheduling
+    landlock = ["no-new-privileges", "landlock-files (ABI 7)", "landlock-tcp", "landlock-scope"]
+    limits_only = ["no-file-writes", "open-files-32", "no-new-processes"]
+    assert not pdf_render.confined(landlock + limits_only)
+    assert not pdf_render.confined(limits_only)
+    assert pdf_render.confined(landlock + ["seccomp"] + limits_only)
+    assert pdf_render.confined(["no-new-privileges", "landlock-files (ABI 2)", "seccomp"] + limits_only)
+    assert pdf_render.confined(["no-new-privileges", "seccomp", "seccomp-files"] + limits_only)
 
 
 def test_no_socket_can_be_made(either_probe: dict):
@@ -225,6 +368,48 @@ def test_no_signal_but_to_itself(either_probe: dict):
     assert either_probe["signal-itself"] == "allowed"
 
 
+def test_nothing_of_another_process_can_be_changed(either_probe: dict):
+    # the server, its parent under the same user: lowering its RLIMIT_CPU would kill it, its RLIMIT_NOFILE or
+    # RLIMIT_FSIZE wedge it, renicing or pinning it slow it down; none of it is Landlock's. Its own limits are its own.
+    _requires(either_probe, "seccomp")
+    assert either_probe["limit-parent-before"] == "allowed"
+    assert either_probe["limit-parent"] == "PermissionError"
+    assert either_probe["limit-itself"] == either_probe["limit-0"] == "allowed"
+    assert either_probe["priority-parent"] == "PermissionError"
+    assert either_probe["affinity-parent"] == "PermissionError"
+    if either_probe["ioprio-before"] == "allowed":
+        assert either_probe["ioprio-parent"] == "EPERM"
+    if either_probe["pidfd-signal-before"] == "allowed":  # a pidfd it held before: still no signal through it
+        assert either_probe["pidfd-signal"] == "EPERM"
+
+
+def test_no_new_process_but_a_thread(either_probe: dict):
+    # a process it started could outlive it, holding its output and the render slot: the filter refuses it (root
+    # included), and so does RLIMIT_NPROC but for root. clone3 answers ENOSYS, so threads are made with clone
+    _requires(either_probe, "seccomp")
+    assert either_probe["fork"] == "PermissionError"
+    if either_probe["clone3-before"] != "ENOSYS":
+        assert either_probe["clone3"] == "ENOSYS"
+    if os.getuid() == 0:
+        assert "no-new-processes" not in either_probe["protections"]
+        assert either_probe["thread"] == "allowed"
+    else:
+        assert "no-new-processes" in either_probe["protections"]
+        assert either_probe["thread"] == "RuntimeError"  # the renderer makes none
+
+
+def test_no_file_can_be_changed_short_of_writing_it(either_probe: dict):
+    # where Landlock didn't apply, the server's database, backups and secret could be removed, renamed or truncated;
+    # below Landlock ABI 3 truncated; on any kernel made readable to all (chmod) or re-dated, which Landlock has no
+    # right for
+    _requires(either_probe, "seccomp")
+    for name in CHANGES:
+        assert either_probe[name] == "PermissionError", name
+    if "setxattr" in either_probe:
+        assert either_probe["setxattr"] == either_probe["removexattr"] == "PermissionError"
+    assert either_probe["unchanged"]
+
+
 def test_no_tcp_connection_can_be_made(probe: dict):
     _requires(probe, "landlock-tcp")
     assert probe["connect-tcp"] == "PermissionError"
@@ -253,6 +438,73 @@ def test_the_renderer_reports_its_protections_once(monkeypatch: pytest.MonkeyPat
     assert "no-file-writes" in message
     if sys.platform == "linux":
         assert "no-new-privileges" in message
+
+
+# ==========================================
+# The seccomp filter's program, run here for each architecture (arm64's too, on any machine)
+
+NEEDED = {
+    # what rendering needs, from the kernel's tables: read, write, close, lseek, fstat, newfstatat, statx, mmap, munmap,
+    # brk, futex, getdents64, exit_group
+    "x86_64": [0, 1, 3, 8, 5, 262, 332, 9, 11, 12, 202, 217, 231],
+    "aarch64": [63, 64, 57, 62, 80, 79, 291, 222, 215, 214, 98, 61, 94],
+}
+_PTHREAD_CLONE_FLAGS = 0x3D0F00  # glibc's pthread_create: CLONE_VM | CLONE_FS | ... | CLONE_THREAD | CLONE_SETTLS ...
+_FORK_CLONE_FLAGS = 0x01200011  # glibc's fork: CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD
+
+
+def _run_filter(program: list, arch: int, number: int, arg0: int = 0) -> int:
+    """What a seccomp filter answers a system call: a classic BPF machine of the instructions the filter uses"""
+    data = struct.pack("<iIQ6Q", number, arch, 0, arg0 & (1 << 64) - 1, 0, 0, 0, 0, 0)  # struct seccomp_data
+    accumulator, index = 0, 0
+    while True:
+        instruction = program[index]
+        if instruction.code == pdf_render._BPF_LD_W_ABS:
+            accumulator = struct.unpack_from("<I", data, instruction.k)[0]
+            index += 1
+        elif instruction.code == pdf_render._BPF_RET_K:
+            return instruction.k
+        else:
+            taken = {
+                pdf_render._BPF_JMP_JEQ_K: accumulator == instruction.k,
+                pdf_render._BPF_JMP_JGE_K: accumulator >= instruction.k,
+                pdf_render._BPF_JMP_JSET_K: accumulator & instruction.k != 0,
+            }[instruction.code]
+            index += 1 + (instruction.jt if taken else instruction.jf)
+
+
+@pytest.mark.parametrize("machine", sorted(pdf_render._SECCOMP_ARCHITECTURES))
+@pytest.mark.parametrize("files", [False, True], ids=["with landlock", "without landlock"])
+def test_the_filter_answers_each_system_call_as_designed(machine: str, files: bool):
+    numbers = pdf_render._SECCOMP_ARCHITECTURES[machine]
+    pid = 4242
+    program = pdf_render._filter_program(numbers, files=files, pid=pid)
+    allow, errno = pdf_render._SECCOMP_RET_ALLOW, pdf_render._SECCOMP_RET_ERRNO
+    eperm, eacces, enosys = errno | 1, errno | 13, errno | 38
+
+    def run(number: int, arg0: int = 0, arch: int = numbers.audit_arch) -> int:
+        return _run_filter(program, arch, number, arg0)
+
+    for number in numbers.refused:
+        assert run(number) == eperm, number
+    for number in numbers.changing:
+        assert run(number) == eacces, number
+    for number in numbers.opening:
+        assert run(number) == (eacces if files else allow), number
+    for number in numbers.signalling:  # only on itself: not its parent, its group (0), everyone (-1)
+        assert run(number, pid) == allow
+        assert run(number, pid + 1) == run(number, 0) == run(number, -1) == run(number, pid | 1 << 32) == eperm
+    for number in numbers.limiting:  # its own limits (pid 0 is the caller), no other process's
+        assert run(number, 0) == run(number, pid) == allow
+        assert run(number, pid + 1) == run(number, -1) == run(number, 1 << 32) == eperm
+    assert run(numbers.clone, _PTHREAD_CLONE_FLAGS) == allow
+    assert run(numbers.clone, _FORK_CLONE_FLAGS) == eperm
+    assert run(numbers.clone3) == enosys
+    for number in NEEDED[machine]:
+        assert run(number) == allow, number
+    assert run(NEEDED[machine][0], arch=0x40000003) == eperm  # another architecture's numbering (i386)
+    if numbers.x32:
+        assert run(pdf_render._X32_SYSCALL_BIT | NEEDED[machine][0]) == eperm
 
 
 # ==========================================
@@ -383,6 +635,31 @@ def test_unconfined_pdfs_are_refused_unless_allowed(
     images.close_pages(pages)
     [(level, message)] = logged
     assert level == logging.WARNING and "AI_INGEST_PDF_UNCONFINED" in message
+
+
+def test_landlock_without_the_seccomp_filter_renders_nothing_unless_allowed(
+    renderer: Callable[..., None], logged: list[tuple[int, str]], monkeypatch: pytest.MonkeyPatch
+):
+    # an architecture without the filter's table (armv7l, ppc64le, riscv64...) where Landlock applies: refused, as
+    # with neither, and the log says the filter is what's missing
+    renderer("seccomp")
+    _unconfined(monkeypatch, False)
+    monkeypatch.setattr(limits, "PAGE_MAX_SIDE", 300)
+    with pytest.raises(images.PageRejected) as e:
+        images.expand_document(io.BytesIO(_scanned_pdf()))
+    assert e.value.reason == IngestRejectReason.pdf_not_supported
+    assert not isinstance(e.value, images.RenderTimedOut)
+    [(level, message)] = logged
+    assert level == logging.ERROR and "seccomp filter" in message and "AI_INGEST_PDF_UNCONFINED=true" in message
+
+    logged.clear()
+    monkeypatch.setattr(images, "_sandbox_logged", False)
+    _unconfined(monkeypatch, True)
+    pages = images.expand_document(io.BytesIO(_scanned_pdf()))
+    assert len(pages) == 2
+    images.close_pages(pages)
+    [(level, message)] = logged
+    assert level == logging.WARNING and "no seccomp filter" in message and "AI_INGEST_PDF_UNCONFINED" in message
 
 
 def test_an_unconfined_renderer_never_parses_the_document(tmp_path: Path):

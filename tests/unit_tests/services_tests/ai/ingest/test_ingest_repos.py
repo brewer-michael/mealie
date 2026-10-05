@@ -4,6 +4,7 @@ conditional updates, batches, settings and notifier options. Runs on SQLite and 
 """
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,7 +22,9 @@ from mealie.repos.repository_recipe_ingest import (
     IngestQueue,
     IngestRepos,
     JobConflict,
+    LimitWait,
     enqueue_task,
+    naive_utc,
     update_job_json,
     utcnow,
 )
@@ -486,11 +489,12 @@ def test_cancelling(db: Session, unique_user: TestUser):
 def test_a_cancelled_retry_no_longer_waits_for_the_monthly_limit(db: Session, unique_user: TestUser):
     """A card retried by hand while waiting for the limit, then cancelled, fails `cancelled`: it isn't retried later"""
     repos = _repos(db, unique_user)
-    job_id = _job(repos, auto_retry_at=utcnow() + timedelta(days=3))
+    job_id = _job(repos, auto_retry_at=utcnow() + timedelta(days=3), lift_retries=2, lift_retry_at=utcnow())
     repos.jobs.enqueue_task(job_id, IngestTaskKind.extract, None, limits.PRIORITY_EXTRACT)
     assert repos.jobs.cancel_task(job_id) == CancelOutcome.cancelled
     row = _row(db, job_id)
     assert (row["status"], row["error_code"], row["auto_retry_at"]) == ("failed", "cancelled", None)
+    assert (row["lift_retries"], row["lift_retry_at"]) == (0, None)  # nor does its lift backoff stay
 
 
 def test_cards_waiting_for_the_monthly_limit_are_read_again_once(db: Session, unique_user_fn_scoped: TestUser):
@@ -512,8 +516,12 @@ def test_cards_waiting_for_the_monthly_limit_are_read_again_once(db: Session, un
     assert (waiting[0].group_id, waiting[0].household_id) == (repos.group_id, repos.household_id)
     assert waiting[0].local_only and not waiting[1].local_only
     assert abs(waiting[0].auto_retry_at - (now + timedelta(days=1))) < timedelta(seconds=1)
+    assert (waiting[0].lift_retries, waiting[0].lift_retry_at) == (0, None)
+    soon_wait, later_wait = waiting
 
-    assert queue.retry_after_limit(soon, repos.household_id)  # type: ignore[arg-type]
+    assert not queue.retry_after_limit(soon_wait, now)  # its reset hasn't come
+    reset = now + timedelta(days=1, seconds=1)
+    assert queue.retry_after_limit(soon_wait, reset)
     row = _row(db, soon)
     assert (row["status"], row["error_code"], row["error_params"], row["auto_retry_at"]) == (
         "processing",
@@ -527,11 +535,62 @@ def test_cards_waiting_for_the_monthly_limit_are_read_again_once(db: Session, un
         limits.PRIORITY_EXTRACT,
         0,
     )
-    assert not queue.retry_after_limit(soon, repos.household_id)  # type: ignore[arg-type]
-    assert not queue.retry_after_limit(later, uuid4())  # another household's id matches nothing
+    assert not queue.retry_after_limit(soon_wait, reset)
+    later_reset = now + timedelta(days=10)
+    assert not queue.retry_after_limit(replace(later_wait, household_id=uuid4()), later_reset)  # matches nothing
     for job_id in not_waiting:
-        assert not queue.retry_after_limit(job_id, repos.household_id)  # type: ignore[arg-type]
+        stale = replace(later_wait, job_id=job_id)
+        assert not queue.retry_after_limit(stale, later_reset)
+        assert not queue.retry_after_limit(stale, later_reset, next_lift_at=later_reset)
     assert soon not in [wait.job_id for wait in queue.waiting_for_limit()]
+
+
+def test_a_lift_queues_a_waiting_card_once_the_last_lifts_wait_is_over(db: Session, unique_user_fn_scoped: TestUser):
+    """
+    A "lifted" limit that queued a card which then failed `limit_reached` again may queue it again only once the wait
+    it set is over, and only if no other lift queued it since the waiting cards were read (another worker process);
+    its reset queues it whatever the wait, and starts the backoff over
+    """
+    repos = _repos(db, unique_user_fn_scoped)
+    queue = IngestQueue(db)
+    now = utcnow()
+    limit = IngestErrorCode.limit_reached.value
+    job_id = _job(repos, status="failed", error_code=limit, auto_retry_at=now + timedelta(days=9))
+
+    def wait_of() -> LimitWait:
+        [wait] = [wait for wait in queue.waiting_for_limit() if wait.job_id == job_id]
+        return wait
+
+    def fails_the_limit_again() -> None:
+        """Read, and over the limit again: waiting, its backoff kept (`finalize_failure`)"""
+        db.execute(
+            sa.update(Job)
+            .where(Job.id == job_id)
+            .values(status="failed", error_code=limit, auto_retry_at=now + timedelta(days=9), task_state=None)
+        )
+        db.commit()
+
+    first_wait = wait_of()
+    assert queue.retry_after_limit(first_wait, now, next_lift_at=now + timedelta(minutes=10))
+    row = _row(db, job_id)
+    assert (row["status"], row["lift_retries"]) == ("processing", 1)
+    assert naive_utc(row["lift_retry_at"]) == now + timedelta(minutes=10)
+
+    fails_the_limit_again()
+    wait = wait_of()
+    assert (wait.lift_retries, wait.lift_retry_at) == (1, now + timedelta(minutes=10))
+    assert not queue.retry_after_limit(wait, now + timedelta(minutes=5), next_lift_at=now + timedelta(minutes=25))
+    # another process's pass, from a list read before the first lift: that lift's count is gone
+    assert not queue.retry_after_limit(first_wait, now + timedelta(minutes=11), next_lift_at=now + timedelta(hours=1))
+    assert queue.retry_after_limit(wait, now + timedelta(minutes=11), next_lift_at=now + timedelta(minutes=31))
+    row = _row(db, job_id)
+    assert (row["lift_retries"], naive_utc(row["lift_retry_at"])) == (2, now + timedelta(minutes=31))
+
+    # its reset comes: read again whatever the wait, which starts over
+    fails_the_limit_again()
+    assert queue.retry_after_limit(wait_of(), now + timedelta(days=9, seconds=1))
+    row = _row(db, job_id)
+    assert (row["status"], row["lift_retries"], row["lift_retry_at"]) == ("processing", 0, None)
 
 
 # ==========================================
