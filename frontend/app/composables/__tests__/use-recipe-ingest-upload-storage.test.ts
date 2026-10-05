@@ -97,12 +97,12 @@ describe.each([
     expect(await storage.lease(b, now + 1000)).toBe(false);
     // its holder renews it
     expect(await storage.lease(a, now + 2000)).toBe(true);
-    // "Use this tab" takes it over
-    expect(await storage.lease(b, now + 2000, true)).toBe(true);
+    // "Use this tab" takes it over (from a tab that didn't let it go)
+    expect(await storage.lease(b, now + 2000, true)).toBe("taken");
     expect(await storage.lease(a, now + 3000)).toBe(false);
     // a holder frozen in the background: its lease runs out, and another tab takes it
     expect(await storage.lease(b, now - 1)).toBe(true);
-    expect(await storage.lease(a, now + 3000)).toBe(true);
+    expect(await storage.lease(a, now + 3000)).toBe("taken");
     // taken from the hold that tab said it let go of (it closed), and from no other
     expect(await storage.lease(c, now + 3000, b)).toBe(false);
     expect(await storage.lease(c, now + 3000, a)).toBe(true);
@@ -134,7 +134,12 @@ describe.each([
 /** What each tab is told as the queue comes and goes */
 function lockEvents() {
   const seen: string[] = [];
-  return { seen, granted: () => seen.push("granted"), waiting: () => seen.push("waiting"), lost: () => seen.push("lost") };
+  return {
+    seen,
+    granted: (forced: boolean) => seen.push(forced ? "granted by force" : "granted"),
+    waiting: () => seen.push("waiting"),
+    lost: () => seen.push("lost"),
+  };
 }
 
 test("two tabs asking for the queue at once without Web Locks: one gets it, the other when it's let go", async () => {
@@ -383,10 +388,44 @@ test("a tab whose lease was taken over finds out before it sends anything", asyn
   expect(a.seen).toEqual(["granted"]);
 
   // tab A is frozen, and tab B takes the queue over ("Use this tab") or once A's lease ran out
-  expect(await storage.lease({ tab: "tab-b", hold: 1 }, Date.now() + QUEUE_LEASE_MS, true)).toBe(true);
+  expect(await storage.lease({ tab: "tab-b", hold: 1 }, Date.now() + QUEUE_LEASE_MS, true)).toBe("taken");
   expect(await lockA.stillHeld()).toBe(false);
   expect(a.seen).toEqual(["granted", "lost"]);
   lockA.release();
+});
+
+test("a tab that takes the queue from a tab that didn't let it go is told so: by force, or once its lease ran out", async () => {
+  const storage = memoryUploadStorage();
+  const a = lockEvents();
+  const b = lockEvents();
+  const c = lockEvents();
+  const lockA = leaseQueueLock(storage, "q-forced", a, "tab-a", null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const lockB = leaseQueueLock(storage, "q-forced", b, "tab-b", null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect([a.seen, b.seen]).toEqual([["granted"], ["waiting"]]);
+
+  // "Use this tab" in B, while A doesn't answer (frozen in the background)
+  lockB.steal();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(b.seen).toEqual(["waiting", "granted by force"]);
+
+  // B is frozen in turn: its lease runs out, and a tab opened then takes the queue
+  const realNow = Date.now.bind(Date);
+  vi.spyOn(Date, "now").mockImplementation(() => realNow() + QUEUE_LEASE_MS + 1000);
+  const lockC = leaseQueueLock(storage, "q-forced", c, "tab-c", null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(c.seen).toEqual(["granted by force"]);
+  vi.restoreAllMocks();
+
+  // one let go of goes to the next tab as it is
+  const d = lockEvents();
+  lockC.release();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const lockD = leaseQueueLock(storage, "q-forced", d, "tab-d", null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(d.seen).toEqual(["granted"]);
+  [lockA, lockB, lockD].forEach(lock => lock.release());
 });
 
 test("each user has a database of their own", () => {

@@ -30,8 +30,8 @@ function settings(overrides: Partial<RecipeIngestionSettingsOut> = {}): RecipeIn
   };
 }
 
-function counts(ready = 0, failed = 0, processing = 0) {
-  return { data: { ready, failed, processing, needsAttention: 0 }, error: null };
+function counts(ready = 0, failed = 0, processing = 0, waiting = 0) {
+  return { data: { ready, failed, processing, needsAttention: 0, waiting }, error: null };
 }
 
 const active = ref(true);
@@ -112,8 +112,15 @@ describe("the layout's recipe card entries", () => {
     expect(nav.showCardsLink.value).toBe(true);
     expect(nav.showScanLink.value).toBe(false);
 
-    api.getCounts.mockResolvedValue(counts(0, 0));
+    // cards waiting for a monthly limit are open too (they aren't counted as failed)
+    api.getCounts.mockResolvedValue(counts(0, 0, 0, 2));
     vi.setSystemTime(Date.now() + NAV_REFRESH_INTERVAL_MS);
+    routePath.value = "/g/home/recipes";
+    await flushPromises();
+    expect(nav.showCardsLink.value).toBe(true);
+
+    api.getCounts.mockResolvedValue(counts(0, 0));
+    vi.setSystemTime(Date.now() + 2 * NAV_REFRESH_INTERVAL_MS);
     routePath.value = "/g/home/recipes/cards";
     await flushPromises();
     expect(nav.showCardsLink.value).toBe(false);

@@ -1,10 +1,11 @@
 // A page opened or reloaded while a backup is restored (docs/ai/PHASE2.md §3.9): the app's first request is answered
-// 503 paused_for_restore, so the page says so, asks again after each Retry-After and opens once the restore is over.
-// Fork-owned.
+// 503 paused_for_restore, so the page says so, asks again every few seconds (whatever Retry-After says) and opens once
+// the restore is over. Fork-owned.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   RESTORE_CHECK_DEFAULT_MS,
   RESTORE_CHECK_MAX_MS,
+  restorePageData,
   restorePageError,
   restoreRetryAfterMs,
   waitForRestoreEnd,
@@ -42,7 +43,9 @@ afterEach(() => {
 
 describe("the server's answer while a backup is restored", () => {
   test("is told from other errors, with how long to wait before asking again", () => {
-    expect(restoreRetryAfterMs(paused("60"))).toBe(60_000);
+    // the server's Retry-After is a minute, but a restore takes seconds: a few seconds at most
+    expect(RESTORE_CHECK_MAX_MS).toBe(5000);
+    expect(restoreRetryAfterMs(paused("60"))).toBe(RESTORE_CHECK_MAX_MS);
     expect(restoreRetryAfterMs(paused("2"))).toBe(2000);
     // no Retry-After, or one that makes no sense: a few seconds; a long one is cut short
     expect(restoreRetryAfterMs(paused(null))).toBe(RESTORE_CHECK_DEFAULT_MS);
@@ -109,25 +112,34 @@ describe("the app's first request (plugins/app-info.client.ts) while a backup is
     return plugin.setup({ $i18n: { t } });
   }
 
-  test("fails with what the error page shows, then loads the page again once the restore is over", async () => {
+  test("fails with what the error page shows, then loads the page again within seconds of the restore's end", async () => {
     const reload = vi.fn();
     vi.stubGlobal("location", { ...window.location, reload });
     axiosGet.mockRejectedValueOnce(paused("60"));
 
     const error = await appInfoPlugin().catch((e: unknown) => e) as Record<string, unknown>;
-    // Nuxt's error page: the status, `statusMessage` as its title and `message` under it
-    expect(error).toMatchObject({ statusCode: 503, statusMessage: restoreText["page-title"], fatal: true });
+    // the app's error page (app/error.vue) shows `data`'s title and text, as Mealie, with no status
+    expect(error).toMatchObject({
+      statusCode: 503,
+      statusMessage: restoreText["page-title"],
+      fatal: true,
+      data: { code: "paused_for_restore", title: restoreText["page-title"], text: restoreText["page-text"] },
+    });
     expect(error.message).toBe(restoreText["page-text"]);
+    expect(restorePageData(error)).toEqual(error.data);
     expect(`${restoreText["page-title"]}. ${restoreText["page-text"]}`).toBe(
       "A backup is being restored. This page will open when it's done.",
     );
 
-    // asked again after Retry-After: still restoring, then over
-    axiosGet.mockRejectedValueOnce(paused("30")).mockResolvedValueOnce({ data: { version: "v3" } });
-    await vi.advanceTimersByTimeAsync(60_000);
+    // the server says to wait a minute (Retry-After: 60), but it's asked again every 5 s
+    axiosGet.mockRejectedValueOnce(paused("60")).mockResolvedValueOnce({ data: { version: "v3" } });
+    await vi.advanceTimersByTimeAsync(RESTORE_CHECK_MAX_MS - 1);
+    expect(axiosGet).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(axiosGet).toHaveBeenCalledTimes(2);
     expect(reload).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(30_000);
+    // the restore ended meanwhile: the next check, 5 s later, opens the page
+    await vi.advanceTimersByTimeAsync(RESTORE_CHECK_MAX_MS);
     expect(axiosGet).toHaveBeenLastCalledWith("/api/app/about");
     expect(reload).toHaveBeenCalledOnce();
   });
@@ -153,4 +165,7 @@ test("restorePageError leaves other errors as they are", () => {
   const reload = vi.fn();
   const error = new Error("boom");
   expect(restorePageError(error, t, reload)).toBe(error);
+  expect(restorePageData(error)).toBeNull();
+  expect(restorePageData({ statusCode: 503, data: { code: "paused_for_restore" } })).toBeNull();
+  expect(restorePageData(null)).toBeNull();
 });

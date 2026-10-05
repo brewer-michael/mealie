@@ -49,9 +49,9 @@ export interface UploadStorage {
    * The queue's lease, where the browser has no Web Locks (`leaseQueueLock`), in one transaction: `holder` takes it, or
    * keeps it, until `until` (ms since the epoch) when no tab holds it, its holder's time ran out or it's `holder`'s tab's
    * already; `over` takes it over, from any tab (`true`) or from the hold named (its tab said it let go of that one).
-   * Answers whether `holder` holds it now.
+   * Answers whether `holder` holds it now (`QueueLeaseAnswer`).
    */
-  lease(holder: QueueLeaseHolder, until: number, over?: true | QueueLeaseHolder): Promise<boolean>;
+  lease(holder: QueueLeaseHolder, until: number, over?: true | QueueLeaseHolder): Promise<QueueLeaseAnswer>;
   /** Lets the lease go, when it's `tab`'s */
   releaseLease(tab: string): Promise<void>;
   /** Forgets everything (logout) */
@@ -92,13 +92,22 @@ interface QueueLease extends QueueLeaseHolder {
   until: number;
 }
 
+/**
+ * Whether a tab holds the queue's lease now: `"taken"` when it took it from another tab's hold that wasn't let go (by
+ * force, or as its time ran out), so that tab may still be open (frozen in the background)
+ */
+export type QueueLeaseAnswer = boolean | "taken";
+
 /** Whether `holder` may take or keep `lease` now (`over`: as `UploadStorage.lease`) */
-function mayLease(lease: QueueLease | undefined, holder: QueueLeaseHolder, over?: true | QueueLeaseHolder): boolean {
-  return over === true
-    || !lease
-    || lease.tab === holder.tab
-    || (!!over && lease.tab === over.tab && lease.hold === over.hold)
-    || lease.until <= Date.now();
+function mayLease(
+  lease: QueueLease | undefined,
+  holder: QueueLeaseHolder,
+  over?: true | QueueLeaseHolder,
+): QueueLeaseAnswer {
+  if (!lease || lease.tab === holder.tab || (!!over && over !== true && lease.tab === over.tab && lease.hold === over.hold)) {
+    return true;
+  }
+  return over === true || lease.until <= Date.now() ? "taken" : false;
 }
 
 /** The database of a user's queue */
@@ -289,11 +298,11 @@ export function indexedDbUploadStorage(name: string, factory: IDBFactory = index
       const transaction = db.transaction([RECORDS], "readwrite");
       const done = transactionDone(transaction);
       const records = transaction.objectStore(RECORDS);
-      let held = false;
+      let held: QueueLeaseAnswer = false;
       const request = records.get(LEASE_KEY);
       request.onsuccess = () => {
-        if (mayLease(request.result as QueueLease | undefined, holder, over)) {
-          held = true;
+        held = mayLease(request.result as QueueLease | undefined, holder, over);
+        if (held) {
           records.put({ tab: holder.tab, hold: holder.hold, until } satisfies QueueLease, LEASE_KEY);
         }
       };
@@ -384,12 +393,12 @@ export function memoryUploadStorage(): UploadStorage & {
     claimedBy(): Promise<string | null> {
       return Promise.resolve(store.owner ?? null);
     },
-    lease(holder: QueueLeaseHolder, until: number, over?: true | QueueLeaseHolder): Promise<boolean> {
-      if (!mayLease(store.leased, holder, over)) {
-        return Promise.resolve(false);
+    lease(holder: QueueLeaseHolder, until: number, over?: true | QueueLeaseHolder): Promise<QueueLeaseAnswer> {
+      const held = mayLease(store.leased, holder, over);
+      if (held) {
+        store.leased = { tab: holder.tab, hold: holder.hold, until };
       }
-      store.leased = { tab: holder.tab, hold: holder.hold, until };
-      return Promise.resolve(true);
+      return Promise.resolve(held);
     },
     releaseLease(tab: string): Promise<void> {
       if (store.leased?.tab === tab) {
@@ -421,8 +430,11 @@ export function openUploadStorage(userId: string): UploadStorage | null {
 
 /** What the tab is told as the queue comes and goes */
 export interface QueueLockEvents {
-  /** This tab keeps the queue now */
-  granted: () => void;
+  /**
+   * This tab keeps the queue now. `forced`: it took the queue from a tab that didn't let it go (stolen from it, or its
+   * lease ran out), which may still be open, frozen in the background; otherwise that tab let it go, or closed.
+   */
+  granted: (forced: boolean) => void;
   /** Another tab keeps it: this one waits, and gets it when that tab lets it go or closes */
   waiting: () => void;
   /** Another tab took the queue over: this one stops keeping it and waits again */
@@ -467,7 +479,7 @@ export function webLocksQueueLock(locks: LockManager, name: string, events: Queu
         mine = resolve;
         letGo = resolve;
         holding = true;
-        events.granted();
+        events.granted(!!options.steal);
       });
     }).catch(() => {
       // the queue was taken over while this tab kept it (a wait given up changes nothing)
@@ -499,7 +511,7 @@ export function webLocksQueueLock(locks: LockManager, name: string, events: Queu
     }
   }, () => {
     holding = true;
-    events.granted();
+    events.granted(false);
   });
 
   return {
@@ -652,7 +664,7 @@ export function leaseQueueLock(
       }
       // a renewal keeps this tab's hold; a take is a new one
       const writing = state === "holding" ? hold : hold + 1;
-      let held: boolean;
+      let held: QueueLeaseAnswer;
       try {
         held = await storage.lease({ tab, hold: writing }, Date.now() + QUEUE_LEASE_MS, over);
       }
@@ -680,7 +692,7 @@ export function leaseQueueLock(
         if (over === true) {
           post({ type: "taken" });
         }
-        events.granted();
+        events.granted(held === "taken");
       }
       else if (!held && state === "holding") {
         state = "waiting";
@@ -801,7 +813,7 @@ export function leaseQueueLock(
 
 /** Nothing to agree on (no Web Locks, no storage to hold a lease): the tab keeps the queue (as before there were two) */
 function soleQueueLock(events: QueueLockEvents): QueueLock {
-  events.granted();
+  events.granted(false);
   return { yield() {}, steal() {}, release() {}, stillHeld: () => Promise.resolve(true) };
 }
 

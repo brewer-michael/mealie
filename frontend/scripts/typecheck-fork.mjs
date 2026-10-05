@@ -18,6 +18,7 @@ const project = ".nuxt/tsconfig.app.json";
 /** The fork's files, relative to `frontend/` (upstream files with a fork hook keep upstream's errors, so they're out) */
 export const FORK_PATHS = [
   /^app\/components\/Domain\/Ingest\//,
+  /^app\/error\.(vue|test\.ts)$/,
   /^app\/components\/Domain\/Group\/(GroupAIProvider|GroupMcp|GroupRecipeCardSettings)/,
   /^app\/components\/Domain\/Household\/HouseholdNotifierAIEvents/,
   /^app\/components\/Domain\/User\/UserMcp/,

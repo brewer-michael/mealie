@@ -778,6 +778,11 @@ let heartbeatInFlight = false;
 const uploadsInFlight = new Set<AbortController>();
 /** Bumped by a reset, so requests still in flight change nothing */
 let generation = 0;
+/**
+ * Bumped only when the user signs out (a reset, a logout here or in another tab): files still being read then are
+ * dropped. The queue going to another tab meanwhile doesn't drop them: they go from here (`addDrafts`).
+ */
+let signOuts = 0;
 let scope: EffectScope | null = null;
 
 const hasPending = computed(
@@ -802,6 +807,13 @@ const photosLeftElsewhere = shallowRef<ReadonlyMap<string, number>>(new Map());
 const leftovers = ref(false);
 /** "Use this tab" was answered: the tab keeping the queue can't hand it over, as some of its photos are only in memory */
 const keptInMemoryElsewhere = ref(false);
+/** The tab keeping the queue has a front waiting for its back, as it last said */
+const frontElsewhere = ref(false);
+/**
+ * "Use this tab" was answered: the tab keeping the queue has a front waiting for its back (its camera may still give it
+ * the back), and hands the queue over once it hasn't; this tab asks again then, while its cards page is shown
+ */
+const frontWaitingElsewhere = ref(false);
 
 /** The photos of this tab's queue a logout would drop */
 const photosHere = computed(() =>
@@ -1288,8 +1300,11 @@ function restoredCard(stored: Omit<StoredCard, "photoIds">, photos: Blob[]): Upl
   };
 }
 
-/** Reads the stored queue back, before anything added meanwhile, and resumes it */
-async function restoreFrom(target: UploadStorage, gen: number) {
+/**
+ * Reads the stored queue back, before anything added meanwhile, and resumes it. `forced`: the queue was taken from a tab
+ * that didn't let it go (`QueueLockEvents.granted`), whose camera may still give it the back of its waiting front.
+ */
+async function restoreFrom(target: UploadStorage, gen: number, forced = false) {
   let loaded: Awaited<ReturnType<UploadStorage["load"]>>;
   try {
     // this tab's from now on: a tab that kept it before writes nothing more
@@ -1377,11 +1392,18 @@ async function restoreFrom(target: UploadStorage, gen: number) {
       const draftPhotos = allPhotos(draft.photoIds);
       return draftPhotos ? [{ key: draft.key, photos: draftPhotos, locked: draft.locked || undefined }] : [];
     });
+  if (front && (forced || pendingFront.value)) {
+    // a front waits for its back in the tab whose camera took it, never for a photo taken here: taken from a tab that
+    // may still be open (its camera may still give it the back), it waits in the tray, a card of its own (Upload or
+    // Done sends it)
+    restoredDrafts.push({ key: newKey("draft"), photos: [front], locked: true });
+  }
+  else if (front) {
+    // the tab that took it closed (or this is it, reloaded): its back is taken here
+    pendingFront.value = front;
+  }
   if (restoredDrafts.length) {
     drafts.value = [...restoredDrafts, ...drafts.value];
-  }
-  if (front && !pendingFront.value) {
-    pendingFront.value = front;
   }
   schedulePersist();
   pump();
@@ -1519,9 +1541,9 @@ function connectUser(userId: string | null, open: (userId: string) => UploadStor
   connecting = settled;
   const current = () => owner === userId && connecting === settled;
   queueLock = openQueueLock(name, {
-    granted: () => {
+    granted: (forced) => {
       if (current()) {
-        void startKeeping().finally(settle);
+        void startKeeping(forced).finally(settle);
       }
     },
     waiting: () => {
@@ -1542,12 +1564,15 @@ function connectUser(userId: string | null, open: (userId: string) => UploadStor
 // ---- which of the user's tabs keeps the queue
 
 type QueueMessage
-  = | { type: "photos"; count: number; tab: string; keeping: boolean }
+  /** `front`: the tab keeping the queue has a front waiting for its back (it hands the queue over once it hasn't) */
+  = | { type: "photos"; count: number; tab: string; keeping: boolean; front?: boolean }
     | { type: "photos?" }
     | { type: "want" }
     | { type: "hand-over" }
     /** The tab keeping the queue can't hand it over: its storage failed, so some photos are only in its memory */
     | { type: "kept-in-memory" }
+    /** The tab keeping the queue hands it over once its front waiting for its back has it (or is sent without) */
+    | { type: "front-waiting" }
     | { type: "logout"; id: string }
     | { type: "logout-done"; id: string };
 
@@ -1572,7 +1597,8 @@ function post(message: QueueMessage) {
  */
 function announcePhotos() {
   if (keeper.value === "here" || leftovers.value) {
-    post({ type: "photos", count: photosHere.value, tab: tabId, keeping: keeper.value === "here" });
+    const keeping = keeper.value === "here";
+    post({ type: "photos", count: photosHere.value, tab: tabId, keeping, front: keeping && pendingFront.value !== null });
   }
 }
 
@@ -1600,6 +1626,8 @@ function onQueueMessage(event: MessageEvent<QueueMessage>) {
       if (keeper.value === "elsewhere") {
         photosElsewhere.value = message.count;
         photosElsewhereHeard.value = true;
+        frontElsewhere.value = !!message.front;
+        resumeTakingOver();
       }
       break;
     case "photos?":
@@ -1622,6 +1650,12 @@ function onQueueMessage(event: MessageEvent<QueueMessage>) {
         keptInMemoryElsewhere.value = true;
       }
       break;
+    case "front-waiting":
+      if (keeper.value === "elsewhere") {
+        frontElsewhere.value = true;
+        frontWaitingElsewhere.value = true;
+      }
+      break;
     case "logout":
       void stopForLogout(message.id);
       break;
@@ -1635,13 +1669,15 @@ function onQueueMessage(event: MessageEvent<QueueMessage>) {
  * This tab keeps the queue now: it claims the stored queue, reads it back and resumes it, with the choices this browser
  * remembers as they are now
  */
-function startKeeping(): Promise<void> {
+function startKeeping(forced = false): Promise<void> {
   keeper.value = "here";
   // photos this tab kept after losing the queue stay in it, and are stored with it from now on
   leftovers.value = false;
   photosElsewhere.value = 0;
   photosElsewhereHeard.value = false;
   keptInMemoryElsewhere.value = false;
+  frontElsewhere.value = false;
+  frontWaitingElsewhere.value = false;
   rereadChoices();
   updateWanting();
   const target = storageHandle;
@@ -1650,7 +1686,7 @@ function startKeeping(): Promise<void> {
   }
   storage = target;
   deletesOnly = null;
-  const reading = restoreFrom(target, generation).catch(error => storageFailed(error)).finally(() => {
+  const reading = restoreFrom(target, generation, forced).catch(error => storageFailed(error)).finally(() => {
     if (restoring === reading) {
       restoring = null;
     }
@@ -1666,6 +1702,8 @@ function keptElsewhere() {
   // until that tab says how many it has
   photosElsewhere.value = 0;
   photosElsewhereHeard.value = false;
+  frontElsewhere.value = false;
+  frontWaitingElsewhere.value = false;
   post({ type: "photos?" });
   updateWanting();
 }
@@ -1705,13 +1743,35 @@ function isStored(photos: readonly Blob[], stored: ReadonlySet<string> | null): 
 }
 
 /**
+ * The cards the storage holds, as far as this tab knows: their record, with every photo it names. Another tab reading
+ * the stored queue back sends them, with those photos, whatever photos the card carries here now (made smaller since:
+ * data saver, or a re-encode the server asked for). Null once that isn't known.
+ */
+function storedCardKeys(): Set<string> | null {
+  if (!storage && !deletesOnly) {
+    return null;
+  }
+  const keys = new Set<string>();
+  writtenRecords.forEach((json, key) => {
+    if (key.startsWith("card:")) {
+      const ids = (JSON.parse(json) as { photoIds?: string[] }).photoIds ?? [];
+      if (ids.length && ids.every(id => writtenPhotos.has(id))) {
+        keys.add(key.slice("card:".length));
+      }
+    }
+  });
+  return keys;
+}
+
+/**
  * Photos of this tab's queue another tab reading the stored queue back wouldn't get: not written yet, refused (the queue
  * was another tab's by then), or not written as the storage failed (`storageFailed`), or what it holds isn't known.
  * Cards the server refused for good don't count.
  */
 function photosOnlyHere(): boolean {
   const stored = storedPhotoIds();
-  return state.value.cards.some(card => card.status !== "done" && !isRefused(card) && !isStored(card.photos, stored))
+  const storedCards = storedCardKeys();
+  return state.value.cards.some(card => card.status !== "done" && !isRefused(card) && !storedCards?.has(card.key))
     || drafts.value.some(draft => !isStored(draft.photos, stored))
     || (!!pendingFront.value && !isStored([pendingFront.value], stored));
 }
@@ -1727,23 +1787,34 @@ function heldOnlyInMemory(): boolean {
   return photosOnlyHere();
 }
 
-/** A tab that lost the queue waits at most this long for its write on the way to say what the storage holds */
+/** A tab that lost the queue waits at most this long for its writes on the way to say what the storage holds */
 const LOSE_QUEUE_WRITE_MS = 2000;
+
+/**
+ * Waits until every write on its way, or queued after it (a photo taken meanwhile), has landed or failed: at most
+ * `timeoutMs` in all
+ */
+async function settleWrites(timeoutMs: number): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while ((saving || persistQueued) && Date.now() < until) {
+    await settleWithin([persistChain], until - Date.now());
+  }
+}
 
 /**
  * Another tab took the queue without this one handing it over (this tab was frozen, or both took it at once): what only
  * this tab holds (not written, or refused) is kept and sent from here, the rest goes (that tab read it back from the
- * storage). With a write on its way, that's decided once it's done (`waited`), or after `LOSE_QUEUE_WRITE_MS` with
- * what it writes counted as not stored: sent twice at worst (the server spots that), never lost. Nothing is sent
- * meanwhile, as the lock says the queue is gone.
+ * storage). With writes on their way, that's decided once every one of them is done (`waited`), or after
+ * `LOSE_QUEUE_WRITE_MS` with what they write counted as not stored: sent twice at worst (the server spots that), never
+ * lost. Nothing is sent meanwhile, as the lock says the queue is gone.
  */
 function loseQueue(waited = false) {
   if (keeper.value !== "here") {
     return;
   }
-  if (saving && !waited) {
+  if ((saving || persistQueued) && !waited) {
     const lock = queueLock;
-    void settleWithin([saving], LOSE_QUEUE_WRITE_MS).then(() => {
+    void settleWrites(LOSE_QUEUE_WRITE_MS).then(() => {
       if (queueLock === lock) {
         loseQueue(true);
       }
@@ -1778,8 +1849,9 @@ function startLeftovers() {
 function keepLeftovers() {
   const before = state.value;
   const stored = storedPhotoIds();
+  const storedCards = storedCardKeys();
   const cards = before.cards
-    .filter(card => card.status !== "done" && !isStored(card.photos, stored))
+    .filter(card => card.status !== "done" && !storedCards?.has(card.key))
     .map(card => (card.status === "uploading" || card.status === "re-encoding"
       ? { ...card, status: "waiting" as const, progress: 0, localOnly: null }
       : card));
@@ -1910,18 +1982,35 @@ function queueTaken(error: QueueTakenError) {
   }
 }
 
+/** A hand-over writes again what came while its last write was on its way, this many times at most */
+export const HAND_OVER_WRITES = 3;
+
+/** Whether the storage doesn't hold everything of the queue yet: a change not written, or photos only here */
+function unwritten(): boolean {
+  return persistQueued || saving !== null || photosOnlyHere();
+}
+
 /**
- * Another tab asked for the queue: what changed last is written first, then this tab lets it go and waits again. A
- * queue with photos the storage doesn't hold (it failed) stays here, and the asking tab is told why.
+ * Another tab asked for the queue: what changed last is written first (and what came while it was written, a few
+ * times at most), then this tab lets it go and waits again; anything still not written then is sent from here
+ * (`keepLeftovers`), never lost. A queue with photos the storage doesn't hold (it failed) stays here, and the asking tab
+ * is told why; so does a queue with a front waiting for its back, as this tab's camera may still give it the back: it's
+ * handed over once the front has its back, or went without (the asking tab asks again).
  */
 async function handOver() {
   if (handingOver) {
     return;
   }
+  if (pendingFront.value) {
+    post({ type: "front-waiting" });
+    return;
+  }
   handingOver = true;
   try {
-    schedulePersist();
-    await persistChain;
+    for (let write = 0; write < HAND_OVER_WRITES && writeTarget() && (write === 0 || unwritten()); write++) {
+      schedulePersist();
+      await persistChain;
+    }
   }
   finally {
     handingOver = false;
@@ -1933,7 +2022,17 @@ async function handOver() {
     post({ type: "kept-in-memory" });
     return;
   }
-  stopKeeping();
+  if (pendingFront.value) {
+    // the camera gave this tab a front while the queue was written
+    post({ type: "front-waiting" });
+    return;
+  }
+  if (unwritten()) {
+    keepLeftovers();
+  }
+  else {
+    stopKeeping();
+  }
   queueLock?.yield();
 }
 
@@ -1942,6 +2041,8 @@ async function handOver() {
  * not while the tab is in the background, so a cards page left open there doesn't pull the queue from the tab in use
  */
 function updateWanting() {
+  // shown again after the other tab's front had its back: "Use this tab" goes on
+  resumeTakingOver();
   const wanting = keeper.value === "elsewhere" && cardsPageViews > 0 && !!channel && pageVisible();
   if (wanting && wantTimer === null) {
     post({ type: "want" });
@@ -1965,12 +2066,14 @@ function takeOverQueue(): Promise<void> {
     return Promise.resolve();
   }
   keptInMemoryElsewhere.value = false;
+  frontWaitingElsewhere.value = false;
   post({ type: "hand-over" });
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | null = null;
-    // handed over, or refused because some of its photos are only in that tab's memory (taking it would lose them)
-    const stop = watch([keeper, keptInMemoryElsewhere], ([now, inMemory]) => {
-      if (now !== "elsewhere" || inMemory) {
+    // handed over, refused because some of its photos are only in that tab's memory (taking it would lose them), or
+    // put off while that tab's front waits for its back
+    const stop = watch([keeper, keptInMemoryElsewhere, frontWaitingElsewhere], ([now, inMemory, frontWaiting]) => {
+      if (now !== "elsewhere" || inMemory || frontWaiting) {
         finish();
       }
     });
@@ -1991,6 +2094,16 @@ function takeOverQueue(): Promise<void> {
   });
 }
 
+/**
+ * "Use this tab" was put off while the other tab's front waited for its back: once that tab says it doesn't any more,
+ * this tab asks again, while its cards page is shown (the user asked there)
+ */
+function resumeTakingOver() {
+  if (frontWaitingElsewhere.value && !frontElsewhere.value && cardsPageViews > 0 && pageVisible()) {
+    void takeOverQueue();
+  }
+}
+
 /** Server batches the queue started that aren't sealed yet */
 function unsealedServerBatches(): string[] {
   return [...new Set(state.value.batches.flatMap(batch =>
@@ -2000,6 +2113,7 @@ function unsealedServerBatches(): string[] {
 /** Stops sending and writing at once: nothing in flight changes the queue any more, and nothing more is stored */
 function stopSending() {
   generation += 1;
+  signOuts += 1;
   uploadsInFlight.forEach(controller => controller.abort());
   uploadsInFlight.clear();
   if (retryTimer !== null) {
@@ -2077,8 +2191,8 @@ function ensureScope() {
     }, { immediate: true });
     // the tray and the waiting front are kept too
     watch([drafts, pendingFront], () => schedulePersist());
-    // the user's other tabs count this tab's photos when they log out
-    watch(photosHere, () => announcePhotos());
+    // the user's other tabs count this tab's photos when they log out, and wait for its front to have its back
+    watch([photosHere, pendingFront], () => announcePhotos());
   });
 }
 
@@ -2643,11 +2757,12 @@ function addDrafts(photos: readonly Blob[]) {
  * `maxPages`; the result names them. A PDF or a multi-page TIFF is a card of its own.
  */
 function addPhotos(photos: readonly Blob[], maxPages = DEFAULT_MAX_PAGES_PER_CARD): Promise<AddPhotosResult> {
-  const gen = generation;
+  // not `generation`: the queue going to another tab while the files are read doesn't drop them (`addDrafts`)
+  const signedIn = signOuts;
   const added = addChain.then(async (): Promise<AddPhotosResult> => {
     const found = await Promise.all(photos.map(photo => inspect(photo)));
     const result: AddPhotosResult = { unsupported: [], tooManyPages: [] };
-    if (gen !== generation) {
+    if (signedIn !== signOuts) {
       return result; // signed out meanwhile
     }
     const usable = photos.filter((photo, index) => {
@@ -2795,6 +2910,8 @@ function openCardsPage(): () => void {
       cardsPageViews = Math.max(0, cardsPageViews - 1);
       if (cardsPageViews === 0) {
         pageDocument?.removeEventListener("visibilitychange", updateWanting);
+        // "Use this tab" put off is let go with the page it was asked on
+        frontWaitingElsewhere.value = false;
       }
       updateWanting();
     }
@@ -2862,6 +2979,11 @@ export function useRecipeIngestUploads() {
      * they'd be lost here; they're uploaded there first
      */
     queueKeptInMemoryElsewhere: readonly(keptInMemoryElsewhere),
+    /**
+     * "Use this tab" waits: the tab keeping the queue has a front waiting for its back. It's handed over once the back is
+     * taken there (or No back is tapped), while this tab's cards page is shown.
+     */
+    queueFrontWaitingElsewhere: readonly(frontWaitingElsewhere),
     /**
      * Another tab keeps the queue, and this one still holds photos not uploaded that only it has: ones the storage
      * didn't hold when the queue left (`keepLeftovers`), or given to it after (`sendAsLeftovers`). They're sent from
@@ -3053,6 +3175,7 @@ function forgetQueueInMemory() {
 
 /** Forgets the queue in memory (between tests, on logout and when the user changes); the stored queue stays */
 export function resetRecipeIngestUploads() {
+  signOuts += 1;
   forgetQueueInMemory();
   heartbeatEpoch += 1;
   heartbeatHolders = 0;
@@ -3088,6 +3211,8 @@ export function resetRecipeIngestUploads() {
   photosElsewhereHeard.value = false;
   photosLeftElsewhere.value = new Map();
   keptInMemoryElsewhere.value = false;
+  frontElsewhere.value = false;
+  frontWaitingElsewhere.value = false;
   owner = null;
   storageHandle = null;
   storage = null;

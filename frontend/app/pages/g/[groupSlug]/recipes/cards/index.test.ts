@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({ getSettings: vi.fn() }));
 const uploads = vi.hoisted(() => ({ closeCardsPage: vi.fn(), openCardsPage: vi.fn(), takeOverQueue: vi.fn() }));
 const queueElsewhere = ref(false);
 const queueKeptInMemoryElsewhere = ref(false);
+const queueFrontWaitingElsewhere = ref(false);
 const uploadingLeftovers = ref(false);
 
 vi.mock("~/composables/api", () => ({
@@ -23,6 +24,7 @@ vi.mock("~/composables/use-recipe-ingest-uploads", async importOriginal => ({
     openCardsPage: uploads.openCardsPage,
     queueElsewhere,
     queueKeptInMemoryElsewhere,
+    queueFrontWaitingElsewhere,
     uploadingLeftovers,
     takeOverQueue: uploads.takeOverQueue,
   }),
@@ -102,6 +104,7 @@ describe("the recipe cards page", () => {
     uploads.takeOverQueue.mockResolvedValue(undefined);
     queueElsewhere.value = false;
     queueKeptInMemoryElsewhere.value = false;
+    queueFrontWaitingElsewhere.value = false;
     uploadingLeftovers.value = false;
     vi.stubGlobal("definePageMeta", vi.fn());
     vi.stubGlobal("useSeoMeta", vi.fn());
@@ -367,13 +370,27 @@ describe("the recipe cards page", () => {
     );
   });
 
-  test("a tab still uploading photos it couldn't save, after the queue left it, says to keep it open", async () => {
+  test("Use this tab put off while the other tab's front waits for its back: the page says the queue comes after", async () => {
+    api.getSettings.mockResolvedValue({ data: settings(), error: null });
+    queueElsewhere.value = true;
+    const wrapper = await mountPage();
+    expect(wrapper.find(".queue-front-waiting").exists()).toBe(false);
+
+    queueFrontWaitingElsewhere.value = true;
+    await flushPromises();
+    expect(wrapper.get(".queue-front-waiting").text()).toBe(
+      "That tab has a card's front waiting for its back. This tab takes over once the back is taken there, or No back is tapped.",
+    );
+    expect(wrapper.find(".queue-elsewhere .btn").exists()).toBe(true);
+  });
+
+  test("a tab still uploading photos the other tab doesn't have, after the queue left it, says to keep it open", async () => {
     api.getSettings.mockResolvedValue({ data: settings(), error: null });
     queueElsewhere.value = true;
     uploadingLeftovers.value = true;
     const wrapper = await mountPage();
     expect(wrapper.get(".uploading-leftovers").text()).toBe(
-      "This tab is still uploading photos it couldn't save on this device. Keep it open until they're uploaded.",
+      "This tab is still uploading photos your other tab doesn't have. Keep it open until they're uploaded.",
     );
     expect(wrapper.find(".upload-queue").exists()).toBe(true);
   });

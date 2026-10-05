@@ -36,6 +36,8 @@ export default {
       "~": path.resolve(__dirname, "./app"),
       "@@": path.resolve(__dirname, "."),
       "~~": path.resolve(__dirname, "."),
+      // fork hook (docs/ai/PHASE2.md §3.9): app/error.vue shows Nuxt's own error page (#app/components/...)
+      "#app": path.resolve(__dirname, "./node_modules/nuxt/dist/app"),
     },
   },
 };

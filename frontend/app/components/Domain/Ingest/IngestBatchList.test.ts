@@ -596,6 +596,42 @@ describe("IngestBatchList", () => {
     expect(wrapper.get(".batch-summary").text()).toBe("Batch done: 2 added, 1 left to review, 2 failed");
   });
 
+  test("one batch: cards waiting for the monthly limit are counted as waiting, not failed, and it isn't done yet", async () => {
+    vi.useFakeTimers();
+    const resets = new Date(Date.now() + 10 * DAY).toISOString();
+    serverJobs = [
+      job({ id: "c1", status: "committed", title: "Banana Mug Cake", recipe: { id: "r1", slug: "banana-mug-cake" } }),
+      job({ id: "w1", position: 1, status: "failed", title: null, error: { code: "limit_reached" }, autoRetryAt: resets }),
+      job({ id: "w2", position: 2, status: "failed", title: null, error: { code: "limit_reached" }, autoRetryAt: resets }),
+      job({ id: "f1", position: 3, status: "failed", title: null, error: { code: "timeout" } }),
+    ];
+    const wrapper = await mountList({ batchId: "b1" });
+    expect(wrapper.get(".batch-summary").text()).toBe("1 added, 2 waiting for the monthly limit, 1 failed");
+
+    // read once the limit allowed it: the batch is done
+    serverJobs = serverJobs.map(j => (j.id.startsWith("w") ? { ...j, status: "ready", error: null, autoRetryAt: null, title: "Scones" } : j));
+    api.getCounts.mockResolvedValue({ data: { processing: 0, ready: 2, needsAttention: 0, failed: 1, waiting: 0 }, error: null });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(wrapper.get(".batch-summary").text()).toBe("Batch done: 1 added, 2 left to review, 1 failed");
+  });
+
+  test("Retry failed leaves the cards waiting for the monthly limit to wait, and isn't offered for them alone", async () => {
+    const resets = new Date(Date.now() + 10 * DAY).toISOString();
+    serverJobs = [
+      job({ id: "w1", status: "failed", error: { code: "limit_reached" }, autoRetryAt: resets }),
+      job({ id: "f1", position: 1, status: "failed", error: { code: "timeout" } }),
+      job({ id: "w2", batchId: "b2", status: "failed", error: { code: "limit_reached" }, autoRetryAt: resets }),
+    ];
+    api.retry.mockResolvedValue({ data: { draftVersion: 0, status: "processing", task: { kind: "extract", state: "queued" } }, error: null });
+    const wrapper = await mountList();
+    // a batch whose failed cards all wait for the limit has no Retry failed
+    expect(wrapper.find("[data-batch='b2'] .batch-retry-failed").exists()).toBe(false);
+
+    await wrapper.get("[data-batch='b1'] .batch-retry-failed").trigger("click");
+    await flushPromises();
+    expect(api.retry.mock.calls.map(call => call[0])).toEqual(["f1"]);
+  });
+
   test("one batch with nothing added yet still says what's going on", async () => {
     serverJobs = [
       job({ id: "r1" }),

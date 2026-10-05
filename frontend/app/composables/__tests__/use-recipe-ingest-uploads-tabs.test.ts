@@ -14,6 +14,18 @@ const api = vi.hoisted(() => ({
 }));
 vi.mock("~/composables/api", () => ({ useUserApi: () => ({ recipeIngest: api }) }));
 vi.mock("~/composables/use-toast", () => ({ alert: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }));
+/** While `reading` is set, a chosen file is read only once it settles (a big PDF takes a moment) */
+const fileReads = vi.hoisted(() => ({ reading: null as Promise<void> | null }));
+vi.mock("~/composables/use-recipe-ingest-files", async (importOriginal) => {
+  const real = await importOriginal<typeof import("~/composables/use-recipe-ingest-files")>();
+  return {
+    ...real,
+    inspectScanFile: async (file: Blob) => {
+      await fileReads.reading;
+      return real.inspectScanFile(file);
+    },
+  };
+});
 
 const JPEG_HEAD = new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]);
 
@@ -214,6 +226,67 @@ async function databases() {
   return (await browser.databases()).map(db => db.name);
 }
 
+/** A promise that settles when `open` is called */
+function gate() {
+  let open = () => {};
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { opened, open };
+}
+
+/** A tab's storage whose writes wait, one by one, for `next()` while `on` (a slow IndexedDB) */
+function gatedSaves() {
+  const waiting: (() => void)[] = [];
+  const saves = {
+    on: false,
+    waiting,
+    /** Lets the oldest write waiting go */
+    next() {
+      waiting.shift()?.();
+    },
+    /** Lets every write go, the ones waiting and the ones to come, and waits for them */
+    async all() {
+      saves.on = false;
+      while (waiting.length) {
+        saves.next();
+        await settle();
+      }
+    },
+    wrap(real: UploadStorage): UploadStorage {
+      return {
+        ...real,
+        save: (change, tab) => (saves.on
+          ? new Promise<void>(resolve => waiting.push(resolve)).then(() => real.save(change, tab))
+          : real.save(change, tab)),
+      };
+    },
+  };
+  return saves;
+}
+
+/** The text of each photo of the tab's cards, by card */
+async function cardTexts(tab: Tab) {
+  return Promise.all(tab.queue.cards.value.map(async card =>
+    (await Promise.all(card.photos.map(async p => (await p.text()).slice(JPEG_HEAD.length)))).join("+")));
+}
+
+/** Uploads that answer at once, each a job */
+function answeringUploads() {
+  let jobs = 0;
+  api.upload.mockImplementation(async (photos: Blob[], options: { localOnly?: boolean; batchId?: string }) => {
+    const tab = sendingTab;
+    const texts = await Promise.all(photos.map(async p => (await p.text()).slice(JPEG_HEAD.length)));
+    sent.push({ tab, photo: texts[0]! });
+    requests.push({ tab, photos: texts, localOnly: options?.localOnly });
+    jobs += 1;
+    return {
+      data: { jobs: [{ id: `job-${jobs}`, position: 0, status: "processing" }], rejected: [], batchId: options.batchId ?? "server-batch" },
+      error: null,
+    };
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   browser = new IDBFactory();
@@ -235,6 +308,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fileReads.reading = null;
   tabs.forEach(tab => tab.uploads.resetRecipeIngestUploads());
   tabs.length = 0;
   vi.unstubAllGlobals();
@@ -288,8 +362,7 @@ describe.each([
     const a = await openTab("A");
     await as(a, async () => {
       a.queue.mode.value = "front-and-back";
-      await a.queue.addPhotos([photo("tray front"), photo("tray back")]);
-      a.queue.takePhoto(photo("waiting front"));
+      await a.queue.addPhotos([photo("tray front"), photo("tray back"), photo("tray alone")]);
     });
     const b = await openTab("B");
     expect(b.queue.queueElsewhere.value).toBe(true);
@@ -299,12 +372,10 @@ describe.each([
     expect(b.queue.queueElsewhere.value).toBe(false);
     expect(a.queue.queueElsewhere.value).toBe(true);
     expect(a.queue.drafts.value).toEqual([]);
-    expect(a.queue.pendingFront.value).toBeNull();
-    expect(await Promise.all(b.queue.drafts.value[0]!.photos.map(p => p.text()))).toEqual([
-      expect.stringContaining("tray front"),
-      expect.stringContaining("tray back"),
+    expect(await Promise.all(b.queue.drafts.value.map(async draft => Promise.all(draft.photos.map(p => p.text()))))).toEqual([
+      [expect.stringContaining("tray front"), expect.stringContaining("tray back")],
+      [expect.stringContaining("tray alone")],
     ]);
-    expect(await b.queue.pendingFront.value!.text()).toContain("waiting front");
     // and A's count is B's now
     expect(a.queue.photosNotUploaded.value).toBe(3);
     expect(b.queue.photosNotUploaded.value).toBe(3);
@@ -599,24 +670,129 @@ describe.each([
     expect(requests).toEqual([{ tab: "B", photos: ["card one"], localOnly: true }]);
   });
 
-  test("a front waiting for its back, taken over by a tab opened in One side mode, pairs with the back", async () => {
+  test("a front waiting for its back keeps the queue in its tab: Use this tab waits for the back, then takes the queue", async () => {
     sharedLocalStorage();
     const a = await openTab("A");
     const b = await openTab("B");
     expect(b.queue.mode.value).toBe("one-side");
     await as(a, () => {
       a.queue.mode.value = "front-and-back";
-      a.queue.takePhoto(photo("front"));
+      a.queue.takePhoto(photo("card front"));
     });
 
+    // the user clicks Use this tab in B while A's camera is still open for the back
+    const closeB = await as(b, () => b.queue.openCardsPage());
+    const started = Date.now();
     await as(b, () => b.queue.takeOverQueue());
     await settle(100);
+    // answered at once, rather than taken after QUEUE_HAND_OVER_MS
+    expect(Date.now() - started).toBeLessThan(a.uploads.QUEUE_HAND_OVER_MS);
+    expect(b.queue.queueElsewhere.value).toBe(true);
+    expect(b.queue.queueFrontWaitingElsewhere.value).toBe(true);
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    expect(await a.queue.pendingFront.value!.text()).toContain("card front");
+
+    // A's camera gives it the back: the card goes from A, and then the queue goes to B, as asked
+    await as(a, () => a.queue.takePhoto(photo("card back")));
+    await settle(100);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    expect(b.queue.queueFrontWaitingElsewhere.value).toBe(false);
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    // B follows A's mode, and its next photo is a front of its own
     expect(b.queue.mode.value).toBe("front-and-back");
-    expect(b.queue.pendingFront.value).not.toBeNull();
-    await as(b, () => b.queue.takePhoto(photo("back")));
-    expect(requests).toEqual([{ tab: "B", photos: ["front", "back"], localOnly: false }]);
     expect(b.queue.pendingFront.value).toBeNull();
+    await as(b, () => b.queue.takePhoto(photo("next front")));
+    expect(await b.queue.pendingFront.value!.text()).toContain("next front");
+    // the card went whole, from A (and again from B, which read it back as A's upload was on its way): never a side
+    // alone, and never with a photo of the other tab
+    expect(new Set(requests.map(request => request.photos.join("+")))).toEqual(new Set(["card front+card back"]));
+    closeB();
   });
+
+  test("a front waiting for its back keeps the queue in its tab until No back is tapped there", async () => {
+    sharedLocalStorage();
+    const a = await openTab("A");
+    const b = await openTab("B");
+    await as(a, () => {
+      a.queue.mode.value = "front-and-back";
+      a.queue.takePhoto(photo("lone front"));
+    });
+    const closeB = await as(b, () => b.queue.openCardsPage());
+    await as(b, () => b.queue.takeOverQueue());
+    await settle(100);
+    expect(b.queue.queueFrontWaitingElsewhere.value).toBe(true);
+
+    await as(a, () => a.queue.noBack());
+    await settle(100);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    expect(new Set(requests.map(request => request.photos.join("+")))).toEqual(new Set(["lone front"]));
+    closeB();
+  });
+
+  test("Use this tab put off while a front waits is let go with the cards page it was asked on", async () => {
+    sharedLocalStorage();
+    const a = await openTab("A");
+    const b = await openTab("B");
+    await as(a, () => {
+      a.queue.mode.value = "front-and-back";
+      a.queue.takePhoto(photo("card front"));
+    });
+    const closeB = await as(b, () => b.queue.openCardsPage());
+    await as(b, () => b.queue.takeOverQueue());
+    await settle(100);
+    expect(b.queue.queueFrontWaitingElsewhere.value).toBe(true);
+    closeB();
+    expect(b.queue.queueFrontWaitingElsewhere.value).toBe(false);
+
+    // the back comes later: the queue stays with A, where the user is
+    await as(a, () => a.queue.takePhoto(photo("card back")));
+    await settle(100);
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    expect(b.queue.queueElsewhere.value).toBe(true);
+  });
+
+  test("a front taken from a tab that didn't hand it over waits in the tray, and its back, given to that tab, goes alone", async () => {
+    sharedLocalStorage();
+    // A hears nothing and says nothing (frozen, or too busy to answer Use this tab in time)
+    vi.stubGlobal("BroadcastChannel", FrozenChannel);
+    const a = await openTab("A");
+    await as(a, () => {
+      a.queue.mode.value = "front-and-back";
+      a.queue.takePhoto(photo("card front"));
+    });
+    vi.stubGlobal("BroadcastChannel", RealBroadcastChannel);
+    const b = await openTab("B");
+    expect(b.queue.queueElsewhere.value).toBe(true);
+
+    // B takes the queue after QUEUE_HAND_OVER_MS (over Web Locks it's stolen; over the lease it's taken over)
+    await as(b, () => b.queue.takeOverQueue());
+    await settle(100);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    // A finds out (at once over Web Locks, at its next renewal over the lease)
+    await new Promise(resolve => setTimeout(resolve, b.storage.QUEUE_RENEW_MS + 500));
+    await settle();
+    expect(a.queue.queueElsewhere.value).toBe(true);
+
+    // the front is in B's tray, a card of its own, not waiting for a photo B takes
+    expect(b.queue.pendingFront.value).toBeNull();
+    expect(await Promise.all(b.queue.drafts.value.map(async draft => Promise.all(draft.photos.map(p => p.text()))))).toEqual([
+      [expect.stringContaining("card front")],
+    ]);
+    // A's camera gives it the back: it goes alone, from A
+    await as(a, () => a.queue.takePhoto(photo("card back")));
+    // B's next photo is a front of its own, and the tray's front isn't joined to a file chosen in B
+    await as(b, async () => {
+      b.queue.takePhoto(photo("next front"));
+      await b.queue.addPhotos([photo("chosen")]);
+    });
+    await settle(50);
+    expect(requests.map(request => `${request.tab}:${request.photos.join("+")}`)).toEqual(["A:card back"]);
+    expect(await b.queue.pendingFront.value!.text()).toContain("next front");
+    expect(await Promise.all(b.queue.drafts.value.map(async draft => Promise.all(draft.photos.map(p => p.text()))))).toEqual([
+      [expect.stringContaining("card front")],
+      [expect.stringContaining("chosen")],
+    ]);
+  }, 20_000);
 
   test("losing the queue while the capture page is shown doesn't keep the batch open once the queue is back", async () => {
     const a = await openTab("A");
@@ -670,6 +846,165 @@ describe.each([
     closeA();
     closeB();
     listener.close();
+  });
+
+  test.each([
+    ["Use this tab in the other tab", false],
+    ["the other tab's cards page shown, this one's hidden", true],
+  ])("files still being read as the queue goes to another tab (%s) go from this tab, once, and are counted", async (_how, byPage) => {
+    const pageA = new FakePage();
+    const pageB = new FakePage();
+    const a = await openTab("A", "u1", pageA);
+    const b = await openTab("B", "u1", pageB);
+    // B's cards page is in a tab in the background, or in a window beside A's (Use this tab)
+    pageB.show(!byPage);
+    const closeA = await as(a, () => a.queue.openCardsPage());
+    const closeB = await as(b, () => b.queue.openCardsPage());
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    let read!: () => void;
+    fileReads.reading = new Promise<void>((resolve) => {
+      read = resolve;
+    });
+    // A: two files chosen, read for a moment (a big PDF is read whole)
+    sendingTab = "A";
+    const adding = a.queue.addPhotos([photo("file one"), photo("file two")]);
+    await settle();
+    // meanwhile the queue goes to B
+    if (byPage) {
+      await as(a, () => pageA.show(false));
+      pageB.show(true);
+    }
+    else {
+      await as(b, () => b.queue.takeOverQueue());
+    }
+    await settle(100);
+    expect(a.queue.queueElsewhere.value).toBe(true);
+
+    sendingTab = "A";
+    read();
+    expect(await adding).toEqual({ unsupported: [], tooManyPages: [] });
+    await settle(50);
+    expect(requests.map(request => `${request.tab}:${request.photos.join("+")}`).sort()).toEqual(["A:file one", "A:file two"]);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
+    expect(b.queue.drafts.value).toEqual([]);
+    expect(b.queue.cards.value).toEqual([]);
+    // B's logout asks about them
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(2);
+    closeA();
+    closeB();
+  });
+
+  test("a photo that comes while the hand-over's last write is on its way is written too, and goes to the other tab", async () => {
+    const saves = gatedSaves();
+    const a = await loadTab("A");
+    await connectTab(a, "u1", id => saves.wrap(a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser)));
+    await settle();
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    const b = await openTab("B");
+
+    // card two's write is slow; Use this tab in B meanwhile: A writes what changed last first
+    saves.on = true;
+    await as(a, () => a.queue.takePhoto(photo("card two")));
+    sendingTab = "B";
+    const taking = b.queue.takeOverQueue();
+    await settle();
+    saves.next();
+    await settle();
+    // the hand-over's own write is on its way when A's camera gives it card three
+    expect(saves.waiting.length).toBeGreaterThan(0);
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    await as(a, () => a.queue.takePhoto(photo("card three")));
+    sendingTab = "B";
+    await saves.all();
+    await taking;
+    await settle(100);
+
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    expect(a.queue.cards.value).toEqual([]);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    expect(await cardTexts(b)).toEqual(["card one", "card two", "card three"]);
+    // two at a time
+    expect(b.queue.cards.value.map(card => card.status)).toEqual(["uploading", "uploading", "waiting"]);
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(3);
+  });
+
+  test("a file read while the hand-over's last write is on its way is written too, and is in the other tab's tray", async () => {
+    const saves = gatedSaves();
+    const a = await loadTab("A");
+    await connectTab(a, "u1", id => saves.wrap(a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser)));
+    await settle();
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    const b = await openTab("B");
+    let read!: () => void;
+    fileReads.reading = new Promise<void>((resolve) => {
+      read = resolve;
+    });
+    sendingTab = "A";
+    const adding = a.queue.addPhotos([photo("file one")]);
+
+    saves.on = true;
+    await as(a, () => a.queue.takePhoto(photo("card two")));
+    sendingTab = "B";
+    const taking = b.queue.takeOverQueue();
+    await settle();
+    saves.next();
+    await settle();
+    // the hand-over's own write is on its way when the file has been read
+    expect(saves.waiting.length).toBeGreaterThan(0);
+    read();
+    expect(await adding).toEqual({ unsupported: [], tooManyPages: [] });
+    await settle();
+    await saves.all();
+    await taking;
+    await settle(100);
+
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    expect(await Promise.all(b.queue.drafts.value.map(async draft => Promise.all(draft.photos.map(p => p.text()))))).toEqual([
+      [expect.stringContaining("file one")],
+    ]);
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(3);
+  });
+
+  test("photos that keep coming while the hand-over writes: what its last write didn't take goes from this tab", async () => {
+    const saves = gatedSaves();
+    const a = await loadTab("A");
+    await connectTab(a, "u1", id => saves.wrap(a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser)));
+    await settle();
+    const b = await openTab("B");
+
+    saves.on = true;
+    const taken = ["card 0"];
+    await as(a, () => a.queue.takePhoto(photo("card 0")));
+    sendingTab = "B";
+    const taking = b.queue.takeOverQueue();
+    await settle();
+    saves.next();
+    await settle();
+    // a photo while each of the hand-over's writes is on its way
+    for (let write = 0; write < a.uploads.HAND_OVER_WRITES; write++) {
+      expect(saves.waiting).toHaveLength(1);
+      const card = `card ${write + 1}`;
+      taken.push(card);
+      await as(a, () => a.queue.takePhoto(photo(card)));
+      sendingTab = "B";
+      saves.next();
+      await settle();
+    }
+    await saves.all();
+    await taking;
+    await settle(100);
+
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(b.queue.queueElsewhere.value).toBe(false);
+    // every card is in one tab or the other, never in neither nor in both: the last one, never written, goes from A
+    const inA = await cardTexts(a);
+    const inB = await cardTexts(b);
+    expect(inA).toEqual([taken.at(-1)]);
+    expect([...inA, ...inB].sort()).toEqual(taken);
+    expect(a.queue.uploadingLeftovers.value).toBe(true);
+    expect(b.uploads.recipeIngestPhotosNotUploaded.value).toBe(taken.length);
   });
 });
 
@@ -866,13 +1201,6 @@ describe("without Web Locks, the tab keeping the queue frozen in the background"
 describe("a tab that loses the queue while it's writing", () => {
   test("waits for the write: a card it wrote before the other tab read the queue goes from that tab only", async () => {
     vi.stubGlobal("navigator", { locks: fakeLocks() });
-    const gate = () => {
-      let open = () => {};
-      const opened = new Promise<void>((resolve) => {
-        open = resolve;
-      });
-      return { opened, open };
-    };
     const slowSave = { on: false, gate: gate() };
     const a = await loadTab("A");
     await connectTab(a, "u1", (id) => {
@@ -907,6 +1235,101 @@ describe("a tab that loses the queue while it's writing", () => {
     await settle(50);
     expect(sent.slice(2).map(request => `${request.tab}:${request.photo}`).sort()).toEqual(["B:card one", "B:card two"]);
     expect(a.queue.uploadingLeftovers.value).toBe(false);
+  }, 10_000);
+
+  test("a photo taken while it waits for its writes is written with them: it goes from the other tab only", async () => {
+    vi.stubGlobal("navigator", { locks: fakeLocks() });
+    const saves = gatedSaves();
+    const a = await loadTab("A");
+    await connectTab(a, "u1", id => saves.wrap(a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser)));
+    await settle();
+    await as(a, () => a.queue.takePhoto(photo("card one")));
+    // card two's write is slow
+    saves.on = true;
+    await as(a, () => a.queue.takePhoto(photo("card two")));
+
+    // B takes the queue (A, stuck writing, doesn't hand it over in time), but reads it only a moment later
+    const claiming = gate();
+    const b = await loadTab("B");
+    await connectTab(b, "u1", (id) => {
+      const real = b.storage.indexedDbUploadStorage(b.storage.uploadStorageName(id), browser);
+      return { ...real, claim: tab => claiming.opened.then(() => real.claim(tab)) };
+    });
+    await as(b, () => b.queue.takeOverQueue());
+    await settle();
+    expect(a.queue.queueElsewhere.value).toBe(false);
+
+    // A still shows the capture page while it waits: the user takes card three, written after card two
+    await as(a, () => a.queue.takePhoto(photo("card three")));
+    await as(a, () => saves.all());
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.cards.value).toEqual([]);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    await as(b, () => claiming.open());
+    await settle(50);
+    expect(await cardTexts(b)).toEqual(["card one", "card two", "card three"]);
+    // A never sent card three: the queue was B's by then
+    expect(sent.filter(request => request.photo === "card three")).toEqual([]);
+  }, 10_000);
+
+  test("a card made smaller while it waits for its writes goes from the other tab only, as it was stored", async () => {
+    vi.stubGlobal("navigator", { locks: fakeLocks() });
+    sharedLocalStorage().setItem("mealie.recipe-ingest.data-saver", "true");
+    // a browser's encoder, as text: a photo made smaller is "small:<its text>"; one photo's decode waits for `shrunk`
+    const shrinking = { photo: "", shrunk: gate() };
+    vi.stubGlobal("createImageBitmap", async (blob: Blob) => {
+      const text = (await blob.text()).slice(JPEG_HEAD.length).trim();
+      if (text === shrinking.photo) {
+        await shrinking.shrunk.opened;
+      }
+      return { width: 8000, height: 6000, text, close() {} };
+    });
+    vi.stubGlobal("OffscreenCanvas", class {
+      drawn = "";
+      getContext() {
+        return { fillStyle: "", fillRect: () => {}, drawImage: (bitmap: { text: string }) => (this.drawn = bitmap.text) };
+      }
+
+      async convertToBlob() {
+        return new Blob([JPEG_HEAD, `small:${this.drawn}`], { type: "image/jpeg" });
+      }
+    });
+    answeringUploads();
+    const big = (text: string) => new File([JPEG_HEAD, text, " ".repeat(2000)], `${text}.jpg`, { type: "image/jpeg" });
+    const saves = gatedSaves();
+    const a = await loadTab("A");
+    await connectTab(a, "u1", id => saves.wrap(a.storage.indexedDbUploadStorage(a.storage.uploadStorageName(id), browser)));
+    await settle();
+    await as(a, () => a.queue.takePhoto(big("card one")));
+    expect(sent).toEqual([{ tab: "A", photo: "small:card one" }]);
+
+    // card two: its write is slow, and so is making it smaller
+    const claiming = gate();
+    const b = await loadTab("B");
+    await connectTab(b, "u1", (id) => {
+      const real = b.storage.indexedDbUploadStorage(b.storage.uploadStorageName(id), browser);
+      return { ...real, claim: tab => claiming.opened.then(() => real.claim(tab)) };
+    });
+    await settle();
+    saves.on = true;
+    shrinking.photo = "card two";
+    await as(a, () => a.queue.takePhoto(big("card two")));
+    // B takes the queue (A, stuck writing, doesn't hand it over in time)
+    await as(b, () => b.queue.takeOverQueue());
+    expect(a.queue.queueElsewhere.value).toBe(false);
+    // card two is made smaller while A waits; its first write goes, then B claims the queue, so the next write (the
+    // smaller photo) is refused: the storage holds card two as it was taken
+    await as(a, () => shrinking.shrunk.open());
+    await as(a, () => saves.next());
+    await as(b, () => claiming.open());
+    await as(a, () => saves.all());
+    await settle(50);
+
+    expect(a.queue.queueElsewhere.value).toBe(true);
+    expect(a.queue.cards.value).toEqual([]);
+    expect(a.queue.uploadingLeftovers.value).toBe(false);
+    // sent once, from B, which made it smaller itself
+    expect(sent).toEqual([{ tab: "A", photo: "small:card one" }, { tab: "B", photo: "small:card two" }]);
   }, 10_000);
 });
 

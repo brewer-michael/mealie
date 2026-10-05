@@ -26,6 +26,7 @@ import {
   sourceFileName,
   useRecipeIngestCounts,
   useRecipeIngestSettings,
+  waitsForLimit,
 } from "../use-recipe-ingest";
 import type { TranslateFn } from "../use-recipe-ingest";
 import { CANNOT_SHRINK } from "~/composables/use-recipe-ingest-uploads";
@@ -340,7 +341,7 @@ describe("text", () => {
     expect(rejectReasonText("too_large", t, { limits })).toBe("This file is larger than 20 MB.");
     expect(rejectReasonText("too_many_pages", t, { limits })).toBe("A card can have at most 6 pages.");
     expect(rejectReasonText("too_many_pixels", t, { limits, jpeg: true })).toBe("This photo has more than 200 megapixels.");
-    expect(rejectReasonText("pdf_not_supported", t, { limits })).toBe("This PDF can't be opened. It may need a password or be damaged.");
+    expect(rejectReasonText("pdf_not_supported", t, { limits })).toBe("This PDF couldn't be rendered. It may need a password, be damaged or take too long to render.");
   });
 
   test("the error texts end with a period, and the ones a user can act on say what to do", () => {
@@ -611,6 +612,17 @@ describe("useRecipeIngestSettings", () => {
     api.updateSettings.mockResolvedValueOnce({ data: null });
     expect(await save({ localOnly: false, crossRead: false })).toBe(false);
     expect(saved.value?.localOnly).toBe(true);
+  });
+});
+
+describe("a card waiting for a monthly limit", () => {
+  test("failed limit_reached and read again by itself: waiting, not failed (as the server counts it)", () => {
+    const resets = "2026-11-01T00:00:00";
+    expect(waitsForLimit({ status: "failed", error: { code: "limit_reached" }, autoRetryAt: resets })).toBe(true);
+    // failed otherwise, or no longer read again by itself (it was retried, or its group stopped reading cards)
+    expect(waitsForLimit({ status: "failed", error: { code: "timeout" }, autoRetryAt: resets })).toBe(false);
+    expect(waitsForLimit({ status: "failed", error: { code: "limit_reached" }, autoRetryAt: null })).toBe(false);
+    expect(waitsForLimit({ status: "processing", error: null, autoRetryAt: resets })).toBe(false);
   });
 });
 

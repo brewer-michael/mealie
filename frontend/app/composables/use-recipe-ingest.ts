@@ -173,6 +173,14 @@ export function cardTitle(job: CardTitleFields, t: TranslateFn = globalT): strin
     : t("recipe-ingest.queue.untitled");
 }
 
+/**
+ * A card waiting for a monthly limit: it failed `limit_reached` and is read again by itself (`autoRetryAt`), so it's
+ * counted as waiting, never as failed (the server's `RecipeIngestionJobCounts.waiting`, which `failed` leaves out)
+ */
+export function waitsForLimit(job: Pick<RecipeIngestionJobSummary, "status" | "error" | "autoRetryAt">): boolean {
+  return job.status === "failed" && job.error?.code === "limit_reached" && !!job.autoRetryAt;
+}
+
 /** The HTTP status of a failed API call, if it got a response */
 export function errorStatusOf(error: unknown): number | null {
   return (error as { response?: { status?: number } } | null)?.response?.status ?? null;
@@ -505,7 +513,7 @@ export interface RecipeIngestNavBadge {
  * menu's "Scan recipe cards". Both follow the shared settings, which a group manager's changes reload; the counts are
  * refreshed on window focus, on coming back to the tab and on route changes, at most every 30 s, and settings that
  * failed to load are tried again on the next route change. The sidebar entry also shows while the household has cards
- * open (ready, failed or being read) even when new cards can't be read, and gets a red badge, with one toast, when an
+ * open (ready, failed, being read or waiting for a monthly limit) even when new cards can't be read, and gets a red badge, with one toast, when an
  * upload failed for good while no cards page was open. Nothing is asked of a server with card scanning turned off.
  */
 export function useRecipeIngestNav(options: RecipeIngestNavOptions) {
@@ -518,7 +526,8 @@ export function useRecipeIngestNav(options: RecipeIngestNavOptions) {
   const canReadCards = computed(() => options.active.value && !!settings.value?.canReadCards);
   const openCards = computed(() => {
     const current = counts.counts.value;
-    return (current?.ready ?? 0) + (current?.failed ?? 0) + (current?.processing ?? 0);
+    // cards waiting for a monthly limit are counted apart from the failed ones
+    return (current?.ready ?? 0) + (current?.failed ?? 0) + (current?.waiting ?? 0) + (current?.processing ?? 0);
   });
 
   function refreshCounts(force = false) {

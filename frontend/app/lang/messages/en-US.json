@@ -1442,7 +1442,8 @@
       "cards-retrying": "{count} card retrying | {count} cards retrying",
       "cards-not-uploaded": "{count} card didn't upload | {count} cards didn't upload",
       "queue-kept-in-memory": "That tab couldn't save its photos on this device, so they can't move here. Let them upload there first.",
-      "uploading-leftovers": "This tab is still uploading photos it couldn't save on this device. Keep it open until they're uploaded."
+      "queue-front-waiting": "That tab has a card's front waiting for its back. This tab takes over once the back is taken there, or No back is tapped.",
+      "uploading-leftovers": "This tab is still uploading photos your other tab doesn't have. Keep it open until they're uploaded."
     },
     "queue": {
       "title": "Cards",
@@ -1474,6 +1475,7 @@
       "summary-added": "{count} added",
       "summary-left": "{count} left to review",
       "summary-reading": "{count} still being read",
+      "summary-waiting": "{count} waiting for the monthly limit",
       "summary-failed": "{count} failed",
       "add-clean": "Add {count} clean card | Add {count} clean cards",
       "add-clean-title": "Add {count} card as a recipe? | Add {count} cards as recipes?",
@@ -1835,7 +1837,7 @@
     "reject": {
       "too_large": "This file is larger than {mib} MB.",
       "unsupported_format": "This isn't a supported image. Use JPEG, PNG, WebP, HEIC, AVIF, TIFF or PDF.",
-      "pdf_not_supported": "This PDF can't be opened. It may need a password or be damaged.",
+      "pdf_not_supported": "This PDF couldn't be rendered. It may need a password, be damaged or take too long to render.",
       "too_many_pixels": "This photo has more than {megapixels} megapixels.",
       "unreadable_image": "This image couldn't be read. It may be damaged or incomplete.",
       "too_many_pages": "A card can have at most {pages} pages.",

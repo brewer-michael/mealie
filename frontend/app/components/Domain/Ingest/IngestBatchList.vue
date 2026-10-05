@@ -260,6 +260,7 @@ import {
   useRecipeIngestCounts,
   useRecipeIngestSettings,
   useRecipeIngestText,
+  waitsForLimit,
 } from "~/composables/use-recipe-ingest";
 import type { RecipeIngestQueueNotice } from "~/composables/use-recipe-ingest";
 import { carryReviewNotice } from "~/composables/use-recipe-ingest-review";
@@ -299,8 +300,11 @@ interface BatchView {
   createdAt: string | null;
   source: IngestSource;
   ready: number;
+  /** Failed cards, not counting the ones waiting for a monthly limit */
   failed: number;
-  /** Failed cards Retry can read now: "Retry failed" retries them */
+  /** Cards waiting for a monthly limit (`waitsForLimit`): read again by themselves */
+  waiting: number;
+  /** Failed cards Retry can read now: "Retry failed" retries them (not the ones waiting for a monthly limit) */
   retryable: number;
   /** Ready cards with nothing to check and nothing reading them: "Add N clean cards" adds them */
   clean: Job[];
@@ -396,6 +400,16 @@ function canRetry(job: Job): boolean {
   return !failedLocalOnly(job) || settings.value?.localOnlyAvailable !== false;
 }
 
+/** Failed, not waiting for a monthly limit (that card is read again by itself, and counts as waiting) */
+function hasFailed(job: Job): boolean {
+  return job.status === "failed" && !waitsForLimit(job);
+}
+
+/** "Retry failed" reads it again: failed, and Retry can read it now */
+function retriesWithBatch(job: Job): boolean {
+  return hasFailed(job) && canRetry(job);
+}
+
 /** The time a card was added as a recipe, or uploaded; 0 for none (a server time without an offset is UTC) */
 function time(value: string | null | undefined): number {
   return serverDate(value)?.getTime() ?? 0;
@@ -423,8 +437,9 @@ const batches = computed<BatchView[]>(() => {
       createdAt: first?.createdAt ?? null,
       source: first?.source ?? "app",
       ready: sorted.filter(job => job.status === "ready").length,
-      failed: sorted.filter(job => job.status === "failed").length,
-      retryable: sorted.filter(job => job.status === "failed" && canRetry(job)).length,
+      failed: sorted.filter(hasFailed).length,
+      waiting: sorted.filter(waitsForLimit).length,
+      retryable: sorted.filter(retriesWithBatch).length,
       clean: sorted.filter(isClean),
     };
   });
@@ -437,8 +452,8 @@ const batches = computed<BatchView[]>(() => {
 const noticeInBatch = computed(() => !!notice.value?.batchId && batches.value.some(b => b.id === notice.value?.batchId));
 
 /**
- * The batch so far: "3 added, 1 left to review, 2 still being read, 1 failed". "Batch done" only once none of its
- * cards is being read; a card being added counts as added.
+ * The batch so far: "3 added, 1 left to review, 2 still being read, 1 waiting for the monthly limit, 1 failed". "Batch
+ * done" only once none of its cards is being read or waiting to be; a card being added counts as added.
  */
 const batchSummary = computed(() => {
   if (!props.batchId) {
@@ -448,11 +463,13 @@ const batchSummary = computed(() => {
   const count = (status: IngestStatus) => open.filter(job => job.status === status).length;
   const added = recent.value.filter(job => job.batchId === props.batchId).length + count("committing");
   const reading = count("processing");
+  const waiting = open.filter(waitsForLimit).length;
   const parts = [
     { key: "recipe-ingest.queue.summary-added", count: added },
     { key: "recipe-ingest.queue.summary-left", count: count("ready") },
     { key: "recipe-ingest.queue.summary-reading", count: reading },
-    { key: "recipe-ingest.queue.summary-failed", count: count("failed") },
+    { key: "recipe-ingest.queue.summary-waiting", count: waiting },
+    { key: "recipe-ingest.queue.summary-failed", count: open.filter(hasFailed).length },
   ]
     .filter(part => part.count > 0)
     .map(part => i18n.t(part.key, { count: part.count }));
@@ -460,7 +477,7 @@ const batchSummary = computed(() => {
     return null;
   }
   const summary = parts.join(", ");
-  return reading ? summary : i18n.t("recipe-ingest.queue.batch-done", { summary });
+  return reading || waiting ? summary : i18n.t("recipe-ingest.queue.batch-done", { summary });
 });
 
 function formatDate(value: string | null): string {
@@ -550,7 +567,9 @@ function clearPollTimer() {
 }
 
 function countsKey(value: RecipeIngestionJobCounts | null | undefined): string | null {
-  return value ? [value.processing ?? 0, value.ready ?? 0, value.needsAttention ?? 0, value.failed ?? 0].join("/") : null;
+  return value
+    ? [value.processing ?? 0, value.ready ?? 0, value.needsAttention ?? 0, value.failed ?? 0, value.waiting ?? 0].join("/")
+    : null;
 }
 
 /** Refreshes the shared counts (the sidebar's) after a change this list made or saw, and remembers them */
@@ -873,7 +892,7 @@ async function cancelJob(job: Job) {
 async function retryFailed(batch: BatchView) {
   retryingBatch.value = batch.id;
   try {
-    await Promise.all(batch.jobs.filter(job => job.status === "failed" && canRetry(job)).map(job => retryOne(job)));
+    await Promise.all(batch.jobs.filter(retriesWithBatch).map(job => retryOne(job)));
   }
   finally {
     retryingBatch.value = null;

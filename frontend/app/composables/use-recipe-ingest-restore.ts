@@ -1,8 +1,8 @@
 /**
  * A page opened or reloaded while a backup is restored (docs/ai/PHASE2.md §3.9): the server answers every request with
  * 503 `paused_for_restore` and `Retry-After` for a moment, the app's first one too (`plugins/app-info.client.ts`), so
- * the app can't start. The page says so instead of Nuxt's "503 Internal Server Error", asks again after each
- * `Retry-After`, and loads the app once the restore is over. Fork-owned.
+ * the app can't start. The page says so as Mealie (`app/error.vue`), not as Nuxt's "503" error page, asks again every
+ * few seconds, and loads the app once the restore is over. Fork-owned.
  */
 import axios from "axios";
 
@@ -10,8 +10,11 @@ import axios from "axios";
 export const PAUSED_FOR_RESTORE = "paused_for_restore";
 /** How long to wait before asking again when the answer says nothing (no `Retry-After`) */
 export const RESTORE_CHECK_DEFAULT_MS = 5000;
-/** The longest wait between two checks, whatever `Retry-After` says */
-export const RESTORE_CHECK_MAX_MS = 60_000;
+/**
+ * The longest wait between two checks, whatever `Retry-After` says: a restore takes seconds, and its Retry-After is a
+ * minute (the server's word for any client), so the page opens within a few seconds of the restore's end
+ */
+export const RESTORE_CHECK_MAX_MS = 5000;
 
 interface ErrorAnswer {
   response?: { status?: number; headers?: Record<string, unknown>; data?: { detail?: { code?: unknown } } };
@@ -83,10 +86,26 @@ export function waitForRestoreEnd(
   };
 }
 
+/** What the restore page (`app/error.vue`) shows, carried by the error `restorePageError` makes (Nuxt keeps `data`) */
+export interface RestorePageData {
+  code: typeof PAUSED_FOR_RESTORE;
+  title: string;
+  text: string;
+}
+
+/** The restore page's texts when `error` is the one `restorePageError` made; null for any other error */
+export function restorePageData(error: unknown): RestorePageData | null {
+  const data = (error as { data?: Partial<RestorePageData> } | null)?.data;
+  return data?.code === PAUSED_FOR_RESTORE && typeof data.title === "string" && typeof data.text === "string"
+    ? { code: PAUSED_FOR_RESTORE, title: data.title, text: data.text }
+    : null;
+}
+
 /**
  * What the app's first request (`plugins/app-info.client.ts`) fails with: for the server's answer while a backup is
- * restored, an error Nuxt's error page shows as "A backup is being restored. This page will open when it's done.",
- * and the page is loaded again once the restore is over (`waitForRestoreEnd`); any other error as it is
+ * restored, an error the app's error page (`app/error.vue`) shows as "A backup is being restored. This page will open
+ * when it's done.", and the page is loaded again once the restore is over (`waitForRestoreEnd`); any other error as
+ * it is
  */
 export function restorePageError(
   error: unknown,
@@ -98,10 +117,11 @@ export function restorePageError(
     return error;
   }
   waitForRestoreEnd(retryAfter, reload);
-  // Nuxt's error page shows the status, `statusMessage` as its title and `message` under it
-  return Object.assign(new Error(t("recipe-ingest.restore.page-text")), {
-    statusCode: 503,
-    statusMessage: t("recipe-ingest.restore.page-title"),
-    fatal: true,
-  });
+  const data: RestorePageData = {
+    code: PAUSED_FOR_RESTORE,
+    title: t("recipe-ingest.restore.page-title"),
+    text: t("recipe-ingest.restore.page-text"),
+  };
+  // the texts go in `data` too: Nuxt keeps it as it is, while `statusMessage` loses what an HTTP status line can't hold
+  return Object.assign(new Error(data.text), { statusCode: 503, statusMessage: data.title, data, fatal: true });
 }

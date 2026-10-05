@@ -117,6 +117,10 @@
         <div v-if="queueKeptInMemoryElsewhere" class="queue-kept-in-memory mt-2">
           {{ $t("recipe-ingest.capture.queue-kept-in-memory") }}
         </div>
+        <!-- "Use this tab" waits: that tab's camera may still give its waiting front the back (it comes here after) -->
+        <div v-else-if="queueFrontWaitingElsewhere" class="queue-front-waiting mt-2">
+          {{ $t("recipe-ingest.capture.queue-front-waiting") }}
+        </div>
         <!-- photos only this tab has (not saved here as the queue left, or given to it after): they upload from here -->
         <div v-if="uploadingLeftovers" class="uploading-leftovers mt-2">
           {{ $t("recipe-ingest.capture.uploading-leftovers") }}
@@ -180,7 +184,7 @@ import { useRecipeIngestUploads } from "~/composables/use-recipe-ingest-uploads"
  * limit skips, and shows the household's inbox: photos waiting there and why, and the ones it refused. Those change
  * by themselves, so while the page is visible the settings are asked again every minute, and on coming back to it.
  * When another tab of this browser keeps the user's upload queue, the page says so instead of capturing, with "Use this
- * tab" (and why, when that tab can't hand it over). Fork-owned.
+ * tab" (and why, when that tab can't hand it over yet). Fork-owned.
  */
 definePageMeta({
   middleware: ["group-only"],
@@ -212,6 +216,7 @@ const {
   openCardsPage,
   queueElsewhere,
   queueKeptInMemoryElsewhere,
+  queueFrontWaitingElsewhere,
   uploadingLeftovers,
   takeOverQueue,
 } = useRecipeIngestUploads();
