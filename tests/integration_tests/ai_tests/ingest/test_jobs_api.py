@@ -390,10 +390,17 @@ def test_counts(api_client: TestClient, unique_user_fn_scoped: TestUser):
     seed_job(user, draft=banana_draft(steps=[CardDraftStep(text="Microwave for 2 minutes.")]))
     seed_job(user, status=IngestStatus.processing)
     seed_job(user, status=IngestStatus.failed)
+    # failed `limit_reached`: waits for the monthly limit to reset or be raised, then it's read again; not failed
+    seed_job(
+        user,
+        status=IngestStatus.failed,
+        error_code=IngestErrorCode.limit_reached.value,
+        auto_retry_at=utcnow() + timedelta(days=3),
+    )
 
     response = api_client.get(f"{JOBS}/counts", headers=user.token)
     assert response.status_code == 200
-    assert response.json() == {"processing": 1, "ready": 2, "needsAttention": 1, "failed": 1}
+    assert response.json() == {"processing": 1, "ready": 2, "needsAttention": 1, "failed": 1, "waiting": 1}
 
 
 def test_routes_answer_503_when_ingest_is_disabled(

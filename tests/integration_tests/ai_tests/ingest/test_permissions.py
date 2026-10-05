@@ -60,7 +60,7 @@ def test_another_households_card_is_a_404_everywhere(
     listed = api_client.get(JOBS, params={"perPage": -1}, headers=other.token).json()["items"]
     assert str(job_id) not in {item["id"] for item in listed}
     counts = api_client.get(f"{JOBS}/counts", headers=other.token).json()
-    assert counts == {"processing": 0, "ready": 0, "needsAttention": 0, "failed": 0}
+    assert counts == {"processing": 0, "ready": 0, "needsAttention": 0, "failed": 0, "waiting": 0}
 
     # nothing changed
     after = job_row(job_id)

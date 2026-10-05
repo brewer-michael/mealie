@@ -176,6 +176,12 @@ class RecipeIngestionJobCounts(MealieModel):
     needs_attention: int = 0
     """Ready cards with an unresolved error or warning"""
     failed: int = 0
+    """Cards that couldn't be read, not counting those waiting for a monthly limit"""
+    waiting: int = 0
+    """
+    Cards waiting for a monthly limit: they failed `limit_reached` and are read again automatically once it resets or
+    is raised (`auto_retry_at`)
+    """
 
 
 class RecipeIngestionBatchJob(MealieModel):

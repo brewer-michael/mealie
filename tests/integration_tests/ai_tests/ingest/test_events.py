@@ -7,6 +7,7 @@ claim's lease: at least once per notifier, given up on after `NOTIFY_ATTEMPTS`.
 
 import calendar
 import json
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -815,10 +816,13 @@ def _job_ids(batch_id: UUID) -> list[UUID]:
         return list(session.execute(stmt.order_by(RecipeIngestionJob.position)).scalars())
 
 
-def _arm(job_id: UUID) -> None:
-    """What the automatic retry does as it queues a card that waited for a monthly limit (the queueing commits)"""
+def _arm(job_id: UUID, *, reset: bool = False) -> None:
+    """
+    What the automatic retry does as it queues a card that waited for a monthly limit (the queueing commits): `reset`
+    when its limit's reset came, else a lift queued it
+    """
     with session_context() as session:
-        events.arm_limit_wave(session, job_id)
+        events.arm_limit_wave(session, {job_id: reset})
         session.commit()
 
 
@@ -831,8 +835,8 @@ def _set_notify(batch_id: UUID, **values: Any) -> None:
 def test_queueing_a_card_that_waited_arms_its_batch_again(unique_user_fn_scoped: TestUser, published: Outbox):
     user = unique_user_fn_scoped
     notifier(user, "json://first.local/hook")
-    batch_id = make_batch(user, "ready", "failed", "failed")
-    _, first, second = _job_ids(batch_id)
+    batch_id = make_batch(user, "ready", "failed", "failed", "failed")
+    _, first, second, third = _job_ids(batch_id)
     assert events.maybe_notify_batch(batch_id) is True
     hashes = notify_state(batch_id)["notify_delivered"]
 
@@ -842,26 +846,37 @@ def test_queueing_a_card_that_waited_arms_its_batch_again(unique_user_fn_scoped:
     assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"]) == (None, None, 0)
     assert state["notify_delivered"] == [f"limit-wave:{first}"]
 
-    # another card joins the wave still to come
-    _arm(second)
-    assert notify_state(batch_id)["notify_delivered"] == sorted([f"limit-wave:{first}", f"limit-wave:{second}"])
+    # another card joins the wave still to come; its entry says its reset queued it (a lift queued the first)
+    _arm(second, reset=True)
+    wave = sorted([f"limit-wave:{first}", f"limit-reset:{second}"])
+    assert notify_state(batch_id)["notify_delivered"] == wave
 
-    # a wave being sent starts over with the card that joined it, and the attempt in flight writes nothing more
+    # a wave being sent goes on for its own cards: one queued meanwhile is its next wave, not told of in this one
     with session_context() as session:
-        stale = events._claim(session, batch_id, utcnow())
-    assert stale is not None and stale.attempt == 1
-    _arm(second)
+        sending = events._claim(session, batch_id, utcnow())
+    assert sending is not None and sending.attempt == 1
+    claimed = notify_state(batch_id)
+    _arm(third)
     state = notify_state(batch_id)
-    assert (state["notify_claimed_at"], state["notify_attempts"]) == (None, 0)
-    assert state["notify_delivered"] == sorted([f"limit-wave:{first}", f"limit-wave:{second}"])
-    # the next attempt has the same number, but not the same lease: the stale one can't renew or record over it
+    assert (state["notify_claimed_at"], state["notify_attempts"]) == (
+        claimed["notify_claimed_at"],
+        claimed["notify_attempts"],
+    )
+    assert state["notify_delivered"] == sorted([*wave, f"next:limit-wave:{third}"])
+    # the attempt still holds it: its records keep the next wave, and its last one starts it
     with session_context() as session:
-        again = events._claim(session, batch_id, utcnow() + timedelta(seconds=1))
-        assert again is not None and again.attempt == stale.attempt
-        assert events._renew_claim(stale.lease) is False
-        assert events._record(session, stale.lease, hashes, notified_at=utcnow()) is False
-        assert events._renew_claim(again.lease) is True
-    assert notify_state(batch_id)["notified_at"] is None
+        assert events._renew_claim(sending.lease) is True
+        assert events._record(session, sending.lease, [*wave, *hashes]) is True
+        assert notify_state(batch_id)["notify_delivered"] == sorted([*wave, *hashes, f"next:limit-wave:{third}"])
+        assert events._record(session, sending.lease, [*wave, *hashes], notified_at=utcnow()) is True
+    assert sending.lease.next_wave is True
+    state = notify_state(batch_id)
+    assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"]) == (None, None, 0)
+    assert state["notify_delivered"] == [f"limit-wave:{third}"]
+    # and that attempt writes nothing more
+    with session_context() as session:
+        assert events._renew_claim(sending.lease) is False
+        assert events._record(session, sending.lease, hashes, notified_at=utcnow()) is False
 
     # a batch whose own notification is still to come counts the card as it is once read: nothing changes
     other = make_batch(user, "failed")
@@ -870,20 +885,47 @@ def test_queueing_a_card_that_waited_arms_its_batch_again(unique_user_fn_scoped:
     _arm(card)
     assert notify_state(other) == before
 
-    # one being sent (or waiting to be tried again) starts over, so it counts the card once read
+    # one being sent (or waiting to be tried again) goes on as it is, and the card is its next wave
     with session_context() as session:
-        stale = events._claim(session, other, utcnow())
-    assert stale is not None
-    _arm(card)
+        own = events._claim(session, other, utcnow())
+    assert own is not None
+    _arm(card, reset=True)
+    assert notify_state(other)["notify_delivered"] == [f"next:limit-reset:{card}"]
+    with session_context() as session:
+        assert events._record(session, own.lease, [], notified_at=utcnow()) is True
     state = notify_state(other)
     assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"], state["notify_delivered"]) == (
         None,
         None,
         0,
-        [],
+        [f"limit-reset:{card}"],
     )
+
+
+def test_a_notification_given_up_on_starts_its_next_wave(unique_user_fn_scoped: TestUser, published: Outbox):
+    """The last attempt's process died while a card was queued: giving up on it still tells of that card once read"""
+    notifier(unique_user_fn_scoped, "json://ha.local/hook")
+    batch_id = make_batch(unique_user_fn_scoped, "ready", "failed")
+    _, card = _job_ids(batch_id)
+    now = utcnow()
+    _set_notify(batch_id, notify_attempts=limits.NOTIFY_ATTEMPTS, notify_claimed_at=now)  # the last attempt, dying
+    _arm(card)
+    assert notify_state(batch_id)["notify_delivered"] == [f"next:limit-wave:{card}"]
+
     with session_context() as session:
-        assert events._record(session, stale.lease, [], notified_at=utcnow()) is False
+        assert batch_id in events.give_up_batches(session, now + LEASE)
+    state = notify_state(batch_id)
+    assert (state["notified_at"], state["notify_claimed_at"], state["notify_attempts"], state["notify_delivered"]) == (
+        None,
+        None,
+        0,
+        [f"limit-wave:{card}"],
+    )
+    _read(card)
+    assert events.maybe_notify_batch(batch_id) is True
+    [wave] = for_batch(published, batch_id)
+    assert wave.data.job_ids == [card]
+    assert wave.event.message.body.startswith("1 card that waited for the monthly limit was read.")
 
 
 # ==================================================================================================================
@@ -1006,8 +1048,8 @@ def test_a_card_queued_while_its_wave_is_claimed_is_in_the_wave(
     arming: dict[str, threading.Thread] = {}
     arm = events.arm_limit_wave
 
-    def arm_and_mark(session: Session, job_id: UUID) -> None:
-        arm(session, job_id)
+    def arm_and_mark(session: Session, queued: dict[UUID, bool]) -> None:
+        arm(session, queued)
         arming["thread"] = threading.current_thread()
 
     def before_commit(session: Session) -> None:
@@ -1047,8 +1089,8 @@ def test_a_card_queued_while_its_batch_is_claimed_is_counted_once_read(
 ):
     """
     The retry phase queues a card that waited while the batch's last card finishes and claims the batch's own
-    notification. The queueing waits for the claim's commit, finds it and starts the notification over, so once the
-    card is read the batch is told again, counting it. (On PostgreSQL the queueing read the batch's state without
+    notification. The queueing waits for the claim's commit and finds it: the notification goes on as it is, and the
+    card is the batch's next wave, told of once it's read. (On PostgreSQL the queueing read the batch's state without
     waiting for the claim, found nothing claimed and left it: the card was never counted.)
     """
     user = unique_user_fn_scoped
@@ -1094,15 +1136,248 @@ def test_a_card_queued_while_its_batch_is_claimed_is_counted_once_read(
     finally:
         sa.event.remove(db_setup.engine, "after_cursor_execute", after_execute)
 
-    told = len(for_batch(published, batch_id))
+    # the batch's notification never counts the card as read: it waited still, or was queued (and isn't counted) by
+    # the time the notification was put together
+    [own] = for_batch(published, batch_id)
+    assert (own.data.ready_count, own.data.failed_count) == (2, 0) and own.data.waiting_count in (0, 1)
     _read(waiting)
-    assert events.maybe_notify_batch(batch_id) is True  # the card is told once read
-    [sent] = for_batch(published, batch_id)[told:]
-    # the batch's notification started over (and counts it), or went out first and the card is a wave of its own
-    if sent.data.job_ids == [waiting]:
-        assert sent.event.message.body.startswith("1 card that waited for the monthly limit was read.")
-    else:
-        assert (sent.data.ready_count, sent.data.failed_count) == (3, 0)
+    assert events.maybe_notify_batch(batch_id) is True  # the card is told once read, in a wave of its own
+    [_, sent] = for_batch(published, batch_id)
+    assert sent.data.job_ids == [waiting]
+    assert sent.event.message.body.startswith("1 card that waited for the monthly limit was read.")
+
+
+def _waiting_list(monkeypatch: pytest.MonkeyPatch, *order: UUID) -> list[UUID]:
+    """
+    The retry phase's list of waiting cards: those of `order` that wait, in that order. The list returned is `order`:
+    change it for the next run.
+    """
+    listing = list(order)
+    waiting_for_limit = IngestQueue.waiting_for_limit
+
+    def listed(self: IngestQueue) -> list[LimitWait]:
+        waits = {wait.job_id: wait for wait in waiting_for_limit(self) if wait.job_id in listing}
+        return [waits[job_id] for job_id in listing if job_id in waits]
+
+    monkeypatch.setattr(IngestQueue, "waiting_for_limit", listed)
+    return listing
+
+
+def _status(job_id: UUID) -> str:
+    with session_context() as session:
+        stmt = sa.select(RecipeIngestionJob.status).where(RecipeIngestionJob.id == job_id)
+        return session.execute(stmt).scalar_one()
+
+
+def test_the_waiting_cards_are_listed_batch_by_batch(unique_user_fn_scoped: TestUser):
+    """On a reset day every card has the same retry time: each batch's cards come together, in capture order"""
+    user = unique_user_fn_scoped
+    batches = [make_batch(user, "waiting", "waiting", "waiting") for _ in range(3)]
+    cards = {job_id: batch_id for batch_id in batches for job_id in _job_ids(batch_id)}
+    with session_context() as session:
+        listed = [wait for wait in IngestQueue(session).waiting_for_limit() if wait.job_id in cards]
+
+    assert [wait.batch_id for wait in listed] == [cards[wait.job_id] for wait in listed]
+    order = [wait.batch_id for wait in listed]
+    assert order == sorted(order, key=order.index)  # one run of each batch
+    for batch_id in batches:
+        assert [wait.job_id for wait in listed if wait.batch_id == batch_id] == _job_ids(batch_id)
+
+
+def test_a_batchs_waiting_cards_are_queued_together(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    One retry run queues every household's due cards, another batch's between this one's (by their list): each batch's
+    are queued in one transaction, so a dispatcher that reads one of them right away finds its batch-mate being read
+    too, and the batch gets one wave for both. (Queued one by one, the first was read and told of in a wave of its own
+    before the run reached the second.)
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready", "waiting", "waiting")
+    other = make_batch(user, "waiting")
+    _, first, second = _job_ids(batch_id)
+    [between] = _job_ids(other)
+    for batch in (batch_id, other):
+        assert events.maybe_notify_batch(batch) is True
+    told = len(for_batch(published, batch_id))
+    for job_id in (first, between, second):
+        _waits_for_its_reset(job_id)
+    _waiting_list(monkeypatch, first, between, second)
+
+    batch_mate: list[str] = []
+    """The second card's status when a dispatcher read the first"""
+
+    def after_commit(session: Session) -> None:
+        # a dispatcher reads the first card as soon as it's queued, and its finalize notifies the batch
+        if not batch_mate and _status(first) == IngestStatus.processing.value:
+            batch_mate.append(_status(second))
+            _read(first)
+            events.maybe_notify_batch(batch_id)
+
+    sa.event.listen(Session, "after_commit", after_commit)
+    try:
+        assert retries.retry_waiting(utcnow()) == 3
+    finally:
+        sa.event.remove(Session, "after_commit", after_commit)
+    assert batch_mate == [IngestStatus.processing.value]  # queued with it, so it's still being read
+
+    _read(second)
+    assert events.maybe_notify_batch(batch_id) is True
+    [wave] = for_batch(published, batch_id)[told:]
+    assert wave.data.job_ids == [first, second]
+    assert wave.event.message.body.startswith("2 cards that waited for the monthly limit were read.")
+
+
+def test_a_card_queued_while_its_wave_is_being_sent_is_the_next_wave(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Wave [C1] is claimed and being sent when the retry phase queues C2. The send goes on for C1, whose counts it has
+    right, and C2 is the batch's next wave, told of once it's read: each card is told of once. (The wave used to start
+    over with both, after its notifiers already had it: they heard of C1 twice.)
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready", "waiting", "waiting")
+    _, c1, c2 = _job_ids(batch_id)
+    assert events.maybe_notify_batch(batch_id) is True
+    told = len(for_batch(published, batch_id))
+    listing = _waiting_list(monkeypatch, c1)
+    _waits_for_its_reset(c1)
+    assert retries.retry_waiting(utcnow()) == 1
+    _read(c1)
+
+    sending, go_on = threading.Event(), threading.Event()
+    deliver = published.deliver
+
+    def deliver_slowly(event: events.AIEvent, url: str) -> bool:
+        if not sending.is_set():
+            sending.set()
+            assert go_on.wait(30)
+        return deliver(event, url)
+
+    monkeypatch.setattr(events, "deliver", deliver_slowly)
+    try:
+        finalize = _Running(lambda: events.maybe_notify_batch(batch_id))  # C1's finalize sends its wave
+        assert sending.wait(30)
+        claimed = notify_state(batch_id)
+        listing[:] = [c2]
+        _waits_for_its_reset(c2)
+        assert retries.retry_waiting(utcnow()) == 1
+        state = notify_state(batch_id)
+        assert (state["notify_claimed_at"], state["notify_attempts"]) == (
+            claimed["notify_claimed_at"],
+            claimed["notify_attempts"],
+        )
+        assert f"next:limit-reset:{c2}" in state["notify_delivered"]
+    finally:
+        go_on.set()
+    assert finalize.join() is True
+
+    state = notify_state(batch_id)
+    assert (state["notified_at"], state["notify_claimed_at"], state["notify_delivered"]) == (
+        None,
+        None,
+        [f"limit-reset:{c2}"],
+    )
+    _read(c2)
+    assert events.maybe_notify_batch(batch_id) is True
+    waves = for_batch(published, batch_id)[told:]
+    assert [wave.data.job_ids for wave in waves] == [[c1], [c2]]
+    assert all(w.event.message.body.startswith("1 card that waited for the monthly limit was read.") for w in waves)
+    assert published.delivered_to(batch_id, "ha.local") == told + 2
+
+
+def test_a_card_read_while_its_wave_was_being_sent_is_told_of_right_after(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """The next wave's card was read before the wave in flight was done: its finalize found it claimed, so the
+    attempt that starts the next wave sends it too"""
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    batch_id = make_batch(user, "ready", "waiting", "waiting")
+    _, c1, c2 = _job_ids(batch_id)
+    assert events.maybe_notify_batch(batch_id) is True
+    told = len(for_batch(published, batch_id))
+    listing = _waiting_list(monkeypatch, c1)
+    _waits_for_its_reset(c1)
+    assert retries.retry_waiting(utcnow()) == 1
+    _read(c1)
+
+    sending, go_on = threading.Event(), threading.Event()
+    deliver = published.deliver
+
+    def deliver_slowly(event: events.AIEvent, url: str) -> bool:
+        if not sending.is_set():
+            sending.set()
+            assert go_on.wait(30)
+        return deliver(event, url)
+
+    monkeypatch.setattr(events, "deliver", deliver_slowly)
+    try:
+        finalize = _Running(lambda: events.maybe_notify_batch(batch_id))
+        assert sending.wait(30)
+        listing[:] = [c2]
+        _waits_for_its_reset(c2)
+        assert retries.retry_waiting(utcnow()) == 1
+        _read(c2)
+        assert events.maybe_notify_batch(batch_id) is False  # C2's finalize: the wave is being sent
+    finally:
+        go_on.set()
+    assert finalize.join() is True
+
+    waves = for_batch(published, batch_id)[told:]
+    assert [wave.data.job_ids for wave in waves] == [[c1], [c2]]
+    assert notify_state(batch_id)["notified_at"] is not None
+
+
+def test_no_card_is_told_of_twice_when_its_queueing_races_its_wave(
+    unique_user_fn_scoped: TestUser, published: Outbox, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    C1's read and its wave run at the same time as C2's queueing, in every interleaving the two threads happen to
+    take: each card is told of once, as read, whether in one wave or two
+    """
+    user = unique_user_fn_scoped
+    notifier(user, "json://ha.local/hook")
+    allowed = _waiting_list(monkeypatch)
+    rng = random.Random(6)
+
+    for _ in range(20):
+        batch_id = make_batch(user, "ready", "waiting", "waiting")
+        _, c1, c2 = _job_ids(batch_id)
+        assert events.maybe_notify_batch(batch_id) is True
+        told = len(for_batch(published, batch_id))
+        allowed[:] = [c1]
+        _waits_for_its_reset(c1)
+        assert retries.retry_waiting(utcnow()) == 1
+        allowed[:] = [c2]
+        _waits_for_its_reset(c2)
+        delays = (rng.random() * 0.01, rng.random() * 0.01)
+
+        def finish_c1(delay: float = delays[0], batch_id: UUID = batch_id, c1: UUID = c1) -> bool:
+            time.sleep(delay)
+            _read(c1)
+            return events.maybe_notify_batch(batch_id)
+
+        def queue_c2(delay: float = delays[1]) -> int:
+            time.sleep(delay)
+            return retries.retry_waiting(utcnow())
+
+        finishing, queueing = _Running(finish_c1), _Running(queue_c2)
+        finishing.join()
+        assert queueing.join() == 1
+        _read(c2)
+        events.maybe_notify_batch(batch_id)
+        events.housekeeping(utcnow() + LEASE)  # anything left claimed
+
+        waves = for_batch(published, batch_id)[told:]
+        told_of = [job_id for wave in waves for job_id in wave.data.job_ids]
+        assert sorted(told_of) == sorted([c1, c2]), [w.event.message.body for w in waves]
+        assert all("waited for the monthly limit" in wave.event.message.body for wave in waves)
+        assert notify_state(batch_id)["notified_at"] is not None
 
 
 def test_a_batch_housekeeping_reaches_late_gets_a_full_lease(

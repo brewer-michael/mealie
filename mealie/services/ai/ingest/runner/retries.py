@@ -14,9 +14,11 @@ so the card fails `limit_reached` again while the check keeps saying "lifted") q
 `LIMIT_RECHECK_INTERVAL`, then twice that, and so on up to `LIFT_RETRY_MAX_WAIT`, until its reset. That wait is kept on
 the card (`lift_retries`, `lift_retry_at`), so every worker process keeps it.
 
-Queueing a card also arms its batch's notification again (`events.arm_limit_wave`, in the queueing's transaction, once
-the card was queued), so the household hears once the cards that waited are read: one notification per batch for the
-cards queued together.
+A batch's cards that are due are queued together, in one transaction under the household's intake lock, which also
+arms the batch's notification again (`events.arm_limit_wave`, once the cards were queued), so the household hears once
+the cards that waited are read: one notification for the batch's cards queued together, however many other batches'
+cards the run queues around them. Each card is kept in it with why it was queued (its reset came, or a lift), so a
+card that waits again after its reset is told so.
 
 Everything here is a conditional update on the card still waiting as the run read it, so every worker process running
 it is harmless: a run working from a list another process has acted on since queues nothing and arms nothing.
@@ -130,8 +132,9 @@ def forget_checks() -> None:
 
 def retry_waiting(now: datetime) -> int:
     """
-    Reads again the cards waiting for a monthly limit whose retry time has come or whose limit no longer applies;
-    how many were queued (wake the dispatcher then). Stops quietly while a backup restore pauses ingestion.
+    Reads again the cards waiting for a monthly limit whose retry time has come or whose limit no longer applies, each
+    batch's together; how many were queued (wake the dispatcher then). Stops quietly while a backup restore pauses
+    ingestion.
     """
     if storage.is_paused():
         return 0
@@ -140,43 +143,85 @@ def retry_waiting(now: datetime) -> int:
     if not waiting:
         return 0
 
-    group_local_only: dict[UUID, bool] = {}
-    this_run: dict[_LimitKey, bool] = {}
-    retried = 0
+    batches: dict[UUID, list[LimitWait]] = {}
     for wait in waiting:
+        batches.setdefault(wait.batch_id, []).append(wait)  # the soonest retry first, as listed
+
+    run = _Run(now)
+    retried = 0
+    for waits in batches.values():
         if storage.is_paused():
             break
         try:
-            due = wait.auto_retry_at <= now
-            next_lift_at: datetime | None = None
-            if not due:
-                if wait.group_id not in group_local_only:
-                    with session_context() as session:
-                        group_local_only[wait.group_id] = (
-                            IngestRepos(session, wait.group_id, None).settings.get().local_only
-                        )
-                        session.commit()
-                if not _lifted(wait, group_local_only[wait.group_id], this_run):
-                    continue
-                if wait.lift_retry_at is not None and wait.lift_retry_at > now:
-                    continue  # the last lift didn't help it: it waits a while before the next one reads it
-                next_lift_at = now + timedelta(seconds=lift_wait(wait.lift_retries + 1))
-            with session_context() as session:
-                # the household's intake lock before the card's row, as every writer of its cards takes them
-                lock_household_intake(session, wait.household_id)
-                if not IngestQueue(session).retry_after_limit(wait, now, next_lift_at=next_lift_at, commit=False):
-                    # no longer waiting as read: queued by another process, retried by hand, read or discarded
-                    session.rollback()
-                    continue
-                # the batch notifies again once the card is read (its notification went out when it failed), armed
-                # in the queueing's transaction, now that the card is queued
-                events.arm_limit_wave(session, wait.job_id)
-                session.commit()
-            retried += 1
-            reason = "its retry time has come" if due else "its monthly limit no longer applies"
-            logger.info(f"Recipe card job {wait.job_id}: read again, {reason}")
+            retried += _retry_batch(waits, run)
         except Exception as e:
             if storage.is_paused():
                 break  # a backup restore began: the rows are being replaced
-            logger.error(f"Recipe card job {wait.job_id}: couldn't queue it again after its limit:\n{safe_trace(e)}")
+            logger.error(
+                f"Recipe card batch {waits[0].batch_id}: couldn't queue its cards again after their limit:\n"
+                f"{safe_trace(e)}"
+            )
     return retried
+
+
+class _Run:
+    """One run of the retry phase: its time, and what it found out once for every batch"""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+        self.group_local_only: dict[UUID, bool] = {}
+        self.lifted: dict[_LimitKey, bool] = {}
+
+    def next_lift_at(self, wait: LimitWait) -> datetime | None:
+        """
+        When a lift may queue the card again should it not help, if a lift queues it now: its limit no longer applies
+        and its last lift's wait is over. None when it isn't to be queued by a lift now.
+        """
+        if wait.group_id not in self.group_local_only:
+            with session_context() as session:
+                settings = IngestRepos(session, wait.group_id, None).settings.get()
+                session.commit()
+            self.group_local_only[wait.group_id] = settings.local_only
+        if not _lifted(wait, self.group_local_only[wait.group_id], self.lifted):
+            return None
+        if wait.lift_retry_at is not None and wait.lift_retry_at > self.now:
+            return None  # the last lift didn't help it: it waits a while before the next one reads it
+        return self.now + timedelta(seconds=lift_wait(wait.lift_retries + 1))
+
+
+def _retry_batch(waits: list[LimitWait], run: _Run) -> int:
+    """
+    Queues the batch's cards (`waits`) whose retry time has come or whose limit no longer applies, together: in one
+    transaction under the household's intake lock, which arms the batch's notification once for all of them. How many.
+    """
+    due: list[tuple[LimitWait, datetime | None]] = []
+    for wait in waits:
+        if wait.auto_retry_at <= run.now:
+            due.append((wait, None))
+        elif (next_lift_at := run.next_lift_at(wait)) is not None:
+            due.append((wait, next_lift_at))
+    if not due:
+        return 0
+
+    queued: dict[UUID, bool] = {}
+    """Each card queued, with whether its reset came (else a lift queued it)"""
+    with session_context() as session:
+        # the household's intake lock before the cards' rows, as every writer of its cards takes them
+        lock_household_intake(session, waits[0].household_id)
+        queue = IngestQueue(session)
+        for wait, next_lift_at in due:
+            # False: no longer waiting as read (queued by another process, retried by hand, read or discarded)
+            if queue.retry_after_limit(wait, run.now, next_lift_at=next_lift_at, commit=False):
+                queued[wait.job_id] = next_lift_at is None
+        if not queued:
+            session.rollback()
+            return 0
+        # the batch notifies again once the cards are read (its notification went out when they failed), armed in
+        # the queueing's transaction, now that they're queued
+        events.arm_limit_wave(session, queued)
+        session.commit()
+
+    for job_id, reset in queued.items():
+        reason = "its retry time has come" if reset else "its monthly limit no longer applies"
+        logger.info(f"Recipe card job {job_id}: read again, {reason}")
+    return len(queued)

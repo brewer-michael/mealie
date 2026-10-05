@@ -29,6 +29,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import struct
@@ -38,7 +39,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -680,8 +681,58 @@ _UNCONFINED = "unconfined"
 _TIME_LIMIT_SIGNALS = (-signal.SIGKILL, -signal.SIGXCPU)
 """The exit statuses of a renderer stopped by its CPU time limit (`RLIMIT_CPU`, soft and hard alike)"""
 RENDER_OUTPUT_GRACE = 5.0
-"""Seconds the renderer's output may take to end once it's killed: what still holds it then is left behind"""
+"""
+Seconds past its time limit the renderer's output may take to end once it's killed: then it's closed, whatever still
+holds it (a process the renderer started that left its group), and that process is left behind
+"""
+_OUTPUT_POLL = 0.25
+"""The longest a read of the renderer's output waits before it checks again whether it's to stop"""
 _sandbox_logged = False
+
+
+class _OutputGaveUp(Exception):
+    """The read of the renderer's output stopped: its deadline passed, or it was closed"""
+
+
+class _Output:
+    """
+    The renderer's stdout, read straight from its pipe (non-blocking, waiting with `poll`) until `until` (a
+    `time.monotonic()` time) at the latest, and no longer once `stopped()`: a process the renderer started that left
+    its group (where nothing confines it, `AI_INGEST_PDF_UNCONFINED`, as root) may hold the pipe's write end for as
+    long as it lives, and a read waiting for it would hold the reading thread and the pipe as long. Where there's no
+    `poll` (Windows, which has no process groups either), reads block until the renderer's output ends.
+    """
+
+    def __init__(self, stream: BinaryIO, until: float, stopped: Callable[[], bool]) -> None:
+        self._stream = stream
+        self._until = until
+        self._stopped = stopped
+        self._poll: select.poll | None = None
+        if hasattr(select, "poll"):
+            self._fd = stream.fileno()
+            os.set_blocking(self._fd, False)
+            self._poll = select.poll()
+            self._poll.register(self._fd, select.POLLIN)
+
+    def read(self, size: int) -> bytes:
+        """`size` bytes, fewer only at the output's end; `_OutputGaveUp` once the deadline passed or it's stopped"""
+        if self._poll is None:
+            return self._stream.read(size)
+        data = bytearray()
+        while len(data) < size:
+            wait = self._until - time.monotonic()
+            if wait <= 0 or self._stopped():
+                raise _OutputGaveUp()
+            if not self._poll.poll(math.ceil(min(wait, _OUTPUT_POLL) * 1000)):
+                continue
+            try:
+                chunk = os.read(self._fd, size - len(data))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break  # its end: every process holding it has closed it
+            data += chunk
+        return bytes(data)
 
 
 class _RenderedFrames:
@@ -692,21 +743,27 @@ class _RenderedFrames:
         self.result: dict | None = None
         self.broken = False
         self.closed = False
+        self.gave_up = False
+        """The output was still open at the read's deadline: something the renderer started holds it"""
 
-    def read(self, stream: BinaryIO) -> None:
+    def read(self, stream: BinaryIO, until: float) -> None:
         """
-        The frames up to the result, then `stream` closed: by this thread, as closing it from another while a read
-        waits for the renderer would wait too
+        The frames up to the result, read until `until` (a `time.monotonic()` time) at the latest, then `stream`
+        closed: by this thread, as closing it from another while a read waits for the renderer would wait too. The
+        thread ends by `until` whatever still holds the output (`_Output`).
         """
         try:
-            self._read(stream)
+            self._read(stream, until)
         finally:
             stream.close()
+            if self.closed:
+                self._close_pages()  # a page it began after `close`
 
-    def _read(self, stream: BinaryIO) -> None:
+    def _read(self, stream: BinaryIO, until: float) -> None:
         try:
+            output = _Output(stream, until, lambda: self.closed)
             while self.result is None and not self.closed:
-                header = stream.read(_FRAME_HEADER)
+                header = output.read(_FRAME_HEADER)
                 if len(header) < _FRAME_HEADER:
                     return  # it ended without a result: crashed, or killed
                 kind, length = header[:1], int.from_bytes(header[1:], "big")
@@ -715,16 +772,19 @@ class _RenderedFrames:
                     and length <= MAX_RENDERED_PAGE_BYTES
                     and len(self.pages) < limits.MAX_PAGES_PER_CARD
                 ):
-                    self._read_page(stream, length)
+                    self._read_page(output, length)
                 elif kind == _RESULT_FRAME and length <= MAX_RESULT_BYTES:
-                    self.result = self._read_result(stream, length)
+                    self.result = self._read_result(output, length)
                 else:
                     self.broken = True  # an unknown frame, too large, or a page too many: nothing after it is read
                     return
+        except _OutputGaveUp:
+            self.broken = True
+            self.gave_up = not self.closed
         except OSError, ValueError, _BrokenFrame:
             self.broken = True
 
-    def _read_page(self, stream: BinaryIO, length: int) -> None:
+    def _read_page(self, stream: _Output, length: int) -> None:
         page: SpooledTemporaryFile[bytes] = SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
         self.pages.append(page)
         left = length
@@ -737,7 +797,7 @@ class _RenderedFrames:
         page.seek(0)
 
     @staticmethod
-    def _read_result(stream: BinaryIO, length: int) -> dict:
+    def _read_result(stream: _Output, length: int) -> dict:
         data = stream.read(length)
         if len(data) < length:
             raise _BrokenFrame()
@@ -747,8 +807,11 @@ class _RenderedFrames:
         return result
 
     def close(self) -> None:
-        self.closed = True  # a reader left behind (`_run_renderer`) stops at its next frame
-        for page in self.pages:
+        self.closed = True  # a reader still running stops within `_OUTPUT_POLL`
+        self._close_pages()
+
+    def _close_pages(self) -> None:
+        for page in list(self.pages):
             page.close()
 
 
@@ -858,8 +921,11 @@ def _run_renderer(document: Path) -> _RenderedFrames:
 
     frames = _RenderedFrames()
     assert process.stdout is not None
-    # the reader closes the renderer's stdout once it's done with it
-    reader = threading.Thread(target=frames.read, args=(process.stdout,), name="pdf-render-output", daemon=True)
+    # the reader closes the renderer's stdout once it's done with it, by the time limit and its grace at the latest
+    output_until = deadline + RENDER_OUTPUT_GRACE
+    reader = threading.Thread(
+        target=frames.read, args=(process.stdout, output_until), name="pdf-render-output", daemon=True
+    )
     reader.start()
     timed_out = False
     try:
@@ -873,14 +939,18 @@ def _run_renderer(document: Path) -> _RenderedFrames:
                 timed_out = True
         if timed_out or frames.broken:
             _stop_renderer(process)
-            reader.join(RENDER_OUTPUT_GRACE)  # its output ends with it
-            if reader.is_alive():
-                # a process it started that left its group still holds the output: the reader is left to end with
-                # it, and the render slot isn't held for it
-                logger.warning("A process the PDF renderer started outlived it; it was left behind")
+            # its output ends with it; what still holds it then (a process it started that left its group) doesn't
+            # hold the reader: it closes the output at `output_until`
+            reader.join(max(0.0, output_until - time.monotonic()) + _OUTPUT_POLL)
+            if frames.gave_up or reader.is_alive():
+                logger.warning(
+                    "A process the PDF renderer started outlived it, holding its output: the output was closed, "
+                    "and the process left behind"
+                )
         returncode = process.wait()
     except BaseException:
-        _stop_renderer(process)  # this thread was interrupted: the renderer doesn't outlive it
+        frames.close()  # this thread was interrupted: the reader stops, and the renderer doesn't outlive it
+        _stop_renderer(process)
         raise
 
     if timed_out or (not frames.broken and returncode in _TIME_LIMIT_SIGNALS):

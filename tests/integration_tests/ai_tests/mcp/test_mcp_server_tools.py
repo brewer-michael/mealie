@@ -169,7 +169,14 @@ def test_read_tools_return_what_rest_returns(api_client: TestClient, unique_user
     assert [r["slug"] for r in by_name["suggest_from_ingredients"]["recipes"]] == [recipe.slug]
     assert [e["recipe_slug"] for e in by_name["whats_planned"]["entries"]] == [recipe.slug]
     assert sorted(item["text"] for item in by_name["get_shopping_list"]["items"]) == ["eggs", "milk"]
-    assert set(by_name["recipe_card_queue"]) == {"speech", "ready", "needs_attention", "processing", "failed"}
+    assert set(by_name["recipe_card_queue"]) == {
+        "speech",
+        "ready",
+        "needs_attention",
+        "processing",
+        "failed",
+        "waiting",
+    }
 
 
 def test_results_are_compact_json(read_token: str):

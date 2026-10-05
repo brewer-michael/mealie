@@ -417,6 +417,7 @@ export interface RecipeIngestionJobCounts {
   ready?: number;
   needsAttention?: number;
   failed?: number;
+  waiting?: number;
 }
 export interface RecipeIngestionJobError {
   code: IngestErrorCode;

@@ -9,6 +9,7 @@ import signal
 import struct
 import sys
 import tempfile
+import threading
 import time
 import zlib
 from collections.abc import Iterator
@@ -1276,26 +1277,71 @@ def test_a_process_the_renderer_started_is_stopped_with_it(fake_renderer, monkey
     assert not _running(pid)
 
 
+def _output_readers() -> set[threading.Thread]:
+    return {thread for thread in threading.enumerate() if thread.name == "pdf-render-output"}
+
+
+def _open_pipes() -> set[str]:
+    """This process's open pipe ends, by fd and pipe"""
+    pipes: set[str] = set()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue  # closed meanwhile
+        if target.startswith("pipe:"):
+            pipes.add(f"{fd}:{target}")
+    return pipes
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="process groups and /proc: Linux")
 def test_a_process_that_left_the_renderers_group_doesnt_hold_the_render(
     fake_renderer, monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
-    # one that left the group (setsid) outlives the kill and keeps the output open: the wait for the output is bounded,
-    # so the render still ends at its time limit (the render slot isn't held until that process ends), with a warning
+    # one that left the group (setsid) outlives the kill and keeps the output open, as one a hostile PDF started could
+    # where nothing confines the renderer (`AI_INGEST_PDF_UNCONFINED`, as root): the render still ends at its time
+    # limit, with a warning, and nothing of the server's stays with that process: the thread that read the output is
+    # gone and its end of the pipe closed (a write then fails there, not here)
     pidfile = tmp_path / "started.pid"
     fake_renderer(_forking_renderer(pidfile, leave_group=True))
     monkeypatch.setattr(images, "pdf_render_timeout", lambda: 1.0)
     monkeypatch.setattr(images, "RENDER_OUTPUT_GRACE", 0.5)
     warnings: list[str] = []
     monkeypatch.setattr(images.logger, "warning", warnings.append)
+    readers, pipes = _output_readers(), _open_pipes()
     try:
         started = time.monotonic()
         with pytest.raises(images.RenderTimedOut):
             images.expand_document(io.BytesIO(_pdf_of(RED, size=(30, 20))))
         assert time.monotonic() - started < 5
         assert any("outlived" in message for message in warnings)
+        assert _running(_started_process(pidfile))  # it's still there, holding its end of the pipe
+        assert _output_readers() - readers == set()
+        assert _open_pipes() - pipes == set()
     finally:
         os.kill(_started_process(pidfile), signal.SIGKILL)
+
+
+def test_the_renderers_output_is_read_until_its_deadline_only():
+    # half a frame, then nothing, while the write end stays open (as an escaped process may keep it): the read gives up
+    # at its deadline by itself and closes its end, so the writer's next write fails there
+    read, write = os.pipe()
+    try:
+        os.write(write, b"P" + (64).to_bytes(8, "big") + b"png")
+        frames = images._RenderedFrames()
+        reader = threading.Thread(target=frames.read, args=(os.fdopen(read, "rb"), time.monotonic() + 0.5))
+        started = time.monotonic()
+        reader.start()
+        reader.join(5)
+        assert not reader.is_alive()
+        assert 0.4 < time.monotonic() - started < 3
+        assert frames.broken and frames.gave_up
+        assert frames.result is None
+        frames.close()  # the page it began
+        with pytest.raises(BrokenPipeError):
+            os.write(write, b"more")
+    finally:
+        os.close(write)
 
 
 def test_a_pdf_that_takes_too_much_cpu_time_is_stopped_by_its_limit(monkeypatch: pytest.MonkeyPatch):

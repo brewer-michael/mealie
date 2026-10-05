@@ -146,7 +146,10 @@ class RecipeIngestJobsController(IngestController):
 
     @router.get("/jobs/counts", response_model=RecipeIngestionJobCounts)
     def get_counts(self) -> RecipeIngestionJobCounts:
-        """Processing, ready, ready with something to check, and failed cards (the sidebar and HA's sensor)"""
+        """
+        Processing, ready, ready with something to check, failed cards, and those waiting for a monthly limit (not
+        failed: read again automatically) (the sidebar and HA's sensor)
+        """
         with self._answer():
             return self.review.counts()
 

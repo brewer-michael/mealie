@@ -25,15 +25,20 @@ or "Recipe cards waiting" when its only cards to tell of wait for a monthly limi
 **Cards that waited for a monthly limit.** A card that failed `limit_reached` is read again automatically later
 (`runner/retries.py`), at the next reset or sooner once the limit is raised. Its batch's notification says it waits,
 never that it failed ("2 cards are waiting for the monthly limit. They'll be read when it resets on Nov 1, or sooner if
-it's raised.", after what the batch's other cards came to; `waiting_count`, apart from `failed_count`). Queueing it
-again arms the batch's notification again for a "wave" (`arm_limit_wave`, in the queueing's transaction, once the card
-was queued): `notified_at` and the attempt are cleared and the card's id is kept in `notify_delivered`
-(`limit-wave:<job id>`, beside the delivery hashes). Once none of the batch's cards is still being read, the
-notification goes out as above, at least once per notifier, counting only the wave's cards that were read ("2 cards
-that waited for the monthly limit were read. 1 card is ready to review (1 failed)."), one per batch for the cards
-queued together. When none of them was read (each failed `limit_reached` again, and waits on), nothing is sent. A claim
-re-checks, in a statement of its own, that no card of the batch is being read: on PostgreSQL its conditional update
-may have waited for a queueing's commit and checked the cards as they were before it.
+it's raised.", after what the batch's other cards came to; `waiting_count`, apart from `failed_count`). The retry
+queues a batch's due cards together, and that arms the batch's notification again for a "wave" (`arm_limit_wave`, in
+the queueing's transaction, once the cards were queued): `notified_at` and the attempt are cleared and the cards' ids
+are kept in `notify_delivered` (`limit-reset:<job id>` for a card its reset queued, `limit-wave:<job id>` for one a
+lift queued, beside the delivery hashes). Once none of the batch's cards is still being read, the notification goes
+out as above, at least once per notifier, telling of the wave's cards only: those that were read, then those that
+still wait (each failed `limit_reached` again) with their new date ("1 card that waited for the monthly limit was read.
+1 card is ready to review. 2 cards still wait for the monthly limit. They'll be read when it resets on Dec 1, or
+sooner if it's raised."). When none of them was read, it's sent only if a card its reset queued waits again ("Recipe
+cards waiting"): the batch was told it would be read then. A lift that didn't help tells nobody, since its backoff
+reads the card again and again. Cards queued while the batch's notification is being sent (claimed, its own or a
+wave's) don't change it: they're its next wave (`next:<entry>`), which its last record starts, so no notifier hears
+of a card twice. A claim re-checks, in a statement of its own, that no card of the batch is being read: on PostgreSQL
+its conditional update may have waited for a queueing's commit and checked the cards as they were before it.
 
 **Counts and a link only:** no card names or text, since notifications leave the server. Logs name a notifier by its
 id and name, never by its URL, which holds its secrets.
@@ -47,7 +52,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import partial
@@ -67,8 +72,8 @@ from mealie.db.models.group import Group
 from mealie.db.models.household.events import GroupEventNotifierModel
 from mealie.db.models.recipe_ingest import RecipeIngestionBatch, RecipeIngestionJob
 from mealie.lang.providers import Translator
-from mealie.repos.repository_recipe_ingest import IngestRepos, naive_utc, utcnow
-from mealie.schema.recipe_ingest import IngestErrorCode, IngestRejectReason, IngestStatus, RecipeIngestionJobCounts
+from mealie.repos.repository_recipe_ingest import IngestRepos, naive_utc, utcnow, waits_for_limit
+from mealie.schema.recipe_ingest import IngestRejectReason, IngestStatus, RecipeIngestionJobCounts
 from mealie.services.event_bus_service.event_bus_listeners import AppriseEventListener
 from mealie.services.event_bus_service.event_types import (
     INTERNAL_INTEGRATION_ID,
@@ -313,6 +318,7 @@ def ready_message(
     waited: int = 0,
     waiting: int = 0,
     reset: datetime | None = None,
+    still_waiting: bool = False,
 ) -> EventBusMessage:
     """
     'Recipe cards ready' / '10 cards are ready to review (2 need a look, 1 failed).', titled 'Recipe cards not read'
@@ -320,12 +326,14 @@ def ready_message(
     '2 cards that waited for the monthly limit were read. 1 card is ready to review (1 failed).' `waiting`: the cards
     waiting for a monthly limit, which aren't failed and are said last, read at `reset` at the latest: '… 2 cards are
     waiting for the monthly limit. They'll be read when it resets on Nov 1, or sooner if it's raised.'; with no card
-    ready or failed, that's the whole body, titled 'Recipe cards waiting'.
+    ready or failed, that's the whole body, titled 'Recipe cards waiting'. `still_waiting`: a wave's cards that waited
+    already and wait again: '… 2 cards still wait for the monthly limit. They'll be read when it resets on Dec 1, …'.
     """
     waits = ""
     if waiting:
         date = reset_date(reset, translator) if reset is not None else ""
-        waits = translator.t("recipe-ingest.notification-waiting", count=waiting, date=date)
+        words = "recipe-ingest.notification-still-waiting" if still_waiting else "recipe-ingest.notification-waiting"
+        waits = translator.t(words, count=waiting, date=date)
         if not counts.ready and not counts.failed:
             return EventBusMessage(title=translator.t("recipe-ingest.notification-title-waiting"), body=waits)
 
@@ -430,33 +438,73 @@ def _claimable(batch_id: UUID | None, now: datetime) -> list[sa.ColumnElement[bo
 
 LIMIT_WAVE_PREFIX = "limit-wave:"
 """
-A `notify_delivered` entry naming a card read again after waiting for a monthly limit, whose batch notifies again for
-it (`arm_limit_wave`); the other entries are delivery hashes (`NotifierURL.delivery_key`), which never start so
+A `notify_delivered` entry naming a card a lift queued again (its monthly limit no longer applied) after it waited for
+it, whose batch notifies again for it (`arm_limit_wave`); the other entries are delivery hashes
+(`NotifierURL.delivery_key`), which never start so
 """
+LIMIT_RESET_PREFIX = "limit-reset:"
+"""
+The same for a card queued again because its limit's reset came: the batch was told it would be read then, so should it
+wait again (the new month's limit ran out too), the batch is told so even when none of the wave's cards was read
+"""
+NEXT_WAVE_PREFIX = "next:"
+"""
+Before a wave entry: a card queued again while the batch's notification was being sent (claimed), which that
+notification doesn't tell of. It's the batch's next wave, which the notification's last record starts (`_record`).
+"""
+_WAVE_PREFIXES = (LIMIT_WAVE_PREFIX, LIMIT_RESET_PREFIX)
 
 
-def _wave_entry(job_id: UUID) -> str:
-    return f"{LIMIT_WAVE_PREFIX}{job_id}"
+def _wave_entry(job_id: UUID, *, reset: bool) -> str:
+    return f"{LIMIT_RESET_PREFIX if reset else LIMIT_WAVE_PREFIX}{job_id}"
+
+
+def _entry_ids(entries: Iterable[str], prefixes: tuple[str, ...] = _WAVE_PREFIXES) -> set[UUID]:
+    """The cards named by the entries that start with one of `prefixes`"""
+    ids: set[UUID] = set()
+    for entry in entries:
+        for prefix in prefixes:
+            if entry.startswith(prefix):
+                try:
+                    ids.add(UUID(entry.removeprefix(prefix)))
+                except ValueError:
+                    pass
+                break
+    return ids
 
 
 def _wave_ids(entries: Iterable[str]) -> set[UUID]:
     """The cards of a batch's pending wave, from its `notify_delivered`"""
-    ids: set[UUID] = set()
-    for entry in entries:
-        if entry.startswith(LIMIT_WAVE_PREFIX):
-            try:
-                ids.add(UUID(entry.removeprefix(LIMIT_WAVE_PREFIX)))
-            except ValueError:
-                continue
-    return ids
+    return _entry_ids(entries)
+
+
+def _next_wave_entries(entries: Iterable[str]) -> set[str]:
+    """The entries of the batch's next wave (`NEXT_WAVE_PREFIX`)"""
+    return {entry for entry in entries if entry.startswith(NEXT_WAVE_PREFIX)}
+
+
+def _next_wave(entries: Iterable[str]) -> list[str]:
+    """The entries of the batch's next wave, as they'll be once it's started"""
+    return sorted(entry.removeprefix(NEXT_WAVE_PREFIX) for entry in _next_wave_entries(entries))
+
+
+def _done(entries: Iterable[str], now: datetime) -> dict[str, Any]:
+    """
+    What a batch's row gets once its notification is done, or given up on: `notified_at`; or, when cards were queued
+    again while it was being sent (`NEXT_WAVE_PREFIX`), a wave of those, due again once they're read
+    """
+    upcoming = _next_wave(entries)
+    if not upcoming:
+        return {"notified_at": now}
+    return {"notified_at": None, "notify_claimed_at": None, "notify_attempts": 0, "notify_delivered": upcoming}
 
 
 @dataclass
 class _Lease:
     """
     One attempt's hold on a batch's notification: its number, and the lease's current start (`notify_claimed_at`),
-    which the `Heartbeat` moves on. Every write of the attempt is fenced on both, so once the batch is armed again
-    (`arm_limit_wave`, which clears them) the attempt writes nothing, even if a later one has its number.
+    which the `Heartbeat` moves on. Every write of the attempt is fenced on both, so once another attempt took it over
+    (or it was given up on, or settled) the attempt writes nothing, even if a later one has its number.
     """
 
     batch_id: UUID
@@ -464,6 +512,8 @@ class _Lease:
     claimed_at: datetime
     lock: threading.Lock = field(default_factory=threading.Lock)
     """Held for each fenced write, so a renewal and a record never use the start the other is replacing"""
+    next_wave: bool = False
+    """Set once the attempt's last record started the batch's next wave (`_record`)"""
 
     def fence(self) -> list[sa.ColumnElement[bool]]:
         return [
@@ -478,7 +528,10 @@ class _Lease:
 class _Claim:
     lease: _Lease
     delivered: frozenset[str]
-    """The notifiers earlier attempts reached (`NotifierURL.delivery_key`), and a pending wave's cards"""
+    """
+    The notifiers earlier attempts reached (`NotifierURL.delivery_key`), a pending wave's cards, and the next wave's
+    as they were when it was claimed
+    """
 
     @property
     def attempt(self) -> int:
@@ -554,65 +607,111 @@ def _renew_claim(lease: _Lease) -> bool:
         return True
 
 
+def _hold_row(session: Session, conditions: Iterable[sa.ColumnElement[bool]]) -> list[str] | None:
+    """
+    Takes the row of the batch where `conditions` hold for the rest of the session's transaction, with a write that
+    changes nothing (PostgreSQL's row lock, SQLite's write lock), and reads its `notify_delivered`: an arm
+    (`arm_limit_wave`, which locks the row too) can't add to its next wave before the transaction ends. None when
+    `conditions` don't hold.
+    """
+    conditions = list(conditions)
+    stmt = sa.update(Batch).where(*conditions).values(notify_attempts=Batch.notify_attempts)
+    result = session.execute(stmt, execution_options={"synchronize_session": False})
+    if not (isinstance(result, CursorResult) and result.rowcount == 1):
+        return None
+    entries = session.execute(sa.select(Batch.notify_delivered).where(*conditions)).scalar_one()
+    return list(entries or ())
+
+
 def _record(session: Session, lease: _Lease, delivered: Iterable[str], *, notified_at: datetime | None = None) -> bool:
     """
-    Records the notifiers that have the batch's notification (and keeps a wave's cards) and, with `notified_at`, that
-    it's done, if the attempt still holds `lease` (no later attempt took it over, nothing settled or armed it again);
-    whether it did
+    Records the notifiers that have the batch's notification (and keeps a wave's cards, and its next wave's) and, with
+    `notified_at`, that it's done, if the attempt still holds `lease` (no later attempt took it over, nothing settled
+    or gave it up); whether it did. Done, with cards queued again while it was being sent, it starts their wave
+    (`_done`, `lease.next_wave`).
     """
-    values: dict[str, Any] = {"notify_delivered": sorted(delivered)}
-    if notified_at is not None:
-        values["notified_at"] = notified_at
     with lease.lock:
-        return _fenced_update(session, lease, values)
+        try:
+            entries = _hold_row(session, lease.fence())
+            if entries is None:
+                session.rollback()
+                return False
+            upcoming = _next_wave_entries(entries)
+            values: dict[str, Any] = {"notify_delivered": sorted({*delivered, *upcoming})}
+            if notified_at is not None:
+                values.update(_done(upcoming, notified_at))
+            stmt = sa.update(Batch).where(*lease.fence()).values(**values)
+            result = session.execute(stmt, execution_options={"synchronize_session": False})
+            recorded = isinstance(result, CursorResult) and result.rowcount == 1
+            session.commit()
+        except BaseException:
+            session.rollback()
+            raise
+    if recorded and notified_at is not None and upcoming:
+        lease.next_wave = True
+    return recorded
 
 
 ARM_TRIES = 10
 """How often `arm_limit_wave` reads the notification's state again when another process changed it meanwhile"""
 
 
-def arm_limit_wave(session: Session, job_id: UUID) -> None:
+def arm_limit_wave(session: Session, queued: Mapping[UUID, bool]) -> None:
     """
-    Arms the notification of the batch of a card the automatic retry has just queued after it waited for a monthly
-    limit (`runner/retries.py`), in the queueing's transaction, which the caller then commits, so the card is never
-    queued without it, nor the batch armed for a card that wasn't queued. Under the household's intake lock
-    (`intake.lock_household_intake`), so two processes arming one batch keep both cards; the batch's row is read
+    Arms the notification of the batch whose cards the automatic retry has just queued after they waited for a monthly
+    limit (`runner/retries.py`; `queued`: each card, with whether its limit's reset came, else a lift queued it), in
+    the queueing's transaction, which the caller then commits, so no card is queued without it, nor the batch armed for
+    a card that wasn't queued. The cards are one batch's, queued together. Under the household's intake lock
+    (`intake.lock_household_intake`), so two processes arming one batch keep every card; the batch's row is read
     locked (`FOR UPDATE` on PostgreSQL, where a claim being made meanwhile is waited for and seen; SQLite serializes
     writers already), and the write fenced on the notification's state as read, so it never lands between another
     process's claim and its record:
-    - the batch's notification went out: it's due again once the card is read, for a wave of the cards that waited
-      (`notified_at`, the claim and the attempts cleared, the card's id kept in `notify_delivered`);
-    - a wave is pending: the card joins it, and one being sent starts over (its counts didn't have the card);
-    - the batch's own notification is pending: it counts the card as it is once read, and one being sent (or waiting
-      to be tried again) starts over, for the same reason.
+    - the batch's notification went out: it's due again once the cards are read, for a wave of them (`notified_at`,
+      the claim and the attempts cleared, the cards' ids kept in `notify_delivered`, `LIMIT_RESET_PREFIX` or
+      `LIMIT_WAVE_PREFIX` by why they were queued);
+    - a wave is pending, not being sent: the cards join it;
+    - the batch's notification is being sent (or waits to be tried again), its own or a wave's: it goes on for its own
+      cards, whose counts it has right, and these are its next wave (`NEXT_WAVE_PREFIX`), which its last record starts
+      (`_record`), so no notifier is told of a card twice;
+    - the batch's own notification is still to come: it counts the cards as they are once read.
     """
-    job = session.execute(sa.select(Job.batch_id, Job.household_id).where(Job.id == job_id)).one_or_none()
-    if job is None:
+    if not queued:
         return
-    lock_household_intake(session, job.household_id)
+    rows = session.execute(sa.select(Job.id, Job.batch_id, Job.household_id).where(Job.id.in_(queued))).all()
+    batches = {(row.batch_id, row.household_id) for row in rows}
+    if not batches:
+        return
+    if len(batches) > 1:
+        raise ValueError("arm_limit_wave arms one batch: its cards queued together")
+    [(batch_id, household_id)] = batches
+    arming = {_wave_entry(row.id, reset=queued[row.id]) for row in rows}
+    lock_household_intake(session, household_id)
     for _ in range(ARM_TRIES):
         state = session.execute(
             sa.select(Batch.notified_at, Batch.notify_claimed_at, Batch.notify_attempts, Batch.notify_delivered)
-            .where(Batch.id == job.batch_id)
+            .where(Batch.id == batch_id)
             .with_for_update()
         ).one_or_none()
         if state is None:
             return
         entries = set(state.notify_delivered or ())
-        wave = {entry for entry in entries if entry.startswith(LIMIT_WAVE_PREFIX)}
-        start_over = {"notified_at": None, "notify_claimed_at": None, "notify_attempts": 0}
         if state.notified_at is not None:
-            values: dict[str, Any] = {**start_over, "notify_delivered": [_wave_entry(job_id)]}
-        elif wave and state.notify_claimed_at is None:
-            values = {"notify_delivered": sorted(entries | {_wave_entry(job_id)})}
-        elif wave:
-            values = {**start_over, "notify_delivered": sorted(wave | {_wave_entry(job_id)})}
+            # with what's left of a next wave, should a notification have been settled before it started it
+            wave = sorted(arming | set(_next_wave(entries)))
+            values: dict[str, Any] = {
+                "notified_at": None,
+                "notify_claimed_at": None,
+                "notify_attempts": 0,
+                "notify_delivered": wave,
+            }
         elif state.notify_claimed_at is not None:
-            values = {**start_over, "notify_delivered": []}
+            values = {"notify_delivered": sorted(entries | {f"{NEXT_WAVE_PREFIX}{entry}" for entry in arming})}
+        elif any(entry.startswith(_WAVE_PREFIXES) for entry in entries):
+            values = {"notify_delivered": sorted(entries | arming)}
         else:
             return  # its own notification is still to come
         fence = [
-            Batch.id == job.batch_id,
+            Batch.id == batch_id,
             Batch.notify_attempts == state.notify_attempts,
             Batch.notified_at.is_(None) if state.notified_at is None else Batch.notified_at == state.notified_at,
             Batch.notify_claimed_at.is_(None)
@@ -623,19 +722,7 @@ def arm_limit_wave(session: Session, job_id: UUID) -> None:
         result = session.execute(stmt, execution_options={"synchronize_session": False})
         if isinstance(result, CursorResult) and result.rowcount == 1:
             return
-    raise RuntimeError(f"Recipe card batch {job.batch_id}: its notification kept changing; not armed")
-
-
-def _waiting_for_limit() -> list[sa.ColumnElement[bool]]:
-    """
-    A card waiting for a monthly limit: it failed `limit_reached` and is read again automatically (`auto_retry_at`),
-    so no notification calls it failed
-    """
-    return [
-        Job.status == IngestStatus.failed.value,
-        Job.error_code == IngestErrorCode.limit_reached.value,
-        Job.auto_retry_at.is_not(None),
-    ]
+    raise RuntimeError(f"Recipe card batch {batch_id}: its notification kept changing; not armed")
 
 
 @dataclass(frozen=True)
@@ -643,10 +730,13 @@ class _Tally:
     """What a notification says of some of a batch's cards"""
 
     counts: RecipeIngestionJobCounts
-    """Ready, needing a look, and failed (not counting those waiting)"""
+    """Ready, needing a look, failed (not counting those waiting), and waiting for a monthly limit"""
     read: list[UUID]
     """The cards that are ready or failed, in review order"""
-    waiting: int = 0
+    waiting: list[UUID]
+    """The cards waiting for a monthly limit, in review order"""
+    told: list[UUID]
+    """Both, in review order"""
     reset: datetime | None = None
     """When the waiting cards are read at the latest: the last of their `auto_retry_at`"""
 
@@ -654,7 +744,7 @@ class _Tally:
 def _tally(session: Session, batch: Batch, *only: sa.ColumnElement[bool]) -> tuple[_Tally, list[UUID]]:
     """The batch's cards (those where `only` holds) counted for a notification, and all of their ids in review order"""
     repos = IngestRepos(session, batch.group_id, batch.household_id)
-    waits = sa.and_(*_waiting_for_limit())
+    waits = sa.and_(*waits_for_limit())
     rows = session.execute(
         sa.select(Job.id, Job.status, Job.error_count, Job.warning_count, waits.label("waits"), Job.auto_retry_at)
         .where(Job.batch_id == batch.id, *only, *repos.jobs.scope)
@@ -662,22 +752,34 @@ def _tally(session: Session, batch: Batch, *only: sa.ColumnElement[bool]) -> tup
     ).all()
     ready = [row for row in rows if row.status == IngestStatus.ready.value]
     failed = [row for row in rows if row.status == IngestStatus.failed.value and not row.waits]
-    waiting = [naive_utc(row.auto_retry_at) for row in rows if row.waits]
+    waiting = [row for row in rows if row.waits]
     counts = RecipeIngestionJobCounts(
         ready=len(ready),
         needs_attention=sum(1 for row in ready if row.error_count or row.warning_count),
         failed=len(failed),
+        waiting=len(waiting),
     )
     read = {row.id for row in [*ready, *failed]}
-    tally = _Tally(counts, [row.id for row in rows if row.id in read], len(waiting), max(waiting, default=None))
+    tally = _Tally(
+        counts,
+        read=[row.id for row in rows if row.id in read],
+        waiting=[row.id for row in waiting],
+        told=[row.id for row in rows if row.id in read or row.waits],
+        reset=max((naive_utc(row.auto_retry_at) for row in waiting), default=None),
+    )
     return tally, [row.id for row in rows]
 
 
-def _event(session: Session, batch: Batch, tally: _Tally, job_ids: list[UUID], waited: int = 0) -> AIEvent:
+def _event(
+    session: Session, batch: Batch, tally: _Tally, job_ids: list[UUID], *, waited: int = 0, wave: bool = False
+) -> AIEvent:
     translator = translator_for(batch.locale)
     counts = tally.counts
+    message = ready_message(
+        counts, translator, waited=waited, waiting=counts.waiting, reset=tally.reset, still_waiting=wave
+    )
     return AIEvent(
-        message=ready_message(counts, translator, waited=waited, waiting=tally.waiting, reset=tally.reset),
+        message=message,
         event_type=AIEventTypes.recipe_ingestion_ready,
         integration_id=INTERNAL_INTEGRATION_ID,
         document_data=EventIngestionReadyData(
@@ -686,33 +788,37 @@ def _event(session: Session, batch: Batch, tally: _Tally, job_ids: list[UUID], w
             ready_count=counts.ready,
             needs_attention_count=counts.needs_attention,
             failed_count=counts.failed,
-            waiting_count=tally.waiting,
+            waiting_count=counts.waiting,
             review_url=cards_url(group_slug(session, batch.group_id), batch.id),
         ),
     )
 
 
-def _ready_event(session: Session, batch: Batch) -> AIEvent | None:
+def _ready_event(session: Session, batch: Batch, upcoming: set[UUID]) -> AIEvent | None:
     """
     The batch's notification; None when it has nothing to look at (no ready, failed or waiting card). A card waiting
-    for a monthly limit is said to wait, not to have failed; its batch notifies again once it's read (a wave).
+    for a monthly limit is said to wait, not to have failed; its batch notifies again once it's read (a wave). The
+    cards of the batch's next wave (`upcoming`, queued again while this was being sent) are its to tell of.
     """
-    tally, job_ids = _tally(session, batch)
+    tally, job_ids = _tally(session, batch, *([Job.id.not_in(upcoming)] if upcoming else []))
     if not tally.read and not tally.waiting:
         return None
     return _event(session, batch, tally, job_ids)
 
 
-def _wave_event(session: Session, batch: Batch, wave: set[UUID]) -> AIEvent | None:
+def _wave_event(session: Session, batch: Batch, wave: set[UUID], reset: set[UUID]) -> AIEvent | None:
     """
-    The notification of a wave of the batch's cards that waited for a monthly limit, counting only those that were
-    read (`job_ids` too); None when none of them was: each failed `limit_reached` again and waits on (for a wave of
-    its own once read), or is gone
+    The notification of a wave of the batch's cards that waited for a monthly limit: those that were read, then those
+    that still wait (each failed `limit_reached` again; a wave of their own once read) with their new date. `job_ids`
+    are both, in review order. None when none of them was read and none that still waits was queued by its limit's
+    reset (`reset`): a lift that didn't help is told of to nobody (its backoff reads the card again and again, with the
+    same news each time), nor are cards that are gone; one its reset queued is, since the batch was told it would be
+    read then.
     """
     tally, _ = _tally(session, batch, Job.id.in_(wave))
-    if not tally.read:
+    if not tally.read and not reset.intersection(tally.waiting):
         return None
-    return _event(session, batch, replace(tally, waiting=0, reset=None), tally.read, waited=len(tally.read))
+    return _event(session, batch, tally, tally.told, waited=len(tally.read), wave=True)
 
 
 def maybe_notify_batch(batch_id: UUID) -> bool:
@@ -721,28 +827,45 @@ def maybe_notify_batch(batch_id: UUID) -> bool:
     written in the last 24 hours) and no other process is sending it. Whether this call finished it: every notifier
     that opted in has it (or there's none). False when it wasn't due or was being sent elsewhere, when a notifier
     didn't get it (housekeeping tries again), and when the finished batch has nothing to look at (every card
-    committed or discarded already, or a wave's cards are all still waiting). Blocking (Apprise).
+    committed or discarded already, or a wave's cards were queued by a lift and all still wait). Blocking (Apprise).
     """
     return _notify_batch(batch_id, utcnow())
 
 
 def _notify_batch(batch_id: UUID, now: datetime) -> bool:
-    """`maybe_notify_batch` at `now`"""
+    """
+    `maybe_notify_batch` at `now`; then, when it started the batch's next wave (cards queued again while it was being
+    sent, `_record`), that wave, should its cards have been read meanwhile (their finalize found it claimed)
+    """
+    lease, finished = _notify_attempt(batch_id, now)
+    while lease is not None and lease.next_wave:
+        lease, _ = _notify_attempt(batch_id, utcnow())
+    return finished
+
+
+def _notify_attempt(batch_id: UUID, now: datetime) -> tuple[_Lease | None, bool]:
+    """
+    One attempt at the batch's notification at `now`: its lease (None when it claimed nothing), and whether it's done
+    """
     with session_context() as session:
         claim = _claim(session, batch_id, now)
         if claim is None:
-            return False
+            return None, False
         lease = claim.lease
 
         # anything raised from here leaves the claim: housekeeping tries again once its lease has passed
         batch = session.get(Batch, batch_id)
         if batch is None:
-            return False
+            return lease, False
         wave = _wave_ids(claim.delivered)
-        event = _wave_event(session, batch, wave) if wave else _ready_event(session, batch)
+        if wave:
+            event = _wave_event(session, batch, wave, _entry_ids(claim.delivered, (LIMIT_RESET_PREFIX,)))
+        else:
+            # the next wave as it is now: cards may have been queued again since the claim
+            event = _ready_event(session, batch, _entry_ids(_next_wave(batch.notify_delivered or ())))
         if event is None:
             _record(session, lease, claim.delivered, notified_at=utcnow())
-            return False
+            return lease, False
 
         listener = AIEventAppriseListener(batch.group_id, batch.household_id, session)
         targets = listener.targets(event)  # ends the session's transaction before anything is sent
@@ -764,16 +887,16 @@ def _notify_batch(batch_id: UUID, now: datetime) -> bool:
                     continue
                 delivered.add(target.delivery_key)
                 if not _record(session, lease, delivered):
-                    return False  # taken over (this attempt stalled past its lease), armed again, or settled
+                    return lease, False  # taken over (this attempt stalled past its lease), given up on, or settled
 
         if not missed:
-            return _record(session, lease, delivered, notified_at=utcnow())
+            return lease, _record(session, lease, delivered, notified_at=utcnow())
         if claim.attempt >= limits.NOTIFY_ATTEMPTS and _record(session, lease, delivered, notified_at=utcnow()):
             logger.error(
                 f"Recipe card batch {batch_id}: gave up on the ready notification after {claim.attempt} attempts; "
                 f"never delivered to {', '.join(target.label for target in missed)}"
             )
-        return False
+        return lease, False
 
 
 def due_batches(session: Session, now: datetime) -> list[UUID]:
@@ -807,13 +930,19 @@ def settle_stale_batches(session: Session, now: datetime) -> int:
 def give_up_batches(session: Session, now: datetime) -> list[UUID]:
     """
     Marks as notified the batches whose last attempt didn't finish (its process died part way) once its lease has
-    passed: no attempt is left to finish them. The batches it gave up on.
+    passed: no attempt is left to finish them. A batch with cards queued again meanwhile starts their wave instead
+    (`_done`). The batches it gave up on.
     """
     conditions = [Batch.notified_at.is_(None), Batch.notify_attempts >= limits.NOTIFY_ATTEMPTS, _lease_free(now)]
     given_up: list[UUID] = []
     try:
-        for batch_id in list(session.execute(sa.select(Batch.id).where(*conditions)).scalars()):
-            stmt = sa.update(Batch).where(Batch.id == batch_id, *conditions).values(notified_at=now)
+        # in one order, so two processes taking the same batches' rows wait for each other rather than deadlock
+        stmt = sa.select(Batch.id).where(*conditions).order_by(Batch.id)
+        for batch_id in list(session.execute(stmt).scalars()):
+            entries = _hold_row(session, [Batch.id == batch_id, *conditions])
+            if entries is None:
+                continue
+            stmt = sa.update(Batch).where(Batch.id == batch_id, *conditions).values(**_done(entries, now))
             result = session.execute(stmt, execution_options={"synchronize_session": False})
             if isinstance(result, CursorResult) and result.rowcount == 1:
                 given_up.append(batch_id)
@@ -917,10 +1046,7 @@ def send_test_notification(
     data shape (with no batch, and the household's current counts), so a Home Assistant automation can be tried out.
     Whether it was delivered; a failure is logged (by the notifier's id and name, never its URL). Blocking (Apprise).
     """
-    repos = IngestRepos(session, group_id, household_id)
-    counts = repos.jobs.counts()
-    waiting = session.execute(sa.select(sa.func.count(Job.id)).where(*_waiting_for_limit(), *repos.jobs.scope))
-    waiting_count = waiting.scalar_one()  # counted apart from the failed ones, as a batch's notification counts them
+    counts = IngestRepos(session, group_id, household_id).jobs.counts()  # waiting cards apart from the failed ones
     slug = group_slug(session, group_id)
     if session.in_transaction():
         session.commit()  # nothing held open while Apprise sends
@@ -937,8 +1063,8 @@ def send_test_notification(
             job_ids=[],
             ready_count=counts.ready,
             needs_attention_count=counts.needs_attention,
-            failed_count=counts.failed - waiting_count,
-            waiting_count=waiting_count,
+            failed_count=counts.failed,
+            waiting_count=counts.waiting,
             review_url=cards_url(slug),
         ),
     )

@@ -191,6 +191,7 @@
         "notification-title-waiting": "Recipe cards waiting",
         "notification-waiting": "{count} card is waiting for the monthly limit. It'll be read when it resets on {date}, or sooner if it's raised. | {count} cards are waiting for the monthly limit. They'll be read when it resets on {date}, or sooner if it's raised.",
         "notification-waiting-body": "{summary} {waiting}",
+        "notification-still-waiting": "{count} card still waits for the monthly limit. It'll be read when it resets on {date}, or sooner if it's raised. | {count} cards still wait for the monthly limit. They'll be read when it resets on {date}, or sooner if it's raised.",
         "notification-reset-date": "{month} {day}",
         "months-short": {
             "1": "Jan",
@@ -228,7 +229,8 @@
             "failed": "{count} couldn't be read | {count} couldn't be read",
             "list-separator": ", ",
             "list-and": "{first} and {last}",
-            "details": "{details}."
+            "details": "{details}.",
+            "waiting": "{count} is waiting for the monthly limit | {count} are waiting for the monthly limit"
         },
         "notification-rejected": {
             "title": "Recipe cards not added",

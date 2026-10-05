@@ -92,7 +92,7 @@ def test_an_app_batch_is_created_listed_and_sealed(api_client: TestClient, reade
     assert batch["source"] == "app"
     assert batch["sealedAt"] is None
     assert batch["jobs"] == []
-    assert batch["counts"] == {"processing": 0, "ready": 0, "needsAttention": 0, "failed": 0}
+    assert batch["counts"] == {"processing": 0, "ready": 0, "needsAttention": 0, "failed": 0, "waiting": 0}
     batch_id = batch["id"]
 
     # cards arrive out of order; the form's position is their capture order

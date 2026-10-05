@@ -530,35 +530,137 @@ def test_cards_over_the_limit_are_told_they_wait_then_that_they_were_read(
     assert read.message.body == "2 cards that waited for the monthly limit were read. 2 cards are ready to review."
 
 
-def test_a_card_that_fails_the_limit_again_sends_nothing(
+def _limit_reached_but(*read: UUID) -> Any:
+    """A handler: the new month's limit runs out again, after the cards `read` were read"""
+
+    async def handler(ctx: TaskContext) -> Any:
+        if ctx.job_id in read:
+            return extract_result()
+        raise AIProviderLimitReachedError("every provider is over its monthly limit again")
+
+    return handler
+
+
+def _date(when: datetime) -> str:
+    return f"{calendar.month_abbr[when.month]} {when.day}"
+
+
+async def _queue_and_read(dispatcher: IngestDispatcher, jobs: Jobs) -> None:
+    """The retry phase queues the waiting cards, then the dispatcher reads them all (a few at a time)"""
+    await dispatcher.run_once()
+    for _ in range(10):
+        await dispatcher.run_once()
+        await settle(dispatcher)
+        if all(jobs.row(job_id)["status"] != IngestStatus.processing for job_id in jobs.ids):
+            return
+    raise AssertionError("the cards were never read")
+
+
+def _batch_notified_at(jobs: Jobs) -> datetime | None:
+    with session_context() as session:
+        return session.execute(
+            sa.select(RecipeIngestionBatch.notified_at).where(RecipeIngestionBatch.id == jobs.batch_id)
+        ).scalar_one()
+
+
+@pytest.mark.parametrize("queued_by", ["reset", "lift"])
+def test_a_wave_tells_of_its_cards_that_still_wait(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+    queued_by: str,
+):
+    """
+    The batch was told its 3 cards wait for the monthly limit and are read when it resets. The reset comes (or the
+    limit is raised): the 3 are queued at once, and the limit runs out again after the first. The wave says the first
+    was read and that the 2 others still wait, with their new date, never as if every card had been read.
+    """
+    jobs.ready()
+    retry_in = -timedelta(seconds=1) if queued_by == "reset" else timedelta(days=3)
+    first, second, third = (_waiting(jobs, retry_in=retry_in) for _ in range(3))
+    _notified_batch(jobs)
+    limit.set(queued_by == "reset")  # a lift: the limit no longer applies
+    handlers.default = _limit_reached_but(first)
+
+    run(_queue_and_read(dispatcher, jobs))
+    assert jobs.row(first)["status"] == IngestStatus.ready
+    for job_id in (second, third):
+        row = jobs.row(job_id)
+        assert (row["status"], row["error_code"]) == (IngestStatus.failed, LIMIT)
+        assert naive_utc(row["auto_retry_at"]) == next_limit_reset()
+
+    [sent] = notifications
+    assert sent.message.title == "Recipe cards ready"
+    assert sent.message.body == (
+        "1 card that waited for the monthly limit was read. 1 card is ready to review. 2 cards still wait for the "
+        f"monthly limit. They'll be read when it resets on {_date(next_limit_reset())}, or sooner if it's raised."
+    )
+    data = sent.document_data
+    assert isinstance(data, events.EventIngestionReadyData)
+    assert (data.ready_count, data.failed_count, data.waiting_count) == (1, 0, 2)
+    assert data.job_ids == [first, second, third]  # what it tells of, in capture order
+    assert events.maybe_notify_batch(jobs.batch_id) is False
+    assert len(notifications) == 1
+
+
+def test_cards_their_reset_queued_that_all_wait_again_are_told_so(
     dispatcher: IngestDispatcher,
     jobs: Jobs,
     handlers: FakeHandlers,
     limit: LimitChecks,
     notifications: list[events.AIEvent],
 ):
-    job_id = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    """
+    The batch was told its cards would be read when the limit resets. The reset comes, and the new month's limit runs
+    out before any of them is read: the household hears that they still wait, until the next reset.
+    """
+    first = _waiting(jobs, retry_in=-timedelta(seconds=1))
+    second = _waiting(jobs, retry_in=-timedelta(seconds=1))
     _notified_batch(jobs)
+    handlers.default = _limit_reached_but()
 
-    async def limit_reached(ctx: TaskContext) -> Any:
-        raise AIProviderLimitReachedError("every provider is still over its monthly limit")
+    run(_queue_and_read(dispatcher, jobs))
+    for job_id in (first, second):
+        row = jobs.row(job_id)
+        assert (row["status"], row["error_code"]) == (IngestStatus.failed, IngestErrorCode.limit_reached)
 
-    handlers.default = limit_reached
+    [sent] = notifications
+    assert sent.event_type == events.AIEventTypes.recipe_ingestion_ready
+    assert sent.message.title == "Recipe cards waiting"
+    assert sent.message.body == (
+        f"2 cards still wait for the monthly limit. They'll be read when it resets on {_date(next_limit_reset())}, "
+        "or sooner if it's raised."
+    )
+    data = sent.document_data
+    assert isinstance(data, events.EventIngestionReadyData)
+    assert (data.ready_count, data.failed_count, data.waiting_count, data.job_ids) == (0, 0, 2, [first, second])
+    assert _batch_notified_at(jobs) is not None  # once
+    assert events.maybe_notify_batch(jobs.batch_id) is False
 
-    async def scenario() -> None:
-        await dispatcher.run_once()
-        await dispatcher.run_once()
-        await settle(dispatcher)
 
-    run(scenario())
+def test_a_card_a_lift_queued_that_fails_the_limit_again_sends_nothing(
+    dispatcher: IngestDispatcher,
+    jobs: Jobs,
+    handlers: FakeHandlers,
+    limit: LimitChecks,
+    notifications: list[events.AIEvent],
+):
+    """
+    A raised limit that doesn't help a card (it fails `limit_reached` again) tells nobody: its reset date hasn't moved,
+    and the lift backoff reads it again and again, which would repeat the same news each time
+    """
+    job_id = _waiting(jobs)  # its reset is days away
+    _notified_batch(jobs)
+    limit.set(False)  # raised
+    handlers.default = _limit_reached_but()
+
+    run(_queue_and_read(dispatcher, jobs))
     row = jobs.row(job_id)
-    assert (row["status"], row["error_code"]) == (IngestStatus.failed, IngestErrorCode.limit_reached)
+    assert (row["status"], row["error_code"], row["lift_retries"]) == (IngestStatus.failed, LIMIT, 1)
     assert notifications == []
-    with session_context() as session:
-        notified_at = session.execute(
-            sa.select(RecipeIngestionBatch.notified_at).where(RecipeIngestionBatch.id == jobs.batch_id)
-        ).scalar_one()
-    assert notified_at is not None  # settled: nothing left to send for it
+    assert _batch_notified_at(jobs) is not None  # settled: nothing left to send for it
 
 
 def test_a_card_that_fails_for_good_after_the_wait_is_told(

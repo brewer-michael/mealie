@@ -29,16 +29,19 @@ class RecipeCardQueueResult(ToolResult):
     ready: int = Field(description="Cards read and waiting to be reviewed")
     needs_attention: int = Field(description="Of the ready cards, those with something to check")
     processing: int = Field(description="Cards still being read")
-    failed: int = Field(description="Cards that couldn't be read")
+    failed: int = Field(description="Cards that couldn't be read, not counting those waiting for the monthly limit")
+    waiting: int = Field(
+        description="Cards waiting for the monthly limit: read again automatically once it resets or is raised"
+    )
 
 
 def queue_speech(counts: RecipeIngestionJobCounts, translator: Translator) -> str:
     """
     '7 recipe cards are ready to review. 2 need a closer look and 1 is still being read.', in `translator`'s language
-    (en-US for a text it doesn't have)
+    (en-US for a text it doesn't have). Cards waiting for the monthly limit are said to wait, never to have failed.
     """
     t = with_fallback(translator).t
-    if not (counts.ready or counts.processing or counts.failed):
+    if not (counts.ready or counts.processing or counts.failed or counts.waiting):
         return t(f"{VOICE}.none-waiting")
     first = t(f"{VOICE}.ready", count=counts.ready)  # "No recipe cards are ready to review yet." for none
 
@@ -51,6 +54,8 @@ def queue_speech(counts: RecipeIngestionJobCounts, translator: Translator) -> st
         rest.append(t(f"{VOICE}.still-reading", count=counts.processing))
     if counts.failed:
         rest.append(t(f"{VOICE}.failed", count=counts.failed))
+    if counts.waiting:
+        rest.append(t(f"{VOICE}.waiting", count=counts.waiting))
 
     if not rest:
         return first
@@ -70,6 +75,7 @@ def _recipe_card_queue(ctx: ToolContext, args: RecipeCardQueueArgs) -> RecipeCar
         needs_attention=counts.needs_attention,
         processing=counts.processing,
         failed=counts.failed,
+        waiting=counts.waiting,
     )
 
 
@@ -77,8 +83,9 @@ recipe_card_queue = AITool(
     name="recipe_card_queue",
     description=(
         "How many scanned recipe cards are waiting in Mealie: ready to review, needing a closer look, still being "
-        "read, or failed. Use it for questions like 'any recipe cards to review?'. Returns counts only; the cards "
-        "themselves are reviewed in Mealie's Recipe cards page."
+        "read, failed, or waiting for the monthly limit (read again automatically later). Use it for questions like "
+        "'any recipe cards to review?'. Returns counts only; the cards themselves are reviewed in Mealie's Recipe "
+        "cards page."
     ),
     args=RecipeCardQueueArgs,
     result=RecipeCardQueueResult,

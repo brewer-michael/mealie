@@ -16,6 +16,8 @@ repository factory stays untouched.
 
 **Public interface**
 - `utcnow()`: the naive-UTC "now" that every ingest query binds.
+- `waits_for_limit()`: the conditions of a card waiting for a monthly limit (failed `limit_reached`, retried
+  automatically), which every count keeps apart from the failed cards.
 - `JobConflict`: `update_job_json` lost the race for `row_version` four times in a row.
 - `JobWrite(before, values)`: what `update_job_json` read and what it wrote.
 - `update_job_json(session, job_id, mutate, *, where=(), scope=())`: reads the job (matching `where` and `scope`),
@@ -172,6 +174,7 @@ class LimitWait:
     job_id: UUID
     group_id: UUID
     household_id: UUID
+    batch_id: UUID
     local_only: bool
     """The card's own `local_only` (its group's setting applies on top)"""
     auto_retry_at: datetime
@@ -431,7 +434,7 @@ class IngestJobsRepo:
         return list(self.session.execute(stmt).scalars()), total
 
     def counts(self, *, batch_id: UUID | None = None) -> RecipeIngestionJobCounts:
-        """Processing, ready, ready with something to check, and failed jobs"""
+        """Processing, ready, ready with something to check, failed, and waiting for a monthly limit (not failed)"""
         return _counts(self.session, [*self.scope, *([Job.batch_id == batch_id] if batch_id else [])])
 
     def find_duplicate(self, source_sha256: str) -> UUID | None:
@@ -558,6 +561,18 @@ class IngestJobsRepo:
         return _rowcount(result) == 1
 
 
+def waits_for_limit() -> list[sa.ColumnElement[bool]]:
+    """
+    A card waiting for a monthly limit: it failed `limit_reached` and is read again automatically (`auto_retry_at`),
+    so nothing counts it as failed
+    """
+    return [
+        Job.status == IngestStatus.failed.value,
+        Job.error_code == IngestErrorCode.limit_reached.value,
+        Job.auto_retry_at.is_not(None),
+    ]
+
+
 def _counts(session: Session, conditions: Sequence[sa.ColumnElement[bool]]) -> RecipeIngestionJobCounts:
     def count_where(*criteria: sa.ColumnElement[bool]) -> sa.ColumnElement[int]:
         return sa.func.coalesce(sa.func.sum(sa.case((sa.and_(*criteria), 1), else_=0)), 0)
@@ -568,10 +583,15 @@ def _counts(session: Session, conditions: Sequence[sa.ColumnElement[bool]]) -> R
         count_where(ready),
         count_where(ready, sa.or_(Job.error_count > 0, Job.warning_count > 0)),
         count_where(Job.status == IngestStatus.failed.value),
+        count_where(*waits_for_limit()),
     ).where(*conditions)
-    processing, ready_count, needs_attention, failed = session.execute(stmt).one()
+    processing, ready_count, needs_attention, failed, waiting = session.execute(stmt).one()
     return RecipeIngestionJobCounts(
-        processing=processing, ready=ready_count, needs_attention=needs_attention, failed=failed
+        processing=processing,
+        ready=ready_count,
+        needs_attention=needs_attention,
+        failed=failed - waiting,  # the waiting ones are failed cards too
+        waiting=waiting,
     )
 
 
@@ -1159,33 +1179,33 @@ class IngestQueue:
     @staticmethod
     def _waiting_for_limit() -> list[sa.ColumnElement[bool]]:
         """A card whose first reading failed because every provider was over its monthly limit, waiting to retry"""
-        return [
-            Job.status == IngestStatus.failed.value,
-            Job.error_code == IngestErrorCode.limit_reached.value,
-            Job.auto_retry_at.is_not(None),
-            Job.task_state.is_(None),
-        ]
+        return [*waits_for_limit(), Job.task_state.is_(None)]
 
     def waiting_for_limit(self) -> list[LimitWait]:
-        """Every card waiting for a monthly limit to reset or be raised (`auto_retry_at`), the soonest retry first"""
+        """
+        Every card waiting for a monthly limit to reset or be raised (`auto_retry_at`), the soonest retry first, a
+        batch's cards together (in capture order) among those with the same retry time, as on a reset day
+        """
         stmt = (
             sa.select(
                 Job.id,
                 Job.group_id,
                 Job.household_id,
+                Job.batch_id,
                 Job.local_only,
                 Job.auto_retry_at,
                 Job.lift_retries,
                 Job.lift_retry_at,
             )
             .where(*self._waiting_for_limit())
-            .order_by(Job.auto_retry_at, Job.id)
+            .order_by(Job.auto_retry_at, Job.batch_id, Job.position, Job.created_at, Job.id)
         )
         waiting = [
             LimitWait(
                 job_id=row.id,
                 group_id=row.group_id,
                 household_id=row.household_id,
+                batch_id=row.batch_id,
                 local_only=bool(row.local_only),
                 auto_retry_at=naive_utc(row.auto_retry_at),
                 lift_retries=row.lift_retries or 0,
